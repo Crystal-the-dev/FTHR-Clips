@@ -185,5 +185,6 @@ Licence texts: [`licenses/`](licenses/), also installed alongside the app.
 | [`docs/SUPPORTED_PLATFORMS.md`](docs/SUPPORTED_PLATFORMS.md) | The real support matrix — what was actually tested, and where |
 | [`docs/TESTING.md`](docs/TESTING.md) | How to verify a build; build vs headless vs desktop tests |
 | [`docs/AUDIT_REPORT.md`](docs/AUDIT_REPORT.md) | Consolidated audit — all findings, all three passes |
+| [`docs/AUDIT-014-LINUX-FFMPEG.md`](docs/AUDIT-014-LINUX-FFMPEG.md) | How the Linux LGPL FFmpeg is pinned, built against and verified |
 | [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md) | The gates a release must pass before it may be tagged |
 | [`docs/SOURCE_OF_TRUTH.md`](docs/SOURCE_OF_TRUTH.md) | Which tree is authoritative, and how backups work |

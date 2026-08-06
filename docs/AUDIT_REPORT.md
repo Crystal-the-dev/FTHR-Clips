@@ -114,7 +114,7 @@ which desktop it detected and print the exact command to bind.
 | AUDIT-011 | P2 | UI responsiveness | **PARTIALLY FIXED** (III) |
 | AUDIT-012 | P2 | Privacy | **OPEN** |
 | AUDIT-013 | **P0** | Licensing | **OPEN — RELEASE BLOCKER** |
-| AUDIT-014 | **P0** | Linux packaging | **OPEN — RELEASE BLOCKER** |
+| AUDIT-014 | P0 | Linux packaging | **CONDITIONALLY RESOLVED** (2026-08-06) — see [AUDIT-014-LINUX-FFMPEG.md](AUDIT-014-LINUX-FFMPEG.md) |
 | AUDIT-015 | P1 | Linux save pipeline | **FIXED** (III) |
 | AUDIT-016 | P2 | Linux portability | **FIXED** (III) |
 
