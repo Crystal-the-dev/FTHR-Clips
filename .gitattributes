@@ -1,0 +1,102 @@
+# FTHR Clips — line ending and diff behaviour
+#
+# The repo is developed on Windows and built on both Windows and Linux.
+# Everything is stored LF in the repository. Files that only ever run through
+# a Windows interpreter (.bat/.cmd/.ps1, Inno Setup, MSBuild) are checked out
+# CRLF; shell scripts are forced LF so they stay executable under bash.
+#
+# This file exists before the first commit on purpose: normalising afterwards
+# would rewrite every text file in the tree in a single noise commit.
+
+# Default: let git detect text and normalise to LF in the repository.
+* text=auto eol=lf
+
+# ---------------------------------------------------------------------------
+# Windows-only tooling — must be CRLF in the working tree
+# ---------------------------------------------------------------------------
+*.bat           text eol=crlf
+*.cmd           text eol=crlf
+*.ps1           text eol=crlf
+*.iss           text eol=crlf
+*.sln           text eol=crlf
+*.vcxproj       text eol=crlf
+*.vcxproj.filters text eol=crlf
+*.props         text eol=crlf
+*.targets       text eol=crlf
+*.rc            text eol=crlf
+
+# ---------------------------------------------------------------------------
+# POSIX shell — must stay LF or bash chokes on \r
+# ---------------------------------------------------------------------------
+*.sh            text eol=lf
+AppDir/AppRun   text eol=lf
+*.desktop       text eol=lf
+
+# ---------------------------------------------------------------------------
+# Source
+# ---------------------------------------------------------------------------
+*.py            text eol=lf diff=python
+*.pyi           text eol=lf diff=python
+*.c             text eol=lf diff=cpp
+*.h             text eol=lf diff=cpp
+*.cpp           text eol=lf diff=cpp
+*.hpp           text eol=lf diff=cpp
+*.cmake         text eol=lf
+CMakeLists.txt  text eol=lf
+*.spec          text eol=lf diff=python
+
+# ---------------------------------------------------------------------------
+# Data / docs
+# ---------------------------------------------------------------------------
+*.md            text eol=lf
+*.json          text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.xml           text eol=lf
+*.txt           text eol=lf
+*.def           text eol=lf
+*.pc            text eol=lf
+LICENSE         text eol=lf
+licenses/*      text eol=lf
+
+# ---------------------------------------------------------------------------
+# Binary — never diff, never munge line endings
+# ---------------------------------------------------------------------------
+*.png           binary
+*.ico           binary
+*.bmp           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.ttf           binary
+*.otf           binary
+*.mp3           binary
+*.wav           binary
+*.lib           binary
+*.a             binary
+*.dll           binary
+*.exe           binary
+*.so            binary
+*.so.*          binary
+*.dylib         binary
+*.pdb           binary
+*.obj           binary
+*.zip           binary
+*.docx          binary
+*.AppImage      binary
+
+# ---------------------------------------------------------------------------
+# Git LFS
+# ---------------------------------------------------------------------------
+# Deliberately NOT used. The only files large enough to justify it (FFmpeg
+# runtime DLLs 152 MB, vc_redist 25 MB, the built installer 215 MB) are either
+# re-downloadable from a sha256-pinned manifest or are release artefacts.
+# Tracked binaries are the FFmpeg import libs (~1.6 MB), icons, fonts and
+# notification sounds — all small and all effectively write-once.
+
+# ---------------------------------------------------------------------------
+# Export hygiene: keep CI and planning noise out of `git archive` tarballs.
+# ---------------------------------------------------------------------------
+.github         export-ignore
+.gitattributes  export-ignore
+.gitignore      export-ignore

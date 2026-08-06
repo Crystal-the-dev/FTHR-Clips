@@ -1,0 +1,114 @@
+import json
+import shutil
+import subprocess
+import threading
+from PyQt6.QtCore import QObject, QTimer, pyqtSignal
+from core.compositor import detect_compositor
+
+
+def _get_active_window_title() -> str | None:
+    """Return the active window title, or None if unavailable.
+
+    - Hyprland: hyprctl activewindow -j
+    - All others: xdotool getactivewindow + getwindowname (covers XWayland games)
+    Returns None if the tool is unavailable or call fails.
+    """
+    comp = detect_compositor()
+
+    if comp == 'hyprland':
+        try:
+            r = subprocess.run(
+                ['hyprctl', 'activewindow', '-j'],
+                capture_output=True, timeout=1,
+            )
+            data = json.loads(r.stdout.decode(errors='replace'))
+            return data.get('title', '') or data.get('class', '') or None
+        except Exception:
+            return None
+
+    if shutil.which('xdotool') is None:
+        return None
+
+    try:
+        r = subprocess.run(['xdotool', 'getactivewindow'],
+                           capture_output=True, timeout=1)
+        if r.returncode != 0:
+            return None
+        wid = r.stdout.decode().strip()
+        r2 = subprocess.run(['xdotool', 'getwindowname', wid],
+                            capture_output=True, timeout=1)
+        if r2.returncode != 0:
+            return None
+        return r2.stdout.decode().strip() or None
+    except Exception:
+        return None
+
+
+class FocusMonitor(QObject):
+    focus_lost     = pyqtSignal()
+    focus_regained = pyqtSignal()
+    _title_polled  = pyqtSignal(object)  # worker thread → main thread
+
+    def __init__(self, target_name: str = '', parent=None):
+        super().__init__(parent)
+        self._target  = target_name
+        self._focused = True
+        self._poll_running = False
+        self._timer   = QTimer(self)
+        self._timer.setInterval(2000)
+        # The title lookup shells out to xdotool/hyprctl (blocking, up to 2s
+        # worst case) — run it off the Qt main thread.
+        self._timer.timeout.connect(self._start_poll)
+        self._title_polled.connect(self._apply_title)
+
+    def _start_poll(self):
+        if not self._target or self._poll_running:
+            return
+        self._poll_running = True
+
+        def _work():
+            try:
+                title = _get_active_window_title()
+            except Exception:
+                title = None
+            self._title_polled.emit(title)
+
+        threading.Thread(target=_work, daemon=True,
+                         name='fthr-focus-poll').start()
+
+    def _apply_title(self, title):
+        self._poll_running = False
+        self._evaluate(title)
+
+    def set_target(self, name: str):
+        self._target  = name
+        self._focused = True
+
+    def start(self):
+        self._focused = True
+        self._timer.start()
+
+    def stop(self):
+        self._timer.stop()
+
+    def _title_matches(self, title: str) -> bool:
+        if not self._target:
+            return True
+        return self._target.lower() in title.lower()
+
+    def _poll(self):
+        """Synchronous poll — used by tests and as a manual refresh."""
+        if not self._target:
+            return
+        self._evaluate(_get_active_window_title())
+
+    def _evaluate(self, title):
+        if title is None or not self._target:
+            return
+        focused = self._title_matches(title)
+        if focused and not self._focused:
+            self._focused = True
+            self.focus_regained.emit()
+        elif not focused and self._focused:
+            self._focused = False
+            self.focus_lost.emit()

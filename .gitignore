@@ -1,0 +1,149 @@
+# FTHR Clips — ignore rules
+#
+# Rule of thumb: source, build scripts, project files and licence texts are
+# tracked. Anything a build regenerates, anything a user produces at runtime,
+# and anything we can re-download from a pinned manifest is not.
+#
+# If you add a rule here, check `git status --ignored` afterwards and make sure
+# you did not accidentally shadow a real source file. `.gitignore` has bitten
+# this project once already (`AppDir/` used to swallow the .desktop source).
+
+# ---------------------------------------------------------------------------
+# Third-party binaries — re-downloadable, verified by sha256
+# ---------------------------------------------------------------------------
+# The FFmpeg *headers* and *import libs* under third_party/ffmpeg/{include,lib}
+# ARE tracked: without them the Windows engine cannot compile at all, and they
+# are small. Only the runtime DLLs / .exe (152 MB) are excluded — fetch them
+# with `python tools/fetch_third_party.py --ffmpeg`, which verifies the sha256
+# recorded in tools/ffmpeg_manifest.json.
+FTHRcapture/FTHRclips/third_party/ffmpeg/bin/
+
+# MSVC redistributable pulled in by the Inno Setup installer.
+# Fetch with `python tools/fetch_third_party.py --vcredist`.
+redist/
+
+# ---------------------------------------------------------------------------
+# Build outputs
+# ---------------------------------------------------------------------------
+# PyInstaller
+/build/
+/dist/
+/dist_old_gpl_*/
+*.spec.bak
+
+# Visual Studio / MSBuild
+.vs/
+FTHRcapture/x64/
+FTHRcapture/FTHRclips/x64/
+*.obj
+*.iobj
+*.ipdb
+*.pdb
+*.idb
+*.tlog
+*.ilk
+*.exp
+*.lastbuildstate
+*.vcxproj.user
+
+# CMake / Linux engine
+FTHRcapture_linux/build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# AppImage packaging: `AppDir/fthr-clips.desktop` and `AppDir/fthr-clips.png`
+# are SOURCE and stay tracked. build_linux.sh generates AppRun and the usr/
+# tree into its own build directory; the copies here are stale artefacts.
+AppDir/AppRun
+AppDir/usr/
+*.AppImage
+
+# Inno Setup installer output
+/Output/
+*.iss.bak
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.pyd
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# ---------------------------------------------------------------------------
+# Runtime / user data — never belongs in the repo
+# ---------------------------------------------------------------------------
+# Real user state lives in ~/.fthr/ (settings.json, hotkeys.json,
+# upload_history.json). These patterns catch stray copies dropped into the tree.
+.fthr/
+settings.json
+settings.json.tmp
+settings.json.corrupt
+hotkeys.json
+upload_history.json
+*.log
+*.dmp
+crashdumps/
+
+# Recorded clips, screenshots and exports
+Clips/
+Exported/
+Shared/
+Screenshots/*
+!Screenshots/.gitkeep
+*.mp4
+*.mkv
+*.mov
+*.webm
+*.avi
+*.flv
+
+# ---------------------------------------------------------------------------
+# Secrets — belt and braces. Nothing matching these should ever exist here.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.crt
+*.cer
+*_secrets.json
+credentials.json
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+
+# ---------------------------------------------------------------------------
+# Not source
+# ---------------------------------------------------------------------------
+# Binary planning document — tracked history is useless and it bloats the pack.
+FTHRClips_Roadmap.docx
+*.docx
+# Joke/scratch file left in the tree; safe to delete from disk.
+FTHRCLIPS.exe.txt
