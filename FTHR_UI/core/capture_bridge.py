@@ -165,10 +165,41 @@ class CaptureBridge:
             return False
 
         size = ctypes.sizeof(SharedMemoryLayout)
+
+        # Layout check BEFORE mapping. The struct is the entire contract and
+        # there is no version field inside it, so the region's size is the only
+        # signal available at runtime. If an engine built from a different
+        # shared_memory.h is running, every field past the drift point would
+        # otherwise be read as garbage — silently. Refusing with a message
+        # naming both sizes is the difference between a five-minute diagnosis
+        # and a week of "the encoder reports nonsense".
+        #
+        # The mapping NAME already carries a layout version (_v3), so an old
+        # engine and a new UI normally cannot meet at all. This catches the
+        # case where someone bumps the struct without bumping the name.
+        try:
+            actual = os.fstat(fd).st_size
+        except OSError:
+            actual = -1
+        if actual >= 0 and actual != size:
+            os.close(fd)
+            print(
+                f'[Bridge] Shared-memory layout mismatch on {shm_path}: the '
+                f'engine created {actual} bytes, this UI expects {size} bytes '
+                f'for {self.SHARED_MEM_NAME}.\n'
+                f'[Bridge] The running engine was built from a different '
+                f'shared_memory.h. Rebuild the Linux engine from this source '
+                f'tree (see CONTRIBUTING.md, "The shared-memory contract"). '
+                f'Refusing to map it — reading it would return garbage.'
+            )
+            return False
+
         try:
             self._linux_mmap = _mmap.mmap(fd, size, access=_mmap.ACCESS_WRITE)
         except Exception as e:
-            os.close(fd)
+            # No close() here: the finally below owns it. Closing in both places
+            # made the second close raise EBADF *out of the finally*, replacing
+            # the intended `return False` with an exception.
             print(f'mmap failed: {e}')
             return False
         finally:
@@ -296,23 +327,41 @@ class CaptureBridge:
 
         # Spin until the engine acks. Should be near-instant; the 1s ceiling is
         # purely so a dead/hung engine doesn't lock the UI forever.
+        #
+        # CLIP_SAVED counts as an ack. The Linux engine runs SaveClip
+        # *synchronously* on its command loop: it writes SAVE_STARTED, encodes,
+        # then overwrites the same field with CLIP_SAVED. A short clip on a fast
+        # encoder finishes inside our poll interval, so SAVE_STARTED is gone
+        # before we ever observe it — and this loop used to spin the full second
+        # and then report failure for a clip that was written correctly.
+        # Verified on Linux/x11grab/av1_nvenc: a 10 s clip did exactly this.
+        _ACKS = (ResponseType.SAVE_STARTED,
+                 ResponseType.CLIP_SAVED,
+                 ResponseType.ERROR_OCCURRED)
         start = time.monotonic()
-        while self._layout.engine_response not in (ResponseType.SAVE_STARTED,
-                                                     ResponseType.ERROR_OCCURRED):
+        while self._layout.engine_response not in _ACKS:
             if time.monotonic() - start > 1.0:
-                print('Timeout waiting for SAVE_STARTED')
+                print('Timeout waiting for save acknowledgement')
                 return False
             time.sleep(0.001)
-        
-        # Check if successful
+
         response = self._layout.engine_response
-        self._layout.engine_response = ResponseType.NONE
-        
+
         if response == ResponseType.ERROR_OCCURRED:
+            self._layout.engine_response = ResponseType.NONE
             print('Engine returned ERROR_OCCURRED')
             return False
-        
-        # SAVE_STARTED received - task is queued, encoding happens in background
+
+        if response == ResponseType.CLIP_SAVED:
+            # Already finished. Deliberately do NOT consume it — poll_async_result()
+            # is what tells the UI the clip landed, and swallowing it here would
+            # make the confirmation disappear on exactly the fast saves this
+            # branch exists for.
+            print(f'Clip saved (engine finished synchronously): {output_path}')
+            return True
+
+        # SAVE_STARTED — task queued, encoding continues in the background.
+        self._layout.engine_response = ResponseType.NONE
         print(f'Clip save queued: {output_path} ({duration}s)')
         return True
 

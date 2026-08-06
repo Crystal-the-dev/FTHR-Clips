@@ -133,9 +133,15 @@ def test_lock_is_released_when_holder_dies():
     # reported pid tests what the docstring claims — the kernel releases the
     # primitive when the *holding* process dies — on any interpreter layout.
     _kill_pid(holder_pid)
-    _wait_for_pid_gone(holder_pid, timeout=10)
+    # Reap before polling. On Linux the holder IS our direct child, and a killed
+    # child stays a zombie — still a live pid to kill(pid, 0) — until its parent
+    # waits on it. Polling first therefore never terminates.
     child.kill()          # tidy up the stub, if there was one
-    child.wait(timeout=10)
+    try:
+        child.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+    _wait_for_pid_gone(holder_pid, timeout=10)
 
     guard = SingleInstance()
     try:
@@ -174,6 +180,18 @@ def _pid_alive(pid: int) -> bool:
             ['tasklist', '/FI', f'PID eq {pid}', '/NH'],
             capture_output=True, text=True, check=False).stdout
         return str(pid) in out
+    # A zombie still answers kill(pid, 0), so ask /proc for the process state
+    # before falling back to the signal probe.
+    try:
+        with open(f'/proc/{pid}/stat', 'rb') as fh:
+            # comm may contain spaces and parentheses; state is the field
+            # immediately after the closing paren.
+            state = fh.read().rpartition(b')')[2].split()[0:1]
+        return state != [b'Z'] if state else False
+    except FileNotFoundError:
+        return False
+    except OSError:
+        pass
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

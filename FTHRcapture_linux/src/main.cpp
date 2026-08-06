@@ -176,6 +176,13 @@ int main(int argc, char* argv[]) {
 
             switch (cmd) {
             case fthr::CommandType::SAVE_CLIP: {
+                // Clear any message left by an earlier failure. engine_string
+                // was only ever written on error and never reset, so after one
+                // failed save every subsequent SUCCESS still carried the old
+                // "SaveClip failed: ..." text — and poll_async_result() reports
+                // ('saved', <that stale text>) straight into the UI.
+                layout->engine_string[0] = '\0';
+
                 // Immediately acknowledge so Python UI doesn't time out
                 layout->engine_response =
                     static_cast<uint32_t>(fthr::ResponseType::SAVE_STARTED);
