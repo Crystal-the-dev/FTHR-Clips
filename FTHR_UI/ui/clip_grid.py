@@ -16,6 +16,7 @@
 import os
 import sys
 import subprocess
+from core import linux_tools
 import hashlib
 import cv2
 from datetime import datetime
@@ -619,7 +620,11 @@ class ClipThumbnail(QFrame):
             if sys.platform == 'win32':
                 subprocess.Popen(['explorer', f'/select,{self.file_path}'])
             else:
-                subprocess.Popen(['xdg-open', os.path.dirname(self.file_path)])
+                _opener = linux_tools.path('xdg-open')
+                if _opener:
+                    subprocess.Popen([_opener, os.path.dirname(self.file_path)])
+                else:
+                    print(f'[Clips] {linux_tools.missing_message("xdg-open")}')
         elif action == copy_act:
             QApplication.clipboard().setText(self.file_path)
         elif upload_act and action == upload_act:
@@ -709,7 +714,11 @@ class ClipThumbnail(QFrame):
             if sys.platform == 'win32':
                 subprocess.Popen(['explorer', f'/select,{self.file_path}'])
             else:
-                subprocess.Popen(['xdg-open', os.path.dirname(self.file_path)])
+                _opener = linux_tools.path('xdg-open')
+                if _opener:
+                    subprocess.Popen([_opener, os.path.dirname(self.file_path)])
+                else:
+                    print(f'[Clips] {linux_tools.missing_message("xdg-open")}')
         elif action == copy_act:
             QApplication.clipboard().setText(self.file_path)
         elif upload_act and action == upload_act:

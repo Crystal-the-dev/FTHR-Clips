@@ -1,9 +1,9 @@
 import json
-import shutil
 import subprocess
 import threading
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from core.compositor import detect_compositor
+from core import linux_tools
 
 
 def _get_active_window_title() -> str | None:
@@ -18,7 +18,7 @@ def _get_active_window_title() -> str | None:
     if comp == 'hyprland':
         try:
             r = subprocess.run(
-                ['hyprctl', 'activewindow', '-j'],
+                [linux_tools.require('hyprctl'), 'activewindow', '-j'],
                 capture_output=True, timeout=1,
             )
             data = json.loads(r.stdout.decode(errors='replace'))
@@ -26,16 +26,16 @@ def _get_active_window_title() -> str | None:
         except Exception:
             return None
 
-    if shutil.which('xdotool') is None:
+    if not linux_tools.available('xdotool'):
         return None
 
     try:
-        r = subprocess.run(['xdotool', 'getactivewindow'],
+        r = subprocess.run([linux_tools.require('xdotool'), 'getactivewindow'],
                            capture_output=True, timeout=1)
         if r.returncode != 0:
             return None
         wid = r.stdout.decode().strip()
-        r2 = subprocess.run(['xdotool', 'getwindowname', wid],
+        r2 = subprocess.run([linux_tools.require('xdotool'), 'getwindowname', wid],
                             capture_output=True, timeout=1)
         if r2.returncode != 0:
             return None

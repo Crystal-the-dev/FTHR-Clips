@@ -98,6 +98,7 @@ from version import (
     __version__ as APP_VERSION, APP_NAME, BUILD_DATE,
     SOURCE_LICENSE, DISTRIBUTION_LICENSE,
 )
+from core import linux_tools
 from core.capture_bridge import CaptureBridge
 from core.hotkey_manager import HotkeyManager
 from core.game_detector import GameDetector
@@ -2194,12 +2195,23 @@ class MainWindow(QMainWindow):
 
         captured = False
         if sys.platform != 'win32':
-            result = subprocess.run(
-                ['grim', str(raw_path)],
-                capture_output=True,
-                **_NO_WINDOW,
-            )
-            captured = result.returncode == 0
+            # grim is Wayland-only and often absent. Resolve it explicitly so a
+            # missing tool is a clear message rather than a swallowed
+            # FileNotFoundError that made screenshots silently do nothing.
+            grim = linux_tools.path('grim')
+            if grim:
+                result = subprocess.run(
+                    [grim, str(raw_path)],
+                    capture_output=True,
+                    **_NO_WINDOW,
+                )
+                captured = result.returncode == 0
+                if not captured:
+                    print(f'[Screenshot] grim failed: '
+                          f'{result.stderr.decode(errors="replace").strip()}')
+            else:
+                print(f'[Screenshot] {linux_tools.missing_message("grim")} '
+                      f'Falling back to the Qt screen grab.')
 
         if not captured:
             screen = QApplication.primaryScreen()
@@ -2735,7 +2747,11 @@ class MainWindow(QMainWindow):
             if sys.platform == 'win32':
                 os.startfile(str(folder))  # os.startfile exists on Windows only
             else:
-                subprocess.Popen(['xdg-open', str(folder)])
+                opener = linux_tools.path('xdg-open')
+                if opener:
+                    subprocess.Popen([opener, str(folder)])
+                else:
+                    print(f'[UI] {linux_tools.missing_message("xdg-open")}')
         except Exception as e:
             print(f'[UI] Could not open clips folder: {e}')
 
@@ -5430,6 +5446,11 @@ def main():
         return
 
     print("Main.py successfully initiated")
+
+    # Which external helpers resolved to what, and from which PATH. Bug reports
+    # saying "screenshots don't work" used to arrive with nothing to go on.
+    if sys.platform != 'win32':
+        print(linux_tools.report())
 
     # A second instance is destructive, not just redundant: two capture
     # engines fight over NVENC and over the single-writer shared-memory

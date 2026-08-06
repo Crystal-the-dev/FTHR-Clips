@@ -9,7 +9,9 @@ def test_get_active_window_hyprland_success():
     mock_result.stdout = b'{"title": "Minecraft", "class": "java"}'
     mock_result.returncode = 0
     with patch('core.focus_monitor.subprocess.run', return_value=mock_result), \
-         patch('core.focus_monitor.detect_compositor', return_value='hyprland'):
+         patch('core.focus_monitor.detect_compositor', return_value='hyprland'), \
+         patch('core.focus_monitor.linux_tools.require',
+               return_value='/usr/bin/hyprctl'):
         title = _get_active_window_title()
     assert title == 'Minecraft'
 
@@ -24,7 +26,7 @@ def test_get_active_window_hyprland_failure_returns_none():
 def test_get_active_window_xdotool_success():
     def fake_run(cmd, **kw):
         m = MagicMock()
-        if cmd == ['xdotool', 'getactivewindow']:
+        if cmd[1:] == ['getactivewindow']:
             m.stdout = b'12345678\n'; m.returncode = 0
         elif 'getwindowname' in cmd:
             m.stdout = b'Counter-Strike 2\n'; m.returncode = 0
@@ -33,14 +35,16 @@ def test_get_active_window_xdotool_success():
         return m
     with patch('core.focus_monitor.subprocess.run', side_effect=fake_run), \
          patch('core.focus_monitor.detect_compositor', return_value='kwin'), \
-         patch('core.focus_monitor.shutil.which', return_value='/usr/bin/xdotool'):
+         patch('core.focus_monitor.linux_tools.available', return_value=True), \
+         patch('core.focus_monitor.linux_tools.require',
+               return_value='/usr/bin/xdotool'):
         title = _get_active_window_title()
     assert title == 'Counter-Strike 2'
 
 
 def test_get_active_window_no_xtools_returns_none():
     with patch('core.focus_monitor.detect_compositor', return_value='kwin'), \
-         patch('core.focus_monitor.shutil.which', return_value=None):
+         patch('core.focus_monitor.linux_tools.available', return_value=False):
         title = _get_active_window_title()
     assert title is None
 

@@ -1,16 +1,17 @@
 import sys
 import json
-import shutil
 import subprocess
 import threading
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from core.compositor import detect_compositor
+from core import linux_tools
 
 
 def _enumerate_via_hyprctl() -> list:
     """List windows on Hyprland via hyprctl clients -j."""
     try:
-        r = subprocess.run(['hyprctl', 'clients', '-j'],
+        hyprctl = linux_tools.require('hyprctl')
+        r = subprocess.run([hyprctl, 'clients', '-j'],
                            capture_output=True, timeout=2)
         clients = json.loads(r.stdout.decode(errors='replace'))
         windows = []
@@ -30,11 +31,12 @@ def _enumerate_via_hyprctl() -> list:
 def _enumerate_via_xdotool() -> list:
     """List visible windows via xdotool + xprop. Works for XWayland and X11.
     Covers Steam/Proton games and most Linux native games."""
-    if shutil.which('xdotool') is None:
+    if not linux_tools.available('xdotool'):
         return []
     try:
         r = subprocess.run(
-            ['xdotool', 'search', '--all', '--onlyvisible', '--maxdepth', '2', ''],
+            [linux_tools.require('xdotool'), 'search', '--all',
+             '--onlyvisible', '--maxdepth', '2', ''],
             capture_output=True, timeout=3)
         if r.returncode != 0:
             return []
@@ -45,14 +47,16 @@ def _enumerate_via_xdotool() -> list:
     windows = []
     for wid in wids[:50]:  # cap to avoid slow scans
         try:
-            r_name = subprocess.run(['xdotool', 'getwindowname', wid],
+            r_name = subprocess.run([linux_tools.require('xdotool'),
+                                     'getwindowname', wid],
                                     capture_output=True, timeout=1)
             title = r_name.stdout.decode().strip()
             if not title:
                 continue
 
             is_game = False
-            r_prop = subprocess.run(['xprop', '-id', wid, '_NET_WM_STATE'],
+            xprop = linux_tools.path('xprop')
+            r_prop = subprocess.run([xprop, '-id', wid, '_NET_WM_STATE'],
                                     capture_output=True, timeout=1)
             if r_prop.returncode == 0:
                 is_game = '_NET_WM_STATE_FULLSCREEN' in r_prop.stdout.decode()

@@ -59,9 +59,11 @@ def detect_compositor() -> str:
 
 def has_xtools() -> bool:
     """True if xdotool is available (needed for focus/game detection on non-Hyprland)."""
-    return shutil.which('xdotool') is not None
+    from core import linux_tools
+    return linux_tools.available('xdotool')
 
 
 def has_wmctrl() -> bool:
     """True if wmctrl is available."""
-    return shutil.which('wmctrl') is not None
+    from core import linux_tools
+    return linux_tools.available('wmctrl')
