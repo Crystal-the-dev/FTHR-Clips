@@ -68,13 +68,47 @@ if [ ${#_missing_sys[@]} -gt 0 ]; then
 fi
 echo "    All dependencies found."
 
+# ── 1c. Pinned LGPL FFmpeg (AUDIT-014) ────────────────────────────────────
+# The distribution's FFmpeg is a GPL build. The engine is compiled against this
+# tree and ships with it; nothing here ever links /usr/lib FFmpeg.
+FFMPEG_ROOT="$SCRIPT_DIR/FTHRcapture_linux/third_party/ffmpeg"
+echo ""
+echo ">>> Ensuring the pinned LGPL FFmpeg is present..."
+if ! python3 "$SCRIPT_DIR/tools/fetch_third_party.py" --ffmpeg-linux; then
+    echo "ERROR: could not obtain the pinned LGPL FFmpeg."
+    echo "  Without it the engine would link the distribution's GPL build and"
+    echo "  the licence gate would refuse to package the result (AUDIT-014)."
+    exit 1
+fi
+
 # ── 2. Build Linux C++ engine ─────────────────────────────────────────────
 echo ""
-echo ">>> Building Linux capture engine..."
+echo ">>> Building Linux capture engine (against the pinned LGPL FFmpeg)..."
 cd "$SCRIPT_DIR/FTHRcapture_linux"
-cmake -B build -DCMAKE_BUILD_TYPE=Release > /dev/null
+rm -rf build
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DFTHR_FFMPEG_ROOT="$FFMPEG_ROOT"     | grep -E "FFmpeg|error" || true
 cmake --build build -j"$(nproc)" 2>&1 | grep -E "^\[|error:" || true
+[ -x build/FTHRclips ] || { echo "ERROR: engine build produced no binary."; exit 1; }
 echo "    Engine built: FTHRcapture_linux/build/FTHRclips"
+
+# Prove the engine really links the pinned libraries before we package anything.
+echo ""
+echo ">>> Verifying engine linkage..."
+_bad=0
+for so in $(readelf -d build/FTHRclips | grep -oE 'lib(avcodec|avformat|avutil|avdevice|swscale|swresample)\.so\.[0-9]+'); do
+    if ! [ -e "$FFMPEG_ROOT/lib/$so" ]; then
+        echo "    ERROR: engine needs $so, which is not in the pinned tree"
+        _bad=1
+    fi
+done
+if readelf -d build/FTHRclips | grep -qE 'RPATH|RUNPATH'; then
+    echo "    RPATH: $(readelf -d build/FTHRclips | grep -oE '\[.*\]' | head -1)"
+else
+    echo "    ERROR: engine has no RPATH — it would load system libraries."
+    _bad=1
+fi
+[ "$_bad" -eq 0 ] || { echo "ERROR: engine linkage check failed."; exit 1; }
+echo "    Engine links only the pinned LGPL FFmpeg."
 cd "$SCRIPT_DIR"
 
 # ── 3. Bundle with PyInstaller ─────────────────────────────────────────────
@@ -136,6 +170,45 @@ _rm "libprotobuf*.so*"
 
 AFTER="$(du -sh "$PYINST_DIR" | cut -f1)"
 echo "    After strip: $AFTER"
+
+# ── 4b. Remove GPL FFmpeg copies PyInstaller collected (AUDIT-014) ────────
+# cv2 and Qt link the *system* FFmpeg, so PyInstaller collects libavcodec.so.60
+# and friends even though the engine never touches them. A GPL library sitting
+# in the AppDir is a GPL library being distributed, so they go.
+#
+# The regex matches the eight FFmpeg library names EXACTLY, anchored on the
+# basename. An earlier version used the glob 'libav*.so*', which also matched
+# libavif (the AV1 *image* codec Qt and OpenCV use) and libavc1394. Deleting
+# those produced a bundle that died on startup with
+#   ImportError: libavif-cbf1e83c.so.16.3.0: cannot open shared object file
+# Do not widen this pattern back to a glob.
+_FFMPEG_LIB_RE='.*/lib(avcodec|avformat|avutil|avdevice|avfilter|swscale|swresample|postproc)\.so[.0-9]*$'
+
+# Kept on purpose:
+#   *.so.62/.60/.11/.9/.6  the pinned LGPL runtime the engine links (manifest)
+#   *.so.61/.59/.8/.5      Qt Multimedia's own FFmpeg from the PyQt6-Qt6 wheel,
+#                          LGPLv2.1, documented in ffmpeg_manifest_linux.json.
+#                          Removing it would break Qt Multimedia playback.
+_keep_regex='libavcodec\.so\.6[12]|libavformat\.so\.6[12]|libavutil\.so\.(59|60)|libavdevice\.so\.62|libavfilter\.so\.11|libswscale\.so\.[89]|libswresample\.so\.[56]'
+
+echo ""
+echo ">>> Removing GPL FFmpeg copies collected from the system..."
+_removed=0
+while IFS= read -r f; do
+    base="$(basename "$f")"
+    if echo "$base" | grep -qE "$_keep_regex"; then continue; fi
+    if strings -a "$f" 2>/dev/null | grep -q -- '--enable-gpl'; then
+        echo "    GPL, removed: $base"
+    else
+        echo "    undocumented FFmpeg copy, removed: $base"
+    fi
+    rm -f "$f"
+    _removed=$((_removed + 1))
+done < <(find "$INT" -regextype posix-extended -regex "$_FFMPEG_LIB_RE" | sort)
+echo "    Removed $_removed file(s)."
+
+echo ">>> FFmpeg libraries remaining in the bundle:"
+find "$INT" -regextype posix-extended -regex "$_FFMPEG_LIB_RE" -printf '    %f\n' | sort
 
 # ── 5. Verify the app still launches after stripping ──────────────────────
 echo ""

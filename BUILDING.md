@@ -60,7 +60,7 @@ python -m ruff check .
 ```
 
 All must pass. See [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md) for
-the full gate list — there are two outstanding release blockers.
+the full gate list — one release blocker remains (AUDIT-013, PyQt6 is GPLv3).
 
 ---
 
@@ -176,13 +176,24 @@ bash tools/linux_system_report.sh
 
 ### 2. Build the capture engine
 
+First install the pinned LGPL FFmpeg the engine is built against (AUDIT-014):
+
 ```bash
-cmake -S FTHRcapture_linux -B FTHRcapture_linux/build -DCMAKE_BUILD_TYPE=Release
+python tools/fetch_third_party.py --ffmpeg-linux
+```
+
+```bash
+cmake -S FTHRcapture_linux -B FTHRcapture_linux/build       -DCMAKE_BUILD_TYPE=Release       -DFTHR_FFMPEG_ROOT="$PWD/FTHRcapture_linux/third_party/ffmpeg"
 cmake --build FTHRcapture_linux/build --parallel
 ldd FTHRcapture_linux/build/FTHRclips | grep 'not found'   # must print nothing
 ```
 
 Output: `FTHRcapture_linux/build/FTHRclips`.
+
+A **Release build without `-DFTHR_FFMPEG_ROOT` is refused**, on purpose: the
+distribution's FFmpeg is a GPL build and linking it silently is what AUDIT-014
+recorded. A Debug/RelWithDebInfo build may use the system FFmpeg and says so
+loudly — never package one.
 
 Notes on the build:
 
@@ -190,9 +201,12 @@ Notes on the build:
   tree** (`FTHRcapture_linux/protocols/`), not the build directory. They are
   tracked in git so a clone builds without `wayland-scanner`, but the source tree
   must be writable.
-- `target_compile_options` appends `-O2` *after* the `-O3 -DNDEBUG` that
-  `CMAKE_BUILD_TYPE=Release` contributes, so the effective optimisation level is
-  `-O2`. Harmless, but `Release` does not mean what it looks like here.
+- The engine carries an `$ORIGIN`-relative `RPATH` (DT_RPATH, not RUNPATH) so
+  it loads the bundled FFmpeg wherever the bundle is mounted, and so transitive
+  dependencies inherit the search path. No absolute build-host path is baked in.
+- `target_compile_options` used to append `-O2` *after* the `-O3 -DNDEBUG` that
+  `CMAKE_BUILD_TYPE=Release` contributes, silently downgrading Release builds.
+  The redundant `-O2` was removed; `-Wall -Wextra` stayed.
 - The binary is not stripped; `FTHR_linux.spec` strips it when bundling.
 - Two warnings are expected: an unused `clock_ns()` in `encoder.cpp` and a
   `memset` on the non-trivial `WlrBackend::FrameBuffer`.
@@ -244,30 +258,25 @@ Steps: dependency check → engine build → PyInstaller bundle → strip unused
 libraries → smoke test → assemble AppDir → **licence verification** →
 `appimagetool`. The filename carries the version from `FTHR_UI/version.py`.
 
-#### The licence gate will stop you
+#### The licence gate (AUDIT-014)
 
 `build_linux.sh` runs `tools/verify_release_licenses.py --appdir` before packing
-and **refuses to build** if a GPL FFmpeg made it into the bundle:
+and refuses to build if a GPL FFmpeg made it into the bundle. As of 2026-08-06
+that gate passes, because the Linux build no longer uses the distribution's
+FFmpeg at all:
 
-```
-47 checks, 12 failed
-  - libavcodec.so.60: GPL build flags present -> --enable-gpl, --enable-libx264, ...
-ERROR: licence verification failed - refusing to build the AppImage.
-```
+* `tools/fetch_third_party.py --ffmpeg-linux` installs a pinned **LGPL** FFmpeg
+  (BtbN `n8.1.2-34-g9b6c8969e0`, LGPLv3, glibc 2.28 baseline) into
+  `FTHRcapture_linux/third_party/ffmpeg`, verifying the archive and all seven
+  libraries against `tools/ffmpeg_manifest_linux.json`.
+* CMake **refuses a Release build** without `-DFTHR_FFMPEG_ROOT` rather than
+  silently linking `/usr/lib`.
+* The engine carries an `$ORIGIN` RPATH, so it loads the bundled libraries even
+  where a system FFmpeg exists.
+* The gate hash-verifies every shipped library and checks the licence of the
+  FFmpeg copies that arrive inside the PyQt6-Qt6 and opencv wheels.
 
-This is not a bug. Distribution FFmpeg is normally a GPL build, the engine links
-against it, and PyInstaller bundles what the engine links. Shipping that puts the
-whole artifact under the GPL.
-
-Two ways out, neither a change you can make in the build script:
-
-1. Bundle an LGPL FFmpeg the way the Windows build does (see
-   `tools/ffmpeg_manifest.json` and AUDIT-005) and link the engine against it.
-2. Decide the Linux build is GPLv3 and say so everywhere. PyQt6 is
-   `GPL-3.0-only` and forces this conclusion anyway — see `KNOWN_ISSUES.md`
-   → AUDIT-013.
-
-Until one is chosen there is no publishable Linux AppImage.
+If it does fail, it is telling you something real. Do not add exceptions to it.
 
 ### Verified build state
 
@@ -281,7 +290,8 @@ Ubuntu 24.04 / WSL2, 2026-08-06:
 | Engine starts, creates `/dev/shm/FTHR_SharedMemory_v3` | OK |
 | PyInstaller bundle | OK — 580 MB, engine included |
 | AppDir contents (licences, icon, `.desktop`, no user data) | OK |
-| AppImage produced | **NO** — blocked by the licence gate above |
+| Licence gate | **PASS** — 83 checks, 0 failed, 0 warnings |
+| AppImage produced | **YES** — 219 MB, starts (offscreen), engine loads all 7 bundled FFmpeg libraries |
 
 Full detail in [`docs/SUPPORTED_PLATFORMS.md`](docs/SUPPORTED_PLATFORMS.md) and
 [`docs/AUDIT_REPORT.md`](docs/AUDIT_REPORT.md).

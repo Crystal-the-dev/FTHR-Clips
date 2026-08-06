@@ -142,19 +142,36 @@ of these it found.
 
 ## Licence note for Linux builds
 
-Distribution FFmpeg is normally built `--enable-gpl --enable-libx264
---enable-libx265`. Ubuntu 24.04's is. The Linux engine links against it, and
-PyInstaller bundles it — so `build_linux.sh` **refuses to produce an AppImage**
-on such a system:
+**Resolved 2026-08-06 (AUDIT-014).** The Linux engine no longer touches the
+distribution's FFmpeg. It is compiled against, and ships with, a pinned LGPL
+build:
 
-```
-47 checks, 12 failed
-FAILURES — do not publish this build:
-  - libavcodec.so.60: GPL build flags present -> --enable-gpl, --enable-libx264, ...
-ERROR: licence verification failed - refusing to build the AppImage.
-```
+| | |
+|---|---|
+| Version | `n8.1.2-34-g9b6c8969e0` (BtbN, release branch 8.1) |
+| Licence | LGPL v3 or later (`--enable-version3`, no `--enable-gpl`) |
+| SONAMEs | libavcodec.so.62, libavformat.so.62, libavutil.so.60, libavdevice.so.62, libavfilter.so.11, libswscale.so.9, libswresample.so.6 |
+| Software encoders | libopenh264 (H.264), libkvazaar (HEVC), libsvtav1/libaom (AV1) — no x264, no x265 |
+| Hardware encoders | NVENC, VAAPI, QSV all present |
+| glibc baseline | 2.28 — but see the portability note below |
+| Provenance | `tools/ffmpeg_manifest_linux.json`, archive and per-library sha256 |
 
-That gate is working as intended (AUDIT-005). Producing a distributable Linux
-build needs either an LGPL FFmpeg bundled the way the Windows build does it, or
-a deliberate decision to release as GPLv3 — which PyQt6 (GPL-3.0-only) forces
-anyway. See `KNOWN_ISSUES.md` → AUDIT-013.
+Two further FFmpeg copies live inside Python wheels — Qt Multimedia's
+(PyQt6-Qt6, LGPLv2.1) and OpenCV's (opencv-python-headless, LGPLv2.1). Neither
+is loaded by the engine; both are documented in the manifest and licence-checked
+on every build.
+
+### Minimum Linux base
+
+| Component | Requires |
+|---|---|
+| Pinned FFmpeg | glibc 2.28 |
+| FTHR engine | **glibc 2.38** |
+| Whole AppImage | **glibc 2.39** |
+
+The bundle as a whole is limited by what it was **built on**, not by FFmpeg: the
+engine and the PyInstaller runtime were compiled on Ubuntu 24.04 (glibc 2.39).
+So the AppImage currently needs **glibc ≥ 2.39** — Ubuntu 24.04, Debian 13,
+Fedora 40 or newer. Building on an older base image would lower this
+considerably; that has not been done and is `NOT RUN`.
+

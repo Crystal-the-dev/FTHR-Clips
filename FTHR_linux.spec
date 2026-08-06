@@ -67,12 +67,50 @@ def _find_lib(soname):
 
 _PORTAUDIO = _find_lib('libportaudio.so.2')
 
+# ---------------------------------------------------------------------------
+# LGPL FFmpeg — AUDIT-014
+#
+# The engine is COMPILED against this tree (see FTHRcapture_linux/CMakeLists.txt,
+# FTHR_FFMPEG_ROOT) and must load it at runtime. Its SONAMEs are a different
+# generation from the distribution's (libavcodec.so.62 vs .so.60), so a system
+# FFmpeg cannot accidentally satisfy the engine — but PyInstaller will happily
+# collect the system copies as well, pulled in by cv2 and Qt, and the AppDir
+# would then contain GPL libraries even though nothing links them.
+#
+# So: ship these deliberately, and drop the GPL strays in a post-processing
+# step in build_linux.sh.
+# ---------------------------------------------------------------------------
+_FFMPEG_ROOT = ROOT / 'FTHRcapture_linux' / 'third_party' / 'ffmpeg'
+_FFMPEG_LIB = _FFMPEG_ROOT / 'lib'
+
+if not _FFMPEG_LIB.is_dir():
+    raise SystemExit(
+        'FTHR_linux.spec: the pinned LGPL FFmpeg is missing.\n'
+        f'  Expected: {_FFMPEG_LIB}\n'
+        '  Fetch it: python tools/fetch_third_party.py --ffmpeg-linux\n'
+        '  Bundling the distribution FFmpeg instead is what AUDIT-014 records:\n'
+        '  it is a GPL build and the licence gate will refuse to package it.')
+
+# Real files only — the .so and .so.N entries are symlinks into these, and
+# PyInstaller resolves and flattens them anyway.
+_FFMPEG_LIBS = sorted(
+    p for p in _FFMPEG_LIB.glob('lib*.so.*')
+    if p.is_file() and not p.is_symlink()
+)
+if len(_FFMPEG_LIBS) < 7:
+    raise SystemExit(
+        f'FTHR_linux.spec: expected 7 FFmpeg libraries in {_FFMPEG_LIB}, '
+        f'found {len(_FFMPEG_LIBS)}. Re-run '
+        f'`python tools/fetch_third_party.py --ffmpeg-linux --force`.')
+
 a = Analysis(
     [str(UI_DIR / 'main.py')],
     pathex=[str(UI_DIR)],
     binaries=[
         (str(ENGINE_BIN), '.'),
         (_PORTAUDIO, '.'),
+        # The verified LGPL FFmpeg the engine was built against.
+        *[(str(p), '.') for p in _FFMPEG_LIBS],
         *_so('platforms',                           'PyQt6/Qt6/plugins/platforms'),
         *_so('wayland-decoration-client',           'PyQt6/Qt6/plugins/wayland-decoration-client'),
         *_so('wayland-shell-integration',           'PyQt6/Qt6/plugins/wayland-shell-integration'),
@@ -86,6 +124,11 @@ a = Analysis(
         (str(ROOT / 'LICENSE'), '.'),
         (str(ROOT / 'THIRD_PARTY_NOTICES.md'), '.'),
         (str(ROOT / 'licenses'), 'licenses'),
+        # LGPLv3 obliges us to ship FFmpeg's licence text with the binaries,
+        # and the manifest is what tools/verify_release_licenses.py checks the
+        # shipped libraries against.
+        (str(_FFMPEG_ROOT / 'LICENSE.txt'), 'licenses/ffmpeg'),
+        (str(ROOT / 'tools' / 'ffmpeg_manifest_linux.json'), 'licenses/ffmpeg'),
         (str(ASSETS_DIR / 'fonts'),          'assets/fonts'),
         (str(ASSETS_DIR / 'icons'),          'assets/icons'),
         (str(ASSETS_DIR / 'sounds'),         'assets/sounds'),

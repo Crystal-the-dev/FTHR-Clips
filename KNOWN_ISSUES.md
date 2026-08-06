@@ -12,7 +12,6 @@ Without it most reports are not actionable.
 | Issue | Detail |
 |---|---|
 | **PyQt6 is GPL-3.0-only** (AUDIT-013) | Qt itself is LGPLv3, but the *bindings* are GPLv3, so any bundle containing PyQt6 is GPLv3 **as a whole** — including this one. FTHR's own source stays MIT (`LICENSE`), but a download must never be advertised as MIT. Three ways out: port to PySide6 (LGPLv3), release deliberately as GPLv3, or buy a commercial PyQt licence. Until one is chosen, this blocks a public release. |
-| **No Linux AppImage can be built** (AUDIT-014) | Distribution FFmpeg is a GPL build (`--enable-gpl --enable-libx264 --enable-libx265`). The Linux engine links against it and PyInstaller bundles it, so `build_linux.sh` correctly refuses at the licence gate: *"47 checks, 12 failed … refusing to build the AppImage"*. The Windows side solved this in AUDIT-005 by bundling an LGPL FFmpeg; Linux has no equivalent yet. Either do the same for Linux, or accept GPLv3 (which AUDIT-013 forces anyway). |
 
 ## Resolved since the audit
 
@@ -22,6 +21,7 @@ Without it most reports are not actionable.
 | ~~**No version control**~~ (AUDIT-008) | Resolved 2026-08-06. The authoritative tree is a git repository with `.gitignore`, `.gitattributes`, a documented source of truth (`docs/SOURCE_OF_TRUTH.md`) and release gates (`docs/RELEASE_CHECKLIST.md`). No tag exists yet — see the blocker above. |
 | ~~**Unpinned dependencies**~~ (AUDIT-009) | Resolved 2026-08-06. `requirements-alpha.txt` pins the full transitive closure; `requirements.in` holds the direct list. Verified by two clean installs. |
 | ~~**Hotkey socket in world-writable /tmp**~~ (AUDIT-003b) | Resolved 2026-08-06. AUDIT-003 fixed the socket *mode*; the *path* was still `/tmp/fthr_hotkey.sock`, which any local user could squat — and the old code then ran an unconditional `unlink()` on it, either deleting a stranger's file or (under the sticky bit) failing and leaving hotkeys dead indefinitely. The socket moved to `$XDG_RUNTIME_DIR/fthr/` and now refuses to remove anything that is not a dead socket owned by you. 16 new tests, verified on Linux. |
+| ~~**No Linux AppImage could be built**~~ (AUDIT-014) | Resolved 2026-08-06. The Linux engine is now compiled against, and ships with, a pinned **LGPL** FFmpeg (BtbN `n8.1.2-34-g9b6c8969e0`, glibc 2.28 baseline) instead of the distribution's GPL build. CMake refuses a Release build without `-DFTHR_FFMPEG_ROOT`; the engine carries a `$ORIGIN` RPATH so it loads the bundled libraries; every shipped library is sha256-verified against `tools/ffmpeg_manifest_linux.json`. `build_linux.sh` now runs to completion: **83 licence checks, 0 failed**, and a 219 MB AppImage that starts. |
 | ~~**Bare-name external tool calls**~~ | Resolved 2026-08-06. `hyprctl`, `xdotool`, `xprop`, `grim`, `nc` and `xdg-open` were invoked by bare name, so `PATH` decided which binary ran and a missing tool surfaced as a swallowed `FileNotFoundError`. Now resolved once to an absolute path through `core/linux_tools.py`, cached, logged at startup, with required/optional classification. 13 new tests including `PATH` shadowing. |
 
 ## Unverified — treat as unknown, not as working

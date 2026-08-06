@@ -88,7 +88,9 @@ def check_no_hardcoded(rep: Report, rel: str, label: str) -> None:
 _UNRELATED = {
     # sip version named in a comment explaining a crash workaround.
     'FTHR_UI/main.py': {'6.15.1'},
-    'build_linux.sh': set(),
+    # libavif soname quoted in a comment explaining why the FFmpeg cleanup
+    # regex must not be widened back to a glob.
+    'build_linux.sh': {'16.3.0'},
 }
 
 

@@ -176,10 +176,13 @@ def _wait_for_pid_gone(pid: int, timeout: float) -> None:
 
 def _pid_alive(pid: int) -> bool:
     if sys.platform == 'win32':
+        # Capture bytes, not text. tasklist emits output in the console codepage,
+        # and on a localised Windows that contains bytes cp1252 cannot decode —
+        # text=True then fails and hands back None instead of a string.
         out = subprocess.run(
             ['tasklist', '/FI', f'PID eq {pid}', '/NH'],
-            capture_output=True, text=True, check=False).stdout
-        return str(pid) in out
+            capture_output=True, check=False).stdout or b''
+        return str(pid).encode() in out
     # A zombie still answers kill(pid, 0), so ask /proc for the process state
     # before falling back to the signal probe.
     try:

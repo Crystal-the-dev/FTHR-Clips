@@ -26,17 +26,16 @@ Three ways forward — this is a product decision, not an engineering one:
 | Release deliberately as **GPLv3** | Zero code work. All README/RELEASE_NOTES/About/store copy must say GPLv3, and full corresponding source must be offered. |
 | Buy a **commercial PyQt licence** | Zero code work, recurring cost, removes the copyleft obligation. |
 
-**Second blocker, Linux only: AUDIT-014 — no AppImage can be built.**
+**AUDIT-014 is resolved (2026-08-06).** The Linux engine is compiled against and
+ships a pinned LGPL FFmpeg; a Release build cannot fall back to the
+distribution's GPL one. An AppImage now exists and passes the licence gate.
 
-Distribution FFmpeg is a GPL build. The Linux engine links against it and
-PyInstaller bundles it, so `build_linux.sh` stops at its own licence gate. The
-Windows side solved this in AUDIT-005 by bundling an LGPL FFmpeg; Linux has no
-equivalent. Until that is done, or GPLv3 is accepted, there is no Linux
-distributable at all.
+What that does **not** fix: PyQt6 is still GPL-3.0-only, so the bundle as a
+whole is still GPLv3. AUDIT-014 removed one of the two reasons, not both.
 
 ### Linux release recommendation: 🟡 LINUX CONDITIONAL GO
 
-Conditional on: (a) AUDIT-013 and AUDIT-014 resolved, and (b) at least one
+Conditional on: (a) AUDIT-013 resolved (AUDIT-014 now is), and (b) at least one
 bare-metal desktop session — Hyprland *and* one of KDE/GNOME — actually
 recording a clip with visible content and firing a hotkey. What has been proven
 is the build, the IPC, the encode and the file. What has **not** been proven is
@@ -108,7 +107,7 @@ Everything else below is either already green or is honest, tracked work.
 | 6.1 | Windows engine builds clean (MSBuild, Release x64) | **PASS** — rebuilt 2026-08-05 with VS 2022 |
 | 6.2 | Windows bundle builds clean (PyInstaller) | **PASS** — rebuilt 2026-08-06 from the locked venv |
 | 6.3 | Linux engine builds clean (CMake, Release) | **PASS** — clean configure + build from an empty build dir on Ubuntu 24.04: 0 errors, 2 warnings, 0 missing shared libraries |
-| 6.4 | Linux AppImage builds | **FAIL — RELEASE BLOCKER (AUDIT-014)** — the PyInstaller bundle succeeds (580 MB, engine and licence paperwork included, no user data) but `build_linux.sh` refuses at the licence gate: distro FFmpeg is a GPL build and gets bundled. 47 checks, 12 failed. No AppImage exists. |
+| 6.4 | Linux AppImage builds | **PASS** — AUDIT-014 resolved. Engine compiled against the pinned LGPL FFmpeg, licence gate 83 checks / 0 failed, AppImage produced (219 MB) and it starts. |
 | 6.5 | CI green on all jobs | **NOT RUN** — the workflow has never executed; there is no remote yet |
 
 ## 7. Runtime verification — the part no CI can do for you
