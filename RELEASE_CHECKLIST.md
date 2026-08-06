@@ -26,6 +26,22 @@ Three ways forward — this is a product decision, not an engineering one:
 | Release deliberately as **GPLv3** | Zero code work. All README/RELEASE_NOTES/About/store copy must say GPLv3, and full corresponding source must be offered. |
 | Buy a **commercial PyQt licence** | Zero code work, recurring cost, removes the copyleft obligation. |
 
+**Second blocker, Linux only: AUDIT-014 — no AppImage can be built.**
+
+Distribution FFmpeg is a GPL build. The Linux engine links against it and
+PyInstaller bundles it, so `build_linux.sh` stops at its own licence gate. The
+Windows side solved this in AUDIT-005 by bundling an LGPL FFmpeg; Linux has no
+equivalent. Until that is done, or GPLv3 is accepted, there is no Linux
+distributable at all.
+
+### Linux release recommendation: 🟡 LINUX CONDITIONAL GO
+
+Conditional on: (a) AUDIT-013 and AUDIT-014 resolved, and (b) at least one
+bare-metal desktop session — Hyprland *and* one of KDE/GNOME — actually
+recording a clip with visible content and firing a hotkey. What has been proven
+is the build, the IPC, the encode and the file. What has **not** been proven is
+that FTHR Clips records a Linux screen.
+
 Everything else below is either already green or is honest, tracked work.
 
 ---
@@ -60,7 +76,7 @@ Everything else below is either already green or is honest, tracked work.
 | 3.2 | Two clean installs produce identical package sets | **PASS** — 2026-08-06, two fresh venvs, 25 packages, `Compare-Object` empty |
 | 3.3 | `pip check` reports no conflicts | **PASS** |
 | 3.4 | Imports succeed from a clean install | **PASS** — both venvs |
-| 3.5 | Identical test results across clean installs | **PASS** — 106 passed / 3 skipped in system Python, venv1 and venv2 |
+| 3.5 | Identical test results across clean installs | **PASS** — identical in system Python, venv1 and venv2 on Windows; the lock also resolves and passes on CPython 3.12 under Linux |
 | 3.6 | PyInstaller analysis succeeds from the locked environment | **PASS** — full Windows build from venv1, exit 0 |
 
 ## 4. Version consistency
@@ -79,7 +95,7 @@ Everything else below is either already green or is honest, tracked work.
 
 | # | Gate | Status |
 |---|---|---|
-| 5.1 | `python -m pytest tests/` green | **PASS** — 106 passed, 3 skipped (Linux-only) |
+| 5.1 | `python -m pytest tests/` green | **PASS** — Windows 112 passed / 27 skipped; **Linux 138 passed / 1 skipped** (2026-08-06, Ubuntu 24.04, CPython 3.12.3) |
 | 5.2 | `python -m ruff check .` clean | **PASS** |
 | 5.3 | `python -m compileall FTHR_UI tests tools` clean | **PASS** |
 | 5.4 | `tools/verify_shared_memory_contract.py` | **PASS** — 23 fields, 2712 B (win32) / 4248 B (linux), enums and reserved slots 4–9 intact |
@@ -91,8 +107,8 @@ Everything else below is either already green or is honest, tracked work.
 |---|---|---|
 | 6.1 | Windows engine builds clean (MSBuild, Release x64) | **PASS** — rebuilt 2026-08-05 with VS 2022 |
 | 6.2 | Windows bundle builds clean (PyInstaller) | **PASS** — rebuilt 2026-08-06 from the locked venv |
-| 6.3 | Linux engine builds clean (CMake, Release) | **NOT RUN** |
-| 6.4 | Linux AppImage builds | **NOT RUN** |
+| 6.3 | Linux engine builds clean (CMake, Release) | **PASS** — clean configure + build from an empty build dir on Ubuntu 24.04: 0 errors, 2 warnings, 0 missing shared libraries |
+| 6.4 | Linux AppImage builds | **FAIL — RELEASE BLOCKER (AUDIT-014)** — the PyInstaller bundle succeeds (580 MB, engine and licence paperwork included, no user data) but `build_linux.sh` refuses at the licence gate: distro FFmpeg is a GPL build and gets bundled. 47 checks, 12 failed. No AppImage exists. |
 | 6.5 | CI green on all jobs | **NOT RUN** — the workflow has never executed; there is no remote yet |
 
 ## 7. Runtime verification — the part no CI can do for you
@@ -103,10 +119,13 @@ Everything else below is either already green or is honest, tracked work.
 | 7.2 | Windows: a real clip is captured via the hotkey and plays back | **NOT RUN** |
 | 7.3 | Windows: installer install → launch → update → uninstall | **NOT RUN** |
 | 7.4 | Windows: uninstall removes what it claims to | **NOT RUN** |
-| 7.5 | Linux: engine starts and captures on a real compositor | **NOT RUN** |
-| 7.6 | Linux: AppImage launches and captures | **NOT RUN** |
-| 7.7 | Linux: the Linux-only fixes are exercised (hotkey socket 0600, flock guard, libopenh264/libkvazaar in `encoder.cpp`) | **NOT RUN** |
-| 7.8 | Performance / soak measurement | **NOT RUN** — no performance claim may be published without this |
+| 7.5 | Linux: engine starts and captures on a real compositor | **PARTIAL** — engine starts, maps shared memory, captures and encodes on Ubuntu 24.04/WSL2 via the **x11grab fallback** with `av1_nvenc`. **No real compositor was involved**: WSLg's Weston implements neither `wlr-screencopy` nor `ext-image-copy-capture`, and the engine says so clearly. Hyprland/KDE/GNOME remain `NOT RUN`. |
+| 7.5b | Linux: a clip is saved, decodes, and contains a picture | **PARTIAL** — clips save and are valid (AV1 1280×720@30 + AAC 48 kHz stereo, both `start_time=0`, full decode 0 errors, unicode paths OK, invalid paths refused cleanly). **The frames are all black** (luma min 0, max 0, 1 distinct value) — XWayland under WSLg has no content to grab. The pipeline is proven; the picture is not. |
+| 7.6 | Linux: AppImage launches and captures | **NOT RUN** — no AppImage exists (6.4) |
+| 7.7 | Linux: the Linux-only fixes are exercised | **PASS** — single-instance `flock` verified with real processes (acquire → second refused → SIGKILL holder → third acquires; lock `~/.fthr/fthr.lock` uid=you mode=600). Hotkey socket verified at `$XDG_RUNTIME_DIR/fthr/hotkey.sock`, dir 0700, socket 0600, 16 new tests. |
+| 7.7b | Linux: hotkeys actually fire from a compositor bind | **NOT RUN** — no compositor available |
+| 7.7c | Linux: audio capture | **PASS (headless)** — PulseAudio capture starts (48 kHz stereo float32) and a clip with a real AAC track was produced. Device switching, disconnection and "no microphone" remain `NOT RUN`. |
+| 7.8 | Performance / soak measurement | **NOT RUN** — no 2-hour / 50-clip soak on either platform. No performance claim may be published. |
 | 7.9 | Quality comparison OpenH264 vs. the old x264 fallback | **NOT RUN** |
 
 > Gates 7.1–7.9 are the honest gap. The alpha has been *built* and its logic is
@@ -126,6 +145,9 @@ Everything else below is either already green or is honest, tracked work.
 | 8.4 | `CONTRIBUTING.md` describes the real layout and build | **PASS** |
 | 8.5 | `SOURCE_OF_TRUTH.md` present | **PASS** |
 | 8.6 | `BUILD_WINDOWS.md` matches the actual build (Python 3.14, no imageio-ffmpeg) | **PASS** |
+| 8.7 | `BUILDING.md` (Linux) matches the actual build | **PASS** — written from the verified run |
+| 8.8 | `TESTING.md` separates build / headless / desktop tests | **PASS** |
+| 8.9 | `SUPPORTED_PLATFORMS.md` states a real, narrow support matrix | **PASS** — one environment tested, everything else `NOT RUN` |
 
 ---
 

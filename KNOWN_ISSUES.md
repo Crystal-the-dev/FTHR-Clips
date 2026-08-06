@@ -12,6 +12,7 @@ Without it most reports are not actionable.
 | Issue | Detail |
 |---|---|
 | **PyQt6 is GPL-3.0-only** (AUDIT-013) | Qt itself is LGPLv3, but the *bindings* are GPLv3, so any bundle containing PyQt6 is GPLv3 **as a whole** — including this one. FTHR's own source stays MIT (`LICENSE`), but a download must never be advertised as MIT. Three ways out: port to PySide6 (LGPLv3), release deliberately as GPLv3, or buy a commercial PyQt licence. Until one is chosen, this blocks a public release. |
+| **No Linux AppImage can be built** (AUDIT-014) | Distribution FFmpeg is a GPL build (`--enable-gpl --enable-libx264 --enable-libx265`). The Linux engine links against it and PyInstaller bundles it, so `build_linux.sh` correctly refuses at the licence gate: *"47 checks, 12 failed … refusing to build the AppImage"*. The Windows side solved this in AUDIT-005 by bundling an LGPL FFmpeg; Linux has no equivalent yet. Either do the same for Linux, or accept GPLv3 (which AUDIT-013 forces anyway). |
 
 ## Resolved since the audit
 
@@ -20,33 +21,62 @@ Without it most reports are not actionable.
 | ~~**GPL FFmpeg**~~ (AUDIT-005) | Resolved 2026-08-05. The `--enable-gpl` build was replaced with the BtbN **LGPL** build `n8.1.2-21-gce3c09c101` (ABI-identical, avcodec-62). Software fallbacks moved x264 → libopenh264 and x265 → libkvazaar; NVENC/AMF/QSV untouched. `imageio-ffmpeg` (also GPL, and never actually bundled on Windows — which is why watermark, crop and export silently no-opped) was removed entirely in favour of `core/ffmpeg_tools.py`. Licence texts now ship inside the bundle; `tools/verify_release_licenses.py` gates it in CI. |
 | ~~**No version control**~~ (AUDIT-008) | Resolved 2026-08-06. The authoritative tree is a git repository with `.gitignore`, `.gitattributes`, a documented source of truth (`SOURCE_OF_TRUTH.md`) and release gates (`RELEASE_CHECKLIST.md`). No tag exists yet — see the blocker above. |
 | ~~**Unpinned dependencies**~~ (AUDIT-009) | Resolved 2026-08-06. `requirements-alpha.txt` pins the full transitive closure; `requirements.in` holds the direct list. Verified by two clean installs. |
+| ~~**Hotkey socket in world-writable /tmp**~~ (AUDIT-003b) | Resolved 2026-08-06. AUDIT-003 fixed the socket *mode*; the *path* was still `/tmp/fthr_hotkey.sock`, which any local user could squat — and the old code then ran an unconditional `unlink()` on it, either deleting a stranger's file or (under the sticky bit) failing and leaving hotkeys dead indefinitely. The socket moved to `$XDG_RUNTIME_DIR/fthr/` and now refuses to remove anything that is not a dead socket owned by you. 16 new tests, verified on Linux. |
+| ~~**Bare-name external tool calls**~~ | Resolved 2026-08-06. `hyprctl`, `xdotool`, `xprop`, `grim`, `nc` and `xdg-open` were invoked by bare name, so `PATH` decided which binary ran and a missing tool surfaced as a swallowed `FileNotFoundError`. Now resolved once to an absolute path through `core/linux_tools.py`, cached, logged at startup, with required/optional classification. 13 new tests including `PATH` shadowing. |
 
 ## Unverified — treat as unknown, not as working
 
-- **Linux has never been run** in this audit cycle: no build, no launch, no
-  test. This includes two fixes written for Linux (single-instance lock, hotkey
-  socket permissions).
-- **The GUI has not been launched** on Windows this cycle. The test suite covers
-  logic only.
-- **Neither engine has been rebuilt** from a clean checkout.
-- **The installer** has not been tested for install / update / uninstall.
-- **No performance or soak testing** was done. Any performance claim you read
-  elsewhere is not backed by measurement.
+- **No Linux desktop capture has ever been confirmed to contain a picture.**
+  The pipeline was verified end to end on Ubuntu 24.04 / WSL2 (engine → ring
+  buffer → NVENC → valid decodable MP4 with AAC audio), but the captured frames
+  measured **all black** (luma min 0, max 0, one distinct value). XWayland under
+  WSLg has no root-window content to grab. The plumbing works; the picture is
+  unproven. See `SUPPORTED_PLATFORMS.md`.
+- **No real Linux desktop was tested**: Hyprland, KDE Plasma, GNOME and bare
+  metal X11 are all `NOT RUN`. Neither Wayland capture backend
+  (`wlr-screencopy`, `ext-image-copy-capture`) has ever succeeded — WSLg's
+  Weston implements neither, so only the x11grab fallback was exercised.
+- **No Linux hotkey has ever fired.** The Hyprland auto-config path
+  (`~/.config/hypr/fthr-hotkeys.conf` + `hyprctl reload`) is untested.
+- **The GUI has not been launched** on either platform this cycle. The test
+  suite covers logic; nobody has seen a window.
+- **The Windows engine has not been re-verified at runtime**, and no clip has
+  been saved on Windows this cycle.
+- **The installer** has not been tested for install / update / uninstall, and
+  **no AppImage has been produced** (the licence gate blocks it — see below).
+- Untested on Linux: multi-monitor, monitor switching, resolution changes,
+  fractional scaling, fullscreen games, lock/unlock, suspend/resume, device
+  removal during capture.
+- **No performance or soak testing** was done on either platform. Any
+  performance claim you read elsewhere is not backed by measurement.
 - **The C++ engines (~12k LOC) have zero automated tests** and were not reviewed.
 
 ## Platform limitations
 
 ### Linux
 - **Global hotkeys only work fully on Hyprland**, where binds are written
-  automatically. On **KDE, GNOME and X11** you must bind keys manually:
+  automatically. On **KDE, GNOME and X11** you must bind keys manually. Get the
+  exact command from Settings → Hotkeys; it looks like:
   ```
-  echo -n "save_clip" | nc -U /tmp/fthr_hotkey.sock
+  echo -n "save_clip" | /usr/bin/nc -U $XDG_RUNTIME_DIR/fthr/hotkey.sock
   ```
-  Direct key capture needs root and is disabled by design. The app warns when it
-  detects this situation.
-- Requires `nc`, `grim`, and `xdotool` (KDE/GNOME game detection). Missing tools
-  currently cause a silent feature failure rather than a clear message.
-- Wayland only for capture (wlr-screencopy); X11 is a fallback path.
+  Direct key capture needs root and is disabled by design. The app names your
+  desktop and the command to bind rather than just saying hotkeys are dead.
+- The hotkey socket moved out of `/tmp` (AUDIT-003b). It now lives in
+  `$XDG_RUNTIME_DIR/fthr/` (dir `0700`, socket `0600`), falling back to
+  `~/.fthr/run/`. A stale `/tmp/fthr_hotkey.sock` from an older build is removed
+  on startup **only** if it is a dead socket you own.
+- Wayland capture needs `wlr-screencopy` (wlroots compositors: Hyprland, Sway,
+  river) or `ext-image-copy-capture`. **KWin and Mutter implement neither**, so
+  KDE and GNOME fall back to x11grab via XWayland. The engine reports which
+  backend it chose.
+- Optional tools (`hyprctl`, `xdotool`, `xprop`, `grim`, `nc`, `xdg-open`) are
+  resolved once through `PATH` to an absolute path and logged at startup. A
+  missing tool now produces a message naming the tool, what breaks, and what to
+  install — it used to fail silently.
+- `sounddevice` needs the **system** PortAudio library (`libportaudio2` /
+  `portaudio`). Without it the app fails at import with
+  `OSError: PortAudio library not found`, and no amount of pip installing helps.
 
 ### Windows
 - **Clip paths are capped at 255 characters.** A long profile name plus a long
