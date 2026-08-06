@@ -1,0 +1,292 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+
+# No secrets are used anywhere in this workflow, and none should ever be added.
+# The release-verification job exists partly to catch a credential that made it
+# into the tree; giving that job access to credentials would be self-defeating.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ==========================================================================
+  # Python — the UI and its tests, on both platforms that ship a build.
+  # ==========================================================================
+  python:
+    name: Python ${{ matrix.python-version }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        # 3.14 is the interpreter the alpha is actually built with (the shipped
+        # bundle contains python314.dll). 3.12 is the floor we claim to support.
+        python-version: ["3.12", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements-alpha.txt
+            requirements-dev.txt
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -q -y \
+            libpulse0 libegl1 libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
+            libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+            libxcb-xinerama0 libxkbcommon-x11-0
+
+      - name: Install pinned dependencies
+        # The alpha lock is the ONLY install path. If it does not resolve on a
+        # supported interpreter, that is a release bug, not a CI inconvenience.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-alpha.txt -r requirements-dev.txt
+
+      - name: Assert the environment matches the lock
+        # Catches a transitive dependency that resolved to something other than
+        # what requirements-alpha.txt pins — the exact AUDIT-009 failure mode.
+        run: python -m pip check
+
+      - name: Assert imageio-ffmpeg is absent (AUDIT-005)
+        shell: bash
+        run: |
+          if python -m pip show imageio-ffmpeg > /dev/null 2>&1; then
+            echo "::error::imageio-ffmpeg is installed. It bundles a GPLv3 FFmpeg"
+            echo "::error::and must never enter a build environment."
+            exit 1
+          fi
+          echo "imageio-ffmpeg absent."
+
+      - name: Byte-compile all sources
+        # A syntax error in a rarely imported module otherwise only shows up at
+        # runtime, inside a frozen bundle, on a user's machine.
+        run: python -m compileall -q FTHR_UI tests tools
+
+      - name: Lint
+        run: python -m ruff check .
+
+      - name: Tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest tests/ -v --tb=short
+
+      - name: PyInstaller analysis (Windows)
+        # Full bundling needs the compiled engine, which this job does not have.
+        # The Analysis phase alone still proves the spec parses, the version
+        # resource generates, and every hidden import resolves.
+        if: runner.os == 'Windows'
+        run: python -m PyInstaller FTHR.spec --clean --noconfirm --log-level WARN
+        continue-on-error: false
+
+  # ==========================================================================
+  # Linux capture engine
+  # ==========================================================================
+  linux-engine:
+    name: Linux engine (CMake)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -q -y \
+            cmake g++ pkg-config \
+            libavcodec-dev libavformat-dev libavutil-dev \
+            libswscale-dev libswresample-dev \
+            libpulse-dev libx11-dev libxext-dev libxfixes-dev \
+            libwayland-dev wayland-protocols
+
+      - name: Configure
+        run: cmake -B FTHRcapture_linux/build -S FTHRcapture_linux -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        # Warnings are surfaced but not fatal yet: the engine has never been
+        # built warning-clean and turning them into errors here would make the
+        # first green run impossible. Tighten once the backlog is cleared.
+        run: |
+          cmake --build FTHRcapture_linux/build -j"$(nproc)" 2>&1 | tee build.log
+          echo "--- warning summary ---"
+          grep -c "warning:" build.log || echo "0 warnings"
+
+      - name: Fail on compile errors
+        run: |
+          if grep -q "error:" build.log; then
+            echo "::error::compile errors in the Linux engine"
+            exit 1
+          fi
+
+      - name: Verify the binary exists
+        run: test -x FTHRcapture_linux/build/FTHRclips
+
+      # Deliberately NOT run: the engine's own capture path. A GitHub runner
+      # has no compositor, no DRM device and no audio server. Starting it here
+      # would test the failure path and prove nothing about capture.
+
+  # ==========================================================================
+  # Windows capture engine
+  # ==========================================================================
+  windows-engine:
+    name: Windows engine (MSBuild)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Fetch FFmpeg runtime
+        # Headers and import libs are tracked; the 152 MB of DLLs are not.
+        # The fetch verifies every file against tools/ffmpeg_manifest.json.
+        run: python tools/fetch_third_party.py --ffmpeg
+
+      - name: Report missing third-party files clearly
+        shell: bash
+        run: |
+          missing=0
+          for f in include/libavcodec/avcodec.h lib/avcodec.lib bin/avcodec-62.dll; do
+            p="FTHRcapture/FTHRclips/third_party/ffmpeg/$f"
+            if [ ! -f "$p" ]; then
+              echo "::error::missing third-party file: $p"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || {
+            echo "::error::Run: python tools/fetch_third_party.py --ffmpeg"
+            exit 1
+          }
+
+      - name: Build (Release | x64)
+        run: >
+          msbuild FTHRcapture\FTHRcapture.sln
+          -p:Configuration=Release
+          -p:Platform=x64
+          -m
+          -verbosity:minimal
+
+      - name: Verify the binary exists and is x64
+        shell: pwsh
+        run: |
+          $exe = "FTHRcapture\x64\Release\FTHRclips.exe"
+          if (-not (Test-Path $exe)) { throw "engine binary not produced" }
+          # PE header: 0x8664 = x86-64. A silent Win32 build would link but
+          # then fail to load the x64 FFmpeg DLLs at runtime.
+          $fs = [IO.File]::OpenRead($exe)
+          $br = New-Object IO.BinaryReader($fs)
+          $fs.Position = 0x3C
+          $fs.Position = $br.ReadInt32() + 4
+          $machine = $br.ReadUInt16()
+          $br.Close()
+          if ($machine -ne 0x8664) { throw ("wrong architecture: 0x{0:X}" -f $machine) }
+          "engine OK, x64"
+
+  # ==========================================================================
+  # Release verification — the gates that decide whether a tag is allowed.
+  # ==========================================================================
+  release-verification:
+    name: Release verification
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the large-file check inspects history
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Licences (AUDIT-005)
+        # Refuses any tree that reintroduces GPL FFmpeg components or drops
+        # the third-party licence paperwork.
+        run: python tools/verify_release_licenses.py --tree .
+
+      - name: Version consistency (AUDIT-008)
+        run: python tools/verify_version_consistency.py
+
+      - name: Shared-memory contract
+        run: python tools/verify_shared_memory_contract.py
+
+      - name: Secrets, user data and oversized binaries
+        run: python tools/scan_repo_hygiene.py
+
+      - name: No large blobs in history
+        # A 150 MB DLL committed once stays in the pack forever, even after a
+        # later delete. Cheaper to catch it on the PR that introduces it.
+        run: |
+          limit=$((2 * 1024 * 1024))
+          bad=$(git rev-list --objects --all \
+                | git cat-file --batch-check='%(objecttype) %(objectname) %(objectsize) %(rest)' \
+                | awk -v lim="$limit" '$1 == "blob" && $3 > lim {print $3, $4}' \
+                | sort -rn | head -20)
+          if [ -n "$bad" ]; then
+            echo "::error::blobs above 2 MB found in history:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "No oversized blobs in history."
+
+      - name: Licence claim sanity (AUDIT-013)
+        # PyQt6 is GPL-3.0-only, so a distributed bundle is GPLv3 as a whole.
+        # Fail loudly if the paperwork starts calling a *download* MIT.
+        run: |
+          if grep -rInE '(download|build|installer|release|binary).{0,40}\bMIT\b' \
+               README.md RELEASE_NOTES.md LICENSE 2>/dev/null \
+             | grep -viE 'not .*MIT|MIT-only|never .*MIT'; then
+            echo "::error::A distributable is described as MIT. PyQt6 makes it GPLv3."
+            exit 1
+          fi
+          echo "No misleading MIT claim about a distributable."
+
+  # ==========================================================================
+  # Tag guard
+  # ==========================================================================
+  tag-guard:
+    name: Tag guard
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [python, linux-engine, windows-engine, release-verification]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Tag must match FTHR_UI/version.py
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          src="$(python -c "import sys; sys.path.insert(0,'FTHR_UI'); import version; print(version.__version__)")"
+          if [ "$tag" != "$src" ]; then
+            echo "::error::tag v$tag does not match FTHR_UI/version.py ($src)"
+            exit 1
+          fi
+          echo "Tag v$tag matches the source version."
+
+      # Nothing is published from CI. Uploading an installer that no human has
+      # installed, launched and uninstalled is how an untested build becomes a
+      # release. Artefacts are attached to a GitHub Release by hand, after the
+      # manual gates in RELEASE_CHECKLIST.md have actually been performed.
