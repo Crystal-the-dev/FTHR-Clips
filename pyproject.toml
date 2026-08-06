@@ -1,0 +1,50 @@
+# Tooling configuration only.
+#
+# FTHR Clips is NOT distributed as a Python package — it ships as a PyInstaller
+# bundle (Windows installer / Linux AppImage). There is deliberately no
+# [project] table and no build-system: adding one would imply `pip install .`
+# is a supported path, which it is not.
+
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+# QT_QPA_PLATFORM=offscreen is set in tests/conftest.py rather than here, so it
+# works without the pytest-env plugin.
+markers = [
+    "linux_only: needs a Linux capture backend (skipped elsewhere)",
+]
+filterwarnings = ["error::DeprecationWarning:core.*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"   # lowest interpreter CI exercises
+exclude = [
+    "build", "dist", "dist_old_gpl_*",
+    "FTHRcapture", "FTHRcapture_linux",
+    "AppDir", "Output", "redist",
+]
+
+[tool.ruff.lint]
+# Deliberately narrow. The UI is 17k lines of pre-existing code written to a
+# consistent house style; turning on the full rule set would bury real findings
+# under thousands of cosmetic ones. Widen this as the code is touched, not in
+# one sweep.
+select = [
+    "E9",   # syntax / runtime errors
+    "F",    # pyflakes: undefined names, unused imports, f-string bugs
+    "B",    # bugbear: mutable defaults, misuse of except, loop-variable capture
+    "T20",  # print() outside the deliberate logging paths
+]
+ignore = [
+    "B008",  # function call in default argument — used intentionally in Qt code
+]
+
+[tool.ruff.lint.per-file-ignores]
+# main.py and the tools intentionally print: stdout is tee'd to ~/.fthr/logs.
+"FTHR_UI/main.py" = ["T20"]
+"FTHR_UI/core/*.py" = ["T20"]
+"FTHR_UI/ui/*.py" = ["T20"]
+"tools/*.py" = ["T20"]
+"tests/*.py" = ["T20"]
+"*.spec" = ["F821"]  # PyInstaller injects SPECPATH, Analysis, EXE, COLLECT
