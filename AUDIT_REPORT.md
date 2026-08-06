@@ -1,78 +1,83 @@
-# FTHR Clips — Alpha Release Audit
+# FTHR Clips — Consolidated Alpha Audit
 
-**Audit date:** 2026-08-05
-**Audited tree:** `C:\Users\Tom\Desktop\FTHR_Clips_source\FTHR_Clips`
 **Version under audit:** 1.0.0-alpha
-**Audit environment:** Windows 10 Pro 19045, Python 3.14.3, PyQt6 6.11.0 / Qt 6.11.1
+**Authoritative tree:** `C:\Users\Tom\Desktop\FTHR_Clips_source\FTHR_Clips`
+**Last updated:** 2026-08-06
 
-> **Scope honesty.** This pass covered inventory, build/test reproduction on
-> Windows, static analysis, targeted source review of the IPC / save / hotkey /
-> upload paths, a dependency-and-licence review, and four implemented fixes with
-> regression tests. It did **not** include: a Linux run of any kind, GUI runtime
-> verification, performance measurement, or soak testing. Everything not
-> executed is marked `NOT RUN` and is listed under
-> [Verification still outstanding](#verification-still-outstanding). Nothing in
-> this document is inferred from a passing build.
+This is the single audit document for the project. It merges three passes:
+
+| Pass | Date | Scope | Environment |
+|---|---|---|---|
+| **I — Code & licensing** | 2026-08-05 | Inventory, static analysis, source review of IPC/save/hotkey/upload, dependency & licence review | Windows 10 Pro 19045, CPython 3.14.3, PyQt6 6.11.0 / Qt 6.11.1 |
+| **II — Release engineering** | 2026-08-06 | Source of truth, git, dependency pinning, version centralisation, CI, release gates | same |
+| **III — Linux verification** | 2026-08-06 | Linux build, engine runtime, IPC, clip pipeline, audio, single-instance, socket hardening, AppImage | Ubuntu 24.04.3 LTS under WSL2 + WSLg, CPython 3.12.3, Qt 6.11.0, GCC 13.3, CMake 3.28.3 |
+
+> **Scope honesty.** Nothing here is inferred from a passing build. Every item
+> that was not executed is marked `NOT RUN` and listed in
+> [Verification still outstanding](#verification-still-outstanding).
+> Pass III ran in WSL2, which is **not a Linux desktop** — the consequences of
+> that are stated explicitly wherever they matter.
 
 ---
 
 ## Release decision
 
-### `NO-GO` — for public distribution in the current state
+### `NO-GO` for public distribution · Linux: `CONDITIONAL GO`
 
-> **Updated 2026-08-05 (second pass).** AUDIT-005 (GPL FFmpeg) is now
-> **RESOLVED and verified against a rebuilt Windows artifact**. It has been
-> replaced as the blocker by AUDIT-013, found while doing that work.
+Two licence blockers stand between this tree and a publishable download. Neither
+is an engineering problem; both are decisions.
 
-**AUDIT-013 — PyQt6 is `GPL-3.0-only`, so the distributed build is still a
-GPLv3 work.** Removing the GPL FFmpeg was necessary but not sufficient: the UI
-framework's Python bindings are themselves GPL. Publishing the download as
-"MIT" remains inaccurate, and this is still the one class of defect that cannot
-be walked back after ~1,807 people have the file.
+**AUDIT-013 — PyQt6 is `GPL-3.0-only`.** Qt itself is LGPLv3; the *bindings* are
+not. Any bundle containing PyQt6 is GPLv3 as a whole. Removing the GPL FFmpeg in
+AUDIT-005 was necessary but not sufficient. Publishing the download as "MIT"
+would be inaccurate.
 
-What changed: the licence paperwork now exists, is shipped, and is enforced by
-an automated check, and no GPL FFmpeg component remains in any artifact. What
-has not changed: the *overall* licence of the download.
+**AUDIT-014 — no Linux AppImage can be built.** Distribution FFmpeg is a GPL
+build; the Linux engine links it and PyInstaller bundles it, so `build_linux.sh`
+stops at its own licence gate. There is currently no Linux distributable at all.
 
-With AUDIT-013 decided and the two Linux items verified, this becomes a
-defensible `CONDITIONAL GO` for a clearly-labelled alpha. See
-[Path to GO](#path-to-go).
+Beyond licensing, the honest state is: **the application has been built, tested
+and driven programmatically, but nobody has watched it work.** No GUI has been
+launched on either platform this cycle, no hotkey has ever fired on Linux, and
+no Linux capture has been confirmed to contain a picture.
+
+Options for AUDIT-013 — a product decision:
+
+| Option | Consequence |
+|---|---|
+| Port the UI to **PySide6** (LGPLv3) | Bundle becomes LGPL-compatible; the MIT claim about FTHR's own source stays honest. Most work. |
+| Release deliberately as **GPLv3** | No code work. Every README / RELEASE_NOTES / About / store string must say GPLv3, and full corresponding source must be offered. Also resolves AUDIT-014. |
+| Buy a **commercial PyQt licence** | No code work, recurring cost, removes the copyleft obligation. |
 
 ---
 
 ## What the software is
 
-FTHR Clips is a background instant-replay recorder — the open-source answer to
+A background instant-replay recorder — the open-source answer to
 ShadowPlay/Medal. It keeps a rolling ring buffer of the screen; a global hotkey
-writes the last N seconds to `~/FTHR_Clips` as an MP4.
+writes the last N seconds to disk as an MP4.
 
 ### Architecture
-
-Two processes, one binary contract:
 
 ```
 ┌──────────────────────────┐   Shared memory: FTHR_SharedMemory_v3    ┌────────────────────────────┐
 │  FTHR_UI  (Python/PyQt6) │ ◄──────────────────────────────────────► │  Capture engine (C++)      │
 │  ~17.3k LOC              │   fixed-layout struct, no serialization  │  Win: ~8.6k LOC (DXGI/WGC) │
-│  main.py = 5.4k LOC      │                                          │  Linux: ~3.3k LOC (wlr)    │
+│  main.py = 5.4k LOC      │                                          │  Linux: ~3.3k LOC (wlr/X11)│
 │  settings / upload / UI  │   Unix socket (Linux hotkeys only)       │  FFmpeg + NVENC/AMF/QSV    │
 └──────────────────────────┘ ◄────────────────────────────────────    └────────────────────────────┘
 ```
 
 The struct in `FTHR_UI/core/capture_bridge.py` must match
-`FTHRcapture/FTHRclips/include/shared_memory.h` byte-for-byte. It is
-hand-maintained on both sides and is the single most fragile contract in the
-project — a field-order mistake produces garbage reads, not a crash.
+`FTHRcapture/FTHRclips/include/shared_memory.h` and
+`FTHRcapture_linux/src/shared_memory.h` byte for byte. It was hand-maintained on
+three sides and is the most fragile contract in the project — a field-order
+mistake produces garbage reads, not a crash. Pass II automated the check.
 
-### Critical components
-
-| Component | Why it is critical |
-|---|---|
-| `core/capture_bridge.py` | Sole channel to the engine. Single-writer contract with no locking. |
-| `main.py::_save_clip` | The one path users actually care about. Fans out into three different async post-processing routes. |
-| `core/hotkey_manager.py` | On Linux the socket is the *only* working hotkey path; the `keyboard` lib needs root. |
-| `core/upload_manager.py` | Only component that sends user data off the machine. |
-| Engine `capture_engine.cpp` (2.6k LOC) | Capture + ring buffer. Not reviewed in this pass. |
+**Measured layout (pass II/III):** 23 fields · **2712 B** on Windows ·
+**4248 B** on Linux · enums aligned · reserved command slots 4–9 intact. The
+Linux figure was confirmed against a *running engine*: `/dev/shm/FTHR_SharedMemory_v3`
+measured exactly 4248 bytes.
 
 ### Windows vs Linux — genuinely different, not a thin abstraction
 
@@ -80,466 +85,601 @@ project — a field-order mistake produces garbage reads, not a crash.
 |---|---|---|
 | Shared memory | `OpenFileMapping`/`MapViewOfFile`, UTF-16 (`c_wchar`) | `mmap` of `/dev/shm`, UTF-8 bytes |
 | Path field size | **256 wchar** — hard cap | 1024 bytes |
-| Hotkeys | `keyboard` lib, works unprivileged | needs root → **falls back to a Unix socket driven by compositor binds** |
+| Hotkeys | `keyboard` lib, works unprivileged | needs root → Unix socket driven by compositor binds |
 | Compositor | n/a | Hyprland auto-configured; KDE/GNOME/X11 require manual binds |
-| Capture | DXGI / Windows Graphics Capture | wlr-screencopy, X11 fallback |
+| Capture | DXGI / Windows Graphics Capture | wlr-screencopy → ext-image-copy-capture → x11grab |
+| `is_recording` | set true while recording | **pinned false by design** ("captures continuously") |
 
-The Linux hotkey story is the weakest part of the product: outside Hyprland the
-user must hand-write compositor binds, and the app can only warn about it.
-
----
-
-## Checks performed
-
-| Check | Status | Result |
-|---|---|---|
-| Repository inventory | ✅ done | 44 Python files / 17.3k LOC; ~12k LOC C++ across two engines |
-| Identify authoritative source tree | ✅ done | 3 stale copies found and excluded (see AUDIT-008) |
-| Windows dependency install | ✅ done | All 7 `requirements.txt` entries resolve |
-| Python byte-compile, whole tree | ✅ done | Clean |
-| Test suite (Windows) | ✅ done | **81 passed, 3 skipped** (was 68/3) |
-| Static analysis (ruff F,E9,B,S,RUF) | ✅ done | 185 findings, triaged below |
-| Source review: IPC / save / hotkey / upload | ✅ done | 4 defects found and fixed |
-| Secret scan (source tree) | ✅ done | **Clean** — no hardcoded credentials |
-| Dependency licence review | ✅ done | **1 blocker** (AUDIT-005) |
-| Windows release build | ❌ NOT RUN | Prebuilt `FTHRclips.exe` + `FTHRClips_Setup_Windows.exe` present but not rebuilt from clean |
-| Linux build | ❌ NOT RUN | No Linux machine available in this environment |
-| GUI runtime verification | ❌ NOT RUN | Would hijack the operator's screen and start recording — needs explicit consent |
-| Performance measurement | ❌ NOT RUN | No measurements taken; **no performance claims are made in this report** |
-| Soak / stress testing | ❌ NOT RUN | |
-| Installer / uninstall test | ❌ NOT RUN | |
-
-### Static analysis summary
-
-`ruff check FTHR_UI tests --select=F,E9,B,S,ASYNC,RUF` → 185 findings.
-
-| Code | Count | Assessment |
-|---|---|---|
-| `S110` try-except-pass | 34 | **Genuine concern.** Bulk silent-failure surface; each swallowed exception is a bug that will never reach a log. Not individually triaged — see AUDIT-007. |
-| `F401` unused import | 33 | Cosmetic. |
-| `S603`/`S607` subprocess | 40 | Mostly false positives (fixed argv, no user input) — but see AUDIT-006 for the real subset. |
-| `RUF001-003` ambiguous unicode | 30 | Cosmetic (em-dashes in comments). |
-| `RUF012` mutable class default | 12 | Latent shared-state risk, none currently exploited. |
-| `S108` hardcoded temp path | 2 | Both real — `/tmp/fthr_hotkey.sock`, `/dev/shm/...`. One fixed (AUDIT-003). |
-| `S324` md5 | 1 | False positive — thumbnail cache key, not security. |
+The Linux hotkey story remains the weakest part of the product: outside Hyprland
+the user must hand-write compositor binds. Pass III made the app say exactly
+which desktop it detected and print the exact command to bind.
 
 ---
 
-## Findings
+## Findings register
 
-### AUDIT-001 · P0 · **FIXED** · Both platforms · Startup
+| ID | Severity | Area | Status |
+|---|---|---|---|
+| AUDIT-001 | P0 | Startup | **FIXED** (I) · **verified on Linux** (III) |
+| AUDIT-002 | P1 | Save pipeline | **FIXED** (I) |
+| AUDIT-003 | P1 | Linux privacy | **FIXED** (I) — socket mode |
+| AUDIT-003b | P1 | Linux privacy | **FIXED** (III) — socket *path* |
+| AUDIT-004 | P2 | Windows save | **FIXED** (I) |
+| AUDIT-005 | P0 | Licensing | **RESOLVED** (I) |
+| AUDIT-006 | P2 | Linux hardening | **FIXED** (III) |
+| AUDIT-007 | P2 | Diagnosability | **OPEN** |
+| AUDIT-008 | P1 | Release engineering | **RESOLVED** (II) |
+| AUDIT-009 | P2 | Reproducibility | **RESOLVED** (II) |
+| AUDIT-010 | P2 | Diagnostics | **FIXED** (I) · hardened (II) |
+| AUDIT-011 | P2 | UI responsiveness | **PARTIALLY FIXED** (III) |
+| AUDIT-012 | P2 | Privacy | **OPEN** |
+| AUDIT-013 | **P0** | Licensing | **OPEN — RELEASE BLOCKER** |
+| AUDIT-014 | **P0** | Linux packaging | **OPEN — RELEASE BLOCKER** |
+| AUDIT-015 | P1 | Linux save pipeline | **FIXED** (III) |
+| AUDIT-016 | P2 | Linux portability | **FIXED** (III) |
+
+---
+
+## Pass I — Code and licensing (2026-08-05)
+
+Tests: **68 → 81 → 93 passed**, 3 skipped.
+
+### AUDIT-001 · P0 · FIXED · Both platforms
 **No single-instance guard — two instances corrupt each other**
 
-**Cause.** `main()` created the window and engine unconditionally. Nothing
-checked whether FTHR Clips was already running.
+Two instances are actively destructive: two engines encode the same screen
+(double GPU load; on single-session NVENC the second silently fails); both map
+`FTHR_SharedMemory_v3`, whose command/response fields are a single-writer
+contract, so each UI consumes the other's `engine_response` and saves time out;
+and on Linux the second instance unlinks the hotkey socket and rebinds it,
+**silently stealing every hotkey from the first**. A double-click on the desktop
+icon was enough.
 
-**User impact.** Two instances are actively destructive, not merely redundant:
-two capture engines encode the same screen (double GPU load; on single-session
-NVENC hardware the second silently fails); both map `FTHR_SharedMemory_v3`,
-whose command/response fields are a single-writer contract, so each UI consumes
-the other's `engine_response` and saves time out; and on Linux the second
-instance calls `os.unlink()` on the hotkey socket and rebinds it, **silently
-stealing every hotkey from the first instance**. A double-click on the desktop
-icon is enough to trigger it.
+New `core/single_instance.py`: named kernel mutex on Windows,
+`flock(LOCK_EX|LOCK_NB)` on `~/.fthr/fthr.lock` on Linux. Both are kernel-owned,
+so a hard crash releases them. Wired in before any engine spawn, socket bind or
+window creation. Deliberately **fails open** — a broken guard must not be the
+thing that stops someone recording.
 
-**Reproduce.** Launch FTHR Clips twice. Before the fix both windows appeared and
-both spawned engines.
+> **Pass III update — verified on Linux with real processes.** First instance
+> acquires; second is refused; first keeps working; `SIGKILL` the holder; a new
+> instance acquires. Lock file `~/.fthr/fthr.lock`, uid = user, **mode 600**.
+> The file remaining on disk after a crash is harmless — the `flock` is the
+> lock, not the file.
+>
+> Pass II also fixed two real defects in the Windows branch: it read
+> `GetLastError()` *through* ctypes (which restores the thread's last-error
+> value around every call, so the guard's answer depended on unrelated preceding
+> Win32 calls), and it truncated a 64-bit `HANDLE` to `c_int` for lack of
+> `argtypes`.
 
-**Change.** New `FTHR_UI/core/single_instance.py` — named kernel mutex
-(`Local\FTHR_Clips_SingleInstance_v1`) on Windows, `flock(LOCK_EX|LOCK_NB)` on
-`~/.fthr/fthr.lock` on Linux. Both primitives are kernel-owned, so a hard crash
-releases them and cannot lock the user out. Wired into `main()` **before** any
-engine spawn, socket bind, or window creation; a `QMessageBox` explains the
-refusal. The guard deliberately **fails open** — if the primitive is
-unavailable, the app starts rather than being blocked by its own safety check.
-
-**Test evidence.** `tests/test_single_instance.py` — 7 tests, all passing,
-including a real **subprocess** conflict test (`test_second_process_is_refused_
-while_first_holds_lock`) and a **hard-kill recovery** test
-(`test_lock_is_released_when_holder_dies`). In-process tests alone would not
-have exercised this, since flock is per-file-description.
-
-**Residual risk.** Verified on Windows only. The POSIX branch is unexercised —
-see [Verification still outstanding](#verification-still-outstanding).
-
----
-
-### AUDIT-002 · P1 · **FIXED** · Both platforms · Save pipeline
+### AUDIT-002 · P1 · FIXED · Both platforms
 **A clip that failed to write reported success — perceived data loss**
 
-**Cause.** `save_clip()` waits only for `SAVE_STARTED`; the engine encodes and
-writes on its own thread afterwards. If that write then failed (disk full, path
-gone, encoder error) the engine set `ERROR_OCCURRED` — and **nothing read it**.
-`_update_status()` polled twice a second and never looked at `engine_response`.
+`save_clip()` waits only for `SAVE_STARTED`; the engine writes afterwards on its
+own thread. If that write failed, the engine set `ERROR_OCCURRED` and **nothing
+read it**. The UI flashed `SAVED`, played the animation, added a grid entry —
+and the clip did not exist. The worst failure mode for a clipping tool.
 
-**User impact.** The UI flashed `SAVED`, played the save animation, and added a
-grid entry. The clip did not exist. The user discovers this later, with no error
-and nothing in the log — the single worst failure mode for a clipping tool, and
-the one most likely to generate "it randomly eats my clips" bug reports.
+New `CaptureBridge.poll_async_result()`: non-blocking, consumes the response
+exactly once, tolerates a garbled `engine_string`. `_update_status()` surfaces a
+real error bar with an **Open folder** action. 6 new tests.
 
-**Reproduce.** Fill the disk (or make `~/FTHR_Clips` read-only after the engine
-acks) and press the save hotkey. Before the fix: `SAVED`, no file, no error.
-
-**Change.** New `CaptureBridge.poll_async_result()` — non-blocking, consumes the
-response exactly once, tolerates a garbled `engine_string`, and ignores
-unrelated response codes. `_update_status()` now surfaces a real error bar with
-an **Open folder** action, and on success refreshes the grid (which previously
-listed the clip *before* the engine had written it).
-
-**Test evidence.** 6 new tests in `tests/test_capture_bridge.py` covering: idle,
-late error, late success, consume-once (the status poll runs 2×/s and would
-otherwise spam the error bar), unrelated-response isolation, and garbled-string
-resilience.
-
-**Residual risk.** Correct handling of the *engine-side* `ERROR_OCCURRED` signal
-is assumed from the struct contract; the engine was not run.
-
----
-
-### AUDIT-003 · P1 · **FIXED** · Linux · Privacy
+### AUDIT-003 · P1 · FIXED · Linux · Privacy
 **World-writable hotkey socket let any local user capture this user's screen**
 
-**Cause.** `/tmp/fthr_hotkey.sock` was bound under the process umask, typically
-mode 0755–0777, in a directory shared by every account on the machine. The
-server accepts any connection and dispatches the command with no authentication.
+`/tmp/fthr_hotkey.sock` was bound under the process umask, typically 0755–0777,
+in a directory shared by every account. The server accepts any connection and
+dispatches with no authentication — so any local account could run
+`echo -n "save_screenshot" | nc -U …` and cause this user's screen to be
+captured to this user's disk.
 
-**User impact.** On a shared/multi-user Linux box, **any** local account could
-run `echo -n "save_screenshot" | nc -U /tmp/fthr_hotkey.sock` and cause this
-user's screen to be captured to this user's disk — then read it if the clips
-directory is readable. Also allows trivial disk-filling by spamming `save_clip`.
-Confidentiality impact, local attacker, no privileges required.
+`bind()` is now wrapped in `umask(0o177)` — a `chmod` after `bind()` would leave
+a race window — followed by an explicit `chmod(0o600)`.
 
-**Change.** `bind()` is now wrapped in `umask(0o177)` so the socket never exists
-with permissive bits (a `chmod` after `bind()` would leave a race window),
-followed by an explicit `chmod(0o600)` for filesystems that ignore umask on
-AF_UNIX nodes.
+The pass-I report noted its own residual risk: *"predictable-path pre-creation by
+another user before FTHR starts is not defended against … a `$XDG_RUNTIME_DIR`
+path would fix both properly."* That is AUDIT-003b, below.
 
-**Test evidence.** ❌ **NOT RUN** — requires Linux. Windows returns early from
-this function. Verification is an outstanding Linux item.
-
-**Residual risk.** The socket remains **unauthenticated for the owning user**,
-which is acceptable (same trust boundary), and predictable-path pre-creation by
-another user before FTHR starts is not defended against. Acceptable for alpha;
-a `$XDG_RUNTIME_DIR` path would fix both properly.
-
----
-
-### AUDIT-004 · P2 · **FIXED** · Windows · Save pipeline
+### AUDIT-004 · P2 · FIXED · Windows
 **Deep paths lost the clip and blamed disk space**
 
-**Cause.** The Windows `ui_string` field is `c_wchar * 256`, so the bridge
-refuses any path over 255 characters — correctly, but it returns a bare `False`,
-indistinguishable from a write failure. The UI then told the user to check disk
-space.
+The Windows `ui_string` field is `c_wchar * 256`, so the bridge refuses paths
+over 255 characters — correctly, but it returned a bare `False`, indistinguishable
+from a write failure, and the UI told the user to check disk space. Reachable
+with a long profile name plus a long game name. `_save_clip()` now reports the
+actual cause, length and limit.
 
-**User impact.** Clip lost, and the error actively misdirects. Reachable without
-anything exotic: a long Windows profile name plus a long game name (the capture
-source name becomes a folder) is enough.
+### AUDIT-005 · P0 · RESOLVED · Both platforms · Licensing
+**The distributed binary was GPLv3, shipped under an MIT notice, with no third-party licences**
 
-**Change.** `_save_clip()` now checks the length before calling the bridge and
-reports the actual cause, the actual length, and the 255 limit.
+The bundled FFmpeg was built `--enable-gpl --enable-version3 --enable-libx264
+--enable-libx265`. Replaced with the BtbN **LGPL** build
+`n8.1.2-21-gce3c09c101` (ABI-identical, avcodec-62). Software fallbacks moved
+x264 → **libopenh264**, x265 → **libkvazaar**; NVENC/AMF/QSV untouched.
 
-**Test evidence.** Logic verified by inspection; the 255-char guard in
-`capture_bridge.save_clip` is pre-existing and unchanged. No new automated test
-— asserting on UI error text would pin wording rather than behaviour.
+`imageio-ffmpeg` (also GPL, and — as it turned out — never actually bundled on
+Windows, which is why watermark, crop and export silently no-opped) was removed
+entirely in favour of `core/ffmpeg_tools.py`.
 
----
+Delivered: `THIRD_PARTY_NOTICES.md`, `licenses/`, `tools/ffmpeg_manifest.json`
+(version + sha256 per shipped binary), and `tools/verify_release_licenses.py`
+as an automated gate. Windows engine and PyInstaller bundle rebuilt and
+verified. Tests 81 → 93.
 
-### AUDIT-005 · P0 · **RESOLVED (2026-08-05)** · Both platforms · Licensing
-**The distributed binary is GPLv3, shipped under an MIT notice, with no third-party licences**
+> **Pass III note.** This gate did its job on its first real Linux exercise —
+> see AUDIT-014.
 
-**This is the finding that makes the release decision `NO-GO`.**
-
-**Evidence.** The bundled FFmpeg DLLs in
-`FTHRcapture/FTHRclips/third_party/ffmpeg/bin/` self-report:
-
-```
-libavcodec license: GPL version 3 or later
-```
-
-Build flags recovered from the binaries: `--enable-gpl`, `--enable-version3`,
-`--enable-libx264`, `--enable-libx265` (80 `--enable-*` flags total;
-`--enable-nonfree` is **not** set). x265 copyright banners are present in
-`avcodec-62.dll`. The C++ engine links these directly via the import libraries
-in `third_party/ffmpeg/lib/`, and `installer_windows.iss` ships the whole
-`dist\FTHRClips\*` tree.
-
-**Why it blocks.** MIT source code is GPL-compatible, so the *project's own
-code* is not the problem — but the **distributed combined work** is subject to
-GPLv3. Currently:
-
-- `LICENSE` and `README.md` present the download as plain MIT. It is not.
-- **No FFmpeg `COPYING`/`LICENSE` text is shipped at all** — no `NOTICE`, no
-  `THIRD_PARTY_NOTICES`. Verified: the only licence file in the tree is the
-  project's own MIT `LICENSE`.
-- GPLv3 obliges a complete-corresponding-source offer for the whole distributed
-  work, which is not present.
-
-Distributing to ~1,807 users in this state is a licence violation on the first
-download, and unlike a code bug it cannot be undone by shipping a patch.
-
-**Two viable resolutions** — a project decision, not a code fix:
-
-1. **Switch to an LGPL FFmpeg build** *(recommended)*. Drop `--enable-gpl`,
-   `--enable-version3`, x264 and x265. The engine already targets NVENC/AMF/QSV,
-   and it already links FFmpeg **dynamically** via DLLs, which is what LGPL
-   requires. Cost: the x264/x265 software fallback path advertised in the README
-   must be dropped or re-sourced. The app keeps its MIT licence.
-2. **Ship as GPLv3.** Relicense the distributed work, include the GPLv3 text and
-   all FFmpeg/x264/x265 notices, and publish a complete corresponding source
-   offer.
-
-Either way `THIRD_PARTY_NOTICES.md` must be created and included in both the
-installer and the AppImage.
-
-> Note: this is a factual reading of the licence markers embedded in the shipped
-> binaries, not legal advice. Given ~1,807 recipients, confirm the chosen path
-> before publishing.
-
-**Second FFmpeg copy.** The Python UI muxes audio using a *different* FFmpeg —
-`imageio-ffmpeg`'s bundled `ffmpeg-win-x86_64-v7.1.exe`. Its licence must be
-covered in the same notices file. Two independent FFmpeg copies also ship
-duplicate megabytes; consolidating is a P3 size win.
-
----
-
-### AUDIT-006 · P2 · **OPEN** · Linux · Security hardening
+### AUDIT-006 · P2 · Linux · Security hardening → **FIXED in pass III**
 **External tools invoked by bare name — PATH-dependent**
 
-16 `subprocess` call sites invoke `hyprctl`, `xdotool`, `nc`, `grim`, `xdg-open`
-by bare name (`focus_monitor.py`, `game_detector.py`, `hotkey_manager.py:317`,
-`clip_grid.py`, `capture_card.py`, `main.py`). Arguments are fixed, so this is
-**not** command injection — the risk is that a directory earlier in `PATH`
-shadows the real binary. Low severity for a desktop app run as the user; worth
-resolving via `shutil.which()` at startup, which also yields a much better error
-than a silent feature failure when the tool is simply not installed.
+16 `subprocess` call sites invoked `hyprctl`, `xdotool`, `xprop`, `nc`, `grim`,
+`xdg-open`, `wmctrl` by bare name. Arguments are fixed, so this is **not**
+command injection — the risk is a directory earlier in `PATH` shadowing the real
+binary, plus a missing tool surfacing as a swallowed `FileNotFoundError`.
+Resolved in pass III; see below.
 
-### AUDIT-007 · P2 · **OPEN** · Both · Diagnosability
+### AUDIT-007 · P2 · Both · Diagnosability · **OPEN**
 **34 bare `try/except: pass` blocks**
 
 Each is a failure that can never appear in a log or a bug report. For an alpha
-whose entire diagnostic strategy is "testers send `~/.fthr/logs/fthr.log`", this
-is the single biggest obstacle to acting on reports. Recommendation: mechanical
-pass converting each to a logged debug line. Low risk, high diagnostic payoff.
+whose diagnostic strategy is "testers send `~/.fthr/logs/fthr.log`", this is the
+single biggest obstacle to acting on reports. Recommendation: a mechanical pass
+converting each to a logged debug line.
 
-### AUDIT-008 · P1 · **OPEN** · Process · Release engineering
-**The project is not under version control, and stale copies are in play**
-
-`FTHR_Clips_source/FTHR_Clips` has **no `.git` directory**, despite shipping a
-`.gitignore`, a CI workflow, GitHub issue templates, and a README pointing at
-`github.com/FTHR-Community/FTHR-Clips`. Consequences: no history, no bisect when
-an alpha tester reports a regression, no way to tag what was released, and the
-CI workflow is dead weight.
-
-Three additional copies exist on the Desktop and are **not** the source of truth
-— confirmed stale and excluded from this audit:
-
-| Path | State |
-|---|---|
-| `Desktop\clipping\` | Abandoned C++ rewrite, last commit 2026-05-10 |
-| `Desktop\FTHR_CLIPS_BACKUP(1)\` | Older snapshot |
-| `Desktop\FTHR_Clips\` | Empty stub (`engine/FTHRclips/nul`) |
-
-Also: `Desktop\CLAUDE.md` documents a layout (`engine/`, `ui/`) that does not
-match this tree (`FTHRcapture/`, `FTHR_UI/`) and describes stubs that have since
-shipped. It will actively mislead contributors and AI assistants. Fix or delete.
-
-### AUDIT-009 · P2 · **OPEN** · Both · Reproducibility
-**Dependencies unpinned**
-
-`requirements.txt` uses `>=` for all 7 entries. Two testers can therefore run
-materially different Qt versions, which makes UI bug reports non-reproducible —
-this audit ran against PyQt6 6.11.0 while the file only demands `>=6.6.0`.
-Pin exact versions for the alpha and keep a separate unpinned dev file.
-
-### AUDIT-010 · P2 · **FIXED** · Both · Diagnostics
+### AUDIT-010 · P2 · Both · FIXED
 **About screen reported the wrong version**
 
-The About label was hardcoded `FTHR Clips v1.0.0` while every other source of
-truth said `1.0.0-alpha`. Alpha bug reports quoting the version would have been
-ambiguous about which build was meant. Now derived from
-`QApplication.applicationVersion()`, so it cannot drift again.
+The About label was hardcoded `FTHR Clips v1.0.0` while every other source said
+`1.0.0-alpha`. Pass II went further and removed the whole class of drift — see
+AUDIT-008.
 
-### AUDIT-011 · P2 · **OPEN** · Both · UI responsiveness
+### AUDIT-011 · P2 · Both · UI responsiveness · **PARTIALLY FIXED**
 **`save_clip()` blocks the Qt event loop for up to 1 second**
 
 The `SAVE_STARTED` handshake busy-waits with `time.sleep(0.001)` on the main
-thread. Against a healthy engine this is milliseconds. Against a hung one the UI
-freezes for a full second on every hotkey press. AUDIT-002's crash detection
-reduces exposure but does not remove it. Fix properly by moving the handshake
-off the main thread. **No measurement was taken** — this is a code-structure
-finding, not a profiled result.
+thread. Against a hung engine the UI freezes for a full second on every hotkey
+press.
 
-### AUDIT-012 · P2 · **OPEN** · Both · Privacy
+> **Pass III.** The most common trigger is gone: on Linux the engine finishes
+> fast saves *before* Python observes `SAVE_STARTED`, so the loop used to spin
+> the entire second on every short clip — and then report failure. `CLIP_SAVED`
+> now counts as an acknowledgement (AUDIT-015). The structural busy-wait on the
+> main thread remains; fixing it properly means moving the handshake off the
+> main thread. **No measurement was taken** — this is a code-structure finding.
+
+### AUDIT-012 · P2 · Both · Privacy · **OPEN**
 **Upload auth header stored in plaintext**
 
 `upload_auth_header` (typically a bearer token) is written to
-`~/.fthr/settings.json` in cleartext. Consistent with a local-first tool and
-arguably acceptable for alpha, but it must be **documented** so users do not put
-a high-value token there. Also: `test_server_connection()` passes a user-supplied
-URL to `urllib.request.urlopen` without scheme validation, so `file://` is
-accepted (ruff `S310`); restrict to http/https.
+`~/.fthr/settings.json` in cleartext. Arguably acceptable for a local-first
+alpha, but it must be documented — it is, in `KNOWN_ISSUES.md`. Also:
+`test_server_connection()` passes a user-supplied URL to `urllib.request.urlopen`
+without scheme validation, so `file://` is accepted; restrict to http/https.
+
+### AUDIT-013 · P0 · Both · Licensing · **OPEN — RELEASE BLOCKER**
+**PyQt6 is `GPL-3.0-only`, so the distributed build is a GPLv3 work**
+
+Qt itself is LGPLv3 — it is the Python bindings that are GPL. This is
+independent of AUDIT-005 and is not fixed by it. FTHR's own source stays MIT
+(`LICENSE`), but a *download* must never be advertised as MIT. The third FFmpeg
+copy inside Qt Multimedia (avcodec-61, LGPLv2.1) is conformant and documented.
+
+Pass II made the split explicit in the About dialog and added a CI grep that
+fails if any distributable is described as MIT.
 
 ---
 
-## Findings summary
+## Pass II — Release engineering (2026-08-06)
 
-| ID | P | Component | Status |
-|---|---|---|---|
-| AUDIT-001 | P0 | Startup | ✅ Fixed + 7 tests |
-| AUDIT-005 | P0 | Licensing (FFmpeg) | ✅ Fixed + 12 tests + CI gate + artifact verified |
-| AUDIT-013 | **P0** | **Licensing (PyQt6)** | ❌ **Open — blocks release** |
-| AUDIT-002 | P1 | Save pipeline | ✅ Fixed + 6 tests |
-| AUDIT-003 | P1 | Linux privacy | ✅ Fixed (unverified on Linux) |
-| AUDIT-008 | P1 | Release engineering | ❌ Open |
-| AUDIT-004 | P2 | Windows save | ✅ Fixed |
-| AUDIT-010 | P2 | Diagnostics | ✅ Fixed |
-| AUDIT-006 | P2 | Linux hardening | ❌ Open |
-| AUDIT-007 | P2 | Diagnosability | ❌ Open |
-| AUDIT-009 | P2 | Reproducibility | ❌ Open |
-| AUDIT-011 | P2 | UI responsiveness | ❌ Open |
-| AUDIT-012 | P2 | Privacy | ❌ Open |
+Tests: **93 → 106 passed**, 3 skipped. Both AUDIT-008 and AUDIT-009 closed.
 
-**Fixed: 5 (2 of them P0/P1 data-integrity). Open: 7 (1 release-blocking).**
+### AUDIT-008 · P1 · Process · **RESOLVED**
+**The project was not under version control, and stale copies were in play**
+
+The tree had no `.git` directory despite shipping a `.gitignore`, a CI workflow,
+issue templates and a README pointing at a GitHub repo. No history, no bisect, no
+way to tag what was released. Three stale Desktop copies were in play, plus a
+`CLAUDE.md` documenting an `engine/` + `ui/` layout two refactors old and shared
+memory `_v1` when the contract is `_v3`.
+
+Delivered:
+
+- **Git repository**, branch `main`, honest single-commit import of the existing
+  source — no fabricated history. 365 tracked files, 5.8 MB.
+- **`.gitignore`** rewritten by category with reasons. It caught a real trap: the
+  old `AppDir/` rule would have swallowed `fthr-clips.desktop` and the icon,
+  which are *source* read by `build_linux.sh` — a clean clone would not have
+  built.
+- **`.gitattributes`** committed *before* the import, so line-ending
+  normalisation never becomes an unreviewable whole-tree rewrite. CRLF for
+  Windows tooling, LF forced for shell scripts.
+- **`SOURCE_OF_TRUTH.md`** — names the authoritative tree, lists the
+  non-authoritative copies with ready-to-review archive commands (not executed;
+  nothing here depends on those paths), and replaces the backup model that
+  created the ambiguity: *a backup is a `git clone --mirror` or a `git bundle`,
+  never a working directory.*
+- **`FTHR_UI/version.py`** as the single source of the product version. `main.py`,
+  both PyInstaller specs and `build_linux.sh` derive from it;
+  `tools/verify_version_consistency.py` fails the build on any file that
+  hardcodes a version or disagrees. The Windows `.exe` now carries a VERSIONINFO
+  resource — **verified: ProductVersion / FileVersion = `1.0.0-alpha`**; it
+  previously had none at all, so "which build are you running?" was
+  unanswerable. Also found: the About page said `Build: 2026.04.28`, four months
+  stale.
+- **`tools/verify_shared_memory_contract.py`** + 13 tests. Parses both C++
+  headers, models compiler alignment, and compares field order, types, array
+  extents, offsets, total size, enum values and the reserved slots 4–9 — for
+  both platforms, from either platform. **Four negative tests** mutate a layout
+  and assert the verifier rejects it; a gate that cannot fail is worse than none.
+- **`tools/scan_repo_hygiene.py`** — secrets, user state, media and oversized
+  binaries, scanned against what git actually tracks.
+- **`tools/fetch_third_party.py`** — re-downloads the FFmpeg runtime (152 MB) and
+  vc_redist, verifying every FFmpeg file against `ffmpeg_manifest.json`. This is
+  what lets those binaries stay out of git without breaking a clean clone.
+- **CI extended**: Python on Ubuntu *and* Windows across 3.12/3.14 installing
+  from the lock, plus `pip check`, an `imageio-ffmpeg` absence assertion,
+  byte-compile, ruff, pytest, a Windows PyInstaller run, **both C++ engines
+  built**, a PE-architecture check, four release gates, a history scan for blobs
+  over 2 MB, and a tag guard. Nothing is published from CI on purpose.
+- **`RELEASE_CHECKLIST.md`** with `PASS` / `FAIL` / `NOT RUN` per gate, and no tag.
+
+### AUDIT-009 · P2 · Both · **RESOLVED**
+**Dependencies unpinned**
+
+`requirements.txt` used `>=` for all 7 entries, so two testers could run
+materially different Qt versions and UI bug reports were not reproducible.
+
+Split into `requirements.in` (direct, human-edited), `requirements-alpha.txt`
+(the lock — full transitive closure, exact pins, the only release install path)
+and `requirements-dev.txt` (pinned tooling). `requirements.txt` remains as a
+pointer.
+
+**Verified with two clean venvs:** identical package sets (25 packages,
+`Compare-Object` empty), `pip check` clean in both, imports succeed, identical
+test results, and a full PyInstaller build from the locked environment.
+
+The exercise immediately paid for itself: one test failed identically in *both*
+venvs and passed on the system interpreter. That was not a lock problem — it
+exposed the ctypes `GetLastError` defect in AUDIT-001 and a test that killed
+`Popen.pid`, which in a Windows virtualenv is a launcher stub rather than the
+process holding the mutex.
+
+**Python 3.14 recorded as the alpha interpreter**, because that is what the
+shipped bundle actually contains (`python314.dll`, `cpython-314` bytecode).
+`BUILD_WINDOWS.md` had told people to use 3.11 *and* to install
+`imageio-ffmpeg` — both wrong, the latter dangerously so.
 
 ---
 
-## Changes made
+## Pass III — Linux verification (2026-08-06)
 
-| File | Change |
+Tests: **106 → 139 total** — Windows 112 passed / 27 skipped, **Linux 138 passed
+/ 1 skipped**. The three tests previously skipped on Windows as "Linux-only"
+finally ran.
+
+> **Environment caveat, stated once and meant throughout.** This ran in WSL2
+> with WSLg: Weston + XWayland, no desktop environment, no wlroots compositor.
+> It is a real Linux kernel, toolchain, filesystem and process model — so build,
+> IPC, permissions, encoding and file output are genuinely tested. It is **not**
+> a Linux desktop, so compositor behaviour, visible capture and hotkeys are not.
+>
+> **Data captured during testing:** the WSLg virtual desktop and the PulseAudio
+> monitor device. Not the Windows desktop. All artefacts were deleted afterwards.
+
+### Build — PASS
+
+```bash
+rm -rf FTHRcapture_linux/build
+cmake -S FTHRcapture_linux -B FTHRcapture_linux/build -DCMAKE_BUILD_TYPE=Release
+cmake --build FTHRcapture_linux/build --parallel
+```
+
+0 errors, 2 warnings (unused `clock_ns()` in `encoder.cpp`; `memset` on the
+non-trivial `WlrBackend::FrameBuffer`), Wayland protocol bindings regenerated,
+ELF x86-64, **`ldd` reports 0 missing libraries**, no absolute paths baked in.
+
+Observation, not a defect: `target_compile_options` appends `-O2` *after* the
+`-O3 -DNDEBUG` contributed by `CMAKE_BUILD_TYPE=Release`, so the effective
+optimisation level is `-O2`. Documented in `BUILDING.md`.
+
+### Engine runtime and IPC — PASS
+
+`/dev/shm/FTHR_SharedMemory_v3`: **4248 bytes, exactly
+`ctypes.sizeof(SharedMemoryLayout)`**, owner = user, **mode 600**. The
+production `CaptureBridge` attached, reported `active_codec=av1_nvenc`, and the
+frame counter advanced.
+
+Backend selection behaved exactly as designed on an unsupported compositor:
+
+```
+[WlrBackend] zwlr_screencopy_manager_v1 not available — compositor must support wlr-screencopy
+[ExtBackend] ext-image-copy-capture not available
+[Backend] No Wayland capture backend available
+[Backend] Using x11grab
+```
+
+That is the legible failure path the audit asked for, and the X11 fallback is
+load-bearing on every non-wlroots desktop. It must not be removed.
+
+Documented divergence found: `is_recording` is pinned `false` on Linux by design
+(*"captures continuously — no discrete recording state"*) while the Windows
+engine sets it. Not a UI bug — the UI derives CAPTURING from the connection —
+but the shared-memory contract did not say so anywhere. It does now.
+
+### Clip pipeline — PASS (with one large caveat)
+
+| Case | Result |
 |---|---|
-| `FTHR_UI/core/single_instance.py` | **New.** Cross-platform single-instance guard. |
-| `FTHR_UI/main.py` | Guard wired into `main()`; async save-failure surfacing in `_update_status()`; Windows long-path pre-check in `_save_clip()`; version label derived from app version. |
-| `FTHR_UI/core/capture_bridge.py` | **New** `poll_async_result()` + `_read_engine_string()`. |
-| `FTHR_UI/core/hotkey_manager.py` | Socket bound under `umask(0o177)` + explicit `chmod(0o600)`. |
-| `tests/test_single_instance.py` | **New.** 7 tests incl. subprocess conflict + hard-kill recovery. |
-| `tests/test_capture_bridge.py` | +6 tests for async save verdicts. |
+| ASCII path | saved, valid |
+| `clip_ünïcøde_日本語_🎮.mp4` | saved, valid |
+| Path near `PATH_MAX` | refused cleanly, no crash |
+| Component over `NAME_MAX` | refused cleanly |
+| Read-only directory | refused cleanly |
+| Two saves back to back | both fine |
 
-**No public API was changed. No feature was removed. No test was weakened or
-disabled.** All changes are additive or replace a silent failure with a reported
-one.
+`ffprobe`: AV1 1280×720 @ 30 fps + AAC 48 kHz stereo, both streams
+`start_time=0.000000`, `ffmpeg -f null -` decodes with **0 errors**.
 
-### Possible side effects to watch
+> **The caveat.** The frames are **entirely black** — measured luma
+> `min 0, max 0, 1 distinct value`. XWayland under WSLg has no root-window
+> content for `x11grab` to read. **The plumbing is proven; the picture is not.**
+> Nobody has confirmed that FTHR Clips records what is on a Linux screen.
 
-- **AUDIT-001** — if a previous FTHR process is left running invisibly (hung,
-  tray-only), the next launch now *refuses* instead of starting a second copy.
-  This is intended, but it converts a silent-corruption failure into a visible
-  "already running" dialog that alpha testers may report as a bug. The dialog
-  text tells them to end the running process.
-- **AUDIT-002** — `poll_async_result()` consumes `engine_response`. It runs on
-  the main thread from the status timer; `save_clip()`'s handshake blocks that
-  same loop, so the two cannot interleave in the current design. **If the
-  AUDIT-011 fix moves the handshake off the main thread, this becomes a real
-  race and both sites will need a lock.** Flagged in the code.
+### Audio — PASS (headless)
+
+PulseAudio 17.0 via WSLg. Capture started (48 kHz stereo float32) and produced a
+clip with a real AAC track. Device switching, disconnection during capture and
+"no microphone present" remain `NOT RUN`.
+
+### AUDIT-003b · P1 · Linux privacy · **FIXED**
+**The hotkey socket path, not just its mode**
+
+AUDIT-003 fixed the *mode*. The *path* was still a fixed
+`/tmp/fthr_hotkey.sock`, and `/tmp` is world-writable — so any local user could
+create that path first, as a file, a directory or a symlink. The old code then
+ran an **unconditional `os.unlink()`** on it. Both outcomes are bad:
+
+- With the sticky bit set (normal for `/tmp`) the unlink fails with `EPERM`,
+  `bind()` fails, and hotkeys are dead. **Any local user could deny this user's
+  hotkeys indefinitely by touching one path.**
+- Without it, FTHR deletes a stranger's file.
+- A symlink there turns the unlink — or the later chmod — into an operation on a
+  file of the attacker's choosing.
+
+New `core/linux_runtime.py`: the socket lives in
+`$XDG_RUNTIME_DIR/fthr/hotkey.sock`, falling back to `~/.fthr/run/` when
+`XDG_RUNTIME_DIR` is unset (containers, `su` without a session). Deliberately
+**not** `/tmp` for the fallback either. Both are validated with `lstat` — a
+symlink is a finding, not a path to follow — must be owned by the current uid,
+and must have no group or other bits.
+
+`prepare_socket_path()` replaces the unconditional unlink: it removes a path only
+if it is a socket, owned by this user, and nobody is listening. A regular file, a
+directory, a symlink, a foreign socket or a live one are each reported and left
+alone. `cleanup_legacy_socket()` migrates users off `/tmp` under the same rules.
+
+**Verified:** socket `0600`, directory `0700`, both owned by the user, `/tmp`
+path absent. 16 new tests, all writing into `tmp_path`, pinning the *refusals*
+as hard as the successes.
+
+### AUDIT-006 · P2 · Linux hardening · **FIXED**
+**Bare-name external tool invocation**
+
+New `core/linux_tools.py` resolves `hyprctl`, `xdotool`, `xprop`, `grim`, `nc`,
+`xdg-open` and `wmctrl` once through `shutil.which()`, caches the result, and
+hands callers an **absolute** path. Tools are classified required/optional
+relative to their own feature — neither is fatal to startup; FTHR degrades
+rather than refusing to run. `missing_message()` names the tool, what breaks, and
+what to install. `report()` dumps the whole resolution table plus `PATH`, and
+`main()` logs it at startup, so "screenshots don't work" arrives with evidence.
+
+Nothing uses `shell=True`; no user-controlled value reaches `argv[0]`. The module
+is import-safe on Windows and short-circuits rather than picking up an unrelated
+same-named `.exe`. 13 new tests manipulate `PATH` directly, including shadowing.
+
+The KDE/GNOME warning was rewritten at the same time: it now names the detected
+desktop, points at that desktop's shortcut UI, prints the exact command to bind,
+and reports a missing `nc` as its own distinct error — instead of implying
+hotkeys are simply broken.
+
+### AUDIT-015 · P1 · Linux save pipeline · **FIXED**
+**Successful clip saves were reported as failures**
+
+The Linux engine runs `SaveClip` *synchronously* on its command loop: it writes
+`SAVE_STARTED`, encodes, then overwrites the same field with `CLIP_SAVED`. The
+bridge's acknowledgement loop only accepted `SAVE_STARTED` or `ERROR_OCCURRED`,
+so whenever the encode finished inside the 1 ms poll interval, `SAVE_STARTED` was
+already gone. The loop spun the full 1 s ceiling and returned `False` — for a
+clip that was on disk and valid.
+
+Observed directly: two identical saves, one returning `True`, the next
+"Timeout waiting for SAVE_STARTED → False" while producing a 6584-byte, fully
+decodable file. The user sees SAVE FAILED plus a one-second stall.
+
+`CLIP_SAVED` now counts as an acknowledgement, and is deliberately **not**
+consumed there — `poll_async_result()` is what tells the UI the clip landed.
+
+Two further defects fixed in the same area:
+
+- **`engine_string` was never cleared on success.** It was only ever written on
+  failure, so after one failed save every subsequent *success* still carried the
+  old `"SaveClip failed: …"` text, and `poll_async_result()` reported
+  `('saved', <stale error>)`. One line in the Linux engine clears it.
+- **Double `close(fd)`** in `_initialize_linux()` — the `except` branch closed
+  the fd and the following `finally` closed it again, so the second close raised
+  `EBADF` *out of the finally*, replacing the intended `return False`.
+
+Added: a **layout-size check before `mmap`**. The struct carries no version
+field, so the region's size is the only runtime signal. A mismatched engine is
+now refused with both sizes and a pointer to the rebuild instructions, instead of
+being mapped and read as garbage. The contract itself is unchanged — no field
+added, moved, resized or renamed, and command IDs 4–9 untouched.
+
+### AUDIT-016 · P2 · Linux portability · **FIXED**
+**The AppImage build was broken on every Debian-family distro**
+
+Two independent causes, both found by actually running `build_linux.sh`:
+
+1. `FTHR_linux.spec` hardcoded `/usr/lib/libportaudio.so.2` — correct on Arch,
+   wrong everywhere Debian-derived, which uses `/usr/lib/<multiarch>/`.
+   PyInstaller aborted. Now resolved via `sysconfig`'s `MULTIARCH` across the
+   common layouts with `ctypes.util.find_library` as a fallback, and a clear
+   `SystemExit` naming the package per distro. The Qt6 plugin directory had the
+   same Arch-only assumption.
+2. The dependency check imported all five modules in one statement (so only the
+   first failure showed) and then advised `pip install … sounddevice`.
+   `sounddevice` imports fine and fails on a missing **system** library:
+   `OSError: PortAudio library not found`. No amount of pip installing fixes
+   that. Failures are now split into "Python package missing" and "system library
+   missing", each with the right remedy and per-distro package names, and the
+   Python branch points at `requirements-alpha.txt`.
+
+### AUDIT-014 · P0 · Linux packaging · **OPEN — RELEASE BLOCKER**
+**No Linux AppImage can be built**
+
+With AUDIT-016 fixed, `build_linux.sh` runs to completion: engine built,
+PyInstaller bundle produced (580 MB, engine included), stripped, smoke-tested,
+AppDir assembled with `LICENSE`, `THIRD_PARTY_NOTICES.md`, all nine licence
+texts, `.desktop` and icon — and **no user data, clips, logs, settings or test
+files**.
+
+It then stops at its own licence gate:
+
+```
+47 checks, 12 failed
+FAILURES — do not publish this build:
+  - libavcodec.so.60: GPL build flags present -> --enable-gpl, --enable-libx264, ...
+ERROR: licence verification failed - refusing to build the AppImage.
+```
+
+Distribution FFmpeg is a GPL build (Ubuntu 24.04's is), the engine links it, and
+PyInstaller bundles what the engine links. **This gate working correctly on its
+first real exercise is the good news.** It also means there is no publishable
+Linux build until an LGPL FFmpeg is bundled the way Windows does it (AUDIT-005),
+or GPLv3 is accepted — which AUDIT-013 forces anyway.
 
 ---
 
-## Test results
+## Verification matrix
 
-**Command:** `QT_QPA_PLATFORM=offscreen python -m pytest tests/ -q`
-**Environment:** Windows 10 Pro 19045, Python 3.14.3, PyQt6 6.11.0, pytest 9.1.1
-
-| | Before | After |
+| Item | Windows | Linux |
 |---|---|---|
-| Passed | 68 | **81** |
-| Skipped | 3 | 3 |
-| Failed | 0 | **0** |
-
-The 3 skips are Linux-only tests (`test_capture_backend_detection.py`), skipped
-by design on Windows.
-
-**Coverage caveat — read this before trusting the green.** 81 passing tests are
-*not* evidence of a working application. The suite exercises pure logic against
-fake shared-memory buffers. It does not, and in this environment cannot, cover:
-the C++ engine (~12k LOC, **zero** automated tests), actual screen capture,
-actual encoding, real IPC against a live engine, any GUI interaction, or
-anything on Linux. Test count went up 19%; real-world confidence did not move
-proportionally.
-
----
-
-## Performance
-
-**NOT RUN.** No profiling, no timing, no memory measurement was performed. This
-report therefore makes **no** performance claims and reports no before/after
-numbers. AUDIT-011 is a structural observation from reading the code, not a
-measured bottleneck.
-
-`docs/PERFORMANCE.txt` (referenced by `Desktop\CLAUDE.md`) does not exist in this
-tree — `docs/` is empty.
-
----
+| Engine builds clean | **PASS** (VS 2022, 08-05) | **PASS** (CMake, 08-06) |
+| Python tests | **PASS** 112 / 27 skipped | **PASS** 138 / 1 skipped |
+| Lint (ruff) | **PASS** | **PASS** |
+| Shared-memory contract | **PASS** 2712 B | **PASS** 4248 B, confirmed against a running engine |
+| Bundle builds | **PASS** (PyInstaller, verified version resource) | **PASS** (PyInstaller) |
+| Installer / AppImage | **NOT RUN** (installer never tested) | **FAIL** — licence gate (AUDIT-014) |
+| Engine runs, IPC works | **NOT RUN** | **PASS** |
+| Clip saved and decodes | **NOT RUN** | **PASS** |
+| Clip contains a picture | **NOT RUN** | **FAIL** — frames are black (WSLg limitation) |
+| Audio captured | **NOT RUN** | **PASS** (headless) |
+| Single-instance guard | **PASS** (tests) | **PASS** (real processes) |
+| Hotkey socket permissions | n/a | **PASS** |
+| Hotkey actually fires | **NOT RUN** | **NOT RUN** |
+| GUI launches | **NOT RUN** | **NOT RUN** |
+| Performance / soak | **NOT RUN** | **NOT RUN** |
 
 ## Verification still outstanding
 
-Ordered by how badly the absence of the check hurts.
+Nothing below has been performed. None of it is a prediction of failure.
 
-1. **Linux: nothing has ever been run.** No build, no launch, no test. Half the
-   advertised platform is completely unverified — including the AUDIT-003 fix
-   and the entire POSIX branch of the AUDIT-001 guard, both written this pass.
-2. **GUI runtime verification on Windows.** The app has not been launched. Not
-   done here because starting a screen recorder on the operator's machine begins
-   capturing their screen — it needs explicit consent. Required checks: launch,
-   engine connects, hotkey saves a clip, clip plays, second launch is now
-   refused, clean exit.
-3. **Clean-room rebuild on both platforms.** Existing `FTHRclips.exe` and
-   `FTHRClips_Setup_Windows.exe` were **not** rebuilt from a fresh checkout.
-4. **Installer lifecycle** — install, update over previous, uninstall, leftovers.
-5. **Soak test** — hours of runtime, hundreds of clips, device hot-swaps.
-6. **Multi-monitor / HiDPI / fractional scaling** on both platforms.
-7. **Hotkeys on KDE/GNOME/X11** — the documented weak spot.
-8. **C++ engine review.** ~12k LOC of buffer/thread/encoder code with no tests
-   was outside this pass and is the largest unexamined risk surface in the
-   project.
+**Both platforms** — GUI launch · a hotkey actually firing · performance
+measurement · a soak run (2 h, 50+ clips, watching RSS, file descriptors,
+threads, zombies) · any review or test of the two C++ engines (~12k LOC, zero
+automated tests) · CI (the workflow has never executed; there is no remote).
+
+**Windows** — a real clip via hotkey · installer install → launch → update →
+uninstall · that uninstall removes what it claims.
+
+**Linux** — every real desktop: Hyprland, KDE Plasma, GNOME, bare-metal X11 and
+Wayland · **any capture containing visible content** · both Wayland backends
+(neither has ever succeeded anywhere) · the Hyprland auto-config path ·
+multi-monitor, monitor switching, resolution changes, fractional scaling ·
+fullscreen games, focus changes, lock/unlock · suspend/resume · device removal
+during capture · AppImage launch.
 
 ---
 
 ## Path to GO
 
-### Before any public download (blocks release)
+### Blocks any public download
 
-| # | Task | Discipline | Size | Depends on | Definition of done |
-|---|---|---|---|---|---|
-| 1 | ~~Resolve AUDIT-005~~ **DONE** — LGPL FFmpeg swapped in, verified | Release | — | — | ✅ `tools/verify_release_licenses.py` passes on tree and rebuilt Windows artifact |
-| 1b | Resolve AUDIT-013: port UI to PySide6, ship as GPLv3, or buy a commercial PyQt licence | Release / legal | **L** | project decision | `README`/`LICENSE` state the true licence of the download |
-| 2 | Create `THIRD_PARTY_NOTICES.md`, include in installer + AppImage | Release | S | 1 | Both artifacts contain it; covers both FFmpeg copies, x264/x265 if kept, NVIDIA SDK header, Qt |
-| 3 | Put the tree under git, tag `v1.0.0-alpha` | Release | S | — | Clean history; CI green; stale Desktop copies archived or deleted |
-| 4 | Verify on real Linux: build, launch, hotkey, clip, **AUDIT-001 + AUDIT-003 fixes** | QA | **L** | 3 | AppImage runs on Hyprland + one of KDE/GNOME; second launch refused; socket is mode 0600 |
-| 5 | Windows runtime verification incl. second-launch refusal | QA | M | 3 | Checklist in `TESTING.md` passes on Win10 **and** Win11 |
+1. **Decide AUDIT-013** — PySide6, GPLv3, or a commercial PyQt licence. Whatever
+   is chosen, `README`, `LICENSE`, `RELEASE_NOTES` and the About dialog must
+   state the true licence of the *download*.
+2. **Resolve AUDIT-014** — bundle an LGPL FFmpeg for Linux, or accept GPLv3.
+   Follows automatically from option 2 of AUDIT-013.
+3. **Run the application.** At minimum: launch the GUI on both platforms, record
+   one clip via hotkey on each, watch them back, and complete one installer
+   lifecycle on Windows.
+4. **One bare-metal Linux desktop** — Hyprland *and* one of KDE/GNOME — recording
+   a clip with visible content and firing a hotkey. Until then Linux stays
+   `CONDITIONAL GO`.
 
-### Before inviting all ~1,807 users (strongly recommended)
+### Strongly recommended before a wide invite
 
-| # | Task | Discipline | Size | Definition of done |
-|---|---|---|---|---|
-| 6 | Pin `requirements.txt` exactly (AUDIT-009) | Build | S | Two clean installs produce identical versions |
-| 7 | Replace the 34 silent `except: pass` with logged handlers (AUDIT-007) | Eng | M | `ruff --select=S110` reports 0; failures reach `fthr.log` |
-| 8 | Fix or delete the stale `Desktop\CLAUDE.md` (AUDIT-008) | Docs | S | Documented layout matches reality |
-| 9 | Document the plaintext auth token + restrict URL schemes (AUDIT-012) | Eng/Docs | S | Warning in upload settings UI; `file://` rejected |
-| 10 | Short soak: 2 h runtime, 50+ clips, watch RAM/handles/zombies | QA | M | No growth trend, no orphaned processes |
-| 11 | Staged rollout — ~50 testers before opening to the server | Release | S | Log-collection instructions published first |
+5. **AUDIT-007** — convert the 34 silent `except: pass` blocks to logged lines.
+   The entire support strategy is "send us your log".
+6. **AUDIT-011** — move the save handshake off the Qt main thread.
+7. **AUDIT-012** — restrict `test_server_connection()` to http/https.
+8. A soak run, so any performance claim is backed by a measurement.
 
 ### During alpha
 
-12. `shutil.which()` for external tools (AUDIT-006) · 13. Move the save handshake
-off the main thread — carefully, see the AUDIT-002 side-effect note (AUDIT-011) ·
-14. First automated tests for the C++ engine · 15. Split `main.py` (5.4k LOC).
+9. Tag `v1.0.0-alpha` only once `RELEASE_CHECKLIST.md` is fully green. A tag is a
+   claim that outlives whoever made it.
+10. Give the C++ engines their first tests.
+
+---
+
+## Repository cleanup — 2026-08-06
+
+Performed after pass III, at the owner's request and with the consequences of
+each group confirmed beforehand.
+
+| Removed | Size | Recovery |
+|---|---|---|
+| `__pycache__`, `.pytest_cache`, `.ruff_cache`, `.vs`, `*.vcxproj.user` | 1.5 MB | regenerated automatically |
+| `FTHRcapture/FTHRclips/x64` (obj, tlog, pdb) | 58.6 MB | MSBuild |
+| `build/` (PyInstaller work dir) | 16.0 MB | PyInstaller |
+| `FTHRcapture_linux/build` | 1.7 MB | CMake |
+| `AppDir/AppRun`, `AppDir/usr` (stale generated copies) | <0.1 MB | `build_linux.sh` regenerates them |
+| `FTHRCLIPS.exe.txt` (scratch file, not source) | <0.1 MB | — |
+| `dist/` (Windows bundle) | 522.0 MB | MSBuild + PyInstaller |
+| `Output/` (built installer) | 215.3 MB | Inno Setup |
+| `FTHRcapture/x64` (built engine + DLLs) | 151.3 MB | MSBuild |
+| `third_party/ffmpeg/bin` | 152.7 MB | `python tools/fetch_third_party.py --ffmpeg` (sha256-verified) |
+| `redist/` | 24.4 MB | `python tools/fetch_third_party.py --vcredist` |
+| `dist_old_gpl_2026-08-05` (pre-AUDIT-005 GPL build) | 130.7 MB | **not recoverable** — removed on explicit instruction |
+| WSL work copy + venv + Linux bundle | ~2.5 GB | recreate per `BUILDING.md` |
+
+**Result: 1,282 MB → 7.7 MB.** Every one of the 365 tracked files is present,
+the working tree is clean, and all four release gates still exit 0.
+
+Two tests moved from *passed* to *skipped* — `"ffmpeg not available"` and
+`"vendored ffmpeg not present in this checkout"`. Both are environment-dependent
+skips behaving correctly; `tools/fetch_third_party.py --ffmpeg` restores them.
+
+`FTHRClips_Roadmap.docx` was **kept**: it is a planning document, not build
+output, even though it is git-ignored.
 
 ---
 
 ## Bottom line
 
-The engineering is in better shape than a 5,400-line `main.py` suggests: the
-error handling is deliberate, the comments record real debugging history, and
-the two genuine data-integrity defects found here (AUDIT-001, AUDIT-002) are now
-fixed with tests that would catch a regression.
+The engineering around the product is now in good shape: it is in git with an
+honest history, its dependencies are pinned and reproducible, its version comes
+from one place and is enforced, its most fragile contract is checked
+automatically on both platforms, and four release gates run in CI. Three passes
+found and fixed sixteen defects, several of which — a socket any local user
+could hijack or wedge, saves reported as failures, a guard whose answer depended
+on unrelated Win32 calls — would have generated exactly the kind of bug report
+that is impossible to act on.
 
-What stands between this and a release is **not** primarily code quality:
-
-- One **licence blocker** that no amount of testing will surface, and that
-  cannot be corrected after 1,807 people have downloaded the file.
-- One **entirely unverified platform** — Linux has never been run, including two
-  fixes written during this pass.
-- **No version control**, so the first regression report cannot be bisected.
-
-Fix the licence, put it in git, and actually run it on Linux — then a clearly
-labelled alpha is a defensible call.
+What has not changed is the shape of the risk. Two licence decisions block any
+download, and **the application still has not been watched working by a human on
+either platform.** Everything verified so far was verified programmatically.
+That is worth a great deal, and it is not the same thing as knowing the product
+records your screen.
