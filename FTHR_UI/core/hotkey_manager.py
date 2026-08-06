@@ -1,13 +1,15 @@
 """
 Hotkey Manager - global keyboard shortcuts for FTHR Clips.
 
-On Linux/Wayland the preferred trigger path is via Hyprland binds that send
-commands to a Unix socket at /tmp/fthr_hotkey.sock.  This file starts that
-socket server automatically so the Hyprland config just needs:
+On Linux/Wayland the preferred trigger path is via compositor binds that send
+commands to a Unix socket. This file starts that socket server automatically.
 
-    bind = , F9,  exec, echo -n "save_clip"          | nc -U /tmp/fthr_hotkey.sock
-    bind = , F10, exec, echo -n "save_extended_clip" | nc -U /tmp/fthr_hotkey.sock
-    bind = , F11, exec, echo -n "save_screenshot"    | nc -U /tmp/fthr_hotkey.sock
+The socket lives in a PRIVATE per-user runtime directory — normally
+$XDG_RUNTIME_DIR/fthr/hotkey.sock — not in /tmp. See core/linux_runtime.py for
+why: /tmp is world-writable, so the path itself could be squatted or symlinked
+by any local user even though the socket mode is 0600. Call
+core.linux_runtime.hotkey_socket_path() for the resolved path; do not hardcode
+one, and do not print one you did not resolve.
 
 On Hyprland these lines are written automatically to ~/.config/hypr/fthr-hotkeys.conf
 whenever a hotkey is changed. The `keyboard` library fallback is kept for
@@ -23,7 +25,8 @@ from PyQt6.QtCore import QObject, pyqtSignal
 import json
 from pathlib import Path
 
-HOTKEY_SOCKET_PATH = '/tmp/fthr_hotkey.sock'
+from core import linux_runtime, linux_tools
+
 _FTHR_HYPR_CONF    = Path.home() / '.config' / 'hypr' / 'fthr-hotkeys.conf'
 _HYPR_CONF         = Path.home() / '.config' / 'hypr' / 'hyprland.conf'
 
@@ -216,10 +219,29 @@ class HotkeyManager(QObject):
             pass
         if comp == 'hyprland':
             return   # binds are auto-written; hotkeys work via the socket
+        # Be specific about which desktop this is and what to actually do.
+        # A vague warning here is why "hotkeys don't work" was the most common
+        # Linux report with no actionable follow-up.
+        where = {
+            'kwin':  'KDE: System Settings -> Shortcuts -> Add Command',
+            'gnome': 'GNOME: Settings -> Keyboard -> Custom Shortcuts',
+            'x11':   "your window manager's keybinding config",
+        }.get(comp or '', "your desktop's custom-shortcut settings")
+
+        if not linux_tools.available('nc'):
+            self.error_occurred.emit(
+                'GLOBAL HOTKEYS UNAVAILABLE',
+                linux_tools.missing_message('nc') +
+                ' Without it, compositor binds cannot reach FTHR Clips.',
+                'error',
+            )
+            return
+
         self.error_occurred.emit(
-            'GLOBAL HOTKEYS UNAVAILABLE',
-            'Direct key capture needs root on Linux. Bind your compositor keys to'
-            f' the socket instead, e.g.:  echo -n "save_clip" | nc -U {HOTKEY_SOCKET_PATH}',
+            'GLOBAL HOTKEYS NEED MANUAL SETUP',
+            'Direct key capture needs root on Linux and is disabled by design. '
+            f'Bind a key in {where} to this command:    '
+            f'{self.socket_command("save_clip")}',
             'warning',
         )
 
@@ -243,11 +265,28 @@ class HotkeyManager(QObject):
         k    = parts[-1].upper() if len(parts[-1]) == 1 else parts[-1]
         return mods, k
 
+    def socket_command(self, action: str) -> str:
+        """The exact shell command a compositor bind must run for *action*.
+
+        Single source for every generated bind and every instruction we show
+        the user. Both the socket path and the `nc` binary are resolved, not
+        guessed: the path moved out of /tmp (AUDIT-003b) and a bare `nc` picks
+        up whatever is first on PATH.
+        """
+        nc = linux_tools.path('nc') or 'nc'
+        sock = getattr(self, '_socket_path', None)
+        if not sock:
+            try:
+                sock = linux_runtime.hotkey_socket_path(create_dir=False)
+            except Exception as exc:
+                print(f'[Hotkey] Cannot determine socket path: {exc}')
+                sock = '<socket unavailable>'
+        return f'echo -n "{action}" | {nc} -U {sock}'
+
     def _build_bind_line(self, action: str) -> str:
         key       = self.hotkeys.get(action, '')
         mod, k    = self._to_hyprland_bind(key)
-        nc_cmd    = f'echo -n "{action}" | nc -U {HOTKEY_SOCKET_PATH}'
-        return f'bind = {mod}, {k}, exec, {nc_cmd}'
+        return f'bind = {mod}, {k}, exec, {self.socket_command(action)}'
 
     def _write_hyprland_config(self) -> None:
         """Write ~/.config/hypr/fthr-hotkeys.conf with current hotkeys."""
@@ -313,8 +352,12 @@ class HotkeyManager(QObject):
         if os.environ.get('HYPRLAND_INSTANCE_SIGNATURE'):
             def _reload():
                 try:
+                    hyprctl = linux_tools.path('hyprctl')
+                    if not hyprctl:
+                        raise FileNotFoundError(
+                            linux_tools.missing_message('hyprctl'))
                     subprocess.run(
-                        ['hyprctl', 'reload'],
+                        [hyprctl, 'reload'],
                         capture_output=True, timeout=5,
                     )
                     print('[Hotkey] Hyprland config reloaded.')
@@ -329,34 +372,59 @@ class HotkeyManager(QObject):
                              name='fthr-hyprctl-apply').start()
 
     def _start_socket_server(self):
-        """Listen on HOTKEY_SOCKET_PATH for Hyprland bind commands."""
+        """Listen on the private hotkey socket for compositor bind commands."""
         # Unix-socket path is Linux-only. On Windows the keyboard library is
         # the one and only hotkey path — starting this would raise
         # AttributeError (no AF_UNIX) and flash a bogus error banner.
         if sys.platform == 'win32' or not hasattr(socket, 'AF_UNIX'):
             return
+
+        # One-time migration: a build before AUDIT-003b bound /tmp/fthr_hotkey.sock.
+        # Remove it only if it is ours and dead; never touch a squatted path.
+        legacy = linux_runtime.cleanup_legacy_socket()
+        if legacy:
+            print(f'[Hotkey] {legacy}')
+
         try:
-            os.unlink(HOTKEY_SOCKET_PATH)
-        except FileNotFoundError:
-            pass
+            sock_path = linux_runtime.hotkey_socket_path()
+            # Refuses to delete anything that is not a stale socket owned by
+            # this user, and refuses to steal a socket a live instance holds.
+            linux_runtime.prepare_socket_path(sock_path)
+        except linux_runtime.RuntimeDirError as e:
+            print(f'[Hotkey] Cannot prepare socket: {e}')
+            self.error_occurred.emit(
+                'HOTKEY SERVER FAILED',
+                f'{e} Hotkeys will not work until this is resolved.',
+                'error',
+            )
+            return
+        except OSError as e:
+            print(f'[Hotkey] Cannot prepare socket: {e}')
+            self.error_occurred.emit(
+                'HOTKEY SERVER FAILED',
+                'Could not create the private runtime directory. '
+                'Hotkeys will not work.',
+                'error',
+            )
+            return
+
+        self._socket_path = sock_path
 
         try:
             srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            # Create the socket with owner-only permissions from the start.
-            # /tmp is world-writable and shared by every account on the box;
-            # a mode-0777 socket lets any local user trigger save_screenshot
-            # and walk away with a picture of this user's screen. Setting the
-            # umask around bind() closes the window in which the socket exists
-            # with permissive bits — a chmod after bind would leave a race.
+            # Owner-only from the moment the node appears. The directory is
+            # already 0700 and user-owned, so this is defence in depth rather
+            # than the only barrier — but a chmod *after* bind() would still
+            # leave a window, so the umask stays.
             _old_umask = os.umask(0o177)
             try:
-                srv.bind(HOTKEY_SOCKET_PATH)
+                srv.bind(sock_path)
             finally:
                 os.umask(_old_umask)
-            # Belt and suspenders: some kernels/filesystems ignore umask for
-            # AF_UNIX nodes, so assert the mode explicitly as well.
+            # Some kernels/filesystems ignore umask for AF_UNIX nodes, so
+            # assert the mode explicitly as well.
             try:
-                os.chmod(HOTKEY_SOCKET_PATH, 0o600)
+                os.chmod(sock_path, 0o600)
             except OSError as e:
                 print(f'[Hotkey] Could not tighten socket permissions: {e}')
             srv.listen(8)
@@ -371,7 +439,7 @@ class HotkeyManager(QObject):
             return
 
         self._socket_running = True
-        print(f"[Hotkey] Socket server listening on {HOTKEY_SOCKET_PATH}")
+        print(f"[Hotkey] Socket server listening on {sock_path}")
 
         _dispatch = {
             'save_clip':               self.save_clip_triggered,
@@ -410,7 +478,7 @@ class HotkeyManager(QObject):
                         print(f"[Hotkey] Socket recv error: {e}")
             srv.close()
             try:
-                os.unlink(HOTKEY_SOCKET_PATH)
+                os.unlink(sock_path)
             except FileNotFoundError:
                 pass
 
