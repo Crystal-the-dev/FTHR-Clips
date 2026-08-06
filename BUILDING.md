@@ -1,11 +1,141 @@
 # Building FTHR Clips
 
-Two native engines and one Python frontend. Windows and Linux builds are
-independent — neither includes the other's engine.
+Two native engines and one Python frontend. The Windows and Linux builds are
+independent — neither artifact contains the other's engine.
 
-- Windows: [`BUILD_WINDOWS.md`](BUILD_WINDOWS.md)
-- Linux: this file
-- Platform support and what has actually been tested: [`SUPPORTED_PLATFORMS.md`](SUPPORTED_PLATFORMS.md)
+- [Common setup](#common-setup) · [Windows](#windows) · [Linux](#linux)
+- What has actually been tested: [`docs/SUPPORTED_PLATFORMS.md`](docs/SUPPORTED_PLATFORMS.md)
+- How to verify a build: [`docs/TESTING.md`](docs/TESTING.md)
+
+---
+
+## Common setup
+
+### Python dependencies
+
+Install from the pinned lock files, never a loose `pip install` — unpinned
+installs were AUDIT-009 and made UI bug reports irreproducible:
+
+```bash
+python -m pip install -r requirements-alpha.txt -r requirements-dev.txt
+```
+
+`requirements.in` is the human-edited list of direct dependencies;
+`requirements-alpha.txt` is the lock and the only file a release build installs
+from.
+
+> **Do not install `imageio-ffmpeg`.** It bundles a GPLv3 FFmpeg build. Having it
+> in the environment risks PyInstaller pulling it into the bundle and placing the
+> whole artifact under the GPL (AUDIT-005). It is excluded in `FTHR.spec` and
+> absent from both lock files on purpose.
+
+**Python 3.14 is the alpha build interpreter** — the shipped Windows bundle
+contains `python314.dll` and `cpython-314` bytecode, so building on anything else
+produces a different artifact from the one that was tested. CI also exercises
+3.12, which is the floor, and is what the Linux verification ran on.
+
+### Third-party binaries
+
+The FFmpeg runtime (152 MB) and the MSVC redistributable are not tracked in git.
+The FFmpeg *headers and import libraries* are, so the Windows engine compiles from
+a clean clone — you only need the runtime to link, run and package:
+
+```bash
+python tools/fetch_third_party.py --all
+```
+
+Every FFmpeg file is verified against the sha256 in `tools/ffmpeg_manifest.json`.
+A mismatch aborts: it means either a corrupt download or a different build from
+the one the licence paperwork describes.
+
+### Verify before releasing — either platform
+
+```bash
+python tools/verify_release_licenses.py --tree .
+python tools/verify_version_consistency.py
+python tools/verify_shared_memory_contract.py
+python tools/scan_repo_hygiene.py
+python -m pytest tests/
+python -m ruff check .
+```
+
+All must pass. See [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md) for
+the full gate list — there are two outstanding release blockers.
+
+---
+
+## Windows
+
+Produces a Windows-only installer bundling `FTHRcapture/` (DXGI engine). All
+Linux files are excluded.
+
+### Prerequisites
+
+| Tool | Source |
+|---|---|
+| Visual Studio 2022, Desktop C++ workload | https://visualstudio.microsoft.com |
+| Python 3.14 x64 | https://python.org/downloads |
+| Inno Setup 6 | https://jrsoftware.org/isinfo.php |
+| FFmpeg runtime + VC++ redistributable | `python tools/fetch_third_party.py --all` |
+
+### 1. Build the capture engine
+
+Open `FTHRcapture\FTHRcapture.sln`, set **Release | x64**, Build Solution.
+Or from a shell:
+
+```powershell
+& "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe" `
+    FTHRcapture\FTHRcapture.sln -p:Configuration=Release -p:Platform=x64
+```
+
+Output: `FTHRcapture\x64\Release\FTHRclips.exe`.
+
+> The engine links against the FFmpeg DLLs in
+> `FTHRclips\third_party\ffmpeg\bin\`. A post-build step copies them next to the
+> exe. If you run the exe before rebuilding, copy `*.dll` from that folder into
+> `x64\Release\` by hand.
+
+### 2. Bundle with PyInstaller
+
+```powershell
+python -m PyInstaller FTHR.spec --clean
+```
+
+Output: `dist\FTHRClips\`. The spec generates the Windows VERSIONINFO resource
+from `FTHR_UI/version.py`, so the `.exe` reports its version in Explorer →
+Properties → Details.
+
+Optional size reduction:
+
+```powershell
+$int = "dist\FTHRClips\_internal"
+Remove-Item "$int\libopencv_dnn*","$int\libopencv_ml*","$int\libopencv_calib3d*", `
+            "$int\libopencv_features2d*","$int\libopencv_stitching*", `
+            "$int\Qt6Quick*","$int\Qt6Qml*","$int\Qt6Pdf*" -ErrorAction SilentlyContinue
+```
+
+### 3. Create the installer
+
+Open **Inno Setup Compiler** → `installer_windows.iss` → Build → Compile.
+Output: `Output\FTHRClips_Setup_Windows.exe`.
+
+> `installer_windows.iss` carries the product version as a literal because Inno
+> Setup cannot import Python. `tools/verify_version_consistency.py` fails the
+> build if it disagrees with `FTHR_UI/version.py`.
+
+### What the installer contains
+
+Windows DXGI capture engine · Python runtime and dependencies · Qt6 Widgets (no
+Wayland/QML) · Visual C++ redistributable · Start Menu and optional desktop
+shortcut · uninstaller (removes `%APPDATA%\fthr`).
+
+### Notes
+
+- DXGI desktop capture requires Windows 10 or later.
+- Global hotkeys work unprivileged on Windows.
+- NVENC is auto-detected at runtime, falling back to software encoding.
+
+---
 
 ## Linux
 
@@ -44,49 +174,30 @@ folder). Check what you have:
 bash tools/linux_system_report.sh
 ```
 
-### 2. Python dependencies
-
-Install from the pinned lock — never a loose `pip install` (AUDIT-009):
-
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -r requirements-alpha.txt -r requirements-dev.txt
-```
-
-Python 3.14 is the interpreter the Windows alpha ships with; 3.12 is the floor
-CI exercises and the version the Linux verification ran on.
-
-> Do **not** install `imageio-ffmpeg`. It bundles a GPLv3 FFmpeg (AUDIT-005).
-
-### 3. Build the capture engine
+### 2. Build the capture engine
 
 ```bash
 cmake -S FTHRcapture_linux -B FTHRcapture_linux/build -DCMAKE_BUILD_TYPE=Release
 cmake --build FTHRcapture_linux/build --parallel
-```
-
-Output: `FTHRcapture_linux/build/FTHRclips`. Verify it links cleanly:
-
-```bash
 ldd FTHRcapture_linux/build/FTHRclips | grep 'not found'   # must print nothing
 ```
+
+Output: `FTHRcapture_linux/build/FTHRclips`.
 
 Notes on the build:
 
 - Wayland protocol bindings are generated by `wayland-scanner` **into the source
-  tree** (`FTHRcapture_linux/protocols/`), not into the build directory. They
-  are tracked in git so a clone builds without `wayland-scanner`, but it means
-  the source tree must be writable.
-- `target_compile_options` appends `-O2`, which lands *after* the `-O3 -DNDEBUG`
-  that `CMAKE_BUILD_TYPE=Release` contributes, so the effective optimisation
-  level is `-O2`. Harmless, but `-DCMAKE_BUILD_TYPE=Release` does not mean what
-  it looks like it means here.
+  tree** (`FTHRcapture_linux/protocols/`), not the build directory. They are
+  tracked in git so a clone builds without `wayland-scanner`, but the source tree
+  must be writable.
+- `target_compile_options` appends `-O2` *after* the `-O3 -DNDEBUG` that
+  `CMAKE_BUILD_TYPE=Release` contributes, so the effective optimisation level is
+  `-O2`. Harmless, but `Release` does not mean what it looks like here.
 - The binary is not stripped; `FTHR_linux.spec` strips it when bundling.
-- Two warnings are expected and known: an unused `clock_ns()` in `encoder.cpp`
-  and a `memset` on the non-trivial `WlrBackend::FrameBuffer`.
+- Two warnings are expected: an unused `clock_ns()` in `encoder.cpp` and a
+  `memset` on the non-trivial `WlrBackend::FrameBuffer`.
 
-### 4. Run from source
+### 3. Run from source
 
 ```bash
 python FTHR_UI/main.py
@@ -104,6 +215,25 @@ FTHRclips <fps> <buffer_s> <w> <h> <bitrate_kbps> <_> <_> <_> <scaling>
 FTHRcapture_linux/build/FTHRclips 30 10 1280 720 6000 0 0 0 0 "" 0 4 0 1
 ```
 
+Capture backends are tried in order: `wlr-screencopy` → `ext-image-copy-capture`
+→ `x11grab`. The engine logs which one it selected. No root is required.
+
+### 4. Audio
+
+The engine captures the default PulseAudio monitor source (PipeWire's PulseAudio
+compatibility layer works). To select a specific source:
+
+```bash
+PULSE_SOURCE=alsa_output.pci-0000_00_1f.3.analog-stereo.monitor \
+  FTHRcapture_linux/build/FTHRclips ...
+```
+
+On some distributions your user must be in the `audio` group:
+
+```bash
+sudo usermod -aG audio "$USER"   # then log out and back in
+```
+
 ### 5. AppImage
 
 ```bash
@@ -112,15 +242,12 @@ bash build_linux.sh
 
 Steps: dependency check → engine build → PyInstaller bundle → strip unused
 libraries → smoke test → assemble AppDir → **licence verification** →
-`appimagetool`.
-
-The AppImage filename carries the version from `FTHR_UI/version.py`; do not
-hardcode one.
+`appimagetool`. The filename carries the version from `FTHR_UI/version.py`.
 
 #### The licence gate will stop you
 
-`build_linux.sh` runs `tools/verify_release_licenses.py --appdir` before
-packing, and **refuses to build** if a GPL FFmpeg made it into the bundle:
+`build_linux.sh` runs `tools/verify_release_licenses.py --appdir` before packing
+and **refuses to build** if a GPL FFmpeg made it into the bundle:
 
 ```
 47 checks, 12 failed
@@ -129,10 +256,10 @@ ERROR: licence verification failed - refusing to build the AppImage.
 ```
 
 This is not a bug. Distribution FFmpeg is normally a GPL build, the engine links
-against it, and PyInstaller bundles what the engine links. Shipping that puts
-the whole artifact under the GPL.
+against it, and PyInstaller bundles what the engine links. Shipping that puts the
+whole artifact under the GPL.
 
-Options, none of them code changes you can make in the build script:
+Two ways out, neither a change you can make in the build script:
 
 1. Bundle an LGPL FFmpeg the way the Windows build does (see
    `tools/ffmpeg_manifest.json` and AUDIT-005) and link the engine against it.
@@ -144,16 +271,17 @@ Until one is chosen there is no publishable Linux AppImage.
 
 ### Verified build state
 
-On Ubuntu 24.04 / WSL2, 2026-08-06:
+Ubuntu 24.04 / WSL2, 2026-08-06:
 
 | Step | Result |
 |---|---|
-| CMake configure from empty dir | OK |
+| CMake configure from an empty directory | OK |
 | Build | OK — 0 errors, 2 warnings |
 | `ldd` missing libraries | 0 |
 | Engine starts, creates `/dev/shm/FTHR_SharedMemory_v3` | OK |
 | PyInstaller bundle | OK — 580 MB, engine included |
-| AppDir contents (licences, icon, .desktop, no user data) | OK |
+| AppDir contents (licences, icon, `.desktop`, no user data) | OK |
 | AppImage produced | **NO** — blocked by the licence gate above |
 
-Full detail in `SUPPORTED_PLATFORMS.md` and `TESTING.md`.
+Full detail in [`docs/SUPPORTED_PLATFORMS.md`](docs/SUPPORTED_PLATFORMS.md) and
+[`docs/AUDIT_REPORT.md`](docs/AUDIT_REPORT.md).

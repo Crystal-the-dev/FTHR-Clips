@@ -19,7 +19,7 @@ Without it most reports are not actionable.
 | Issue | Resolution |
 |---|---|
 | ~~**GPL FFmpeg**~~ (AUDIT-005) | Resolved 2026-08-05. The `--enable-gpl` build was replaced with the BtbN **LGPL** build `n8.1.2-21-gce3c09c101` (ABI-identical, avcodec-62). Software fallbacks moved x264 → libopenh264 and x265 → libkvazaar; NVENC/AMF/QSV untouched. `imageio-ffmpeg` (also GPL, and never actually bundled on Windows — which is why watermark, crop and export silently no-opped) was removed entirely in favour of `core/ffmpeg_tools.py`. Licence texts now ship inside the bundle; `tools/verify_release_licenses.py` gates it in CI. |
-| ~~**No version control**~~ (AUDIT-008) | Resolved 2026-08-06. The authoritative tree is a git repository with `.gitignore`, `.gitattributes`, a documented source of truth (`SOURCE_OF_TRUTH.md`) and release gates (`RELEASE_CHECKLIST.md`). No tag exists yet — see the blocker above. |
+| ~~**No version control**~~ (AUDIT-008) | Resolved 2026-08-06. The authoritative tree is a git repository with `.gitignore`, `.gitattributes`, a documented source of truth (`docs/SOURCE_OF_TRUTH.md`) and release gates (`docs/RELEASE_CHECKLIST.md`). No tag exists yet — see the blocker above. |
 | ~~**Unpinned dependencies**~~ (AUDIT-009) | Resolved 2026-08-06. `requirements-alpha.txt` pins the full transitive closure; `requirements.in` holds the direct list. Verified by two clean installs. |
 | ~~**Hotkey socket in world-writable /tmp**~~ (AUDIT-003b) | Resolved 2026-08-06. AUDIT-003 fixed the socket *mode*; the *path* was still `/tmp/fthr_hotkey.sock`, which any local user could squat — and the old code then ran an unconditional `unlink()` on it, either deleting a stranger's file or (under the sticky bit) failing and leaving hotkeys dead indefinitely. The socket moved to `$XDG_RUNTIME_DIR/fthr/` and now refuses to remove anything that is not a dead socket owned by you. 16 new tests, verified on Linux. |
 | ~~**Bare-name external tool calls**~~ | Resolved 2026-08-06. `hyprctl`, `xdotool`, `xprop`, `grim`, `nc` and `xdg-open` were invoked by bare name, so `PATH` decided which binary ran and a missing tool surfaced as a swallowed `FileNotFoundError`. Now resolved once to an absolute path through `core/linux_tools.py`, cached, logged at startup, with required/optional classification. 13 new tests including `PATH` shadowing. |
@@ -31,7 +31,7 @@ Without it most reports are not actionable.
   buffer → NVENC → valid decodable MP4 with AAC audio), but the captured frames
   measured **all black** (luma min 0, max 0, one distinct value). XWayland under
   WSLg has no root-window content to grab. The plumbing works; the picture is
-  unproven. See `SUPPORTED_PLATFORMS.md`.
+  unproven. See `docs/SUPPORTED_PLATFORMS.md`.
 - **No real Linux desktop was tested**: Hyprland, KDE Plasma, GNOME and bare
   metal X11 are all `NOT RUN`. Neither Wayland capture backend
   (`wlr-screencopy`, `ext-image-copy-capture`) has ever succeeded — WSLg's

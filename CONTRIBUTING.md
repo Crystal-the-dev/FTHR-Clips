@@ -2,7 +2,7 @@
 
 Thanks for wanting to contribute. Here's everything you need to know.
 
-> **Before anything else:** read [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md).
+> **Before anything else:** read [`docs/SOURCE_OF_TRUTH.md`](docs/SOURCE_OF_TRUTH.md).
 > There are stale copies of this project on the original development machine,
 > one of which documents a directory layout that no longer exists. Make sure
 > you are in the git repository.
@@ -111,7 +111,7 @@ compiles from a clean clone. The 152 MB of runtime DLLs are not; the fetch
 script pulls them from the exact BtbN release pinned by sha256 in
 `tools/ffmpeg_manifest.json`.
 
-See [`BUILD_WINDOWS.md`](BUILD_WINDOWS.md) for the full walkthrough.
+See [`BUILDING.md`](BUILDING.md) for the full walkthrough.
 
 ### Linux engine
 
@@ -128,7 +128,7 @@ Full AppImage:
 ./build_linux.sh
 ```
 
-See [`FTHRcapture_linux/BUILD.md`](FTHRcapture_linux/BUILD.md).
+See [`BUILDING.md`](BUILDING.md).
 
 ## The shared-memory contract
 

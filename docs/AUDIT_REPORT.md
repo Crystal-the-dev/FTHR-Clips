@@ -280,7 +280,7 @@ Tests: **93 → 106 passed**, 3 skipped. Both AUDIT-008 and AUDIT-009 closed.
 The tree had no `.git` directory despite shipping a `.gitignore`, a CI workflow,
 issue templates and a README pointing at a GitHub repo. No history, no bisect, no
 way to tag what was released. Three stale Desktop copies were in play, plus a
-`CLAUDE.md` documenting an `engine/` + `ui/` layout two refactors old and shared
+`Desktop\CLAUDE.md` documenting an `engine/` + `ui/` layout two refactors old and shared
 memory `_v1` when the contract is `_v3`.
 
 Delivered:
@@ -347,7 +347,7 @@ process holding the mutex.
 
 **Python 3.14 recorded as the alpha interpreter**, because that is what the
 shipped bundle actually contains (`python314.dll`, `cpython-314` bytecode).
-`BUILD_WINDOWS.md` had told people to use 3.11 *and* to install
+`BUILDING.md` had told people to use 3.11 *and* to install
 `imageio-ffmpeg` — both wrong, the latter dangerously so.
 
 ---

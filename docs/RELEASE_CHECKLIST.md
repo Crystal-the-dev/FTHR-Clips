@@ -144,7 +144,7 @@ Everything else below is either already green or is honest, tracked work.
 | 8.3 | `THIRD_PARTY_NOTICES.md` complete and current | **PASS** |
 | 8.4 | `CONTRIBUTING.md` describes the real layout and build | **PASS** |
 | 8.5 | `SOURCE_OF_TRUTH.md` present | **PASS** |
-| 8.6 | `BUILD_WINDOWS.md` matches the actual build (Python 3.14, no imageio-ffmpeg) | **PASS** |
+| 8.6 | `BUILDING.md` matches the actual build (Python 3.14, no imageio-ffmpeg) | **PASS** |
 | 8.7 | `BUILDING.md` (Linux) matches the actual build | **PASS** — written from the verified run |
 | 8.8 | `TESTING.md` separates build / headless / desktop tests | **PASS** |
 | 8.9 | `SUPPORTED_PLATFORMS.md` states a real, narrow support matrix | **PASS** — one environment tested, everything else `NOT RUN` |

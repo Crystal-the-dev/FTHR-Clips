@@ -122,7 +122,7 @@ The AppImage lands in `build_output/`.
 
 ### Windows
 
-Visual Studio 2022 + Python 3.11. See [`BUILD_WINDOWS.md`](BUILD_WINDOWS.md) for the full walkthrough.
+Visual Studio 2022 + Python 3.14. See [`BUILDING.md`](BUILDING.md) for the full walkthrough.
 
 ---
 
@@ -170,3 +170,20 @@ not be described as MIT**.
 
 Full details and every bundled component: [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 Licence texts: [`licenses/`](licenses/), also installed alongside the app.
+
+---
+
+## Documentation
+
+| Document | What it is for |
+|---|---|
+| [`BUILDING.md`](BUILDING.md) | Building the app and both engines, on Windows and Linux |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Tree layout, entry points, the shared-memory contract, conventions |
+| [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) | What is broken, unverified or missing — read before filing a bug |
+| [`SECURITY.md`](SECURITY.md) | Reporting a security issue |
+| [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | Every bundled component and its licence |
+| [`docs/SUPPORTED_PLATFORMS.md`](docs/SUPPORTED_PLATFORMS.md) | The real support matrix — what was actually tested, and where |
+| [`docs/TESTING.md`](docs/TESTING.md) | How to verify a build; build vs headless vs desktop tests |
+| [`docs/AUDIT_REPORT.md`](docs/AUDIT_REPORT.md) | Consolidated audit — all findings, all three passes |
+| [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md) | The gates a release must pass before it may be tagged |
+| [`docs/SOURCE_OF_TRUTH.md`](docs/SOURCE_OF_TRUTH.md) | Which tree is authoritative, and how backups work |
