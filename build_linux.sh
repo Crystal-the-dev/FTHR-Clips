@@ -27,15 +27,45 @@ done
 
 pkg-config --exists libavcodec libpulse-simple wayland-client || {
     echo "ERROR: Missing C++ build deps (ffmpeg / pulseaudio / wayland)."
-    echo "  Arch: sudo pacman -S ffmpeg libpulse wayland"
+    echo "  Arch:          sudo pacman -S ffmpeg libpulse wayland"
+    echo "  Debian/Ubuntu: sudo apt install libavcodec-dev libavformat-dev \\"
+    echo "                   libavutil-dev libavdevice-dev libswscale-dev \\"
+    echo "                   libswresample-dev libpulse-dev libwayland-dev \\"
+    echo "                   wayland-protocols"
     exit 1
 }
 
-python3 -c "import PyQt6, keyboard, cv2, sounddevice, numpy" 2>/dev/null || {
-    echo "ERROR: Missing Python dependencies."
-    echo "  pip install PyQt6 keyboard opencv-python-headless sounddevice numpy"
+# Import each module separately. A combined import reports only the first
+# failure, and the advice it printed ("pip install …") was actively misleading
+# for sounddevice: that one fails on a missing *system* library (PortAudio),
+# which no amount of pip installing will fix. Verified on Ubuntu 24.04.
+_missing_py=()
+_missing_sys=()
+for _m in PyQt6 keyboard cv2 numpy sounddevice; do
+    _err="$(python3 -c "import $_m" 2>&1)" && continue
+    case "$_err" in
+        *PortAudio*)          _missing_sys+=("$_m: PortAudio runtime library") ;;
+        *libGL*|*libEGL*|*libxkb*|*libxcb*)
+                              _missing_sys+=("$_m: a system graphics library — ${_err##*$'\n'}") ;;
+        *)                    _missing_py+=("$_m") ;;
+    esac
+done
+
+if [ ${#_missing_py[@]} -gt 0 ]; then
+    echo "ERROR: Missing Python packages: ${_missing_py[*]}"
+    echo "  Install the pinned alpha set (do NOT pip install loose versions):"
+    echo "    python3 -m pip install -r requirements-alpha.txt"
     exit 1
-}
+fi
+if [ ${#_missing_sys[@]} -gt 0 ]; then
+    echo "ERROR: Python packages are installed but their SYSTEM libraries are not:"
+    for _m in "${_missing_sys[@]}"; do echo "    - $_m"; done
+    echo "  This is not fixed by pip. Install the system packages:"
+    echo "    Arch:          sudo pacman -S portaudio"
+    echo "    Debian/Ubuntu: sudo apt install libportaudio2"
+    echo "    Fedora:        sudo dnf install portaudio"
+    exit 1
+fi
 echo "    All dependencies found."
 
 # ── 2. Build Linux C++ engine ─────────────────────────────────────────────

@@ -13,19 +13,66 @@ ENGINE_BIN = ROOT / 'FTHRcapture_linux' / 'build' / 'FTHRclips'
 _sys.path.insert(0, str(UI_DIR))
 from version import APP_ID  # noqa: E402
 
-# Qt6 plugin dirs — bundle Wayland + XCB so the app works on both
-_QT6_PLUG = Path('/usr/lib/qt6/plugins')
+# Qt6 plugin dirs — bundle Wayland + XCB so the app works on both.
+# Arch puts them in /usr/lib/qt6; Debian/Ubuntu use a multiarch path.
+def _first_existing(*candidates):
+    for c in candidates:
+        p = Path(c)
+        if p.exists():
+            return p
+    return Path(candidates[0])          # keep a stable value for error messages
+
+
+import sysconfig as _sysconfig  # noqa: E402
+
+_MULTIARCH = _sysconfig.get_config_var('MULTIARCH') or 'x86_64-linux-gnu'
+
+_QT6_PLUG = _first_existing(
+    '/usr/lib/qt6/plugins',
+    f'/usr/lib/{_MULTIARCH}/qt6/plugins',
+    '/usr/lib64/qt6/plugins',
+)
 
 def _so(subdir, dest):
     d = _QT6_PLUG / subdir
     return [(str(p), dest) for p in d.glob('*.so')] if d.exists() else []
+
+
+def _find_lib(soname):
+    """Locate a system shared library across distro layouts.
+
+    A hardcoded '/usr/lib/libportaudio.so.2' used to sit in the binaries list.
+    That path is correct on Arch and wrong on every Debian-family distro, which
+    puts it under /usr/lib/<multiarch>/ — so `bash build_linux.sh` aborted with
+    "Unable to find '/usr/lib/libportaudio.so.2'". Verified on Ubuntu 24.04.
+    """
+    import ctypes.util
+    for cand in (f'/usr/lib/{_MULTIARCH}/{soname}',
+                 f'/usr/lib/{soname}',
+                 f'/usr/lib64/{soname}',
+                 f'/lib/{_MULTIARCH}/{soname}'):
+        if Path(cand).exists():
+            return cand
+    # Last resort: ask the dynamic linker.
+    stem = soname.split('.so')[0].removeprefix('lib')
+    found = ctypes.util.find_library(stem)
+    if found and Path(found).exists():
+        return found
+    raise SystemExit(
+        f'FTHR_linux.spec: required system library {soname!r} not found.\n'
+        f'  Arch:          sudo pacman -S portaudio\n'
+        f'  Debian/Ubuntu: sudo apt install libportaudio2\n'
+        f'  Fedora:        sudo dnf install portaudio')
+
+
+_PORTAUDIO = _find_lib('libportaudio.so.2')
 
 a = Analysis(
     [str(UI_DIR / 'main.py')],
     pathex=[str(UI_DIR)],
     binaries=[
         (str(ENGINE_BIN), '.'),
-        ('/usr/lib/libportaudio.so.2', '.'),
+        (_PORTAUDIO, '.'),
         *_so('platforms',                           'PyQt6/Qt6/plugins/platforms'),
         *_so('wayland-decoration-client',           'PyQt6/Qt6/plugins/wayland-decoration-client'),
         *_so('wayland-shell-integration',           'PyQt6/Qt6/plugins/wayland-shell-integration'),
