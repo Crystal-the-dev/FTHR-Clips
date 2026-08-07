@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <cstring>
 #include <string>
 
 namespace fthr {
@@ -35,6 +36,40 @@ struct SharedMemoryLayout {
     bool     multiband_enabled;
     char     active_audio_mappings[1024];
 };
+
+// ---------------------------------------------------------------------------
+// The producer contract (engine -> UI)                          [AUDIT-018]
+//
+//   1. write engine_string / engine_param* — the payload
+//   2. publish engine_response LAST
+//
+// engine_response is the field the UI polls. The moment it changes, the UI is
+// entitled to read every other response field, so they must already be
+// settled. This mirrors the UI's own contract in the other direction, where
+// save_clip() writes ui_string and ui_param* and publishes ui_command last.
+//
+// Getting it backwards does not crash anything — it produces an error report
+// with no message, which is the one diagnostic the message existed to provide,
+// in exactly the race no user can reproduce on request.
+//
+// Consumption is the UI's job alone: only the UI writes
+// engine_response = NONE. The engine must not clear a response it has already
+// published.
+// ---------------------------------------------------------------------------
+
+//: Write `text` into engine_string, always NUL-terminated, always within the
+//: buffer. Use this instead of strcpy/sprintf on the field — an error message
+//: built from a user-supplied path can be arbitrarily long, and engine_string
+//: is a fixed 2048-byte array.
+inline void set_engine_string(SharedMemoryLayout* layout, const std::string& text) {
+    if (!layout) return;
+    const size_t cap = sizeof(layout->engine_string);      // 2048
+    const size_t n   = text.size() < cap - 1 ? text.size() : cap - 1;
+    // memcpy + explicit terminator rather than strncpy: strncpy does not
+    // terminate when it truncates, which is the whole failure mode here.
+    if (n) std::memcpy(layout->engine_string, text.data(), n);
+    layout->engine_string[n] = '\0';
+}
 
 enum class CommandType : uint32_t {
     NONE=0, START_RECORDING=1, STOP_RECORDING=2, SAVE_CLIP=3,

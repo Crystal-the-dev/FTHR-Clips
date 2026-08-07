@@ -176,14 +176,22 @@ int main(int argc, char* argv[]) {
 
             switch (cmd) {
             case fthr::CommandType::SAVE_CLIP: {
-                // Clear any message left by an earlier failure. engine_string
-                // was only ever written on error and never reset, so after one
+                // Clear any message left by an earlier save. engine_string was
+                // only ever written on error and never reset, so after one
                 // failed save every subsequent SUCCESS still carried the old
-                // "SaveClip failed: ..." text — and poll_async_result() reports
-                // ('saved', <that stale text>) straight into the UI.
-                layout->engine_string[0] = '\0';
+                // "SaveClip failed: ..." text straight into the UI.
+                //
+                // This clear is also what makes the publication order below
+                // safe in the one place it cannot be perfect: see the note on
+                // SAVE_STARTED.
+                fthr::set_engine_string(layout, "");
 
-                // Immediately acknowledge so Python UI doesn't time out
+                // Immediately acknowledge so the UI doesn't time out.
+                //
+                // SAVE_STARTED carries no payload of its own, so there is
+                // nothing to publish before it. The engine_string it leaves
+                // behind is the empty one cleared above — never a stale
+                // message from a previous save.
                 layout->engine_response =
                     static_cast<uint32_t>(fthr::ResponseType::SAVE_STARTED);
 
@@ -195,20 +203,25 @@ int main(int argc, char* argv[]) {
                           << " (" << duration_sec << "s)" << std::endl;
 
                 bool ok = engine.SaveClip(out_path, duration_sec, layout);
+
+                // Payload first, response last (AUDIT-018). The previous order
+                // published ERROR_OCCURRED and only then wrote the message, so
+                // a UI polling in between saw a failure with no explanation.
+                if (!ok)
+                    fthr::set_engine_string(
+                        layout, "SaveClip failed: " + out_path);
                 layout->engine_response = ok
                     ? static_cast<uint32_t>(fthr::ResponseType::CLIP_SAVED)
                     : static_cast<uint32_t>(fthr::ResponseType::ERROR_OCCURRED);
-                if (!ok)
-                    snprintf(layout->engine_string,
-                             sizeof(layout->engine_string),
-                             "SaveClip failed: %s", out_path.c_str());
                 break;
             }
 
             case fthr::CommandType::GET_STATUS:
+                // Payload first, response last (AUDIT-018) — engine_param1 is
+                // this response's payload and used to be written after it.
+                layout->engine_param1 = engine.IsNvencActive() ? 1 : 0;
                 layout->engine_response =
                     static_cast<uint32_t>(fthr::ResponseType::STATUS_UPDATE);
-                layout->engine_param1 = engine.IsNvencActive() ? 1 : 0;
                 break;
 
             case fthr::CommandType::RECONFIGURE_ENCODER: {
