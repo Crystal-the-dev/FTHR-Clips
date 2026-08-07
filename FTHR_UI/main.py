@@ -74,8 +74,18 @@ def _setup_file_logging():
         from version import __version__ as _ver
         print(f"\n===== FTHR Clips {_ver} started "
               f"{datetime.now():%Y-%m-%d %H:%M:%S} ({sys.platform}) =====")
-    except Exception:
-        pass  # logging must never prevent startup
+        # Structured logging into the SAME file the tee writes to, so testers
+        # keep sending one log. print() keeps working; new diagnostics go
+        # through core.diagnostics, which timestamps them, names the thread and
+        # redacts credentials on the way out (AUDIT-007).
+        from core import diagnostics
+        diagnostics.configure(log_file=log_file)
+    except Exception as e:
+        # Logging must never prevent startup — but a swallowed failure here is
+        # why a tester's log can be empty with no explanation. Say it on
+        # stderr, which is the one channel that has not been set up yet.
+        print(f'[Startup] File logging unavailable: {type(e).__name__}: {e}',
+              file=sys.__stderr__ or sys.stderr)
 
 
 _setup_file_logging()
