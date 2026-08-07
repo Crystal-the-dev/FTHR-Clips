@@ -4,14 +4,14 @@
 **Authoritative tree:** `C:\Users\Tom\Desktop\FTHR_Clips_source\FTHR_Clips`
 **Last updated:** 2026-08-07
 
-This is the single audit document for the project. It merges three passes:
+This is the single audit document for the project. It merges four passes:
 
 | Pass | Date | Scope | Environment |
 |---|---|---|---|
 | **I — Code & licensing** | 2026-08-05 | Inventory, static analysis, source review of IPC/save/hotkey/upload, dependency & licence review | Windows 10 Pro 19045, CPython 3.14.3, PyQt6 6.11.0 / Qt 6.11.1 |
 | **II — Release engineering** | 2026-08-06 | Source of truth, git, dependency pinning, version centralisation, CI, release gates | same |
-| **IV — Save ownership** | 2026-08-07 | Save-response ownership consolidation, save state machine, event-loop responsiveness | Windows 10 Pro 19045, CPython 3.14, offscreen Qt |
 | **III — Linux verification** | 2026-08-06 | Linux build, engine runtime, IPC, clip pipeline, audio, single-instance, socket hardening, AppImage | Ubuntu 24.04.3 LTS under WSL2 + WSLg, CPython 3.12.3, Qt 6.11.0, GCC 13.3, CMake 3.28.3 |
+| **IV — Save ownership** | 2026-08-07 | Save-response ownership consolidation, save state machine, event-loop responsiveness | Windows 10 Pro 19045, CPython 3.14, offscreen Qt |
 
 > **Scope honesty.** Nothing here is inferred from a passing build. Every item
 > that was not executed is marked `NOT RUN` and listed in
@@ -119,6 +119,7 @@ which desktop it detected and print the exact command to bind.
 | AUDIT-015 | P1 | Linux save pipeline | **FIXED** (III) |
 | AUDIT-016 | P2 | Linux portability | **FIXED** (III) |
 | AUDIT-017 | **P1** | Save pipeline / data integrity | **FIXED** (IV) |
+| AUDIT-018 | P2 | Engine IPC correctness | **OPEN** |
 
 ---
 
@@ -730,15 +731,65 @@ path may only show "SAVING…"; the grid entry, the `clip_saved` signal, the
 upload and the success text all wait for `CLIP_SAVED`, and the file's existence
 and non-zero size are checked before any of it.
 
-### Engine contract note
+### AUDIT-018 · P2 · Engine IPC correctness · **OPEN**
+**The Linux engine publishes the error response before the error text**
 
-`FTHRcapture_linux/src/main.cpp` writes `engine_response = ERROR_OCCURRED`
-*before* `snprintf`-ing the message into `engine_string`. A reader landing in
-that window sees a failure with an empty detail. This is harmless — the engine
-clears `engine_string` at the start of every save, so the detail can be missing
-but never stale or wrong — and the reader tolerates it explicitly. The success
-path writes the string first and the code last, which is the correct order.
-Worth fixing engine-side; not a blocker.
+Found while consolidating the reader; the fix belongs in C++ and was
+deliberately not attempted as a side effect of a Python change.
+
+**Exact site.** `FTHRcapture_linux/src/main.cpp`, the command loop's
+`case fthr::CommandType::SAVE_CLIP:` block, lines 198–205:
+
+```cpp
+bool ok = engine.SaveClip(out_path, duration_sec, layout);
+layout->engine_response = ok                       // ← published FIRST
+    ? static_cast<uint32_t>(fthr::ResponseType::CLIP_SAVED)
+    : static_cast<uint32_t>(fthr::ResponseType::ERROR_OCCURRED);
+if (!ok)
+    snprintf(layout->engine_string,                // ← payload written AFTER
+             sizeof(layout->engine_string),
+             "SaveClip failed: %s", out_path.c_str());
+```
+
+A consumer polling between those two statements observes `ERROR_OCCURRED` with
+`engine_string` still empty.
+
+**Desired invariant** — the same rule the UI already follows in the opposite
+direction, where `save_clip()` writes the path and duration and publishes
+`ui_command` last:
+
+```text
+write engine_string / result payload first
+publish engine_response last
+```
+
+**Why no reproduced user-visible failure.** Three things contain it. The engine
+clears `engine_string` at the start of every `SAVE_CLIP`, so a reader in the
+window sees an *empty* message, never a stale one from a previous save — the
+failure mode is a missing detail, not a wrong one. The two statements are
+adjacent, so the window is a few instructions wide against a 50 ms poll. And
+the UI-side reader now tolerates it explicitly and substitutes its own text
+(`tests/test_save_state.py::test_error_with_empty_string_is_tolerated`).
+
+**Why fix it anyway.** The tolerance is a consumer working around a producer
+that is wrong, and it costs exactly the diagnostic the message exists to
+provide: the one report where the detail goes missing is a race no user can
+reproduce on request. The ordering is also load-bearing for anything added
+later — a second payload field, or an error code — which would inherit the same
+window without the empty-string mitigation.
+
+**Related, same family, also open.** The Windows engine
+(`FTHRcapture/FTHRclips/src/`) never writes `engine_string` at all: `grep`
+returns no hits across its sources, while it sets `ERROR_OCCURRED` at eight
+sites (`capture_engine.cpp` 848, 1179, 1191, 1320, 1330, 1401, 1589 and
+`main.cpp` 301/319). Every Windows save failure therefore reaches the user as
+the UI's generic fallback text, with the specific cause — no packets in the
+snapshot, mux failure, encoder error — visible only in the engine's stdout.
+That is a diagnosability gap, not a correctness one, and it overlaps AUDIT-007.
+
+**Stale comment, engine-side.** The `SAVE_CLIP` block's comment still refers to
+`poll_async_result()`, which Pass IV removed. Harmless, but it should be
+corrected in the same change.
 
 ### Single-flight
 
