@@ -4,13 +4,14 @@
 **Authoritative tree:** `C:\Users\Tom\Desktop\FTHR_Clips_source\FTHR_Clips`
 **Last updated:** 2026-08-07
 
-This is the single audit document for the project. It merges five passes:
+This is the single audit document for the project. It merges six passes:
 
 | Pass | Date | Scope | Environment |
 |---|---|---|---|
 | **I — Code & licensing** | 2026-08-05 | Inventory, static analysis, source review of IPC/save/hotkey/upload, dependency & licence review | Windows 10 Pro 19045, CPython 3.14.3, PyQt6 6.11.0 / Qt 6.11.1 |
 | **II — Release engineering** | 2026-08-06 | Source of truth, git, dependency pinning, version centralisation, CI, release gates | same |
 | **III — Linux verification** | 2026-08-06 | Linux build, engine runtime, IPC, clip pipeline, audio, single-instance, socket hardening, AppImage | Ubuntu 24.04.3 LTS under WSL2 + WSLg, CPython 3.12.3, Qt 6.11.0, GCC 13.3, CMake 3.28.3 |
+| **VI — Diagnosability** | 2026-08-07 | Silent-failure inventory, logging infrastructure, secret redaction, poll-spam restraint, exception gate | Windows 10 Pro 19045, CPython 3.14 |
 | **V — Engine publication contract** | 2026-08-07 | Producer inventory of both engines, publication ordering, Windows error diagnostics, static contract gate | Windows 10 Pro 19045 + MSVC 14.44 · Ubuntu 24.04 under WSL2, GCC 13.3 |
 | **IV — Save ownership** | 2026-08-07 | Save-response ownership consolidation, save state machine, event-loop responsiveness | Windows 10 Pro 19045, CPython 3.14, offscreen Qt |
 
@@ -109,7 +110,7 @@ which desktop it detected and print the exact command to bind.
 | AUDIT-004 | P2 | Windows save | **FIXED** (I) |
 | AUDIT-005 | P0 | Licensing | **RESOLVED** (I) |
 | AUDIT-006 | P2 | Linux hardening | **FIXED** (III) |
-| AUDIT-007 | P2 | Diagnosability | **OPEN** |
+| AUDIT-007 | P2 | Diagnosability | **PARTIALLY FIXED** (VI) |
 | AUDIT-008 | P1 | Release engineering | **RESOLVED** (II) |
 | AUDIT-009 | P2 | Reproducibility | **RESOLVED** (II) |
 | AUDIT-010 | P2 | Diagnostics | **FIXED** (I) · hardened (II) |
@@ -226,7 +227,7 @@ command injection — the risk is a directory earlier in `PATH` shadowing the re
 binary, plus a missing tool surfacing as a swallowed `FileNotFoundError`.
 Resolved in pass III; see below.
 
-### AUDIT-007 · P2 · Both · Diagnosability · **OPEN**
+### AUDIT-007 · P2 · Both · Diagnosability · **PARTIALLY FIXED** (see Pass VI)
 **34 bare `try/except: pass` blocks**
 
 Each is a failure that can never appear in a log or a bug report. For an alpha
@@ -627,7 +628,8 @@ during capture · AppImage launch.
 
 ### Strongly recommended before a wide invite
 
-5. **AUDIT-007** — convert the 34 silent `except: pass` blocks to logged lines.
+5. **AUDIT-007** — 92 undocumented silent handlers remain (Pass VI built the
+   logging floor and the ratchet; the handlers themselves are still to do).
    The entire support strategy is "send us your log".
 6. ~~**AUDIT-011** — move the save handshake off the Qt main thread.~~ Done in
    Pass IV; the handshake was removed rather than moved.
@@ -964,6 +966,129 @@ Runtime verification of the new error paths is **NOT RUN** on either platform:
 forcing a real encoder or disk failure needs a running engine and a human.
 Both AUDIT-019 and AUDIT-021 are therefore *fixed and compiled*, not
 *observed working*.
+
+
+---
+
+## Pass VI — Diagnosability (2026-08-07)
+
+Tests: **267 to 306 passed**, 30 skipped. AUDIT-007 moves to
+**PARTIALLY FIXED** — deliberately not RESOLVED; the remaining work is
+quantified below rather than claimed.
+
+### The inventory
+
+`except: pass` was the wrong thing to count. An AST sweep of the production
+tree found:
+
+| | Count |
+|---|---|
+| Exception handlers total | 232 |
+| Silent handlers (body does nothing observable) | 154 |
+| ...of which carry a justifying comment | 62 |
+| ...of which carry **no** justification | **92** |
+| Bare `except:` | **0** |
+| `except BaseException` | **0** |
+
+"Silent" includes the semantically silent shapes the brief asked for, not just
+`pass`: `continue`, `break`, bare `return`, and `return False` / `return None`
+from a broad handler — a caller receiving those cannot tell "nothing to do"
+from "it broke".
+
+Distribution: `PASS` 81 · `OTHER-SILENT` 50 · `RETURN-None` 6 · `RETURN-BARE`
+5 · `CONTINUE` 5 · `RETURN-False` 3 · `RETURN-True` 3 · `BREAK` 1.
+Concentrated in `main.py` (65 handlers), `clip_viewer.py` (32),
+`hotkey_manager.py` (22) and `clip_grid.py` (19).
+
+### The structural finding
+
+**The application has no logging.** Every diagnostic in 18k lines is a
+`print()`, with stdout/stderr teed into `~/.fthr/logs/fthr.log` by `_LogTee`.
+There is no level, no timestamp per line, no module, no thread name — and a
+clip save crosses the Qt main thread, a mux worker and an upload worker, so an
+interleaved log cannot be attributed. `logger.exception` does not appear
+anywhere because there is no logger.
+
+That is why this pass builds the floor rather than rewriting 92 handlers on
+top of no floor.
+
+### What was built — `FTHR_UI/core/diagnostics.py`
+
+**Structure.** A rotating file handler (2 MB, 2 backups) writing
+`time level [thread] module: message` into the *same* `fthr.log` testers are
+told to send. Existing `print()` calls keep working and keep landing there;
+new diagnostics go through the logger. Startup failure of logging is now
+reported on stderr instead of being swallowed — a tester with an empty log
+previously had no way to know why.
+
+**Redaction.** `redact_secret()`, `sanitize_url_for_log()` and
+`sanitize_headers_for_log()` strip bearer tokens, `Authorization` and `Cookie`
+values, `key=value` secrets, URL credentials and query tokens. A
+`logging.Filter` applies redaction to *every* record as a backstop, so a call
+site — or a library — that logs a raw URL cannot leak. This is the floor
+AUDIT-012 will build on; it exists now so AUDIT-007 does not introduce the
+leak AUDIT-012 is about.
+
+> One real defect was found by its own test: the header pattern stops at the
+> first space, so `Authorization: Bearer eyJ...` was redacted to
+> `Authorization: <redacted> eyJ...` — leaving the token in the log. Ordering
+> the bearer rule first fixes it. This is why redaction needs tests with
+> realistic tokens rather than `"secret123"`.
+
+**Restraint.** `StateLogger` reports a condition on transition, not per poll:
+first failure logged, repeats suppressed, recovery logged once with how long
+it lasted and how many occurrences were suppressed. A changed *reason* is
+treated as new information and logged. 200 polls of a failing engine
+connection produce 1 line, not 200.
+
+**Stack traces.** `log_unexpected()` for category E — a violated invariant, an
+impossible state — logs with `exc_info` and redacted context. Expected
+failures are explicitly kept out of it.
+
+### The gate — `tools/verify_exception_handling.py`
+
+AST-based, so a docstring or a test fixture containing the literal text
+`except: pass` is not a finding. Rules: `BARE-EXCEPT`, `BASE-EXCEPTION`
+(both **forbidden**, currently zero, fail the build outright),
+`BROAD-SWALLOW` and `UNDOCUMENTED-PASS` (**ratcheted**).
+
+The ratchet is set at the measured debt, `BASELINE = 92`, and may only ever go
+down. A new silent handler pushes the count over the line and fails CI while
+the existing debt is worked off deliberately. Mechanically rewriting 92
+handlers into `logger.exception` would have been the wrong fix — several sit
+inside 50 ms polls and would flood the very log this pass exists to make
+readable.
+
+Proven able to fail: `tests/test_exception_gate.py` rejects each bad shape,
+accepts documented handlers and logging handlers, refuses to flag a fixture
+string, and fails on an empty source tree.
+
+### What is NOT done
+
+AUDIT-007 is **not** RESOLVED. Remaining, in priority order:
+
+1. **92 undocumented silent handlers** — each needs classifying (A optional /
+   B degraded / C core / D cleanup / E bug) and either a log line, a narrower
+   exception, or a comment. The gate prevents new ones; it does not fix these.
+2. **No call site has been migrated to the logger yet.** The infrastructure is
+   in place and tested; the 232 handlers still `print()` or stay silent.
+3. Phases not reached this pass: the Qt-slot audit, the subprocess audit
+   (timeouts/stderr capture), the settings-persistence failure paths beyond
+   what already exists, the worker-failure UI propagation review, and the
+   engine-payload end-to-end log assertion.
+
+No runtime smoke test was performed: **NOT RUN**. Nothing here has been
+observed writing a real `fthr.log` outside the test suite.
+
+### Not found
+
+The Phase 13 sweep for false-success patterns after a failed operation found
+no *new* defect of the AUDIT-021 class in the Python tree. The post-processing
+workers already use `try/finally` and set `clip_ready` unconditionally — which
+is a deliberate "always unblock the upload" design, documented, and not a
+silent failure. Whether uploading a clip whose watermark pass failed is
+*correct* is a product question, not a diagnostics defect; it is noted here
+rather than filed as a finding.
 
 
 ---
