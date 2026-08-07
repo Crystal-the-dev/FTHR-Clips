@@ -168,9 +168,13 @@ namespace fthr {
         // -----------------------------------------------------------------------
         // SaveClip worker implementations
         // -----------------------------------------------------------------------
-        void ProcessSaveClipTask(const SaveClipTask& task); // branches on use_encoded_path
-        void MuxEncodedClip(const SaveClipTask& task);      // NVENC path: mux only
-        void EncodeRawClip(const SaveClipTask& task);       // x264 path: encode + mux
+        // These return false when the clip was NOT written, and publish the
+        // reason via SetEngineError() before returning. SaveClipThread used to
+        // ignore the outcome and report CLIP_SAVED unconditionally, so every
+        // Windows save failure reached the user as success (AUDIT-021).
+        bool ProcessSaveClipTask(const SaveClipTask& task); // branches on use_encoded_path
+        bool MuxEncodedClip(const SaveClipTask& task);      // NVENC path: mux only
+        bool EncodeRawClip(const SaveClipTask& task);       // x264 path: encode + mux
 
         // -----------------------------------------------------------------------
         // D3D11 / DXGI / WGC helpers

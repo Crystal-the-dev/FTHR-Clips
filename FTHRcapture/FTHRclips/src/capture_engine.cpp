@@ -800,9 +800,19 @@ namespace fthr {
             std::wcout << L"[SaveClipThread] Processing task " << task.task_id
                 << L": " << task.output_path << std::endl;
 
-            ProcessSaveClipTask(task);
+            const bool ok = ProcessSaveClipTask(task);
 
-            if (task.shared_memory) {
+            // AUDIT-021: this used to publish CLIP_SAVED unconditionally. Every
+            // failure path inside ProcessSaveClipTask had already written
+            // ERROR_OCCURRED — and this line overwrote it a moment later, so
+            // the UI was told every failed save had succeeded.
+            //
+            // Failures publish themselves via SetEngineError(), payload first.
+            // Success is published here, and only here.
+            if (ok && task.shared_memory) {
+                // Clear the message channel before announcing success so a clip
+                // that follows a failed one cannot carry the old error text.
+                SetEngineString(task.shared_memory, L"");
                 task.shared_memory->engine_response = ResponseType::CLIP_SAVED;
             }
         }
@@ -815,12 +825,12 @@ namespace fthr {
     // ProcessSaveClipTask - dispatches to encoded or raw path
     // ===========================================================================
 
-    void CaptureEngine::ProcessSaveClipTask(const SaveClipTask& task) {
+    bool CaptureEngine::ProcessSaveClipTask(const SaveClipTask& task) {
         if (task.use_encoded_path) {
-            MuxEncodedClip(task);
+            return MuxEncodedClip(task);
         }
         else {
-            EncodeRawClip(task);
+            return EncodeRawClip(task);
         }
     }
 
@@ -839,14 +849,15 @@ namespace fthr {
     //   5. Write trailer + close
     // ===========================================================================
 
-    void CaptureEngine::MuxEncodedClip(const SaveClipTask& task) {
+    bool CaptureEngine::MuxEncodedClip(const SaveClipTask& task) {
         const auto& snap = task.encoded_snapshot;
 
         if (snap.packets.empty()) {
             std::cerr << "[MuxEncodedClip] No packets in snapshot" << std::endl;
-            if (task.shared_memory)
-                task.shared_memory->engine_response = ResponseType::ERROR_OCCURRED;
-            return;
+            SetEngineError(task.shared_memory,
+                L"Nothing to save: the replay buffer held no video frames. "
+                L"Let the engine capture for a few seconds before saving.");
+            return false;
         }
 
         // ------------------------------------------------------------------
@@ -1175,9 +1186,10 @@ namespace fthr {
         avformat_alloc_output_context2(&fmt_ctx, nullptr, nullptr, output_utf8);
         if (!fmt_ctx) {
             std::cerr << "[MuxEncodedClip] avformat_alloc_output_context2 failed" << std::endl;
-            if (task.shared_memory)
-                task.shared_memory->engine_response = ResponseType::ERROR_OCCURRED;
-            return;
+            SetEngineError(task.shared_memory,
+                L"Failed to create the output file container. The clip path may "
+                L"be invalid or on an unsupported filesystem.");
+            return false;
         }
 
         // ------------------------------------------------------------------
@@ -1187,9 +1199,9 @@ namespace fthr {
         if (!video_stream) {
             std::cerr << "[MuxEncodedClip] avformat_new_stream (video) failed" << std::endl;
             avformat_free_context(fmt_ctx);
-            if (task.shared_memory)
-                task.shared_memory->engine_response = ResponseType::ERROR_OCCURRED;
-            return;
+            SetEngineError(task.shared_memory,
+                L"Failed to create the video stream in the output file.");
+            return false;
         }
 
         video_stream->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
@@ -1316,9 +1328,17 @@ namespace fthr {
         if (ret < 0) {
             std::cerr << "[MuxEncodedClip] avio_open failed: " << ret << std::endl;
             avformat_free_context(fmt_ctx);
-            if (task.shared_memory)
-                task.shared_memory->engine_response = ResponseType::ERROR_OCCURRED;
-            return;
+            {
+                // avio_open is the disk-full / read-only / path-missing case —
+                // the single most common real failure. Carry the errno-style
+                // code so a bug report can name it.
+                wchar_t msg[512];
+                _snwprintf_s(msg, _TRUNCATE,
+                    L"Could not open the clip file for writing (error %d). "
+                    L"Check free disk space and folder permissions.", ret);
+                SetEngineError(task.shared_memory, msg);
+            }
+            return false;
         }
 
         ret = avformat_write_header(fmt_ctx, nullptr);
@@ -1326,9 +1346,13 @@ namespace fthr {
             std::cerr << "[MuxEncodedClip] avformat_write_header failed: " << ret << std::endl;
             avio_closep(&fmt_ctx->pb);
             avformat_free_context(fmt_ctx);
-            if (task.shared_memory)
-                task.shared_memory->engine_response = ResponseType::ERROR_OCCURRED;
-            return;
+            {
+                wchar_t msg[512];
+                _snwprintf_s(msg, _TRUNCATE,
+                    L"Failed to write the clip file header (error %d).", ret);
+                SetEngineError(task.shared_memory, msg);
+            }
+            return false;
         }
 
         // ------------------------------------------------------------------
@@ -1397,9 +1421,9 @@ namespace fthr {
             std::cerr << "[MuxEncodedClip] av_packet_alloc failed" << std::endl;
             avio_closep(&fmt_ctx->pb);
             avformat_free_context(fmt_ctx);
-            if (task.shared_memory)
-                task.shared_memory->engine_response = ResponseType::ERROR_OCCURRED;
-            return;
+            SetEngineError(task.shared_memory,
+                L"Out of memory while preparing the clip for writing.");
+            return false;
         }
 
         for (size_t i = keyframe_start; i < snap.packets.size(); i++) {
@@ -1525,6 +1549,7 @@ namespace fthr {
             << L" (" << video_packet_count << L" video, "
             << audio_packet_count << L" audio, "
             << actual_duration_s << L"s)" << std::endl;
+        return true;
     }
 
 
@@ -1532,7 +1557,7 @@ namespace fthr {
     // EncodeRawClip (x264 fallback path - formerly ProcessSaveClipTask)
     // ===========================================================================
 
-    void CaptureEngine::EncodeRawClip(const SaveClipTask& task) {
+    bool CaptureEngine::EncodeRawClip(const SaveClipTask& task) {
         EncoderConfig enc_cfg;
         enc_cfg.src_width = task.src_width;
         enc_cfg.src_height = task.src_height;
@@ -1585,9 +1610,10 @@ namespace fthr {
 
         if (!encoder.Initialize(task.output_path.c_str(), enc_cfg)) {
             std::cerr << "[EncodeRawClip] Encoder initialization failed" << std::endl;
-            if (task.shared_memory)
-                task.shared_memory->engine_response = ResponseType::ERROR_OCCURRED;
-            return;
+            SetEngineError(task.shared_memory,
+                L"Failed to initialise the video encoder. The selected codec "
+                L"may be unavailable on this GPU.");
+            return false;
         }
 
         for (size_t i = 0; i < task.frame_count; i++) {
@@ -1597,6 +1623,7 @@ namespace fthr {
 
         encoder.Finalize();
         std::wcout << L"[EncodeRawClip] Done: " << task.output_path << std::endl;
+        return true;
     }
 
 

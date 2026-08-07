@@ -121,6 +121,23 @@ namespace fthr {
         // ------------------------------------------------------------------
         // Response channel (C++ -> Python)
         // ------------------------------------------------------------------
+        // The producer contract (engine -> UI)                  [AUDIT-018]
+        //
+        //   1. write engine_string / engine_param* — the payload
+        //   2. publish engine_response LAST
+        //
+        // engine_response is the field the UI polls. The moment it changes,
+        // the UI is entitled to read every other response field, so they must
+        // already be settled. This mirrors the UI's own contract in the other
+        // direction: save_clip() writes ui_string and ui_param* and publishes
+        // ui_command last.
+        //
+        // Consumption is the UI's job alone: only the UI writes
+        // engine_response = NONE. The engine must not clear a response it has
+        // already published.
+        //
+        // Use SetEngineError() / SetEngineString() below rather than touching
+        // engine_string directly — they enforce both the bound and the order.
         volatile ResponseType engine_response;
         volatile uint32_t     engine_param1;
         volatile uint32_t     engine_param2;
@@ -167,6 +184,40 @@ namespace fthr {
 
 
     // ---------------------------------------------------------------------------
+    // Response payload helpers                                       [AUDIT-018]
+    //
+    // engine_string is wchar_t[512] — 511 usable characters plus a terminator.
+    // Error text is routinely built from a user-supplied output path, which can
+    // be longer than that, so every write goes through here.
+    // ---------------------------------------------------------------------------
+
+    //: Write `text` into engine_string: always NUL-terminated, always inside
+    //: the buffer, truncated if necessary. Does NOT publish a response.
+    inline void SetEngineString(SharedMemoryLayout* layout, const wchar_t* text) {
+        if (!layout) return;
+        const size_t cap = sizeof(layout->engine_string) / sizeof(wchar_t); // 512
+        if (!text) { layout->engine_string[0] = L'\0'; return; }
+        size_t n = 0;
+        while (n < cap - 1 && text[n] != L'\0') {
+            layout->engine_string[n] = text[n];
+            ++n;
+        }
+        // wcsncpy would not terminate on truncation — that is the failure mode
+        // this exists to prevent, so the terminator is written explicitly.
+        layout->engine_string[n] = L'\0';
+    }
+
+    //: Publish a failure: message FIRST, response LAST. This is the only
+    //: sanctioned way for the engine to report ERROR_OCCURRED — writing
+    //: engine_response directly on an error path skips the diagnostic and
+    //: breaks the publication order the UI relies on.
+    inline void SetEngineError(SharedMemoryLayout* layout, const wchar_t* message) {
+        if (!layout) return;
+        SetEngineString(layout, message);
+        layout->engine_response = ResponseType::ERROR_OCCURRED;
+    }
+
+    // ---------------------------------------------------------------------------
     // SharedMemory
     //
     // C++-side owner of the shared memory mapping.
@@ -187,10 +238,11 @@ namespace fthr {
         // Returns a pointer to the mapped layout. Nullptr if not initialized.
         SharedMemoryLayout* GetLayout() { return layout_; }
 
-        // Convenience helpers used by the C++ engine side.
-        void SendCommand(CommandType cmd,
-            uint32_t p1 = 0, uint32_t p2 = 0, uint32_t p3 = 0);
-        bool WaitForResponse(ResponseType expected, DWORD timeout_ms = 5000);
+        // NOTE: SendCommand()/WaitForResponse() used to live here. They were
+        // the *client* half of the protocol — never called by the engine — and
+        // WaitForResponse() consumed engine_response by writing NONE. That made
+        // the engine a second consumer of a channel the UI owns, which is the
+        // defect class AUDIT-017 was. Removed rather than left as a trap.
 
     private:
         HANDLE              file_mapping_;

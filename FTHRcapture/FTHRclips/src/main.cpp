@@ -298,7 +298,10 @@ int main(int argc, char* argv[]) {
                     layout->engine_response = fthr::ResponseType::RECORDING_STARTED;
                 }
                 else {
-                    layout->engine_response = fthr::ResponseType::ERROR_OCCURRED;
+                    // Payload first, response last (AUDIT-018/019).
+                    fthr::SetEngineError(layout,
+                        L"Could not start capturing. The selected capture "
+                        L"source may be unavailable or in use.");
                 }
                 break;
 
@@ -312,11 +315,17 @@ int main(int argc, char* argv[]) {
                 std::wcout << L"[Cmd] SAVE_CLIP -> " << cmd_string
                     << L" (" << cmd_param1 << L"s)" << std::endl;
                 if (engine.SaveClip(cmd_string, cmd_param1, layout)) {
+                    // Clear the message channel before acknowledging, so a
+                    // save that follows a failed one cannot show its text.
+                    fthr::SetEngineString(layout, L"");
                     layout->engine_response = fthr::ResponseType::SAVE_STARTED;
                     std::wcout << L"[Cmd] SAVE_CLIP queued" << std::endl;
                 }
                 else {
-                    layout->engine_response = fthr::ResponseType::ERROR_OCCURRED;
+                    // Payload first, response last (AUDIT-018/019).
+                    fthr::SetEngineError(layout,
+                        L"The capture engine could not queue the save. The "
+                        L"replay buffer may be empty or still starting up.");
                     std::cerr << "[Cmd] SAVE_CLIP failed to queue" << std::endl;
                 }
                 break;

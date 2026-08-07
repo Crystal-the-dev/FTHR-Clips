@@ -44,25 +44,4 @@ namespace fthr {
         }
     }
 
-    void SharedMemory::SendCommand(CommandType cmd, uint32_t p1, uint32_t p2, uint32_t p3) {
-        if (!layout_) return;
-        layout_->ui_param1 = p1;
-        layout_->ui_param2 = p2;
-        layout_->ui_param3 = p3;
-        layout_->ui_command = cmd;
-    }
-
-    bool SharedMemory::WaitForResponse(ResponseType expected, DWORD timeout_ms) {
-        if (!layout_) return false;
-
-        DWORD start = GetTickCount();
-        while (layout_->engine_response != expected) {
-            if (GetTickCount() - start > timeout_ms) return false;
-            Sleep(1);
-        }
-
-        layout_->engine_response = ResponseType::NONE;
-        return true;
-    }
-
 }
