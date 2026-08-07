@@ -4,13 +4,14 @@
 **Authoritative tree:** `C:\Users\Tom\Desktop\FTHR_Clips_source\FTHR_Clips`
 **Last updated:** 2026-08-07
 
-This is the single audit document for the project. It merges four passes:
+This is the single audit document for the project. It merges five passes:
 
 | Pass | Date | Scope | Environment |
 |---|---|---|---|
 | **I — Code & licensing** | 2026-08-05 | Inventory, static analysis, source review of IPC/save/hotkey/upload, dependency & licence review | Windows 10 Pro 19045, CPython 3.14.3, PyQt6 6.11.0 / Qt 6.11.1 |
 | **II — Release engineering** | 2026-08-06 | Source of truth, git, dependency pinning, version centralisation, CI, release gates | same |
 | **III — Linux verification** | 2026-08-06 | Linux build, engine runtime, IPC, clip pipeline, audio, single-instance, socket hardening, AppImage | Ubuntu 24.04.3 LTS under WSL2 + WSLg, CPython 3.12.3, Qt 6.11.0, GCC 13.3, CMake 3.28.3 |
+| **V — Engine publication contract** | 2026-08-07 | Producer inventory of both engines, publication ordering, Windows error diagnostics, static contract gate | Windows 10 Pro 19045 + MSVC 14.44 · Ubuntu 24.04 under WSL2, GCC 13.3 |
 | **IV — Save ownership** | 2026-08-07 | Save-response ownership consolidation, save state machine, event-loop responsiveness | Windows 10 Pro 19045, CPython 3.14, offscreen Qt |
 
 > **Scope honesty.** Nothing here is inferred from a passing build. Every item
@@ -119,7 +120,10 @@ which desktop it detected and print the exact command to bind.
 | AUDIT-015 | P1 | Linux save pipeline | **FIXED** (III) |
 | AUDIT-016 | P2 | Linux portability | **FIXED** (III) |
 | AUDIT-017 | **P1** | Save pipeline / data integrity | **FIXED** (IV) |
-| AUDIT-018 | P2 | Engine IPC correctness | **OPEN** |
+| AUDIT-018 | P2 | Engine IPC correctness | **RESOLVED** (V) |
+| AUDIT-019 | P2 | Windows engine diagnostics | **FIXED — RUNTIME NOT RUN** (V) |
+| AUDIT-020 | P2 | Startup / UI responsiveness | **OPEN** |
+| AUDIT-021 | **P1** | Windows save pipeline | **FIXED — RUNTIME NOT RUN** (V) |
 
 ---
 
@@ -798,6 +802,168 @@ refused with a debug log and the same "SAVING…" flash the 1-second debounce
 always gave — it never confirms a second clip. A timed-out operation is
 deliberately *not* counted as active, so a wedged engine cannot lock the hotkey
 out. No queue was introduced.
+
+
+---
+
+## Pass V — Engine publication contract (2026-08-07)
+
+Tests: **250 to 267 passed**, 30 skipped. Closes AUDIT-018, opens and closes
+AUDIT-019 and AUDIT-021, opens AUDIT-020.
+
+This pass started as a two-line ordering fix and turned up a P1 data-loss
+defect on the primary platform. The producer inventory that found it is below.
+
+### Producer matrix — Linux (`FTHRcapture_linux/`)
+
+Every response write lives in `src/main.cpp`'s command loop. `SaveClip()` is
+called synchronously from that same loop, so there is exactly **one writer
+thread** and no atomics or barriers are warranted. `save_clip.cpp` touches the
+layout only to update `bytes_written`, a progress field with no response.
+
+| Site | Response | Payload | Order before | Order after |
+|---|---|---|---|---|
+| `SAVE_CLIP` ack | `SAVE_STARTED` | none (string cleared first) | ok | ok |
+| `SAVE_CLIP` result | `CLIP_SAVED` / `ERROR_OCCURRED` | `engine_string` | **response first** (bad) | payload first (fixed) |
+| `GET_STATUS` | `STATUS_UPDATE` | `engine_param1` | **response first** (bad) | payload first (fixed) |
+| `RECONFIGURE_ENCODER` | `STATUS_UPDATE` | `active_codec`, `nvenc_active` | ok | ok |
+| `SET_RESOLUTION` / `SET_QUALITY` | `STATUS_UPDATE` | cfg fields (UI-owned) | ok | ok |
+| `STOP_` / `START_RECORDING` | `RECORDING_STOPPED` / `RECORDING_STARTED` | none | ok | ok |
+
+Two violations, not one: the `GET_STATUS` site had the same defect and was not
+in the original report.
+
+### Producer matrix — Windows (`FTHRcapture/FTHRclips/`)
+
+**Two** writer threads, unlike Linux: the command loop (`main.cpp`) publishes
+`SAVE_STARTED`, and `SaveClipThread` (`capture_engine.cpp`) publishes the
+result later. They are sequenced by the save queue, not concurrent for one
+save. `engine_response` is declared `volatile`, which under MSVC's default
+`/volatile:ms` carries acquire/release semantics — adequate here.
+
+| Site | Response | Payload before | Payload after |
+|---|---|---|---|
+| `main.cpp` START_RECORDING fail | `ERROR_OCCURRED` | **none** | message |
+| `main.cpp` SAVE_CLIP queue fail | `ERROR_OCCURRED` | **none** | message |
+| `SaveClipThread` completion | `CLIP_SAVED` | **published unconditionally** | only on success |
+| `MuxEncodedClip` empty snapshot | `ERROR_OCCURRED` | **none** | message |
+| `MuxEncodedClip` alloc output ctx | `ERROR_OCCURRED` | **none** | message |
+| `MuxEncodedClip` new video stream | `ERROR_OCCURRED` | **none** | message |
+| `MuxEncodedClip` `avio_open` | `ERROR_OCCURRED` | **none** | message + code |
+| `MuxEncodedClip` write header | `ERROR_OCCURRED` | **none** | message + code |
+| `MuxEncodedClip` packet alloc | `ERROR_OCCURRED` | **none** | message |
+| `EncodeRawClip` encoder init | `ERROR_OCCURRED` | **none** | message |
+
+### AUDIT-021 · P1 · Windows · Save pipeline · **FIXED**
+**Every failed Windows save was reported to the UI as a success**
+
+Found during the inventory. It is the most serious defect in this pass and was
+not what the pass set out to fix.
+
+`SaveClipThread` ran:
+
+```cpp
+ProcessSaveClipTask(task);                       // void — cannot report failure
+if (task.shared_memory) {
+    task.shared_memory->engine_response = ResponseType::CLIP_SAVED;   // always
+}
+```
+
+All three save functions returned `void`. Each of the seven failure paths
+inside them wrote `ERROR_OCCURRED` and returned — and this line then overwrote
+it with `CLIP_SAVED` microseconds later. **The UI never saw one of those
+errors.** Disk full, unwritable path, encoder unavailable, empty replay
+buffer: all reported as a saved clip. The UI then showed "SAVED", refreshed
+the grid, started post-processing and queued the upload for a file that did
+not exist.
+
+The three functions now return `bool`, failures publish themselves through
+`SetEngineError()`, and success is published in exactly one place.
+
+Partial mitigation already in the tree: Pass IV made the UI stat the file
+before believing `CLIP_SAVED`, so the most common shapes (`avio_open` failed,
+nothing written) surface as "CLIP WAS NOT SAVED" rather than a phantom grid
+entry. That is a backstop, not a fix — a failure after a partial header write
+leaves a non-empty file that passes the check.
+
+### AUDIT-018 · P2 · Both · **RESOLVED**
+**Payload is now published before the response, on both engines**
+
+Both Linux sites corrected. The invariant is stated in both `shared_memory.h`
+files next to the fields it governs, and enforced by
+`tools/verify_engine_response_contract.py`.
+
+Bounded string helpers added: `fthr::set_engine_string()` (Linux, 2048-byte
+`char`, UTF-8) and `fthr::SetEngineString()` / `SetEngineError()` (Windows,
+512 `wchar_t`, UTF-16). Both truncate at the buffer bound and always
+NUL-terminate — `strncpy`/`wcsncpy` do *not* terminate on truncation, which is
+the failure mode being prevented. `SetEngineError()` writes the message and
+then publishes, so the order cannot be got wrong at a call site.
+
+Also removed: `SharedMemory::WaitForResponse()` in the Windows engine, which
+consumed `engine_response` by writing `NONE`. It was the client half of the
+protocol, had no callers, and made the engine a second consumer of a channel
+the UI owns — the same defect class as AUDIT-017, waiting to be called.
+
+### AUDIT-019 · P2 · Windows · Engine diagnostics · **CONFIRMED and FIXED**
+**The Windows engine published errors with no diagnostic payload**
+
+Confirmed by full inventory: a `grep` for `engine_string` across
+`FTHRcapture/FTHRclips/src/` returned **zero** production writes against nine
+`ERROR_OCCURRED` producers. Every distinct Windows failure reached the user as
+the UI's generic fallback text, with the cause visible only in the engine's
+stdout — which no user sends.
+
+Each path now carries a specific message, and the two `libav` paths carry the
+return code. `avio_open` — disk full, read-only target, missing folder, the
+most common real failure — reads: *"Could not open the clip file for writing
+(error N). Check free disk space and folder permissions."*
+
+### The static gate
+
+`tools/verify_engine_response_contract.py` scans both engines and reports
+`ERROR-WITHOUT-PAYLOAD`, `PAYLOAD-AFTER-RESPONSE`, `RAW-PAYLOAD-WRITE`,
+`UNSAFE-STRING` and `ENGINE-CONSUMES`. It tracks brace depth rather than line
+numbers, and blanks comments and string literals first, so it survives
+reformatting and does not trip over the prose describing the contract.
+
+It exists because these paths need a full disk or a dead GPU to execute; a
+pytest run proves nothing about them. **It is proven able to fail**:
+`tests/test_engine_contract_gate.py` feeds it the verbatim pre-fix shapes of
+all three defects and asserts rejection, plus an empty-source-tree case — a
+gate that silently scans nothing after a directory rename would otherwise
+report success forever.
+
+### AUDIT-020 · P2 · Both · Startup / UI responsiveness · **OPEN**
+**The engine connection retry loop blocks the Qt main thread**
+
+Found by the AUDIT-011 sweep for main-thread sleeps. Documented, not fixed —
+that is a separate change and this pass is already large.
+
+`FTHR_UI/main.py::connect_to_engine()` retries `bridge.initialize()` up to
+**10 times with `time.sleep(0.5)`** between attempts, on the Qt main thread:
+a **5-second** worst-case freeze. It runs when the UI attaches to the engine —
+at startup, and on the reconnect path after an engine exit. During it the
+window does not repaint, the status text does not update, and the app is
+"not responding" to the OS.
+
+Mitigating: the happy path returns on the first attempt, and a *separate*
+threaded reconnect path (`_poll_connect`) already exists for the restart case.
+The blocking loop is the startup path. Same fix shape as AUDIT-011 — a QTimer
+with a retry counter instead of a loop.
+
+### Builds
+
+| Target | Command | Result |
+|---|---|---|
+| Windows engine | `MSBuild FTHRcapture/FTHRcapture.sln -p:Configuration=Release -p:Platform=x64` | **compiles and links** — `x64/Release/FTHRclips.exe` produced, no compiler warnings at `-v:minimal`. The post-build step fails (`MSB3073`) copying `third_party/ffmpeg/bin/*.dll`, which are not in a clean checkout; restore with `tools/fetch_third_party.py --ffmpeg`. |
+| Linux engine (Release) | `cmake -DCMAKE_BUILD_TYPE=Release` | **NOT RUN** — refused by the AUDIT-014 licence gate: a Release build requires the pinned LGPL FFmpeg (`FTHR_FFMPEG_ROOT`), which is not fetched in this checkout. The gate behaved correctly. |
+| Linux engine (Debug) | `cmake -DCMAKE_BUILD_TYPE=Debug && cmake --build` | **exit 0**, binary linked. 2 warnings, both pre-existing and in files this pass did not touch (`backend_wlr.cpp` `-Wclass-memaccess`, `encoder.cpp` `-Wunused-function`). |
+
+Runtime verification of the new error paths is **NOT RUN** on either platform:
+forcing a real encoder or disk failure needs a running engine and a human.
+Both AUDIT-019 and AUDIT-021 are therefore *fixed and compiled*, not
+*observed working*.
 
 
 ---
