@@ -2,7 +2,7 @@
 
 **Version under audit:** 1.0.0-alpha
 **Authoritative tree:** `C:\Users\Tom\Desktop\FTHR_Clips_source\FTHR_Clips`
-**Last updated:** 2026-08-06
+**Last updated:** 2026-08-07
 
 This is the single audit document for the project. It merges three passes:
 
@@ -10,6 +10,7 @@ This is the single audit document for the project. It merges three passes:
 |---|---|---|---|
 | **I — Code & licensing** | 2026-08-05 | Inventory, static analysis, source review of IPC/save/hotkey/upload, dependency & licence review | Windows 10 Pro 19045, CPython 3.14.3, PyQt6 6.11.0 / Qt 6.11.1 |
 | **II — Release engineering** | 2026-08-06 | Source of truth, git, dependency pinning, version centralisation, CI, release gates | same |
+| **IV — Save ownership** | 2026-08-07 | Save-response ownership consolidation, save state machine, event-loop responsiveness | Windows 10 Pro 19045, CPython 3.14, offscreen Qt |
 | **III — Linux verification** | 2026-08-06 | Linux build, engine runtime, IPC, clip pipeline, audio, single-instance, socket hardening, AppImage | Ubuntu 24.04.3 LTS under WSL2 + WSLg, CPython 3.12.3, Qt 6.11.0, GCC 13.3, CMake 3.28.3 |
 
 > **Scope honesty.** Nothing here is inferred from a passing build. Every item
@@ -111,12 +112,13 @@ which desktop it detected and print the exact command to bind.
 | AUDIT-008 | P1 | Release engineering | **RESOLVED** (II) |
 | AUDIT-009 | P2 | Reproducibility | **RESOLVED** (II) |
 | AUDIT-010 | P2 | Diagnostics | **FIXED** (I) · hardened (II) |
-| AUDIT-011 | P2 | UI responsiveness | **PARTIALLY FIXED** (III) |
+| AUDIT-011 | P2 | UI responsiveness | **FIXED** (IV) |
 | AUDIT-012 | P2 | Privacy | **OPEN** |
 | AUDIT-013 | **P0** | Licensing | **OPEN — RELEASE BLOCKER** |
 | AUDIT-014 | P0 | Linux packaging | **CONDITIONALLY RESOLVED** (2026-08-06) — see [AUDIT-014-LINUX-FFMPEG.md](AUDIT-014-LINUX-FFMPEG.md) |
 | AUDIT-015 | P1 | Linux save pipeline | **FIXED** (III) |
 | AUDIT-016 | P2 | Linux portability | **FIXED** (III) |
+| AUDIT-017 | **P1** | Save pipeline / data integrity | **FIXED** (IV) |
 
 ---
 
@@ -622,7 +624,8 @@ during capture · AppImage launch.
 
 5. **AUDIT-007** — convert the 34 silent `except: pass` blocks to logged lines.
    The entire support strategy is "send us your log".
-6. **AUDIT-011** — move the save handshake off the Qt main thread.
+6. ~~**AUDIT-011** — move the save handshake off the Qt main thread.~~ Done in
+   Pass IV; the handshake was removed rather than moved.
 7. **AUDIT-012** — restrict `test_server_connection()` to http/https.
 8. A soak run, so any performance claim is backed by a measurement.
 
@@ -664,6 +667,87 @@ skips behaving correctly; `tools/fetch_third_party.py --ffmpeg` restores them.
 
 `FTHRClips_Roadmap.docx` was **kept**: it is a planning document, not build
 output, even though it is git-ignored.
+
+---
+
+## Pass IV — Save-response ownership (2026-08-07)
+
+Tests: **173 → 250 passed**, 30 skipped. Closes AUDIT-011, opens and closes
+AUDIT-017.
+
+### AUDIT-011 · P2 · Both · UI responsiveness · **FIXED**
+**The save handshake no longer runs on the Qt main thread**
+
+The busy-wait is gone rather than moved: no worker thread was added, because
+the work it would do is three shared-memory reads. `save_clip()` is now a pure
+command submit that writes the path, the duration and the command code and
+returns. A dedicated 50 ms `QTimer` — running only while a save is outstanding
+— reads the response, and a Qt-free state machine (`FTHR_UI/core/save_state.py`)
+decides what it means.
+
+Measured, not asserted: `tests/test_save_event_loop.py` runs a real
+`QCoreApplication`, counts 10 ms timer ticks against an engine that never
+answers, and fails if the loop stalls. Against the old implementation the same
+guard trips at 1001 ms. This is the measurement Pass III recorded as missing.
+
+### AUDIT-017 · P1 · Both · Save pipeline · **FIXED**
+**A new save destroyed the previous save's unconsumed verdict**
+
+`save_clip()` opened with `engine_response = NONE` to clear stale state. But
+`engine_response` is a single slot shared with the completion channel, and the
+status poll only ran every 500 ms. A `CLIP_SAVED` or `ERROR_OCCURRED` that had
+arrived but not yet been read was wiped by the next hotkey press. Consequences,
+in order of severity: a failed save reported nothing at all — the user was told
+the clip was fine and found it missing later; a successful save never refreshed
+the grid; and the engine's error message was lost with it.
+
+The window is small but entirely reachable: the debounce allowed a new save one
+second after the previous one, and the poll interval was half a second.
+
+Three things were wrong at once, so all three were fixed together:
+
+1. **Three consumers became one.** `save_clip()` consumed responses,
+   `wait_for_clip_completion()` was a second consumer (unused by the app but
+   live and tested), and `poll_async_result()` was a third. There is now a
+   single reader, `MainWindow._pump_save_responses()`, asserted by a test that
+   fails if a second `consume_save_response()` call site appears.
+2. **Reading was split into peek and consume.** The response and its string are
+   read together as one event and interpreted *before* the field is cleared, so
+   an unattributable response can be logged instead of silently swallowed.
+3. **Nothing clears the field speculatively.** Before submitting a new command
+   the poller drains any pending response first, attributing it to the
+   operation it belongs to.
+
+`test_T6_old_clip_saved_is_processed_before_the_next_save` and
+`test_T6_save_clip_never_clears_a_pending_response` are the regression tests.
+
+### Also corrected: "SAVED" was shown before the clip existed
+
+The submit path emitted `clip_saved`, reloaded the grid, showed "SAVED" and
+started post-processing the moment the command was *written* — before the
+engine had encoded anything. On failure the UI had already lied. Now the submit
+path may only show "SAVING…"; the grid entry, the `clip_saved` signal, the
+upload and the success text all wait for `CLIP_SAVED`, and the file's existence
+and non-zero size are checked before any of it.
+
+### Engine contract note
+
+`FTHRcapture_linux/src/main.cpp` writes `engine_response = ERROR_OCCURRED`
+*before* `snprintf`-ing the message into `engine_string`. A reader landing in
+that window sees a failure with an empty detail. This is harmless — the engine
+clears `engine_string` at the start of every save, so the detail can be missing
+but never stale or wrong — and the reader tolerates it explicitly. The success
+path writes the string first and the code last, which is the correct order.
+Worth fixing engine-side; not a blocker.
+
+### Single-flight
+
+One engine save at a time. A second hotkey press during an active save is
+refused with a debug log and the same "SAVING…" flash the 1-second debounce
+always gave — it never confirms a second clip. A timed-out operation is
+deliberately *not* counted as active, so a wedged engine cannot lock the hotkey
+out. No queue was introduced.
+
 
 ---
 

@@ -19,7 +19,6 @@ import sys
 import ctypes
 from ctypes import Structure, c_uint32, c_bool, c_float, c_uint64
 from enum import IntEnum
-import time
 import os
 
 if sys.platform == 'win32':
@@ -290,22 +289,33 @@ class CaptureBridge:
 
     def save_clip(self, output_path: str, duration: int = 30) -> bool:
         """
-        Yell at the engine: "save the last N seconds, NOW."
+        Hand the engine a SaveClip command and return immediately.
 
-        Fire-and-mostly-forget. We hand the engine a path + duration, it grabs
-        whatever's currently in the ring buffer and starts encoding on its own
-        thread. We only block long enough to hear "yeah I got it" (SAVE_STARTED),
-        not for the actual encode — that would freeze the UI on long clips.
+        **This is a command submit, not a save.** A True return means exactly
+        one thing: the path, the duration and the command code were written
+        into shared memory. It does *not* mean a clip exists, that the engine
+        read the command, or that anything was encoded. The only authority on
+        whether a clip was written is `CLIP_SAVED` arriving in
+        `engine_response` — which this method deliberately does not look at.
 
-        Returns True if the save was successfully queued, False otherwise.
+        Do not add a wait loop here. This runs on the Qt main thread; the
+        previous version busy-waited up to a second for `SAVE_STARTED` and
+        froze the UI on every hotkey press against a slow engine (AUDIT-011).
+        The save poller in main.py owns the response side.
+
+        This method also must never write `engine_response`. `engine_response`
+        is a single-slot field with no queue; clearing it here destroyed the
+        still-unconsumed completion of the *previous* save (AUDIT-017). If a
+        stale response is pending, the poller processes it before this is
+        called — the ordering is enforced by the caller, not by a clear here.
+
+        Returns True if the command was submitted locally, False if the bridge
+        is not connected or the path cannot be represented in the layout.
         """
         if not self.is_connected():
             print('Not connected to capture engine')
             return False
 
-        # Wipe any leftover response first — narrator: it was not, in fact, fine
-        # without this. Stale CLIP_SAVED from a previous run looked like success.
-        self._layout.engine_response = ResponseType.NONE
         # Send command — Linux uses c_char (bytes), Windows uses c_wchar (str)
         if sys.platform != 'win32':
             # Encode and truncate at a char boundary so we never split a multi-byte
@@ -324,45 +334,6 @@ class CaptureBridge:
         # Write the command code LAST. The engine polls ui_command, so once this
         # lands it may read every other field — they all need to be set already.
         self._layout.ui_command = CommandType.SAVE_CLIP
-
-        # Spin until the engine acks. Should be near-instant; the 1s ceiling is
-        # purely so a dead/hung engine doesn't lock the UI forever.
-        #
-        # CLIP_SAVED counts as an ack. The Linux engine runs SaveClip
-        # *synchronously* on its command loop: it writes SAVE_STARTED, encodes,
-        # then overwrites the same field with CLIP_SAVED. A short clip on a fast
-        # encoder finishes inside our poll interval, so SAVE_STARTED is gone
-        # before we ever observe it — and this loop used to spin the full second
-        # and then report failure for a clip that was written correctly.
-        # Verified on Linux/x11grab/av1_nvenc: a 10 s clip did exactly this.
-        _ACKS = (ResponseType.SAVE_STARTED,
-                 ResponseType.CLIP_SAVED,
-                 ResponseType.ERROR_OCCURRED)
-        start = time.monotonic()
-        while self._layout.engine_response not in _ACKS:
-            if time.monotonic() - start > 1.0:
-                print('Timeout waiting for save acknowledgement')
-                return False
-            time.sleep(0.001)
-
-        response = self._layout.engine_response
-
-        if response == ResponseType.ERROR_OCCURRED:
-            self._layout.engine_response = ResponseType.NONE
-            print('Engine returned ERROR_OCCURRED')
-            return False
-
-        if response == ResponseType.CLIP_SAVED:
-            # Already finished. Deliberately do NOT consume it — poll_async_result()
-            # is what tells the UI the clip landed, and swallowing it here would
-            # make the confirmation disappear on exactly the fast saves this
-            # branch exists for.
-            print(f'Clip saved (engine finished synchronously): {output_path}')
-            return True
-
-        # SAVE_STARTED — task queued, encoding continues in the background.
-        self._layout.engine_response = ResponseType.NONE
-        print(f'Clip save queued: {output_path} ({duration}s)')
         return True
 
 
@@ -378,69 +349,73 @@ class CaptureBridge:
         self._layout.ui_command = CommandType.START_RECORDING
         return True
 
-    def wait_for_clip_completion(self, timeout_ms: int = 30000) -> bool:
-        """
-        Optional: Wait for the queued clip to finish encoding.
-        
-        Use this if you need to know when the file is ready.
-        Not required for normal UI flow.
-        
-        Args:
-            timeout_ms: Maximum time to wait (default 30 seconds)
-        
-        Returns:
-            True if CLIP_SAVED received
-            False if timeout or error
-        """
-        if not self.is_connected():
-            return False
-        
-        timeout_sec = timeout_ms / 1000.0
-        start = time.monotonic()
-        while True:
-            resp = self._layout.engine_response
-            if resp == ResponseType.CLIP_SAVED:
-                self._layout.engine_response = ResponseType.NONE
-                return True
-            if resp == ResponseType.ERROR_OCCURRED:
-                self._layout.engine_response = ResponseType.NONE
-                print('wait_for_clip_completion: engine returned ERROR_OCCURRED')
-                return False
-            if time.monotonic() - start > timeout_sec:
-                print(f'Timeout waiting for clip completion ({timeout_ms}ms)')
-                return False
-            time.sleep(0.010)
+    # -- The save response channel -------------------------------------------
+    #
+    # `engine_response` + `engine_string` have exactly ONE reader: the save
+    # poller in main.py. Reading is split into peek + consume on purpose.
+    #
+    # peek_save_response() returns the response *and* the string it belongs to
+    # as one value, without changing anything. The caller interprets it, and
+    # only then calls consume_save_response(). That ordering is what makes an
+    # unexpected or unattributable response loggable instead of silently
+    # swallowed, and it guarantees the string is never paired with the response
+    # of a *different* poll cycle.
+    #
+    # Engine write-order contract:
+    #   Success path — the engine clears engine_string at SAVE_CLIP and writes
+    #   engine_response last, so a peeked CLIP_SAVED always has a settled
+    #   string (usually empty).
+    #   Failure path on Linux — FTHRcapture_linux/src/main.cpp writes
+    #   engine_response = ERROR_OCCURRED *before* snprintf'ing the message.
+    #   A peek landing in that window sees ERROR_OCCURRED with an empty string.
+    #   That is a genuine (small) race in the engine; the consequence is a
+    #   missing detail message, never a wrong one, because engine_string is
+    #   cleared at the start of every save. Callers must therefore tolerate an
+    #   empty detail on failure and substitute their own text.
 
+    #: Responses that belong to a save. Everything else (STATUS_UPDATE,
+    #: RECORDING_STARTED, …) is not ours and must be left in the field.
+    _SAVE_RESPONSES = {
+        ResponseType.CLIP_SAVED: 'saved',
+        ResponseType.ERROR_OCCURRED: 'error',
+        ResponseType.SAVE_STARTED: 'started',
+    }
 
-    def poll_async_result(self) -> tuple[str, str] | None:
-        """Non-blocking check for a late engine verdict on an async SaveClip.
+    def peek_save_response(self) -> tuple[str, str] | None:
+        """Read a pending save response without consuming it.
 
-        save_clip() only waits for SAVE_STARTED — the actual mux/write happens
-        on an engine thread afterwards. If that write then fails (disk full,
-        path vanished, encoder error) the engine sets ERROR_OCCURRED, but
-        nothing was reading it: the UI had already said "SAVED" and the user
-        went looking for a clip that was never written.
-
-        Call this from the status poll. Returns:
-            ('saved', detail)  — CLIP_SAVED seen
-            ('error', detail)  — ERROR_OCCURRED seen
-            None               — nothing pending
-
-        Consumes the response (resets it to NONE) so a single event is only
-        ever reported once.
+        Returns ('started' | 'saved' | 'error', detail) or None. Non-save
+        responses return None and are left untouched.
         """
         if not self.is_connected():
             return None
         try:
             resp = self._layout.engine_response
-            if resp not in (ResponseType.CLIP_SAVED, ResponseType.ERROR_OCCURRED):
+            kind = self._SAVE_RESPONSES.get(resp)
+            if kind is None:
                 return None
-            detail = self._read_engine_string()
-            self._layout.engine_response = ResponseType.NONE
-            return ('saved' if resp == ResponseType.CLIP_SAVED else 'error', detail)
+            return (kind, self._read_engine_string())
         except Exception as e:
-            self._log_read_error_once('poll_async_result', e)
+            self._log_read_error_once('peek_save_response', e)
             return None
+
+    def consume_save_response(self) -> bool:
+        """Clear a save response after it has been interpreted.
+
+        Only clears if a save response is actually present, so a response that
+        arrived between peek and consume is never destroyed unread. This is the
+        only place in the codebase that writes `engine_response`.
+        """
+        if not self.is_connected():
+            return False
+        try:
+            if self._layout.engine_response not in self._SAVE_RESPONSES:
+                return False
+            self._layout.engine_response = ResponseType.NONE
+            return True
+        except Exception as e:
+            self._log_read_error_once('consume_save_response', e)
+            return False
 
     def _read_engine_string(self) -> str:
         """Read engine_string across both layouts (wchar on Windows, bytes on

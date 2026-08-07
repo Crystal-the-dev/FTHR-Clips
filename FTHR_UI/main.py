@@ -100,6 +100,7 @@ from version import (
 )
 from core import linux_tools
 from core.capture_bridge import CaptureBridge
+from core.save_state import (SaveStateMachine, EngineEvent, OutcomeKind)
 from core.hotkey_manager import HotkeyManager
 from core.game_detector import GameDetector
 from core.focus_monitor import FocusMonitor
@@ -410,6 +411,38 @@ def _refresh_all_icons():
 
 def _dims_to_label(w: int, h: int) -> str:
     return _DIMS_TO_LABEL.get((w, h), f'{w}×{h}' if w else 'SOURCE')
+
+
+def select_post_route(*, audio_on: bool, multiband_enabled: bool,
+                      mic_running: bool, watermark: bool, auto_crop: bool,
+                      camera: bool) -> tuple[str, bool]:
+    """Decide which post-processing route a saved clip takes.
+
+    Returns ``(route, has_async_mux)`` where route is exactly one of
+    ``'mic'``, ``'multiband'`` or ``'finalize'``.
+
+    The exclusivity matters: each route ends by setting the ``clip_ready``
+    event, and ``clip_ready`` is the single gate the upload manager waits on.
+    Two routes running for one clip set it twice, and the upload starts against
+    a half-written file — the mic mux's os.replace() racing the watermark
+    pass. This used to be three independent `if` blocks that could all fire;
+    it is a pure function now so the exclusivity can actually be tested.
+
+    ``has_async_mux`` says whether *any* route will touch the file after this
+    returns, which is what the upload manager needs in order to wait.
+    'finalize' only rewrites the file when there is something to apply, so a
+    plain clip with no watermark/crop/camera is ready immediately.
+    """
+    multiband_on = audio_on and multiband_enabled
+    mic_active = audio_on and not multiband_on and mic_running
+
+    if mic_active:
+        return 'mic', True
+    if multiband_on:
+        return 'multiband', True
+    # finalize is the fallback route and always runs, but it only rewrites the
+    # file when one of these is on.
+    return 'finalize', bool(watermark or auto_crop or camera)
 
 
 def _sanitize_foldername(name: str) -> str:
@@ -1646,6 +1679,18 @@ class MainWindow(QMainWindow):
         self.status_timer.timeout.connect(self._update_status)
         self.status_timer.start(500)
 
+        # The save response channel. One state machine, one poller.
+        #
+        # The status timer's 500 ms is too coarse for save feedback — the ack
+        # deadline is 1 s — so a save gets its own short timer that runs only
+        # while something is outstanding. Each tick is a few shared-memory
+        # reads: no sleeping, no I/O, no waiting on threads or subprocesses.
+        # That is what keeps the event loop free (AUDIT-011).
+        self._save_state = SaveStateMachine()
+        self._save_poll_timer = QTimer(self)
+        self._save_poll_timer.setInterval(50)
+        self._save_poll_timer.timeout.connect(self._on_save_poll_tick)
+
     # =======================================================================
     # UI layout
     # =======================================================================
@@ -2600,17 +2645,28 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Debounce hotkey spam: two saves in the same second would produce the
-        # same timestamped filename → engine writes the same file twice and two
-        # mux workers fight over it. One save per second is plenty.
+        # Two admission gates, in order of cheapness:
+        #
+        # 1. The original 1-second debounce. Two saves in the same second
+        #    produce the same timestamped filename → the engine writes the same
+        #    file twice and two mux workers fight over it.
+        # 2. Single-flight. The engine reports through one response slot with no
+        #    correlation id, so a second concurrent save is untrackable: its
+        #    CLIP_SAVED would be indistinguishable from the first one's. Refuse
+        #    it rather than guess.
+        #
+        # Both refusals give the same visible feedback the debounce always gave
+        # — a silently dropped hotkey reads as "the extended-clip key sometimes
+        # doesn't work". Neither ever confirms a second clip.
         now = time.monotonic()
         if now - getattr(self, '_last_save_request', 0.0) < 1.0:
             print('[Save] Ignored — save already in progress (spam guard)')
-            # Give visible feedback — a silently dropped hotkey reads as
-            # "the extended-clip key sometimes doesn't work".
-            self._set_status('SAVING…', status_idle_qss())
-            QTimer.singleShot(1000,
-                lambda: self._set_status('CAPTURING', status_active_qss()))
+            self._show_save_busy_feedback()
+            return
+        if self._save_state.is_busy():
+            print(f'[Save] Ignored — engine save still in flight '
+                  f'({self._save_state.state.value})')
+            self._show_save_busy_feedback()
             return
         self._last_save_request = now
 
@@ -2683,54 +2739,42 @@ class MainWindow(QMainWindow):
         mic_end_time = time.monotonic() - _AUDIO_SAFETY_S
 
         try:
-            if self.bridge.save_clip(str(output_path), duration_seconds):
-                print(f"Clip saved: {output_path.name}")
-                self.clip_saved.emit(str(output_path))
-                self.clip_grid._load_clips()
-                self._set_status('SAVED', status_active_qss())
-                QTimer.singleShot(2000,
-                    lambda: self._set_status('CAPTURING', status_active_qss()))
-                res_label = _dims_to_label(self.capture_width, self.capture_height)
-                self.capture_card.show_clip(duration_seconds, self.capture_fps, res_label)
-                # Notify the upload manager and get the clip-ready event.
-                # The event is set immediately if there's no mic mux pending;
-                # otherwise the mux worker sets it after os.replace() completes.
-                audio_on = self.settings_manager.get('audio_capture_enabled', True)
-                multiband_on = audio_on and self.settings_manager.get('multiband_audio_enabled', False)
-                mic_active = (audio_on and not multiband_on and
-                              MicRecorder.is_available() and MicRecorder().is_running())
-                # finalize_active: watermark/crop/camera need post-processing
-                # when no mux path handles it — they also touch the file async.
-                finalize_active = (
-                    not mic_active and not multiband_on and
-                    (self.settings_manager.get('watermark_enabled', False)
-                     or self.settings_manager.get('auto_crop_enabled', False)
-                     or self.settings_manager.get('camera_enabled', False))
-                )
-                has_async_mux = mic_active or multiband_on or finalize_active
-                clip_ready = self.upload_manager.notify_clip_saved(
-                    str(output_path), has_mic_mux=has_async_mux)
-                # Only start the mic mux when mic is actually active.
-                # Calling it unconditionally caused clip_ready to be set twice
-                # (early-return inside _mux_mic_into_clip + _finalize_clip), so
-                # the upload would start before watermark/crop/camera had run.
-                if mic_active:
-                    self._mux_mic_into_clip(
-                        str(output_path), duration_seconds, mic_end_time, clip_ready)
-                if multiband_on:
-                    self._mux_multiband_into_clip(
-                        str(output_path), duration_seconds, mic_end_time, clip_ready)
-                if not mic_active and not multiband_on:
-                    self._finalize_clip(str(output_path), duration_seconds,
-                                        mic_end_time, clip_ready)
-            else:
+            # A response left over from the previous save may still be sitting
+            # in the field. Drain it *before* submitting, so its completion is
+            # attributed to the save it belongs to. Overwriting it — which the
+            # bridge used to do — silently lost that save's verdict (AUDIT-017).
+            self._pump_save_responses()
+
+            if not self.bridge.save_clip(str(output_path), duration_seconds):
                 self.capture_card.show_error()
                 self.push_error(
                     'CLIP SAVE FAILED',
-                    'Write error. Check disk space at ~/FTHR_Clips.',
+                    'The capture engine did not accept the save command. '
+                    'Check disk space at ~/FTHR_Clips.',
                     level='error',
                     actions=[('OPEN FOLDER', self._open_clips_folder)],
                 )
+                return
+
+            # Submitted — NOT saved. Everything that asserts a clip exists
+            # (grid entry, clip_saved, upload, "SAVED") now waits for
+            # CLIP_SAVED in _on_save_outcome(). All the UI may claim here is
+            # that something is in progress.
+            submit = self._save_state.submit(
+                str(output_path), duration_seconds, time.monotonic(),
+                mic_end_time=mic_end_time,
+            )
+            if not submit.accepted:
+                # is_busy() was checked above; losing the race means another
+                # save slipped in. Refuse loudly rather than track two.
+                print('[Save] Submit rejected by state machine after the '
+                      'command was written — response will be attributed to '
+                      'the operation already in flight')
+                return
+
+            self._set_status('SAVING…', status_idle_qss())
+            self._save_poll_timer.start()
+
         except Exception as e:
             print(f"Save error: {e}")
             self.capture_card.show_error()
@@ -2739,6 +2783,169 @@ class MainWindow(QMainWindow):
                 f'Unexpected error: {e}',
                 level='error',
             )
+
+    def _show_save_busy_feedback(self):
+        """Visible answer to a hotkey we refused. Never confirms a clip."""
+        self._set_status('SAVING…', status_idle_qss())
+        QTimer.singleShot(1000,
+            lambda: self._set_status('CAPTURING', status_active_qss()))
+
+    # -----------------------------------------------------------------------
+    # The save response channel — single reader, single interpreter
+    # -----------------------------------------------------------------------
+
+    def _pump_save_responses(self):
+        """Read at most one engine save response, interpret it, consume it.
+
+        This is the ONLY consumer of engine_response/engine_string. It reads
+        the response and its string together as one event, hands them to the
+        state machine, and clears the field only after the machine has
+        accepted the interpretation.
+        """
+        if not self.bridge or not self.bridge.is_connected():
+            return
+        peeked = self.bridge.peek_save_response()
+        now = time.monotonic()
+
+        if peeked is None:
+            outcome = self._save_state.on_tick(now)
+            if outcome is not None:
+                self._on_save_outcome(outcome)
+            return
+
+        kind, detail = peeked
+        event = {
+            'started': EngineEvent.SAVE_STARTED,
+            'saved':   EngineEvent.CLIP_SAVED,
+            'error':   EngineEvent.ERROR_OCCURRED,
+        }[kind]
+        outcome = self._save_state.on_event(event, detail, now)
+        # Consume only now: the event has been interpreted and attributed.
+        self.bridge.consume_save_response()
+        if outcome is not None:
+            self._on_save_outcome(outcome)
+
+    def _on_save_poll_tick(self):
+        """Dedicated short-interval poll while a save is outstanding.
+
+        Cheap by construction: a handful of shared-memory reads and no I/O.
+        It must never sleep, wait on a subprocess, join a thread or touch the
+        encoder — that is the whole point of AUDIT-011.
+        """
+        self._pump_save_responses()
+        if not self._save_state.is_busy():
+            # Nothing left in flight. A timed-out operation keeps its late
+            # window open via the 500 ms status poll, which also calls
+            # _pump_save_responses(), so stopping the fast timer here does not
+            # lose a late result.
+            self._save_poll_timer.stop()
+
+    def _on_save_outcome(self, outcome):
+        """Act on exactly one state-machine outcome."""
+        op = outcome.operation
+
+        if outcome.kind is OutcomeKind.ACCEPTED:
+            # Engine has the job. Still not saved — no grid, no upload.
+            self._set_status('SAVING…', status_idle_qss())
+            return
+
+        if outcome.kind is OutcomeKind.TIMEOUT_NOTICE:
+            # Not a verdict: the engine is slow, not proven broken. Warn, keep
+            # watching, and do not emit a failure the late result would then
+            # contradict.
+            self._set_status('SAVE SLOW…', status_warning_qss())
+            return
+
+        if outcome.kind is OutcomeKind.FAILED:
+            self.capture_card.show_error()
+            self._set_status('SAVE FAILED', status_warning_qss())
+            QTimer.singleShot(3000,
+                lambda: self._set_status('CAPTURING', status_active_qss()))
+            self.push_error(
+                'CLIP WAS NOT SAVED',
+                outcome.detail or
+                'The capture engine failed while writing the clip. '
+                'Check free disk space at ~/FTHR_Clips.',
+                level='error',
+                actions=[('OPEN FOLDER', self._open_clips_folder)],
+            )
+            return
+
+        if outcome.kind is OutcomeKind.COMPLETED:
+            self._on_clip_written(op, late=outcome.late)
+
+    def _on_clip_written(self, op, late: bool = False):
+        """CLIP_SAVED for `op`. Runs exactly once per operation.
+
+        The state machine guarantees single delivery (`result_emitted`), so the
+        post-processing route below is started once and only once.
+        """
+        output_path = Path(op.output_path)
+
+        # The engine said it wrote the file. Verify before telling the user —
+        # a CLIP_SAVED for a file that is not there is a bug we want to see,
+        # not a broken grid entry the user discovers days later.
+        try:
+            if not output_path.exists() or output_path.stat().st_size == 0:
+                print(f'[Save] CLIP_SAVED but the file is missing or empty: '
+                      f'{output_path.name}')
+                self.capture_card.show_error()
+                self._set_status('SAVE FAILED', status_warning_qss())
+                QTimer.singleShot(3000,
+                    lambda: self._set_status('CAPTURING', status_active_qss()))
+                self.push_error(
+                    'CLIP WAS NOT SAVED',
+                    'The capture engine reported success but no clip file was '
+                    'written. Check free disk space at ~/FTHR_Clips.',
+                    level='error',
+                    actions=[('OPEN FOLDER', self._open_clips_folder)],
+                )
+                return
+        except OSError as e:
+            print(f'[Save] Could not stat the saved clip: {e}')
+
+        duration_seconds = op.duration_seconds
+        mic_end_time = op.context.get('mic_end_time', op.requested_at)
+
+        if late:
+            print(f'[Save] Late success accepted for {output_path.name} — the '
+                  f'timeout warning was premature')
+
+        print(f'Clip saved: {output_path.name}')
+        self.clip_saved.emit(str(output_path))
+        self.clip_grid._known_files = None
+        self.clip_grid._load_clips()
+        self._set_status('SAVED', status_active_qss())
+        QTimer.singleShot(2000,
+            lambda: self._set_status('CAPTURING', status_active_qss()))
+        res_label = _dims_to_label(self.capture_width, self.capture_height)
+        self.capture_card.show_clip(duration_seconds, self.capture_fps, res_label)
+
+        # Pick the post-processing route. Exactly one runs — see
+        # select_post_route() for why that exclusivity is load-bearing.
+        route, has_async_mux = select_post_route(
+            audio_on=self.settings_manager.get('audio_capture_enabled', True),
+            multiband_enabled=self.settings_manager.get('multiband_audio_enabled', False),
+            mic_running=(MicRecorder.is_available() and MicRecorder().is_running()),
+            watermark=self.settings_manager.get('watermark_enabled', False),
+            auto_crop=self.settings_manager.get('auto_crop_enabled', False),
+            camera=self.settings_manager.get('camera_enabled', False),
+        )
+
+        # Notify the upload manager and get the clip-ready event.
+        # The event is set immediately if there's no mux pending; otherwise the
+        # worker sets it after os.replace() completes. clip_ready stays the
+        # single upload gatekeeper.
+        clip_ready = self.upload_manager.notify_clip_saved(
+            str(output_path), has_mic_mux=has_async_mux)
+
+        args = (str(output_path), duration_seconds, mic_end_time, clip_ready)
+        if route == 'mic':
+            self._mux_mic_into_clip(*args)
+        elif route == 'multiband':
+            self._mux_multiband_into_clip(*args)
+        else:
+            self._finalize_clip(*args)
 
     def _open_clips_folder(self):
         """Open ~/FTHR_Clips in the platform file manager."""
@@ -3316,29 +3523,12 @@ class MainWindow(QMainWindow):
             self._set_rec_dot_state('disconnected')
             return
 
-        # A SaveClip that failed *after* the engine acked SAVE_STARTED used to
-        # vanish without a trace: the UI had already flashed "SAVED", so the
-        # user only found out by discovering the clip missing later. Surface it.
-        verdict = self.bridge.poll_async_result()
-        if verdict is not None:
-            kind, detail = verdict
-            if kind == 'error':
-                self.capture_card.show_error()
-                self._set_status('SAVE FAILED', status_warning_qss())
-                QTimer.singleShot(3000,
-                    lambda: self._set_status('CAPTURING', status_active_qss()))
-                self.push_error(
-                    'CLIP WAS NOT SAVED',
-                    detail or 'The capture engine failed while writing the clip. '
-                              'Check free disk space at ~/FTHR_Clips.',
-                    level='error',
-                    actions=[('OPEN FOLDER', self._open_clips_folder)],
-                )
-            else:
-                # The file only exists on disk now — the grid was refreshed at
-                # request time, before the engine had written anything.
-                self.clip_grid._known_files = None
-                self.clip_grid._load_clips()
+        # Second driver of the same single reader. The fast save timer stops as
+        # soon as nothing is in flight; this keeps a *timed-out* operation's
+        # late-result window open, and catches a response for a save the fast
+        # timer had already given up on. Both call the same method, so there is
+        # still exactly one consumer.
+        self._pump_save_responses()
         codec = self.bridge.get_active_codec()
         if codec:
             preset = self.bridge.get_active_preset()
@@ -3557,6 +3747,13 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.status_timer.stop()
+        # Stop polling before anything is torn down, and abandon the in-flight
+        # save explicitly. The engine may still finish it — we simply stop
+        # caring, rather than blocking the shutdown on a verdict that may never
+        # come. Nothing here waits on the engine, so a save in flight cannot
+        # deadlock the exit.
+        self._save_poll_timer.stop()
+        self._save_state.cancel_active(time.monotonic(), reason='shutdown')
         self.hotkey_manager.cleanup()
         # Wait for pending clip post-processing (mic mux / finalize) before
         # exiting — daemon threads killed mid-write corrupt the clip. Typical

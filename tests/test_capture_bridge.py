@@ -59,181 +59,150 @@ def test_set_encoder_config_clamps_preset():
     assert layout.cfg_preset == 7
 
 
-def test_save_clip_timeout_survives_backward_clock_jump(monkeypatch):
-    """H-01: save_clip() must not hang when system clock jumps backward (NTP).
-    Uses a watchdog thread to detect an infinite loop within 5 seconds."""
+def test_save_clip_submits_without_blocking():
+    """AUDIT-011: save_clip() is a command submit and must return immediately.
+
+    The old version busy-waited up to a second for SAVE_STARTED on the Qt main
+    thread. Nothing acks here, so a surviving wait loop shows up as elapsed
+    time. The 100 ms ceiling is generous by three orders of magnitude.
+    """
     import time as _time
-    import threading
 
     layout, buf = _make_fake_layout()
     bridge = _FakeBridge(layout)
-    # engine_response stays NONE — engine never acks, so timeout must fire
+    # engine_response stays NONE — nothing will ever acknowledge this.
 
-    original_time = _time.time
-    call_count = [0]
+    started = _time.monotonic()
+    result = bridge.save_clip(_a_path(), 30)
+    elapsed = _time.monotonic() - started
 
-    def patched_time():
-        call_count[0] += 1
-        # After a few calls simulate NTP adjusting clock backward by 10 seconds
-        if call_count[0] > 5:
-            return original_time() - 10.0
-        return original_time()
-
-    monkeypatch.setattr(_time, 'time', patched_time)
-
-    result = [None]
-    def run():
-        result[0] = bridge.save_clip('/tmp/test.mp4', 30)
-
-    t = threading.Thread(target=run, daemon=True)
-    t.start()
-    t.join(timeout=5.0)
-
-    assert not t.is_alive(), (
-        "save_clip() hung — time.time() clock-jump caused infinite loop; "
-        "use time.monotonic() instead"
+    assert result is True, 'submit should succeed — it only writes fields'
+    assert elapsed < 0.1, (
+        f'save_clip() blocked for {elapsed*1000:.0f} ms — it must not wait '
+        f'for the engine (AUDIT-011)'
     )
-    assert result[0] is False
+    assert layout.ui_command == CommandType.SAVE_CLIP
+    assert layout.ui_param1 == 30
 
 
-def test_wait_for_clip_timeout_survives_backward_clock_jump(monkeypatch):
-    """H-01: wait_for_clip_completion() must not hang when clock jumps backward."""
-    import time as _time
-    import threading
-
+def test_save_clip_writes_command_last():
+    """The engine may read every other field the moment ui_command lands, so
+    the command code has to be written after the path and duration."""
     layout, buf = _make_fake_layout()
     bridge = _FakeBridge(layout)
+    bridge.save_clip(_a_path(), 17)
 
-    original_time = _time.time
-    call_count = [0]
-
-    def patched_time():
-        call_count[0] += 1
-        if call_count[0] > 5:
-            return original_time() - 10.0
-        return original_time()
-
-    monkeypatch.setattr(_time, 'time', patched_time)
-
-    result = [None]
-    def run():
-        result[0] = bridge.wait_for_clip_completion(timeout_ms=500)
-
-    t = threading.Thread(target=run, daemon=True)
-    t.start()
-    t.join(timeout=5.0)
-
-    assert not t.is_alive(), (
-        "wait_for_clip_completion() hung — clock-jump with time.time(); "
-        "use time.monotonic() instead"
-    )
-    assert result[0] is False
+    assert layout.ui_param1 == 17
+    assert layout.ui_command == CommandType.SAVE_CLIP
 
 
-def test_wait_for_clip_completion_returns_false_on_error():
-    """wait_for_clip_completion() must return False immediately on ERROR_OCCURRED,
-    not spin until the timeout fires."""
-    import threading
+def test_save_clip_does_not_touch_engine_response():
+    """AUDIT-017 regression at the bridge boundary.
 
+    `engine_response` is a single slot. Clearing it here destroyed the
+    still-unconsumed verdict of the previous save — the user got no
+    confirmation for a clip that had been written, or no error for one that
+    had not.
+    """
+    for pending in (ResponseType.CLIP_SAVED, ResponseType.ERROR_OCCURRED,
+                    ResponseType.SAVE_STARTED):
+        layout, buf = _make_fake_layout()
+        bridge = _FakeBridge(layout)
+        layout.engine_response = pending
+
+        bridge.save_clip(_a_path(), 30)
+
+        assert layout.engine_response == pending, (
+            f'save_clip() overwrote a pending {pending!r} (AUDIT-017)')
+
+
+def test_save_clip_refuses_when_disconnected():
     layout, buf = _make_fake_layout()
     bridge = _FakeBridge(layout)
-    layout.engine_response = ResponseType.ERROR_OCCURRED
-
-    result = [None]
-    def run():
-        result[0] = bridge.wait_for_clip_completion(timeout_ms=30000)
-
-    t = threading.Thread(target=run, daemon=True)
-    t.start()
-    t.join(timeout=2.0)
-
-    assert not t.is_alive(), (
-        "wait_for_clip_completion() hung on ERROR_OCCURRED instead of returning immediately"
-    )
-    assert result[0] is False
+    layout.is_initialized = False
+    assert bridge.save_clip(_a_path(), 30) is False
 
 
-def test_wait_for_clip_completion_returns_true_on_saved():
-    """wait_for_clip_completion() returns True when CLIP_SAVED arrives."""
+def test_bridge_has_no_second_response_consumer():
+    """AUDIT-011: exactly one consumer. The blocking waiter and the old
+    auto-consuming poller are gone and must not come back."""
+    assert not hasattr(CaptureBridge, 'wait_for_clip_completion')
+    assert not hasattr(CaptureBridge, 'poll_async_result')
+
+
+def test_peek_does_not_consume():
     layout, buf = _make_fake_layout()
     bridge = _FakeBridge(layout)
     layout.engine_response = ResponseType.CLIP_SAVED
 
-    assert bridge.wait_for_clip_completion(timeout_ms=500) is True
-    assert layout.engine_response == ResponseType.NONE
+    for _ in range(3):
+        assert bridge.peek_save_response() == ('saved', '')
+        assert layout.engine_response == ResponseType.CLIP_SAVED
 
 
-# ── AUDIT-002: late async save failures must not vanish ────────────────────
-#
-# save_clip() only waits for SAVE_STARTED. A failure during the background
-# write set ERROR_OCCURRED with nobody reading it, so the UI kept its "SAVED"
-# banner and the clip silently never existed.
-
-def test_poll_async_result_none_when_idle():
+def test_peek_returns_kind_and_detail_together():
     layout, buf = _make_fake_layout()
     bridge = _FakeBridge(layout)
-    assert bridge.poll_async_result() is None
-
-
-def test_poll_async_result_reports_late_error():
-    layout, buf = _make_fake_layout()
-    bridge = _FakeBridge(layout)
+    layout.engine_string = _encode_engine_string('SaveClip failed: disk full')
     layout.engine_response = ResponseType.ERROR_OCCURRED
-    layout.engine_string = _encode_engine_string('disk full while writing clip')
 
-    verdict = bridge.poll_async_result()
-    assert verdict is not None, 'a late ERROR_OCCURRED was swallowed'
-    kind, detail = verdict
+    kind, detail = bridge.peek_save_response()
     assert kind == 'error'
-    assert 'disk full' in detail
+    assert detail == 'SaveClip failed: disk full'
 
 
-def test_poll_async_result_reports_save_completion():
+def test_peek_reports_save_started():
     layout, buf = _make_fake_layout()
     bridge = _FakeBridge(layout)
-    layout.engine_response = ResponseType.CLIP_SAVED
-
-    kind, _ = bridge.poll_async_result()
-    assert kind == 'saved'
+    layout.engine_response = ResponseType.SAVE_STARTED
+    assert bridge.peek_save_response()[0] == 'started'
 
 
-def test_poll_async_result_consumes_the_event_once():
-    """A single engine verdict must produce exactly one UI notification —
-    the status poll runs twice a second and would otherwise spam the error bar."""
+def test_peek_ignores_unrelated_responses():
     layout, buf = _make_fake_layout()
     bridge = _FakeBridge(layout)
-    layout.engine_response = ResponseType.ERROR_OCCURRED
-
-    assert bridge.poll_async_result()[0] == 'error'
-    assert bridge.poll_async_result() is None
-    assert layout.engine_response == ResponseType.NONE
-
-
-def test_poll_async_result_ignores_unrelated_responses():
-    """STATUS_UPDATE / RECORDING_STARTED must not be mistaken for a save verdict."""
-    layout, buf = _make_fake_layout()
-    bridge = _FakeBridge(layout)
-    for resp in (ResponseType.STATUS_UPDATE,
-                 ResponseType.RECORDING_STARTED,
-                 ResponseType.SAVE_STARTED):
+    for resp in (ResponseType.RECORDING_STARTED, ResponseType.RECORDING_STOPPED,
+                 ResponseType.STATUS_UPDATE):
         layout.engine_response = resp
-        assert bridge.poll_async_result() is None, f'{resp!r} misread as a save verdict'
-        # and it must be left alone for whoever actually owns it
+        assert bridge.peek_save_response() is None, f'{resp!r} misread as a save verdict'
+        assert bridge.consume_save_response() is False
         assert layout.engine_response == resp
 
 
-def test_poll_async_result_survives_garbled_engine_string():
-    """A corrupt/garbled detail string must still yield a usable verdict rather
-    than raising into the status timer and killing the poll loop."""
+def test_consume_clears_exactly_once():
+    layout, buf = _make_fake_layout()
+    bridge = _FakeBridge(layout)
+    layout.engine_response = ResponseType.ERROR_OCCURRED
+
+    assert bridge.consume_save_response() is True
+    assert layout.engine_response == ResponseType.NONE
+    assert bridge.consume_save_response() is False
+
+
+def test_peek_survives_garbled_engine_string():
     layout, buf = _make_fake_layout()
     bridge = _FakeBridge(layout)
     layout.engine_response = ResponseType.ERROR_OCCURRED
     if sys.platform != 'win32':
-        layout.engine_string = b'\xff\xfe invalid utf8 \xc3'
+        layout.engine_string = bytes([0xff,0xfe]) + b' invalid utf8 ' + bytes([0xc3])
 
-    verdict = bridge.poll_async_result()
-    assert verdict is not None
-    assert verdict[0] == 'error'
+    peeked = bridge.peek_save_response()
+    assert peeked is not None
+    assert peeked[0] == 'error'
+    assert isinstance(peeked[1], str)
+
+
+def test_peek_returns_none_when_disconnected():
+    layout, buf = _make_fake_layout()
+    bridge = _FakeBridge(layout)
+    layout.engine_response = ResponseType.CLIP_SAVED
+    layout.is_initialized = False
+    assert bridge.peek_save_response() is None
+
+
+def _a_path() -> str:
+    """A path both layouts accept (Windows ui_string is c_wchar * 256)."""
+    return 'C:/clips/test.mp4' if sys.platform == 'win32' else '/tmp/test.mp4'
 
 
 def _encode_engine_string(text: str):
