@@ -255,7 +255,7 @@ bool WlrBackend::Initialize(const CaptureConfig& cfg) {
         frame_ready_  = false;
         frame_failed_ = false;
         buffer_done_  = false;
-        memset(&fb_, 0, sizeof(fb_));
+        fb_ = FrameBuffer{};
         fb_.fd = -1;
 
         sc_frame_ = zwlr_screencopy_manager_v1_capture_output(sc_mgr_, 0, output_);

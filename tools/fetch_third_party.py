@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import sys
 import tarfile
@@ -75,6 +76,42 @@ def _download(url: str, dest: Path) -> None:
                 print(f'\r  {pct:3d}%  {done / 1e6:.1f} / {total / 1e6:.1f} MB',
                       end='', flush=True)
         print()
+
+
+def _ensure_linux_ffmpeg_aliases(
+    lib_dir: Path, soname_map: dict[str, str]
+) -> None:
+    """Materialize and verify FFmpeg SONAME/development-link aliases.
+
+    Python's tarfile extraction on Windows does not reliably preserve every
+    relative symlink in the upstream archive.  A missing ``libfoo.so`` makes
+    pkg-config fall through to /usr/lib at link time; a missing SONAME alias
+    makes an otherwise valid bundle fail at runtime.  Prefer symlinks, then
+    hard links, with a byte copy as the portable last resort.
+    """
+    for versioned_name, soname in soname_map.items():
+        source = lib_dir / versioned_name
+        source_digest = _sha256(source)
+        linker_name = soname.split('.so.', 1)[0] + '.so'
+        for alias_name in (soname, linker_name):
+            alias = lib_dir / alias_name
+            same_file = alias.is_file() and os.path.samefile(alias, source)
+            if same_file or (alias.is_file() and _sha256(alias) == source_digest):
+                continue
+            alias.unlink(missing_ok=True)
+            try:
+                alias.symlink_to(source.name)
+            except OSError:
+                try:
+                    os.link(source, alias)
+                except OSError:
+                    shutil.copy2(source, alias)
+            same_file = alias.is_file() and os.path.samefile(alias, source)
+            if not same_file and (
+                not alias.is_file() or _sha256(alias) != source_digest
+            ):
+                raise RuntimeError(
+                    f'could not materialize FFmpeg library alias: {alias_name}')
 
 
 def fetch_ffmpeg(force: bool) -> int:
@@ -178,6 +215,7 @@ def fetch_ffmpeg_linux(force: bool) -> int:
         if set(expected) <= set(have):
             bad = [n for n, d in expected.items() if _sha256(have[n]) != d]
             if not bad:
+                _ensure_linux_ffmpeg_aliases(lib_dir, manifest['soname_map'])
                 print(f'LGPL FFmpeg {manifest["version"]} already present and verified.')
                 return 0
             print(f'  present but {len(bad)} file(s) failed sha256: {bad}')
@@ -238,6 +276,8 @@ def fetch_ffmpeg_linux(force: bool) -> int:
             if (staged / lic).is_file():
                 shutil.copy2(staged / lic, FFMPEG_LINUX_DIR / 'LICENSE.txt')
                 break
+
+        _ensure_linux_ffmpeg_aliases(lib_dir, manifest['soname_map'])
 
     print(f'LGPL FFmpeg installed into {FFMPEG_LINUX_DIR.relative_to(ROOT)}')
     print(f'  build the engine with: '

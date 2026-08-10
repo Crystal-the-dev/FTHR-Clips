@@ -346,7 +346,10 @@ def check_linux_ffmpeg_libs(root, rep, label, manifest_root=None) -> None:
         rep.fail(f'{label}: cannot validate libraries without the Linux manifest')
         return
     hashes = data.get('shipped_files_sha256') or {}
-    sonames = set((data.get('soname_map') or {}).values())
+    alias_sources = {}
+    for versioned, soname in (data.get('soname_map') or {}).items():
+        alias_sources[soname] = versioned
+        alias_sources[soname.split('.so.', 1)[0] + '.so'] = versioned
     # Qt Multimedia ships its own FFmpeg inside the PyQt6-Qt6 wheel. It is a
     # different SONAME generation, the engine never loads it, and it is LGPL —
     # but it is still FFmpeg in the artifact, so it is checked rather than
@@ -383,8 +386,15 @@ def check_linux_ffmpeg_libs(root, rep, label, manifest_root=None) -> None:
             else:
                 rep.fail(f'{name}: sha256 MISMATCH - expected {hashes[name][:16]}..., '
                          f'got {digest[:16]}... (not the library the manifest describes)')
-        elif name in sonames:
-            rep.ok(f'{name}: SONAME alias of a documented library')
+        elif name in alias_sources:
+            source_name = alias_sources[name]
+            expected = hashes.get(source_name)
+            digest = hashlib.sha256(lib.read_bytes()).hexdigest()
+            if expected and digest == expected:
+                rep.ok(f'{name}: verified alias of documented {source_name}')
+            else:
+                rep.fail(
+                    f'{name}: alias sha256 does not match documented {source_name}')
         elif name in provider_names or any(name.startswith(pf)
                                            for pf in provider_prefixes):
             # Documented additional provider: verify the licence, not the hash.

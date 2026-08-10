@@ -155,11 +155,39 @@ def test_soname_alias_is_accepted(manifest_root, tmp_path):
     In the real tree this is a symlink and is skipped, but PyInstaller flattens
     symlinks into copies, so the gate has to tolerate the name.
     """
+    payload = b'verified alias payload'
+    digest = hashlib.sha256(payload).hexdigest()
+    data = _manifest_data()
+    data['shipped_files_sha256']['libavcodec.so.62.28.102'] = digest
+    (manifest_root / 'tools' / 'ffmpeg_manifest_linux.json').write_text(
+        json.dumps(data), encoding='utf-8')
     art = tmp_path / 'artifact'
-    _write_lib(art, 'libavcodec.so.62')
+    _write_lib(art, 'libavcodec.so.62', payload)
     rep = vrl.Report()
     vrl.check_linux_ffmpeg_libs(art, rep, 'test', manifest_root=manifest_root)
     assert not rep.failures, rep.failures
+
+
+def test_unversioned_linker_alias_is_hash_verified(manifest_root, tmp_path):
+    payload = b'verified linker alias payload'
+    digest = hashlib.sha256(payload).hexdigest()
+    data = _manifest_data()
+    data['shipped_files_sha256']['libavcodec.so.62.28.102'] = digest
+    (manifest_root / 'tools' / 'ffmpeg_manifest_linux.json').write_text(
+        json.dumps(data), encoding='utf-8')
+    art = tmp_path / 'artifact'
+    _write_lib(art, 'libavcodec.so', payload)
+    rep = vrl.Report()
+    vrl.check_linux_ffmpeg_libs(art, rep, 'test', manifest_root=manifest_root)
+    assert not rep.failures, rep.failures
+
+
+def test_tampered_linker_alias_fails(manifest_root, tmp_path):
+    art = tmp_path / 'artifact'
+    _write_lib(art, 'libavcodec.so', b'system or tampered bytes')
+    rep = vrl.Report()
+    vrl.check_linux_ffmpeg_libs(art, rep, 'test', manifest_root=manifest_root)
+    assert rep.failures
 
 
 # ---------------------------------------------------------------------------

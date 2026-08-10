@@ -1,7 +1,6 @@
 #include "encoder.h"
 #include <iostream>
 #include <cstring>
-#include <time.h>
 
 extern "C" {
 #include <libavutil/imgutils.h>
@@ -9,16 +8,6 @@ extern "C" {
 }
 
 namespace fthr {
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-static int64_t clock_ns() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<int64_t>(ts.tv_sec) * 1'000'000'000LL + ts.tv_nsec;
-}
 
 // ---------------------------------------------------------------------------
 // ApplyPreset — maps P1–P7 to vendor-specific preset strings

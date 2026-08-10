@@ -3,6 +3,13 @@ project(FTHRclips_linux CXX C)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(fthr_capture_recovery_test tests/capture_recovery_test.cpp)
+    target_include_directories(fthr_capture_recovery_test PRIVATE src)
+    add_test(NAME capture_recovery_policy COMMAND fthr_capture_recovery_test)
+endif()
+
 find_package(PkgConfig REQUIRED)
 
 # ---------------------------------------------------------------------------
@@ -84,6 +91,23 @@ if(FTHR_FFMPEG_BUNDLED)
                 "FFmpeg resolved to '${_dir}', outside FTHR_FFMPEG_ROOT.\n"
                 "The pinned LGPL distribution is not being used.")
         endif()
+    endforeach()
+
+    # pkg-config names libraries as -lavcodec/-lswscale/etc.  If a linker alias
+    # is absent, the linker silently searches /usr/lib next and can mix the
+    # distribution's GPL FFmpeg into this nominally pinned LGPL build.  Resolve
+    # every direct engine dependency inside the verified tree and fail closed.
+    set(FTHR_FFMPEG_LINK_LIBRARIES)
+    foreach(_lib avdevice avformat avcodec swscale swresample avutil)
+        find_library(FTHR_${_lib}_LIBRARY NAMES ${_lib}
+            PATHS "${FTHR_FFMPEG_ROOT}/lib" NO_DEFAULT_PATH NO_CACHE)
+        if(NOT FTHR_${_lib}_LIBRARY)
+            message(FATAL_ERROR
+                "Pinned FFmpeg linker alias lib${_lib}.so is missing from "
+                "${FTHR_FFMPEG_ROOT}/lib. Re-run: "
+                "python tools/fetch_third_party.py --ffmpeg-linux")
+        endif()
+        list(APPEND FTHR_FFMPEG_LINK_LIBRARIES "${FTHR_${_lib}_LIBRARY}")
     endforeach()
 endif()
 
@@ -186,7 +210,8 @@ target_include_directories(FTHRclips PRIVATE
 )
 
 target_link_libraries(FTHRclips PRIVATE
-    PkgConfig::FFMPEG
+    $<$<BOOL:${FTHR_FFMPEG_BUNDLED}>:${FTHR_FFMPEG_LINK_LIBRARIES}>
+    $<$<NOT:$<BOOL:${FTHR_FFMPEG_BUNDLED}>>:PkgConfig::FFMPEG>
     PkgConfig::WAYLAND
     PkgConfig::PULSE
     pthread rt
@@ -226,5 +251,11 @@ set_target_properties(FTHRclips PROPERTIES
     INSTALL_RPATH_USE_LINK_PATH FALSE
     BUILD_RPATH_USE_ORIGIN TRUE)
 target_link_options(FTHRclips PRIVATE "-Wl,--disable-new-dtags")
+if(FTHR_FFMPEG_BUNDLED)
+    # libavdevice has transitive siblings (notably libavfilter).  Give the
+    # static linker the same closed pinned search set used by the runtime RPATH.
+    target_link_options(FTHRclips PRIVATE
+        "-Wl,-rpath-link,${FTHR_FFMPEG_ROOT}/lib")
+endif()
 
 install(TARGETS FTHRclips RUNTIME DESTINATION bin)
