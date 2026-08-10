@@ -13,6 +13,7 @@ import hashlib
 import json
 import shutil
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -188,6 +189,21 @@ def test_tampered_linker_alias_fails(manifest_root, tmp_path):
     rep = vrl.Report()
     vrl.check_linux_ffmpeg_libs(art, rep, 'test', manifest_root=manifest_root)
     assert rep.failures
+
+
+def test_failed_ffmpeg_runtime_probe_cannot_report_clean(monkeypatch, tmp_path):
+    exe = tmp_path / ('ffmpeg.exe' if sys.platform == 'win32' else 'ffmpeg')
+    exe.write_bytes(b'not executed by this unit test')
+    monkeypatch.setattr(
+        vrl.subprocess,
+        'run',
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=127, stdout='', stderr='loader failure'),
+    )
+    rep = vrl.Report()
+    vrl.check_ffmpeg_executable(exe, rep)
+    assert rep.failures
+    assert not any('-buildconf: clean' in line for line in rep.warnings)
 
 
 # ---------------------------------------------------------------------------

@@ -94,7 +94,7 @@ Everything else below is either already green or is honest, tracked work.
 
 | # | Gate | Status |
 |---|---|---|
-| 5.1 | `python -m pytest tests/` green | **PASS** — Windows **330 passed / 29 skipped** (2026-08-10); Linux native recovery CTest **1/1 passed** under Ubuntu 24.04 / WSL2 |
+| 5.1 | `python -m pytest tests/` green | **PASS** — Windows **331 passed / 29 skipped** (2026-08-10); Linux native recovery CTest **1/1 passed** under Ubuntu 24.04 / WSL2 |
 | 5.2 | `python -m ruff check .` clean | **PASS** |
 | 5.3 | `python -m compileall FTHR_UI tests tools` clean | **PASS** |
 | 5.4 | `tools/verify_shared_memory_contract.py` | **PASS** — 23 fields, 2712 B (win32) / 4248 B (linux), enums and reserved slots 4–9 intact |

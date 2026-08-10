@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import hashlib
+import os
 import re
 import subprocess
 import sys
@@ -142,11 +143,27 @@ def check_binary(path: Path, rep: Report) -> None:
 
 def check_ffmpeg_executable(exe: Path, rep: Report) -> None:
     """Ask the binary itself. Most authoritative check available."""
+    env = os.environ.copy()
+    if os.name != 'nt':
+        # The pinned Linux CLI has no build-tree RPATH. Probe it against the
+        # sibling libraries that ship with it; otherwise the loader exits 127
+        # and an empty stdout used to be misreported as a clean configuration.
+        candidates = (exe.parent / 'lib', exe.parent.parent / 'lib')
+        lib_dir = next((p for p in candidates if p.is_dir()), None)
+        if lib_dir is not None:
+            previous = env.get('LD_LIBRARY_PATH', '')
+            env['LD_LIBRARY_PATH'] = (
+                str(lib_dir) if not previous else f'{lib_dir}{os.pathsep}{previous}')
     try:
         res = subprocess.run([str(exe), '-hide_banner', '-buildconf'],
-                             capture_output=True, text=True, timeout=30)
+                             capture_output=True, text=True, timeout=30, env=env)
     except (OSError, subprocess.SubprocessError) as e:
         rep.warn(f'{exe.name}: could not run -buildconf ({e})')
+        return
+
+    if res.returncode != 0:
+        rep.fail(f'{exe.name}: -buildconf exited {res.returncode}; runtime '
+                 'capabilities were not verified')
         return
 
     conf = res.stdout or ''
@@ -158,10 +175,15 @@ def check_ffmpeg_executable(exe: Path, rep: Report) -> None:
         rep.ok(f'{exe.name} -buildconf: clean')
 
     try:
-        enc = subprocess.run([str(exe), '-hide_banner', '-encoders'],
-                             capture_output=True, text=True, timeout=30).stdout or ''
+        enc_res = subprocess.run([str(exe), '-hide_banner', '-encoders'],
+                                 capture_output=True, text=True, timeout=30, env=env)
     except (OSError, subprocess.SubprocessError):
         return
+    if enc_res.returncode != 0:
+        rep.fail(f'{exe.name}: -encoders exited {enc_res.returncode}; encoder '
+                 'capabilities were not verified')
+        return
+    enc = enc_res.stdout or ''
     for gpl_enc in ('libx264', 'libx265'):
         if re.search(rf'^\s*V\S*\s+{gpl_enc}\b', enc, re.M):
             rep.fail(f'{exe.name}: GPL encoder {gpl_enc} is registered')

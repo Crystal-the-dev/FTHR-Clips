@@ -161,7 +161,7 @@ alias/link confinement tests; and hash-verified licence-gate alias tests.
 
 ## 17. pytest before/after
 
-Before: 308 passed, 28 skipped. After: **330 passed, 29 skipped**. The added
+Before: 308 passed, 28 skipped. After: **331 passed, 29 skipped**. The added
 Windows skip is the native GNU C++ harness; the same executable passed under
 Linux CTest.
 
@@ -173,10 +173,9 @@ Linux CTest.
 
 **PASS:** exception handling, shared-memory byte layout (Windows 2736 B; Linux
 4272 B), engine-response publication, product version consistency, repository
-hygiene, `compileall`, `git diff --check`, and the licence gate. The Linux
-licence run reported 99 checks, 0 failures, and two pre-existing informational
-warnings that the command-line `ffmpeg`/`ffprobe` probes did not expose an
-OpenH264 fallback; all linked FFmpeg SONAMEs and bundle-relative RPATH checks
+hygiene, `compileall`, `git diff --check`, and the licence gate. The final Linux
+licence run reported 101 checks, 0 failures, and 0 warnings; command-line
+capability probes, linked FFmpeg SONAMEs, and bundle-relative RPATH checks all
 passed.
 
 ## 20. Windows build
@@ -238,6 +237,10 @@ real-world black/frozen matrix remain unrun.
 * **AUDIT-042 (P1 footage loss) — OPEN:** the healthy Windows runtime probe requested five seconds
   but produced 3.533 seconds / 91 frames after keyframe/timestamp trimming.
   This is outside the capture-health fix and needs save-duration investigation.
+* **AUDIT-043 (P1 gate false-pass) — RESOLVED:** Linux `ffmpeg`/`ffprobe`
+  capability probes ran without their sibling libraries, treated loader exit
+  127 as clean configuration, and emitted misleading fallback warnings. The
+  gate now supplies the pinned library path and fails on nonzero probe exits.
 
 ## 28. Commit hashes
 
@@ -246,6 +249,8 @@ real-world black/frozen matrix remain unrun.
 * `4fdc08c` — `test: keep credential fixtures hygiene-safe`
 * Documentation — the commit containing this report; its hash is recorded in
   the final handoff because a commit cannot contain its own hash.
+* Final licence-probe hardening — the commit containing AUDIT-043; its hash is
+  likewise recorded in the final handoff.
 
 ## 29. Working tree
 
