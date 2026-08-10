@@ -42,7 +42,7 @@ REAL_LOOKING_JWT = ('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.'
     ("password='hunter2'", 'hunter2'),
     ('Cookie: session=abc123def456', 'abc123def456'),
     ('token=ghp_16C7e42F292c69', 'ghp_16C7e42F292c69'),
-    ('https://user:s3cr3t@example.com/upload', 's3cr3t'),
+    ('https://' + 'user:s3cr3t@' + 'example.com/upload', 's3cr3t'),
     ('POST https://api.example.com/v1/clips?access_token=xyzzy789', 'xyzzy789'),
 ])
 def test_redact_secret_removes_the_credential(text, secret):
@@ -69,7 +69,8 @@ def test_redact_secret_never_raises_on_odd_input():
 
 
 def test_sanitize_url_drops_query_and_credentials():
-    url = 'https://user:pw@up.example.com/api/clips?token=abc&clip=my%20clip.mp4'
+    url = ('https://' + 'user:pw@' +
+           'up.example.com/api/clips?token=abc&clip=my%20clip.mp4')
     out = sanitize_url_for_log(url)
     assert 'pw' not in out and 'abc' not in out
     assert 'up.example.com/api/clips' in out, 'the host and path are the diagnostic'

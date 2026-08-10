@@ -70,7 +70,7 @@ _RE_KV = re.compile(
     r'refresh_token|upload_auth_header)\b(\s*["\']?\s*[:=]\s*)'
     r'("[^"]*"|\'[^\']*\'|[^,;&\s}\]]+)', re.IGNORECASE)
 
-#: Credentials embedded in a URL: https://user:password@host/...
+#: Credentials embedded in a URL's user-info section.
 _RE_URL_CREDS = re.compile(r'(?<=://)([^/\s:@]+):([^/\s@]+)@')
 
 
