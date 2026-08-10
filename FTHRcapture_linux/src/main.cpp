@@ -135,7 +135,7 @@ int main(int argc, char* argv[]) {
 
     // Shared memory
     fthr::SharedMemory shm;
-    if (!shm.Initialize("FTHR_SharedMemory_v3")) {
+    if (!shm.Initialize("FTHR_SharedMemory_v4")) {
         std::cerr << "[FTHR] Shared memory init failed — exiting" << std::endl;
         return 1;
     }
@@ -160,6 +160,12 @@ int main(int argc, char* argv[]) {
     memset(layout->active_audio_mappings, 0, sizeof(layout->active_audio_mappings));
     layout->cfg_codec_pref = static_cast<uint32_t>(cfg.codec_pref);
     layout->cfg_preset     = static_cast<uint32_t>(cfg.preset);
+    layout->capture_health_flags = engine.GetCaptureHealthFlags();
+    layout->capture_generation = engine.GetCaptureGeneration();
+    layout->content_sample_sequence = 0;
+    layout->content_suspicious_streak = 0;
+    layout->content_luma_mean = 0.0f;
+    layout->content_luma_variance = 0.0f;
 
     std::cout << "[FTHR] Ready. Waiting for commands..." << std::endl;
 
@@ -168,7 +174,7 @@ int main(int argc, char* argv[]) {
     signal(SIGTERM, on_signal);
 
     // Command poll loop — same 20ms cadence as Windows version
-    while (!g_quit && engine.IsCapturing()) {
+    while (!g_quit) {
         auto cmd = static_cast<fthr::CommandType>(layout->ui_command);
 
         if (cmd != fthr::CommandType::NONE) {
@@ -275,6 +281,12 @@ int main(int argc, char* argv[]) {
         // Update live status in shared memory
         layout->frames_captured = engine.GetFrameCount();
         layout->nvenc_active    = engine.IsNvencActive();
+        layout->capture_health_flags = engine.GetCaptureHealthFlags();
+        layout->capture_generation = engine.GetCaptureGeneration();
+        layout->content_sample_sequence = engine.GetContentSampleSequence();
+        layout->content_suspicious_streak = engine.GetContentSuspiciousStreak();
+        layout->content_luma_mean = engine.GetContentLumaMean();
+        layout->content_luma_variance = engine.GetContentLumaVariance();
         // Keep active_codec in shared memory up to date
         const std::string& ac = engine.GetActiveCodec();
         if (!ac.empty()) {

@@ -84,6 +84,13 @@ if sys.platform == 'win32':
             # v3 fields
             ('multiband_enabled',     c_bool),
             ('active_audio_mappings', ctypes.c_char * 1024),
+            # v4 capture/content health fields
+            ('capture_health_flags',       c_uint32),
+            ('capture_generation',         c_uint32),
+            ('content_sample_sequence',    c_uint32),
+            ('content_suspicious_streak',  c_uint32),
+            ('content_luma_mean',           c_float),
+            ('content_luma_variance',       c_float),
         ]
 else:
     class SharedMemoryLayout(Structure):
@@ -113,6 +120,13 @@ else:
             # v3 fields
             ('multiband_enabled',     c_bool),
             ('active_audio_mappings', ctypes.c_char * 1024),
+            # v4 capture/content health fields
+            ('capture_health_flags',       c_uint32),
+            ('capture_generation',         c_uint32),
+            ('content_sample_sequence',    c_uint32),
+            ('content_suspicious_streak',  c_uint32),
+            ('content_luma_mean',           c_float),
+            ('content_luma_variance',       c_float),
         ]
 
 
@@ -120,7 +134,7 @@ class CaptureBridge:
     # Bumped the _v1 suffix the day I changed the struct layout and spent two
     # hours wondering why an old engine kept reading my new fields wrong.
     # Versioned name = old + new never accidentally share the same mapping.
-    SHARED_MEM_NAME = 'FTHR_SharedMemory_v3'
+    SHARED_MEM_NAME = 'FTHR_SharedMemory_v4'
 
     # Singleton. There is exactly one engine and one mapping, so one bridge.
     # Anything else just hands you back the same object.
@@ -173,7 +187,7 @@ class CaptureBridge:
         # naming both sizes is the difference between a five-minute diagnosis
         # and a week of "the encoder reports nonsense".
         #
-        # The mapping NAME already carries a layout version (_v3), so an old
+        # The mapping NAME already carries a layout version (_v4), so an old
         # engine and a new UI normally cannot meet at all. This catches the
         # case where someone bumps the struct without bumping the name.
         try:
@@ -437,6 +451,12 @@ class CaptureBridge:
                 'is_recording': self._layout.is_recording,
                 'frames_captured': self._layout.frames_captured,
                 'nvenc_active': self._layout.nvenc_active,
+                'capture_health_flags': self._layout.capture_health_flags,
+                'capture_generation': self._layout.capture_generation,
+                'content_sample_sequence': self._layout.content_sample_sequence,
+                'content_suspicious_streak': self._layout.content_suspicious_streak,
+                'content_luma_mean': self._layout.content_luma_mean,
+                'content_luma_variance': self._layout.content_luma_variance,
             }
         except Exception as e:
             self._log_read_error_once('get_status', e)

@@ -29,6 +29,7 @@ public:
     std::vector<EncodedPacket> TakeSnapshot(uint32_t duration_ms) const;
 
     size_t PacketCount() const;
+    void Clear();
 
 private:
     mutable std::mutex        mutex_;

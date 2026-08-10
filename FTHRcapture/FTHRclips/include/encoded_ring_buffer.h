@@ -143,6 +143,11 @@ namespace fthr {
         // -----------------------------------------------------------------------
         EncodedRingSnapshot TakeSnapshot(size_t frame_count) const;
 
+        // Invalidate replay across a backend recovery. Slot storage is retained
+        // to avoid reallocations; atomic state/count publication makes a
+        // concurrent snapshot safely observe an empty/non-ready buffer.
+        void Clear();
+
 
         // -----------------------------------------------------------------------
         // Stats

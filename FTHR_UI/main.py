@@ -110,6 +110,12 @@ from version import (
 )
 from core import linux_tools
 from core.capture_bridge import CaptureBridge
+from core.capture_health import (
+    CaptureHealthMonitor,
+    CaptureHealthState,
+    evaluate_save_admission,
+)
+from core.diagnostics import get_logger
 from core.save_state import (SaveStateMachine, EngineEvent, OutcomeKind)
 from core.hotkey_manager import HotkeyManager
 from core.game_detector import GameDetector
@@ -1579,6 +1585,9 @@ class MainWindow(QMainWindow):
 
         self.engine_process = None
         self.bridge         = CaptureBridge()
+        self._capture_health = CaptureHealthMonitor()
+        self._capture_health_snapshot = None
+        self._capture_health_log = get_logger('capture.health')
 
         if sys.platform == 'win32':
             if getattr(sys, 'frozen', False):
@@ -2369,7 +2378,8 @@ class MainWindow(QMainWindow):
     def _on_focus_regained(self):
         if self.bridge.is_connected():
             self.bridge.resume_recording()
-            self._set_status('CAPTURING', status_active_qss())
+            # Resume is a request, not proof that fresh frames have returned.
+            self._set_status('CAPTURE STARTING', status_idle_qss())
 
     # =======================================================================
     # Settings handlers
@@ -2396,8 +2406,8 @@ class MainWindow(QMainWindow):
         for attempt in range(1, max_retries + 1):
             if self.bridge.initialize():
                 print(f"Connected to capture engine (attempt {attempt}).")
-                self._set_status('CAPTURING', status_active_qss())
-                self._set_rec_dot_state('capturing')
+                self._set_status('CAPTURE STARTING', status_idle_qss())
+                self._set_rec_dot_state('disconnected')
                 QTimer.singleShot(2000, self._check_hardware_encoding_status)
                 return True
             if attempt < max_retries:
@@ -2459,6 +2469,9 @@ class MainWindow(QMainWindow):
         audio_enabled = self.settings_manager.get('audio_capture_enabled', True)
         audio_arg = '1' if audio_enabled else '0'
         try:
+            # A process/backend restart starts a new replay generation. Keep the
+            # one-per-incident recovery budget, but never carry stale buffer age.
+            self._capture_health.reset(preserve_recovery_budget=True)
             self.engine_process = subprocess.Popen(
                 [str(self.engine_path),
                  str(self.capture_fps), str(self.buffer_seconds),
@@ -2486,8 +2499,8 @@ class MainWindow(QMainWindow):
                         return   # superseded by a newer start/restart
                     if self.bridge.initialize():
                         def _on_connected():
-                            self._set_status('CAPTURING', status_active_qss())
-                            self._set_rec_dot_state('capturing')
+                            self._set_status('CAPTURE STARTING', status_idle_qss())
+                            self._set_rec_dot_state('disconnected')
                             QTimer.singleShot(2000, self._check_hardware_encoding_status)
                             if not self._startup_sound_played:
                                 self._startup_sound_played = True
@@ -2655,6 +2668,27 @@ class MainWindow(QMainWindow):
             )
             return
 
+        admission = evaluate_save_admission(
+            self._capture_health_snapshot, duration_seconds)
+        if not admission.allowed:
+            self.capture_card.show_error()
+            self.push_error(
+                'CLIP NOT SAVED',
+                admission.reason,
+                level='warning',
+                actions=[('RESTART CAPTURE', self._restart_capture_engine)],
+            )
+            self._capture_health_log.warning(
+                'Save rejected by capture health: state=%s reason=%s',
+                (self._capture_health_snapshot.state.value
+                 if self._capture_health_snapshot else 'unknown'),
+                admission.reason,
+            )
+            return
+        if admission.reason:
+            self.push_error('REPLAY BUFFER WARMING', admission.reason, level='warning')
+        duration_seconds = admission.duration_seconds
+
         # Two admission gates, in order of cheapness:
         #
         # 1. The original 1-second debounce. Two saves in the same second
@@ -2797,8 +2831,7 @@ class MainWindow(QMainWindow):
     def _show_save_busy_feedback(self):
         """Visible answer to a hotkey we refused. Never confirms a clip."""
         self._set_status('SAVING…', status_idle_qss())
-        QTimer.singleShot(1000,
-            lambda: self._set_status('CAPTURING', status_active_qss()))
+        QTimer.singleShot(1000, self._update_status)
 
     # -----------------------------------------------------------------------
     # The save response channel — single reader, single interpreter
@@ -2869,8 +2902,7 @@ class MainWindow(QMainWindow):
         if outcome.kind is OutcomeKind.FAILED:
             self.capture_card.show_error()
             self._set_status('SAVE FAILED', status_warning_qss())
-            QTimer.singleShot(3000,
-                lambda: self._set_status('CAPTURING', status_active_qss()))
+            QTimer.singleShot(3000, self._update_status)
             self.push_error(
                 'CLIP WAS NOT SAVED',
                 outcome.detail or
@@ -2901,8 +2933,7 @@ class MainWindow(QMainWindow):
                       f'{output_path.name}')
                 self.capture_card.show_error()
                 self._set_status('SAVE FAILED', status_warning_qss())
-                QTimer.singleShot(3000,
-                    lambda: self._set_status('CAPTURING', status_active_qss()))
+                QTimer.singleShot(3000, self._update_status)
                 self.push_error(
                     'CLIP WAS NOT SAVED',
                     'The capture engine reported success but no clip file was '
@@ -2926,8 +2957,7 @@ class MainWindow(QMainWindow):
         self.clip_grid._known_files = None
         self.clip_grid._load_clips()
         self._set_status('SAVED', status_active_qss())
-        QTimer.singleShot(2000,
-            lambda: self._set_status('CAPTURING', status_active_qss()))
+        QTimer.singleShot(2000, self._update_status)
         res_label = _dims_to_label(self.capture_width, self.capture_height)
         self.capture_card.show_clip(duration_seconds, self.capture_fps, res_label)
 
@@ -2977,7 +3007,7 @@ class MainWindow(QMainWindow):
     def _on_upload_finished(self, path: str, success: bool, msg: str):
         if success:
             self._set_status('UPLOADED', status_active_qss())
-            QTimer.singleShot(2000, lambda: self._set_status('CAPTURING', status_active_qss()))
+            QTimer.singleShot(2000, self._update_status)
             self.capture_card.show_upload(os.path.basename(path))
             # Refresh the badge on the matching clip card if it's visible
             widget = self.clip_grid._thumb_widgets.get(path)
@@ -3497,6 +3527,8 @@ class MainWindow(QMainWindow):
             if self.bridge:
                 self.bridge.shutdown()
             self.bridge = CaptureBridge()
+            self._capture_health_snapshot = self._capture_health.observe(
+                connected=False, frame_count=0, engine_flags=0)
             self._set_status('ENGINE STOPPED', status_warning_qss())
             self.push_error(
                 'ENGINE STOPPED',
@@ -3518,8 +3550,8 @@ class MainWindow(QMainWindow):
                 self.bridge = CaptureBridge()
                 if self.bridge.initialize():
                     print("Reconnected to capture engine.")
-                    self._set_status('CAPTURING', status_active_qss())
-                    self._set_rec_dot_state('capturing')
+                    self._set_status('CAPTURE STARTING', status_idle_qss())
+                    self._set_rec_dot_state('disconnected')
                     self._reconnect_counter = 0
                     QTimer.singleShot(2000, self._check_hardware_encoding_status)
                     return
@@ -3529,6 +3561,8 @@ class MainWindow(QMainWindow):
 
         status = self.bridge.get_status()
         if not status.get('connected'):
+            self._capture_health_snapshot = self._capture_health.observe(
+                connected=False, frame_count=0, engine_flags=0)
             self._set_status('DISCONNECTED', status_warning_qss())
             self._set_rec_dot_state('disconnected')
             return
@@ -3547,24 +3581,89 @@ class MainWindow(QMainWindow):
             if lbl.text() != new_enc_text:
                 lbl.setText(new_enc_text)
         if self.is_capturing:
-            frames   = status.get('frames_captured', 0)
-            new_text = f'CAPTURING  {frames:,}f'
+            frames = status.get('frames_captured', 0)
+            snapshot = self._capture_health.observe(
+                connected=True,
+                frame_count=frames,
+                engine_flags=status.get('capture_health_flags', 0),
+                generation=status.get('capture_generation', 0),
+            )
+            self._capture_health_snapshot = snapshot
+            if snapshot.changed:
+                self._capture_health_log.info(
+                    'Capture health: %s -> %s reason=%s frame_count=%d generation=%d '
+                    'sample_sequence=%d suspicious_streak=%d luma_mean=%.2f '
+                    'luma_variance=%.2f',
+                    snapshot.previous_state.value.upper(),
+                    snapshot.state.value.upper(), snapshot.reason, frames,
+                    status.get('capture_generation', 0),
+                    status.get('content_sample_sequence', 0),
+                    status.get('content_suspicious_streak', 0),
+                    status.get('content_luma_mean', 0.0),
+                    status.get('content_luma_variance', 0.0),
+                )
+
+            state_text = {
+                CaptureHealthState.INITIALIZING: 'CAPTURE STARTING',
+                CaptureHealthState.HEALTHY: f'CAPTURING  {frames:,}f',
+                CaptureHealthState.DEGRADED: 'CAPTURE DEGRADED',
+                CaptureHealthState.CONTENT_SUSPECT: 'CAPTURE DEGRADED — DARK / UNIFORM',
+                CaptureHealthState.STALLED: 'CAPTURE STALLED',
+                CaptureHealthState.FAILED: 'CAPTURE FAILED',
+                CaptureHealthState.RECOVERING: 'RECOVERING CAPTURE',
+                CaptureHealthState.STOPPED: 'CAPTURE STOPPED',
+            }
+            new_text = state_text[snapshot.state]
+            style = (status_active_qss()
+                     if snapshot.state is CaptureHealthState.HEALTHY
+                     else status_idle_qss()
+                     if snapshot.state in {
+                         CaptureHealthState.INITIALIZING,
+                         CaptureHealthState.RECOVERING,
+                     }
+                     else status_warning_qss())
             if self.status_label.text() != new_text:
                 self.status_label.setText(new_text)
                 # setStyleSheet triggers a full re-style of the label and is
                 # expensive (~1ms). Only call it on actual style transitions —
                 # the frame count text updates twice/sec but the style stays
                 # status_active_qss() the whole time we're capturing.
-                if getattr(self, '_last_status_style', None) is not status_active_qss():
-                    self.status_label.setStyleSheet(status_active_qss())
-                    self._last_status_style = status_active_qss()
-            self._set_rec_dot_state('capturing')
+                if getattr(self, '_last_status_style', None) != style:
+                    self.status_label.setStyleSheet(style)
+                    self._last_status_style = style
+            self._set_rec_dot_state(
+                'capturing' if snapshot.state is CaptureHealthState.HEALTHY
+                else 'disconnected')
+
+            if snapshot.changed and snapshot.state is CaptureHealthState.CONTENT_SUSPECT:
+                self.push_error(
+                    'CAPTURE CONTENT LOOKS UNUSUAL',
+                    'Fresh frames are arriving, but the image has remained black '
+                    'or uniform. A dark or static scene may be intentional; check '
+                    'the capture source if it is not.',
+                    level='warning',
+                    actions=[('RESTART CAPTURE', self._restart_capture_engine)],
+                )
+            elif snapshot.changed and snapshot.state in {
+                    CaptureHealthState.STALLED, CaptureHealthState.FAILED}:
+                self.push_error(
+                    'CAPTURE IS NOT HEALTHY',
+                    'The capture engine is not receiving new frames. Clips are '
+                    'disabled until capture recovers.',
+                    level='error',
+                    actions=[('RESTART CAPTURE', self._restart_capture_engine)],
+                )
+
+            if snapshot.request_recovery:
+                self._capture_health_log.warning(
+                    'Capture stalled; bounded automatic backend recovery is '
+                    'engine-owned and a manual process restart is available')
 
     def _set_status(self, text: str, style: str):
         self.status_label.setText(text)
         # Skip the QSS reapply when the style didn't change (CONNECTING ticks
         # every 500ms during reconnect would otherwise re-style on every tick).
-        if getattr(self, '_last_status_style', None) is not style:
+        if getattr(self, '_last_status_style', None) != style:
             self.status_label.setStyleSheet(style)
             self._last_status_style = style
 

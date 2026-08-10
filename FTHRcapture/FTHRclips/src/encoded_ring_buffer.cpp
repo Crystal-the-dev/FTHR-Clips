@@ -246,5 +246,14 @@ namespace fthr {
         return snap;
     }
 
+    void EncodedRingBuffer::Clear() {
+        for (size_t i = 0; i < capacity_; ++i) {
+            slot_states_[i].store(static_cast<uint32_t>(SlotState::EMPTY),
+                                  std::memory_order_release);
+        }
+        count_.store(0, std::memory_order_release);
+        head_.store(0, std::memory_order_release);
+    }
+
 
 } // namespace fthr

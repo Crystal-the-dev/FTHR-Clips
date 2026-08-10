@@ -207,7 +207,7 @@ int main(int argc, char* argv[]) {
     // 3. Initialise shared memory IPC channel
     // ------------------------------------------------------------------
     fthr::SharedMemory memory;
-    if (!memory.Initialize(L"FTHR_SharedMemory_v3")) {
+    if (!memory.Initialize(L"FTHR_SharedMemory_v4")) {
         std::cerr << "[Fatal] Failed to create shared memory" << std::endl;
         std::cout << "Press Enter to exit...";
         std::cin.get();
@@ -229,6 +229,12 @@ int main(int argc, char* argv[]) {
     layout->ui_command = fthr::CommandType::NONE;
     layout->engine_response = fthr::ResponseType::NONE;
     layout->nvenc_active = false;
+    layout->capture_health_flags = fthr::CAPTURE_HEALTH_NONE;
+    layout->capture_generation = 0;
+    layout->content_sample_sequence = 0;
+    layout->content_suspicious_streak = 0;
+    layout->content_luma_mean = 0.0f;
+    layout->content_luma_variance = 0.0f;
 
     std::cout << "Shared memory ready (is_initialized = false until engine starts)." << std::endl;
 
@@ -256,6 +262,8 @@ int main(int argc, char* argv[]) {
     // NOW the engine is fully running — signal Python it's safe to connect.
     layout->is_initialized = true;
     layout->nvenc_active = engine.IsNvencActive();
+    layout->capture_health_flags = engine.GetCaptureHealthFlags();
+    layout->capture_generation = engine.GetCaptureGeneration();
 
     // Populate v2 fields so Python get_active_codec() returns a meaningful string.
     {
@@ -344,6 +352,12 @@ int main(int argc, char* argv[]) {
 
         layout->is_recording = engine.IsRecording();
         layout->frames_captured = engine.GetFrameCount();
+        layout->capture_health_flags = engine.GetCaptureHealthFlags();
+        layout->capture_generation = engine.GetCaptureGeneration();
+        layout->content_sample_sequence = engine.GetContentSampleSequence();
+        layout->content_suspicious_streak = engine.GetContentSuspiciousStreak();
+        layout->content_luma_mean = engine.GetContentLumaMean();
+        layout->content_luma_variance = engine.GetContentLumaVariance();
 
         // 20ms poll interval halves the main-thread wakeup rate compared to the
         // old 10ms while keeping SAVE_CLIP latency well below human perception

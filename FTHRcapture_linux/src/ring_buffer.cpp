@@ -52,4 +52,9 @@ size_t EncodedRingBuffer::PacketCount() const {
     return packets_.size();
 }
 
+void EncodedRingBuffer::Clear() {
+    std::lock_guard<std::mutex> lk(mutex_);
+    packets_.clear();
+}
+
 } // namespace fthr

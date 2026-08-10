@@ -93,6 +93,18 @@ namespace fthr {
         SAVE_STARTED = 6,   // Phase 3: async SaveClip queued successfully
     };
 
+    // v4 capture-health status bits.  These are continuous status, not command
+    // responses: publishing them must never consume or overwrite the save
+    // response slot owned by the UI.
+    enum CaptureHealthFlags : uint32_t {
+        CAPTURE_HEALTH_NONE            = 0,
+        CAPTURE_HEALTH_ACTIVE          = 1u << 0,
+        CAPTURE_HEALTH_RECOVERING      = 1u << 1,
+        CAPTURE_HEALTH_BACKEND_FAILED  = 1u << 2,
+        CAPTURE_HEALTH_CONTENT_SUSPECT = 1u << 3,
+        CAPTURE_HEALTH_PAUSED          = 1u << 4,
+    };
+
 
     // ---------------------------------------------------------------------------
     // SharedMemoryLayout
@@ -180,6 +192,16 @@ namespace fthr {
         // ------------------------------------------------------------------
         volatile bool     multiband_enabled;
         char              active_audio_mappings[1024]; // JSON blob: {app: category}
+
+        // ------------------------------------------------------------------
+        // v4 fields: capture/content health (C++ -> Python)
+        // ------------------------------------------------------------------
+        volatile uint32_t capture_health_flags;
+        volatile uint32_t capture_generation;       // increments after backend reset
+        volatile uint32_t content_sample_sequence;  // ~1 Hz; wraps harmlessly
+        volatile uint32_t content_suspicious_streak;
+        volatile float    content_luma_mean;        // derived metric only, no pixels
+        volatile float    content_luma_variance;    // derived metric only, no pixels
     };
 
 

@@ -35,6 +35,23 @@ struct SharedMemoryLayout {
     // v3 fields
     bool     multiband_enabled;
     char     active_audio_mappings[1024];
+
+    // v4 fields: typed capture state plus privacy-safe derived content metrics.
+    uint32_t capture_health_flags;
+    uint32_t capture_generation;
+    uint32_t content_sample_sequence;
+    uint32_t content_suspicious_streak;
+    float    content_luma_mean;
+    float    content_luma_variance;
+};
+
+enum CaptureHealthFlags : uint32_t {
+    CAPTURE_HEALTH_NONE            = 0,
+    CAPTURE_HEALTH_ACTIVE          = 1u << 0,
+    CAPTURE_HEALTH_RECOVERING      = 1u << 1,
+    CAPTURE_HEALTH_BACKEND_FAILED  = 1u << 2,
+    CAPTURE_HEALTH_CONTENT_SUSPECT = 1u << 3,
+    CAPTURE_HEALTH_PAUSED          = 1u << 4,
 };
 
 // ---------------------------------------------------------------------------

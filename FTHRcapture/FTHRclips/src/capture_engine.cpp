@@ -179,6 +179,7 @@ namespace fthr {
         , context_(nullptr)
         , duplication_(nullptr)
         , staging_texture_(nullptr)
+        , health_staging_texture_(nullptr)
         , nvenc_device_(nullptr)
         , nvenc_context_(nullptr)
         , wgc_active_(false)
@@ -471,6 +472,8 @@ namespace fthr {
         // Start video capture and save-clip threads.
         // Audio is already running so both clocks start together.
         running_.store(true);
+        capture_generation_.fetch_add(1);
+        capture_health_flags_.store(CAPTURE_HEALTH_ACTIVE);
 
         // Select capture thread function: WGC event-driven or DXGI polling loop.
         if (wgc_active_) {
@@ -659,6 +662,16 @@ namespace fthr {
 
     bool CaptureEngine::SaveClip(const wchar_t* path, uint32_t duration_seconds,
         SharedMemoryLayout* shared_memory) {
+
+        const uint32_t health = capture_health_flags_.load();
+        if (!running_.load() ||
+            (health & (CAPTURE_HEALTH_BACKEND_FAILED |
+                       CAPTURE_HEALTH_RECOVERING |
+                       CAPTURE_HEALTH_PAUSED))) {
+            SetEngineError(shared_memory,
+                L"Capture is not receiving new frames. Restart capture before saving.");
+            return false;
+        }
         std::cout << "[CaptureEngine] SaveClip: " << duration_seconds << "s" << std::endl;
 
         // ------------------------------------------------------------------
@@ -1657,6 +1670,124 @@ namespace fthr {
         return s;
     }
 
+    void CaptureEngine::PublishContentMetrics(
+        uint64_t sum, uint64_t sum_sq, uint32_t count) {
+        if (count == 0) return;
+        const float mean = static_cast<float>(sum) / count;
+        const float variance = std::max(
+            0.0f, static_cast<float>(sum_sq) / count - mean * mean);
+        const bool suspicious_sample =
+            (mean <= 8.0f && variance <= 6.0f) || variance <= 2.0f;
+        const uint32_t streak = suspicious_sample
+            ? content_suspicious_streak_.fetch_add(1) + 1
+            : 0;
+        if (!suspicious_sample) content_suspicious_streak_.store(0);
+        content_luma_mean_.store(mean);
+        content_luma_variance_.store(variance);
+        content_sample_sequence_.fetch_add(1);
+        if (streak >= 12)
+            capture_health_flags_.fetch_or(CAPTURE_HEALTH_CONTENT_SUSPECT);
+        else
+            capture_health_flags_.fetch_and(~CAPTURE_HEALTH_CONTENT_SUSPECT);
+    }
+
+    void CaptureEngine::SampleContentBGRA(
+        const uint8_t* data, uint32_t stride, uint32_t width,
+        uint32_t height, uint64_t produced_frame) {
+        if (!data || width == 0 || height == 0 || stride < width * 4 ||
+            produced_frame % std::max<uint32_t>(1, fps_) != 0)
+            return;
+        constexpr uint32_t kColumns = 16;
+        constexpr uint32_t kRows = 9;
+        uint64_t sum = 0;
+        uint64_t sum_sq = 0;
+        for (uint32_t row = 0; row < kRows; ++row) {
+            const uint32_t y = std::min(
+                height - 1, ((2 * row + 1) * height) / (2 * kRows));
+            for (uint32_t column = 0; column < kColumns; ++column) {
+                const uint32_t x = std::min(
+                    width - 1, ((2 * column + 1) * width) / (2 * kColumns));
+                const uint8_t* pixel = data + static_cast<size_t>(y) * stride + x * 4;
+                const uint32_t luma =
+                    (19u * pixel[0] + 183u * pixel[1] + 54u * pixel[2]) >> 8;
+                sum += luma;
+                sum_sq += luma * luma;
+            }
+        }
+        PublishContentMetrics(sum, sum_sq, kColumns * kRows);
+    }
+
+    void CaptureEngine::SampleContentTexture(
+        ID3D11Texture2D* texture, uint64_t produced_frame) {
+        if (!texture || produced_frame % std::max<uint32_t>(1, fps_) != 0)
+            return;
+        D3D11_TEXTURE2D_DESC source{};
+        texture->GetDesc(&source);
+        if (source.Width == 0 || source.Height == 0) return;
+
+        constexpr UINT kColumns = 16;
+        constexpr UINT kRows = 9;
+
+        if (!health_staging_texture_) {
+            D3D11_TEXTURE2D_DESC desc{};
+            desc.Width = kColumns;
+            desc.Height = kRows;
+            desc.MipLevels = 1;
+            desc.ArraySize = 1;
+            desc.Format = source.Format;
+            desc.SampleDesc.Count = 1;
+            desc.Usage = D3D11_USAGE_STAGING;
+            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            if (FAILED(device_->CreateTexture2D(&desc, nullptr,
+                                                &health_staging_texture_)))
+                return;
+        }
+
+        // Copy 144 distributed pixels into one tiny staging texture, then map
+        // once. A single centre strip falsely classified dark wallpapers and
+        // letterboxed scenes as uniform; the full sparse grid matches the CPU
+        // path without a full-frame GPU readback.
+        for (UINT row = 0; row < kRows; ++row) {
+            const UINT y = std::min(
+                source.Height - 1, ((2 * row + 1) * source.Height) / (2 * kRows));
+            for (UINT column = 0; column < kColumns; ++column) {
+                const UINT x = std::min(
+                    source.Width - 1,
+                    ((2 * column + 1) * source.Width) / (2 * kColumns));
+                D3D11_BOX box{x, y, 0, x + 1, y + 1, 1};
+                context_->CopySubresourceRegion(
+                    health_staging_texture_, 0, column, row, 0, texture, 0, &box);
+            }
+        }
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (FAILED(context_->Map(
+                health_staging_texture_, 0, D3D11_MAP_READ, 0, &mapped)))
+            return;
+        uint64_t sum = 0;
+        uint64_t sum_sq = 0;
+        const uint8_t* data = static_cast<const uint8_t*>(mapped.pData);
+        for (UINT row = 0; row < kRows; ++row) {
+            const uint8_t* pixels = data + static_cast<size_t>(row) * mapped.RowPitch;
+            for (UINT column = 0; column < kColumns; ++column) {
+                const uint8_t* pixel = pixels + column * 4;
+                const uint32_t luma =
+                    (19u * pixel[0] + 183u * pixel[1] + 54u * pixel[2]) >> 8;
+                sum += luma;
+                sum_sq += luma * luma;
+            }
+        }
+        context_->Unmap(health_staging_texture_, 0);
+        PublishContentMetrics(sum, sum_sq, kColumns * kRows);
+    }
+
+    void CaptureEngine::ClearReplayForRecovery() {
+        if (encoded_ring_) encoded_ring_->Clear();
+        ring_head_.store(0, std::memory_order_release);
+        ring_count_.store(0, std::memory_order_release);
+        content_suspicious_streak_.store(0);
+        capture_health_flags_.fetch_and(~CAPTURE_HEALTH_CONTENT_SUSPECT);
+    }
+
 
     // ===========================================================================
     // CaptureThread
@@ -1692,6 +1823,8 @@ namespace fthr {
             << target_ms << " ms/frame)  "
             << (nvenc_active_ ? "NVENC" : "software") << " path" << std::endl;
 
+        uint32_t consecutive_acquire_errors = 0;
+
         while (running_.load(std::memory_order_relaxed)) {
 
             DXGI_OUTDUPL_FRAME_INFO info{};
@@ -1703,11 +1836,18 @@ namespace fthr {
 
             if (hr == DXGI_ERROR_ACCESS_LOST) {
                 std::cerr << "[CaptureThread] Access lost - reinitializing DXGI..." << std::endl;
+                capture_health_flags_.store(CAPTURE_HEALTH_RECOVERING);
+                ClearReplayForRecovery();
                 ShutdownD3D11();
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 if (!InitializeD3D11()) {
                     std::cerr << "[CaptureThread] DXGI reinitialization failed." << std::endl;
+                    capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
                     running_.store(false);
+                } else {
+                    capture_generation_.fetch_add(1);
+                    capture_health_flags_.store(CAPTURE_HEALTH_ACTIVE);
+                    consecutive_acquire_errors = 0;
                 }
                 continue;
             }
@@ -1715,9 +1855,17 @@ namespace fthr {
             if (FAILED(hr)) {
                 std::cerr << "[CaptureThread] AcquireNextFrame failed: 0x"
                     << std::hex << hr << std::dec << std::endl;
+                if (++consecutive_acquire_errors >= 100) {
+                    std::cerr << "[CaptureThread] Too many consecutive acquisition errors"
+                              << std::endl;
+                    capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
+                    running_.store(false);
+                    break;
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
             }
+            consecutive_acquire_errors = 0;
 
             // Frame rate limiting BEFORE QueryInterface.
             // At high game FPS (e.g. 300fps, 60fps target) most frames are dropped.
@@ -1750,6 +1898,8 @@ namespace fthr {
                 // DXGI and NVENC share the same NVIDIA device.
                 // CopyResource is a pure GPU op — no CPU read, no stall.
                 // ----------------------------------------------------------
+                SampleContentTexture(
+                    tex, frames_captured_.load(std::memory_order_relaxed) + 1);
                 ID3D11Texture2D* input_tex = hw_encoder_.GetCurrentInputTexture();
                 context_->CopyResource(input_tex, tex);
                 tex->Release();
@@ -1783,6 +1933,10 @@ namespace fthr {
                     continue;
                 }
 
+                SampleContentBGRA(
+                    static_cast<const uint8_t*>(mapped.pData), mapped.RowPitch,
+                    width_, height_, frames_captured_.load(std::memory_order_relaxed) + 1);
+
                 hw_encoder_.EncodeFrameCPU(
                     static_cast<const uint8_t*>(mapped.pData),
                     mapped.RowPitch,
@@ -1815,6 +1969,10 @@ namespace fthr {
                 const size_t slot_idx  = write_pos % max_frames_;
                 uint8_t*     dst       = frame_pool_.GetSlot(slot_idx);
 
+                SampleContentBGRA(
+                    src, mapped.RowPitch, width_, height_,
+                    frames_captured_.load(std::memory_order_relaxed) + 1);
+
                 if (!pitched) {
                     std::memcpy(dst, src, row * height_);
                 }
@@ -1840,6 +1998,8 @@ namespace fthr {
 
         std::cout << "[CaptureThread] Stopped. Total frames: "
                   << frames_captured_.load() << std::endl;
+        if (capture_health_flags_.load() != CAPTURE_HEALTH_BACKEND_FAILED)
+            capture_health_flags_.store(CAPTURE_HEALTH_NONE);
     }
 
 
@@ -2139,6 +2299,7 @@ namespace fthr {
 
         LARGE_INTEGER last_capture;
         QueryPerformanceCounter(&last_capture);
+        uint32_t consecutive_frame_errors = 0;
 
         while (running_.load(std::memory_order_relaxed)) {
 
@@ -2155,22 +2316,25 @@ namespace fthr {
 
             if (!running_.load(std::memory_order_relaxed)) break;
 
-            // Consume the frame FIRST to return the buffer slot to the pool.
-            // WGC's Direct3D11CaptureFramePool has only 2 slots — if we
-            // skip TryGetNextFrame (e.g. via rate limiter 'continue'), the
-            // pool fills up and FrameArrived stops firing → 0 frames captured.
-            auto frame = wgc_state_->frame_pool.TryGetNextFrame();
-            if (!frame) continue;
+            try {
+                // Consume the frame FIRST to return the buffer slot to the pool.
+                // WGC's Direct3D11CaptureFramePool has only 2 slots — if we
+                // skip TryGetNextFrame (e.g. via rate limiter 'continue'), the
+                // pool fills up and FrameArrived stops firing → 0 frames captured.
+                // Acquisition itself can throw after a device/source loss, so it
+                // belongs inside the same bounded error path as surface access.
+                auto frame = wgc_state_->frame_pool.TryGetNextFrame();
+                if (!frame) continue;
 
-            // QPC frame rate limiter — frame already consumed above, so the
-            // pool slot is freed even when we skip processing this frame.
-            LARGE_INTEGER now;
-            QueryPerformanceCounter(&now);
-            if (now.QuadPart - last_capture.QuadPart < target_qpc) {
-                frames_dropped_.fetch_add(1, std::memory_order_relaxed);
-                continue;  // frame destructor returns buffer to pool
-            }
-            last_capture = now;
+                // QPC frame rate limiter — frame already consumed above, so the
+                // pool slot is freed even when we skip processing this frame.
+                LARGE_INTEGER now;
+                QueryPerformanceCounter(&now);
+                if (now.QuadPart - last_capture.QuadPart < target_qpc) {
+                    frames_dropped_.fetch_add(1, std::memory_order_relaxed);
+                    continue;  // frame destructor returns buffer to pool
+                }
+                last_capture = now;
 
             // Focus gate: when capturing for an anti-cheat game via monitor
             // capture, only encode frames while that game is in the foreground.
@@ -2180,13 +2344,18 @@ namespace fthr {
             if (focus_gated_ && target_hwnd_ != 0) {
                 HWND fg = GetForegroundWindow();
                 if (fg != reinterpret_cast<HWND>(target_hwnd_)) {
+                    const uint32_t content = capture_health_flags_.load() &
+                        CAPTURE_HEALTH_CONTENT_SUSPECT;
+                    capture_health_flags_.store(
+                        CAPTURE_HEALTH_ACTIVE | CAPTURE_HEALTH_PAUSED | content);
                     frames_dropped_.fetch_add(1, std::memory_order_relaxed);
                     continue;
                 }
             }
+            capture_health_flags_.fetch_and(~CAPTURE_HEALTH_PAUSED);
+            capture_health_flags_.fetch_or(CAPTURE_HEALTH_ACTIVE);
 
-            // Extract ID3D11Texture2D from the WGC surface
-            try {
+                // Extract ID3D11Texture2D from the WGC surface
                 auto surface = frame.Surface();
 
                 // IDirect3DDxgiInterfaceAccess is a COM interface in
@@ -2207,6 +2376,8 @@ namespace fthr {
                     // Frame is in NVIDIA VRAM, NVENC reads from same device.
                     // CopyResource is a pure GPU operation — no CPU stall.
                     // ----------------------------------------------------------
+                    SampleContentTexture(
+                        tex.get(), frames_captured_.load(std::memory_order_relaxed) + 1);
                     ID3D11Texture2D* input_tex = hw_encoder_.GetCurrentInputTexture();
                     context_->CopyResource(input_tex, tex.get());
                     hw_encoder_.EncodeFrame(now.QuadPart); // use rate-limiter QPC as frame timestamp
@@ -2227,6 +2398,10 @@ namespace fthr {
                                   << std::hex << hr << std::dec << std::endl;
                         continue;
                     }
+
+                    SampleContentBGRA(
+                        static_cast<const uint8_t*>(mapped.pData), mapped.RowPitch,
+                        width_, height_, frames_captured_.load(std::memory_order_relaxed) + 1);
 
                     hw_encoder_.EncodeFrameCPU(
                         static_cast<const uint8_t*>(mapped.pData),
@@ -2255,6 +2430,10 @@ namespace fthr {
                     const size_t   slot_idx  = write_pos % max_frames_;
                     uint8_t*       dst = frame_pool_.GetSlot(slot_idx);
 
+                    SampleContentBGRA(
+                        src, mapped.RowPitch, width_, height_,
+                        frames_captured_.load(std::memory_order_relaxed) + 1);
+
                     if (mapped.RowPitch == static_cast<UINT>(row)) {
                         std::memcpy(dst, src, row * height_);
                     } else {
@@ -2272,15 +2451,24 @@ namespace fthr {
                 }
 
                 frames_captured_.fetch_add(1, std::memory_order_relaxed);
+                consecutive_frame_errors = 0;
 
             } catch (winrt::hresult_error const& e) {
                 std::cerr << "[CaptureThread/WGC] Frame error: 0x"
                           << std::hex << e.code().value << std::dec << std::endl;
+                if (++consecutive_frame_errors >= 30) {
+                    std::cerr << "[CaptureThread/WGC] Too many consecutive frame errors"
+                              << std::endl;
+                    capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
+                    running_.store(false);
+                }
             }
         }
 
         std::cout << "[CaptureThread/WGC] Stopped. Frames captured: "
                   << frames_captured_.load() << std::endl;
+        if (capture_health_flags_.load() != CAPTURE_HEALTH_BACKEND_FAILED)
+            capture_health_flags_.store(CAPTURE_HEALTH_NONE);
 
         winrt::uninit_apartment();
     }
@@ -2670,6 +2858,10 @@ namespace fthr {
     // ===========================================================================
 
     void CaptureEngine::ShutdownD3D11() {
+        if (health_staging_texture_) {
+            health_staging_texture_->Release();
+            health_staging_texture_ = nullptr;
+        }
         if (staging_texture_) { staging_texture_->Release(); staging_texture_ = nullptr; }
         if (duplication_)     { duplication_->Release();     duplication_ = nullptr; }
         if (context_)         { context_->Release();         context_ = nullptr; }

@@ -15,6 +15,7 @@ namespace fthr {
 
 // Forward declaration to avoid circular include with capture_backend.h
 class ICaptureBackend;
+struct RawFrame;
 
 struct CaptureConfig {
     uint32_t    fps;
@@ -49,6 +50,12 @@ public:
     void SetPaused(bool p) { paused_.store(p); }
     bool IsPaused()  const { return paused_.load(); }
     uint64_t GetFrameCount()  const { return frame_count_.load(); }
+    uint32_t GetCaptureHealthFlags() const { return capture_health_flags_.load(); }
+    uint32_t GetCaptureGeneration() const { return capture_generation_.load(); }
+    uint32_t GetContentSampleSequence() const { return content_sample_sequence_.load(); }
+    uint32_t GetContentSuspiciousStreak() const { return content_suspicious_streak_.load(); }
+    float GetContentLumaMean() const { return content_luma_mean_.load(); }
+    float GetContentLumaVariance() const { return content_luma_variance_.load(); }
     void Reconfigure(uint32_t codec_pref, int preset);
     std::string GetActiveCodec() const {
         std::lock_guard<std::mutex> lk(codec_mutex_);
@@ -58,6 +65,8 @@ public:
 
 private:
     void CaptureLoop();
+    bool RunCaptureGeneration();
+    void SampleContent(const RawFrame& frame, uint64_t produced_frame);
 
     CaptureConfig                      cfg_{};
     std::unique_ptr<ICaptureBackend>   backend_;
@@ -69,6 +78,12 @@ private:
     std::atomic<bool>       paused_{false};
     std::atomic<bool>       nvenc_active_{false};
     std::atomic<uint64_t>   frame_count_{0};
+    std::atomic<uint32_t>   capture_health_flags_{CAPTURE_HEALTH_NONE};
+    std::atomic<uint32_t>   capture_generation_{0};
+    std::atomic<uint32_t>   content_sample_sequence_{0};
+    std::atomic<uint32_t>   content_suspicious_streak_{0};
+    std::atomic<float>      content_luma_mean_{0.0f};
+    std::atomic<float>      content_luma_variance_{0.0f};
     std::string active_codec_;
     mutable std::mutex codec_mutex_;
     AudioMultiCapture   multi_audio_;

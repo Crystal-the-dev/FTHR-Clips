@@ -1,11 +1,13 @@
 #include "capture_engine.h"
 #include "capture_backend.h"
+#include "recovery_policy.h"
 #include <chrono>
 #include <iostream>
 #include <cstring>
 #include <cstdio>
 #include <thread>
 #include <mutex>
+#include <algorithm>
 #include <time.h>
 
 namespace fthr {
@@ -66,11 +68,53 @@ void CaptureEngine::Shutdown() {
 // ---------------------------------------------------------------------------
 
 void CaptureEngine::CaptureLoop() {
+    CaptureRecoveryPolicy recovery(static_cast<uint64_t>(cfg_.fps) * 10);
+
+    while (running_.load()) {
+        const uint64_t frames_before = frame_count_.load();
+        if (recovery.Attempts() > 0)
+            capture_health_flags_.store(CAPTURE_HEALTH_RECOVERING);
+
+        if (RunCaptureGeneration()) break;
+        if (!running_.load()) break;
+
+        if (ring_) ring_->Clear();
+        content_suspicious_streak_.store(0);
+        const auto decision = recovery.OnGenerationFailed(
+            frame_count_.load() - frames_before);
+        if (decision.exhausted) {
+            std::cerr << "[Capture] Recovery exhausted after 3 attempts" << std::endl;
+            capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
+            // AUDIT-023: capture-thread state must become false on terminal
+            // backend failure.  The command loop stays alive to publish the
+            // typed failure and reject stale replay data.
+            running_.store(false);
+            break;
+        }
+
+        capture_health_flags_.store(CAPTURE_HEALTH_RECOVERING);
+        const auto backoff = decision.backoff;
+        std::cerr << "[Capture] Recovery attempt " << decision.attempt << "/3 in "
+                  << backoff.count() << " ms"
+                  << std::endl;
+        const bool continue_recovery = WaitForRecoveryBackoff(
+            backoff,
+            [this] { return running_.load(); },
+            [](std::chrono::milliseconds slice) {
+                std::this_thread::sleep_for(slice);
+            });
+        if (!continue_recovery) break;
+    }
+
+    if (capture_health_flags_.load() != CAPTURE_HEALTH_BACKEND_FAILED)
+        capture_health_flags_.store(CAPTURE_HEALTH_NONE);
+}
+
+bool CaptureEngine::RunCaptureGeneration() {
     backend_ = CreateBestBackend(cfg_);
     if (!backend_) {
         std::cerr << "[Capture] No capture backend available — exiting" << std::endl;
-        running_.store(false);
-        return;
+        return false;
     }
 
     uint32_t native_w = backend_->NativeWidth();
@@ -106,11 +150,14 @@ void CaptureEngine::CaptureLoop() {
     if (!encoder_.Open(enc_cfg, codec_used)) {
         std::cerr << "[Capture] Encoder open failed" << std::endl;
         backend_->Shutdown();
-        running_.store(false);
-        return;
+        return false;
     }
     nvenc_active_.store(codec_used.find("nvenc") != std::string::npos);
     { std::lock_guard<std::mutex> lk(codec_mutex_); active_codec_ = codec_used; }
+    capture_generation_.fetch_add(1);
+    capture_health_flags_.store(CAPTURE_HEALTH_ACTIVE);
+    if (ring_) ring_->Clear();
+    content_suspicious_streak_.store(0);
 
     int64_t frame_ns       = 1'000'000'000LL / cfg_.fps;
     int64_t next_encode_ns = 0;
@@ -121,9 +168,14 @@ void CaptureEngine::CaptureLoop() {
 
     while (running_.load()) {
         if (paused_.load()) {
+            capture_health_flags_.store(
+                CAPTURE_HEALTH_ACTIVE | CAPTURE_HEALTH_PAUSED);
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
         }
+        capture_health_flags_.store(
+            CAPTURE_HEALTH_ACTIVE |
+            (capture_health_flags_.load() & CAPTURE_HEALTH_CONTENT_SUSPECT));
 
         RawFrame raw;
         if (!backend_->CaptureFrame(raw)) {
@@ -137,6 +189,8 @@ void CaptureEngine::CaptureLoop() {
         if (raw.timestamp_ns < next_encode_ns) continue;
         next_encode_ns += frame_ns;
 
+        const uint64_t produced = frame_count_.load() + 1;
+        SampleContent(raw, produced);
         encoder_.EncodeFrame(raw.data, raw.stride, raw.timestamp_ns,
             [this](EncodedPacket pkt) { ring_->Push(std::move(pkt)); });
 
@@ -144,7 +198,59 @@ void CaptureEngine::CaptureLoop() {
     }
 
     backend_->Shutdown();
+    backend_.reset();
+    encoder_.Close();
+    nvenc_active_.store(false);
     std::cout << "[Capture] Loop exited. Frames: " << frame_count_.load() << std::endl;
+    return !running_.load();
+}
+
+void CaptureEngine::SampleContent(const RawFrame& frame, uint64_t produced_frame) {
+    // 16x9 sparse samples once per configured second: 144 pixels, no retained
+    // image, no logging and no full-frame scan. Repeated normal imagery is
+    // allowed; only sustained black-like/uniform samples become suspect.
+    if (!frame.data || frame.width == 0 || frame.height == 0 ||
+            frame.stride < frame.width * 4)
+        return;
+    const uint64_t cadence = std::max<uint32_t>(1, cfg_.fps);
+    if (produced_frame % cadence != 0) return;
+
+    constexpr uint32_t kColumns = 16;
+    constexpr uint32_t kRows = 9;
+    constexpr uint32_t kCount = kColumns * kRows;
+    uint64_t sum = 0;
+    uint64_t sum_sq = 0;
+    for (uint32_t row = 0; row < kRows; ++row) {
+        const uint32_t y = std::min(
+            frame.height - 1, ((2 * row + 1) * frame.height) / (2 * kRows));
+        for (uint32_t column = 0; column < kColumns; ++column) {
+            const uint32_t x = std::min(
+                frame.width - 1, ((2 * column + 1) * frame.width) / (2 * kColumns));
+            const uint8_t* pixel = frame.data +
+                static_cast<size_t>(y) * frame.stride + x * 4;
+            const uint32_t luma =
+                (19u * pixel[0] + 183u * pixel[1] + 54u * pixel[2]) >> 8;
+            sum += luma;
+            sum_sq += luma * luma;
+        }
+    }
+    const float mean = static_cast<float>(sum) / kCount;
+    const float variance = std::max(
+        0.0f, static_cast<float>(sum_sq) / kCount - mean * mean);
+    const bool suspicious_sample =
+        (mean <= 8.0f && variance <= 6.0f) || variance <= 2.0f;
+    const uint32_t streak = suspicious_sample
+        ? content_suspicious_streak_.fetch_add(1) + 1
+        : 0;
+    if (!suspicious_sample) content_suspicious_streak_.store(0);
+
+    content_luma_mean_.store(mean);
+    content_luma_variance_.store(variance);
+    content_sample_sequence_.fetch_add(1);
+    uint32_t flags = capture_health_flags_.load();
+    if (streak >= 12) flags |= CAPTURE_HEALTH_CONTENT_SUSPECT;
+    else flags &= ~CAPTURE_HEALTH_CONTENT_SUSPECT;
+    capture_health_flags_.store(flags);
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +301,15 @@ static void write_pcm_wav(const std::string& path,
 
 bool CaptureEngine::SaveClip(const std::string& path, uint32_t duration_sec,
                                SharedMemoryLayout* shm) {
-    if (!ring_) return false;
+    const uint32_t health = capture_health_flags_.load();
+    if (!ring_ || !running_.load() || paused_.load() ||
+            (health & (CAPTURE_HEALTH_BACKEND_FAILED |
+                       CAPTURE_HEALTH_RECOVERING |
+                       CAPTURE_HEALTH_PAUSED))) {
+        std::cerr << "[SaveClip] Refused because capture is not producing frames"
+                  << std::endl;
+        return false;
+    }
 
     uint32_t duration_ms = duration_sec * 1000;
     auto video_packets   = ring_->TakeSnapshot(duration_ms);

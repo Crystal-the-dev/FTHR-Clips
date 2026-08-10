@@ -63,6 +63,7 @@
 #include "encoded_ring_buffer.h" // EncodedRingBuffer
 #include "audio_capture.h"       // AudioCapture (WASAPI loopback -> PCM ring)
 #include "audio_ring_buffer.h"   // AudioRingBuffer (raw float32 PCM)
+#include "shared_memory.h"       // typed v4 capture-health flags
 
 
 namespace fthr {
@@ -143,6 +144,12 @@ namespace fthr {
         bool     IsRecording()   const;
         uint64_t GetFrameCount() const;
         bool     IsNvencActive() const { return nvenc_active_; }
+        uint32_t GetCaptureHealthFlags() const { return capture_health_flags_.load(); }
+        uint32_t GetCaptureGeneration() const { return capture_generation_.load(); }
+        uint32_t GetContentSampleSequence() const { return content_sample_sequence_.load(); }
+        uint32_t GetContentSuspiciousStreak() const { return content_suspicious_streak_.load(); }
+        float GetContentLumaMean() const { return content_luma_mean_.load(); }
+        float GetContentLumaVariance() const { return content_luma_variance_.load(); }
 
         struct Stats {
             uint64_t frames_captured;
@@ -184,6 +191,11 @@ namespace fthr {
         void ShutdownWGC();
         bool InitializeD3D11();           // DXGI desktop capture (active default)
         void ShutdownD3D11();
+        void SampleContentBGRA(const uint8_t* data, uint32_t stride,
+            uint32_t width, uint32_t height, uint64_t produced_frame);
+        void SampleContentTexture(ID3D11Texture2D* texture, uint64_t produced_frame);
+        void PublishContentMetrics(uint64_t sum, uint64_t sum_sq, uint32_t count);
+        void ClearReplayForRecovery();
 
         // -----------------------------------------------------------------------
         // D3D11 state (shared by WGC and DXGI paths)
@@ -192,6 +204,7 @@ namespace fthr {
         ID3D11DeviceContext*    context_;
         IDXGIOutputDuplication* duplication_;      // null when WGC is active
         ID3D11Texture2D*        staging_texture_;  // null on WGC+NVENC path
+        ID3D11Texture2D*        health_staging_texture_; // 16x9 grid, sampled ~1 Hz
 
         // Optimus state: capture on Intel adapter, NVENC on separate NVIDIA device.
         // Used by both DXGI and WGC paths on Optimus laptops.
@@ -296,6 +309,12 @@ namespace fthr {
         // -----------------------------------------------------------------------
         std::atomic<uint64_t> frames_captured_;
         std::atomic<uint64_t> frames_dropped_;
+        std::atomic<uint32_t> capture_health_flags_{CAPTURE_HEALTH_NONE};
+        std::atomic<uint32_t> capture_generation_{0};
+        std::atomic<uint32_t> content_sample_sequence_{0};
+        std::atomic<uint32_t> content_suspicious_streak_{0};
+        std::atomic<float> content_luma_mean_{0.0f};
+        std::atomic<float> content_luma_variance_{0.0f};
     };
 
 
