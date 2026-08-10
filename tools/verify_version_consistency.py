@@ -10,7 +10,7 @@ them disagrees.
 Exit code 0 = consistent, 1 = drift found.
 
 Deliberately NOT checked here:
-  - CaptureBridge.SHARED_MEM_NAME ('FTHR_SharedMemory_v3'). That is the IPC
+  - CaptureBridge.SHARED_MEM_NAME ('FTHR_SharedMemory_v4'). That is the IPC
     layout contract, not the product version. It only changes when the struct
     changes. tools/verify_shared_memory_contract.py owns it.
 """

@@ -93,7 +93,7 @@ FTHRcapture_linux/build/FTHRclips 30 10 1280 720 6000 0 0 0 0 "" 0 4 0 1
 Expected on a machine with no wlroots compositor:
 
 ```
-[SHM] Created: /dev/shm/FTHR_SharedMemory_v3
+[SHM] Created: /dev/shm/FTHR_SharedMemory_v4
 [WlrBackend] zwlr_screencopy_manager_v1 not available — compositor must support wlr-screencopy
 [ExtBackend] ext-image-copy-capture not available
 [Backend] Using x11grab
@@ -103,8 +103,8 @@ Expected on a machine with no wlroots compositor:
 Then, in another shell, check the shared memory:
 
 ```bash
-ls -l /dev/shm/FTHR_SharedMemory_v3      # must be yours, mode 600
-stat -c %s /dev/shm/FTHR_SharedMemory_v3 # must equal ctypes.sizeof(SharedMemoryLayout) = 4248
+ls -l /dev/shm/FTHR_SharedMemory_v4      # must be yours, mode 600
+stat -c %s /dev/shm/FTHR_SharedMemory_v4 # must equal ctypes.sizeof(SharedMemoryLayout) = 4272
 ```
 
 A size mismatch means the running engine was built from a different

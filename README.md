@@ -129,7 +129,7 @@ Visual Studio 2022 + Python 3.14. See [`BUILDING.md`](BUILDING.md) for the full 
 ## Architecture
 
 ```
-┌─────────────────────┐     Shared Memory (v3)     ┌────────────────────────┐
+┌─────────────────────┐     Shared Memory (v4)     ┌────────────────────────┐
 │   FTHR_UI (Python)  │ ◄─────────────────────────► │  FTHRcapture (C++)     │
 │   PyQt6 frontend    │                              │  wlr-screencopy engine │
 │   Settings / Upload │     Unix Socket (hotkeys)    │  FFmpeg encoder        │

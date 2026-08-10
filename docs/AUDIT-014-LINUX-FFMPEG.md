@@ -4,6 +4,11 @@
 **Status:** `AUDIT-014 CONDITIONALLY RESOLVED`
 **Worked in:** Ubuntu 24.04.3 LTS under WSL2 + WSLg · CPython 3.12.3 · GCC 13.3.0 · CMake 3.28.3 · NVIDIA RTX 4060 Ti (driver 610.62)
 
+> **Historical layout note (2026-08-10):** the v3 mapping and 4248-byte size
+> below were accurate for this audit run. Capture-health fields later moved the
+> live IPC contract to `FTHR_SharedMemory_v4` (4272 bytes on Linux); see the
+> [capture-health remediation](AUDIT-022-023-035-CAPTURE-HEALTH.md).
+
 This is the full record of the work: what was measured, what was decided and
 why, what changed, what was verified, and what remains unverified.
 

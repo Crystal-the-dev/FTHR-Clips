@@ -379,13 +379,9 @@ class CaptureBridge:
     #   Success path — the engine clears engine_string at SAVE_CLIP and writes
     #   engine_response last, so a peeked CLIP_SAVED always has a settled
     #   string (usually empty).
-    #   Failure path on Linux — FTHRcapture_linux/src/main.cpp writes
-    #   engine_response = ERROR_OCCURRED *before* snprintf'ing the message.
-    #   A peek landing in that window sees ERROR_OCCURRED with an empty string.
-    #   That is a genuine (small) race in the engine; the consequence is a
-    #   missing detail message, never a wrong one, because engine_string is
-    #   cleared at the start of every save. Callers must therefore tolerate an
-    #   empty detail on failure and substitute their own text.
+    #   Failure path — both engines write the bounded error payload before
+    #   publishing ERROR_OCCURRED. Callers still tolerate an empty detail as
+    #   defense in depth for an older engine or an unmapped/shutting-down IPC.
 
     #: Responses that belong to a save. Everything else (STATUS_UPDATE,
     #: RECORDING_STARTED, …) is not ours and must be left in the field.

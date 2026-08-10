@@ -14,7 +14,7 @@
 #
 # What this file is NOT:
 #   It is not the shared-memory contract version. The IPC layout is versioned
-#   independently through CaptureBridge.SHARED_MEM_NAME ('FTHR_SharedMemory_v3')
+#   independently through CaptureBridge.SHARED_MEM_NAME ('FTHR_SharedMemory_v4')
 #   and must only change when the struct layout itself changes. Do not bump it
 #   because the product version moved.
 

@@ -8,7 +8,7 @@ Two running instances are actively destructive, not merely redundant:
   * Both spawn a capture engine. Two engines encode the same screen in
     parallel — double GPU/NVENC load, and on machines with a single NVENC
     session limit the second engine fails in a way that looks like a bug.
-  * Both map ``FTHR_SharedMemory_v3``. The command/response fields are a
+  * Both map ``FTHR_SharedMemory_v4``. The command/response fields are a
     single-writer contract; two UIs writing ``ui_command`` interleave and
     each one consumes the other's ``engine_response``, so saves time out.
   * On Linux the second instance calls ``os.unlink()`` on

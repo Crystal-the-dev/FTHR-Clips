@@ -4,6 +4,12 @@
 **Authoritative tree:** `C:\Users\Tom\Desktop\FTHR_Clips_source\FTHR_Clips`
 **Last updated:** 2026-08-07
 
+> **Historical layout note (2026-08-10):** measurements below that name
+> `FTHR_SharedMemory_v3` describe the layout at the time of this audit. The
+> capture-health remediation later extended the contract and moved the live
+> mapping to `FTHR_SharedMemory_v4`; see
+> [the dedicated AUDIT-022/023/035 report](AUDIT-022-023-035-CAPTURE-HEALTH.md).
+
 This is the single audit document for the project. It merges six passes:
 
 | Pass | Date | Scope | Environment |

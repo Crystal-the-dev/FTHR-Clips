@@ -27,7 +27,7 @@ edited, built from, or copied back over the tree above.
 | `Desktop\clipping\` | Abandoned C++ stub from 05/2026 | Archive or delete |
 | `Desktop\FTHR_CLIPS_BACKUP(1)\` | Ad-hoc folder backup | Archive or delete |
 | `Desktop\FTHR_Clips\` | Empty directory | Delete |
-| `Desktop\CLAUDE.md` | Notes describing an `engine/` + `ui/` layout that no longer exists, and shared memory `_v1` (current is `_v3`) | **Delete or replace** — see below |
+| `Desktop\CLAUDE.md` | Notes describing an `engine/` + `ui/` layout that no longer exists, and shared memory `_v1` (current is `_v4`) | **Delete or replace** — see below |
 
 ### Recommended manual cleanup
 

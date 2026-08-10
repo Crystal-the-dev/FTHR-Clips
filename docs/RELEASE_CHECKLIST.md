@@ -88,13 +88,13 @@ Everything else below is either already green or is honest, tracked work.
 | 4.4 | Installer version matches | **PASS** — `installer_windows.iss`, gated |
 | 4.5 | AppImage filename carries the version | **PASS** — derived in `build_linux.sh` |
 | 4.6 | UI, About dialog and log banner report the version | **PASS** |
-| 4.7 | Shared-memory contract version NOT bumped for a product release | **PASS** — still `FTHR_SharedMemory_v3` |
+| 4.7 | Shared-memory contract changes carry a new mapping version | **PASS** — deliberately bumped to `FTHR_SharedMemory_v4` for typed capture-health fields (AUDIT-022/023/035) |
 
 ## 5. Code and contract
 
 | # | Gate | Status |
 |---|---|---|
-| 5.1 | `python -m pytest tests/` green | **PASS** — Windows 112 passed / 27 skipped; **Linux 138 passed / 1 skipped** (2026-08-06, Ubuntu 24.04, CPython 3.12.3) |
+| 5.1 | `python -m pytest tests/` green | **PASS** — Windows **330 passed / 29 skipped** (2026-08-10); Linux native recovery CTest **1/1 passed** under Ubuntu 24.04 / WSL2 |
 | 5.2 | `python -m ruff check .` clean | **PASS** |
 | 5.3 | `python -m compileall FTHR_UI tests tools` clean | **PASS** |
 | 5.4 | `tools/verify_shared_memory_contract.py` | **PASS** — 23 fields, 2712 B (win32) / 4248 B (linux), enums and reserved slots 4–9 intact |

@@ -25,7 +25,7 @@ Also checked:
   - CommandType / ResponseType enum values match on all three sides
   - the deprecated SET_* command slots 4..9 are still occupied, so a future
     command cannot silently reuse a number an old engine still answers to
-  - the mapping name still carries a layout version suffix (_v3)
+  - the mapping name still carries a layout version suffix (_v4)
 
 Not checked (cannot be, from source alone):
   - that the running engine binary was built from these headers. That is what
