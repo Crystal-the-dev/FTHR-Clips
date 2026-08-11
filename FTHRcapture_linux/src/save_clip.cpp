@@ -1,4 +1,5 @@
 #include "save_clip.h"
+#include "transactional_save.h"
 #include <iostream>
 #include <cstring>
 
@@ -24,7 +25,7 @@ static void set_shm_bytes(SharedMemoryLayout* shm, uint64_t bytes) {
 // save_clip_to_file
 // ---------------------------------------------------------------------------
 
-bool save_clip_to_file(
+static bool write_clip_to_temporary_file(
     const std::string&               path,
     const std::vector<EncodedPacket>& video_packets,
     const std::vector<float>&        audio_pcm,
@@ -35,10 +36,12 @@ bool save_clip_to_file(
     uint32_t                         width,
     uint32_t                         height,
     AVCodecID                        video_codec_id,
-    SharedMemoryLayout*              shm
+    SharedMemoryLayout*              shm,
+    std::string&                     error_message
 ) {
     if (video_packets.empty()) {
         std::cerr << "[SaveClip] No video packets to write" << std::endl;
+        error_message = "Nothing to save: the replay buffer contains no video packets";
         return false;
     }
 
@@ -48,9 +51,10 @@ bool save_clip_to_file(
     bool ok = true;
 
     AVFormatContext* fmt_ctx = nullptr;
-    if (avformat_alloc_output_context2(&fmt_ctx, nullptr, nullptr,
+    if (avformat_alloc_output_context2(&fmt_ctx, nullptr, "mp4",
                                         path.c_str()) < 0) {
         std::cerr << "[SaveClip] avformat_alloc_output_context2 failed" << std::endl;
+        error_message = "Failed to create the MP4 output container for the temporary clip";
         return false;
     }
 
@@ -60,6 +64,7 @@ bool save_clip_to_file(
     AVStream* vid_stream = avformat_new_stream(fmt_ctx, nullptr);
     if (!vid_stream) {
         avformat_free_context(fmt_ctx);
+        error_message = "Failed to create the video stream in the temporary clip";
         return false;
     }
     vid_stream->id         = 0;
@@ -178,6 +183,8 @@ skip_audio_setup:
     if (!(fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
         if (avio_open(&fmt_ctx->pb, path.c_str(), AVIO_FLAG_WRITE) < 0) {
             std::cerr << "[SaveClip] avio_open failed: " << path << std::endl;
+            error_message = "Could not open the temporary clip for writing; check free disk "
+                "space and folder permissions: " + path;
             ok = false;
             goto cleanup;
         }
@@ -185,6 +192,7 @@ skip_audio_setup:
 
     if (avformat_write_header(fmt_ctx, nullptr) < 0) {
         std::cerr << "[SaveClip] avformat_write_header failed" << std::endl;
+        error_message = "Failed to write the MP4 header for the temporary clip: " + path;
         ok = false;
         goto cleanup;
     }
@@ -220,6 +228,8 @@ skip_audio_setup:
                 av_strerror(ret, errbuf, sizeof(errbuf));
                 std::cerr << "[SaveClip] av_interleaved_write_frame failed: "
                           << errbuf << std::endl;
+                error_message = "Failed while writing video packets to the temporary clip: "
+                    + std::string(errbuf);
                 ok = false;
                 goto cleanup;
             }
@@ -256,10 +266,18 @@ skip_audio_setup:
 
             if (avcodec_send_frame(aac_ctx, aac_frame) < 0) {
                 std::cerr << "[SaveClip] avcodec_send_frame (audio) failed\n";
+                error_message = "Failed while encoding audio for the temporary clip";
                 ok = false;
                 goto cleanup;
             }
-            while (avcodec_receive_packet(aac_ctx, aac_pkt) == 0) {
+            while (true) {
+                const int receive_ret = avcodec_receive_packet(aac_ctx, aac_pkt);
+                if (receive_ret == AVERROR(EAGAIN) || receive_ret == AVERROR_EOF) break;
+                if (receive_ret < 0) {
+                    error_message = "Failed while receiving encoded audio for the temporary clip";
+                    ok = false;
+                    goto cleanup;
+                }
                 aac_pkt->stream_index = aud_stream->index;
                 av_packet_rescale_ts(aac_pkt,
                     { 1, audio_sample_rate },
@@ -270,6 +288,8 @@ skip_audio_setup:
                     char errbuf[128];
                     av_strerror(wret, errbuf, sizeof(errbuf));
                     std::cerr << "[SaveClip] audio write failed: " << errbuf << "\n";
+                    error_message = "Failed while writing audio packets to the temporary clip: "
+                        + std::string(errbuf);
                     ok = false;
                     goto cleanup;
                 }
@@ -280,23 +300,44 @@ skip_audio_setup:
         }
 
         // Flush AAC encoder
-        avcodec_send_frame(aac_ctx, nullptr);
-        while (avcodec_receive_packet(aac_ctx, aac_pkt) == 0) {
+        int flush_ret = avcodec_send_frame(aac_ctx, nullptr);
+        if (flush_ret < 0 && flush_ret != AVERROR_EOF) {
+            error_message = "Failed while finalizing audio for the temporary clip";
+            ok = false;
+            goto cleanup;
+        }
+        while (true) {
+            flush_ret = avcodec_receive_packet(aac_ctx, aac_pkt);
+            if (flush_ret == AVERROR(EAGAIN) || flush_ret == AVERROR_EOF) break;
+            if (flush_ret < 0) {
+                error_message = "Failed while draining audio for the temporary clip";
+                ok = false;
+                goto cleanup;
+            }
             aac_pkt->stream_index = aud_stream->index;
             av_packet_rescale_ts(aac_pkt,
                 { 1, audio_sample_rate },
                 aud_stream->time_base);
-            if (av_interleaved_write_frame(fmt_ctx, aac_pkt) < 0) {
+            flush_ret = av_interleaved_write_frame(fmt_ctx, aac_pkt);
+            if (flush_ret < 0) {
                 av_packet_unref(aac_pkt);
-                break;   // flush errors are non-fatal — trailer will still finalize
+                error_message = "Failed while writing finalized audio to the temporary clip";
+                ok = false;
+                goto cleanup;
             }
             av_packet_unref(aac_pkt);
         }
     }
 
     if (ok) {
-        av_write_trailer(fmt_ctx);
-        std::cout << "[SaveClip] Written: " << path << std::endl;
+        const int trailer_ret = av_write_trailer(fmt_ctx);
+        if (trailer_ret < 0) {
+            char errbuf[128];
+            av_strerror(trailer_ret, errbuf, sizeof(errbuf));
+            error_message = "Failed to finalize the temporary MP4 container: "
+                + std::string(errbuf);
+            ok = false;
+        }
     }
 
 cleanup:
@@ -305,11 +346,71 @@ cleanup:
     if (swr_ctx)   swr_free(&swr_ctx);
     if (aac_ctx)   avcodec_free_context(&aac_ctx);
     if (fmt_ctx) {
-        if (fmt_ctx->pb && !(fmt_ctx->oformat->flags & AVFMT_NOFILE))
-            avio_closep(&fmt_ctx->pb);
+        if (fmt_ctx->pb && !(fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
+            const int close_ret = avio_closep(&fmt_ctx->pb);
+            if (close_ret < 0) {
+                if (ok) {
+                    char errbuf[128];
+                    av_strerror(close_ret, errbuf, sizeof(errbuf));
+                    error_message = "Failed to close the temporary clip: "
+                        + std::string(errbuf);
+                    ok = false;
+                } else {
+                    std::cerr << "[SaveClip] Secondary close failure: "
+                              << close_ret << std::endl;
+                }
+            }
+        }
         avformat_free_context(fmt_ctx);
     }
     return ok;
+}
+
+bool save_clip_to_file(
+    const std::string&               path,
+    const std::vector<EncodedPacket>& video_packets,
+    const std::vector<float>&        audio_pcm,
+    int                              audio_sample_rate,
+    int                              audio_channels,
+    const std::vector<uint8_t>&      extradata,
+    uint32_t                         fps,
+    uint32_t                         width,
+    uint32_t                         height,
+    AVCodecID                        video_codec_id,
+    SharedMemoryLayout*              shm,
+    std::string*                     error_message
+) {
+    const auto result = transactional_save::Run(
+        path,
+        [&](const std::filesystem::path& temporary_path, std::string& writer_error) {
+            return write_clip_to_temporary_file(
+                temporary_path.string(),
+                video_packets,
+                audio_pcm,
+                audio_sample_rate,
+                audio_channels,
+                extradata,
+                fps,
+                width,
+                height,
+                video_codec_id,
+                shm,
+                writer_error);
+        });
+
+    if (result.cleanup_error) {
+        std::cerr << "[SaveClip] Secondary cleanup failure for "
+                  << result.temporary_path << ": "
+                  << result.cleanup_error.message() << std::endl;
+    }
+    if (!result.success) {
+        if (error_message)
+            *error_message = transactional_save::DescribeFailure(result);
+        return false;
+    }
+
+    std::cout << "[SaveClip] Committed: " << path << std::endl;
+    return true;
 }
 
 } // namespace fthr

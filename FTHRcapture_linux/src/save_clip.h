@@ -27,7 +27,8 @@ bool save_clip_to_file(
     uint32_t                         width,
     uint32_t                         height,
     AVCodecID                        video_codec_id,
-    SharedMemoryLayout*              shm
+    SharedMemoryLayout*              shm,
+    std::string*                     error_message
 );
 
 } // namespace fthr

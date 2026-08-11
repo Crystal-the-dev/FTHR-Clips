@@ -208,14 +208,18 @@ int main(int argc, char* argv[]) {
                 std::cout << "[FTHR] SAVE_CLIP -> " << out_path
                           << " (" << duration_sec << "s)" << std::endl;
 
-                bool ok = engine.SaveClip(out_path, duration_sec, layout);
+                std::string save_error;
+                bool ok = engine.SaveClip(
+                    out_path, duration_sec, layout, &save_error);
 
                 // Payload first, response last (AUDIT-018). The previous order
                 // published ERROR_OCCURRED and only then wrote the message, so
                 // a UI polling in between saw a failure with no explanation.
                 if (!ok)
                     fthr::set_engine_string(
-                        layout, "SaveClip failed: " + out_path);
+                        layout, save_error.empty()
+                            ? "SaveClip failed: " + out_path
+                            : save_error);
                 layout->engine_response = ok
                     ? static_cast<uint32_t>(fthr::ResponseType::CLIP_SAVED)
                     : static_cast<uint32_t>(fthr::ResponseType::ERROR_OCCURRED);

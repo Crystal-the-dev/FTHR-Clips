@@ -57,6 +57,7 @@
 #include "audio_capture.h"
 #include "audio_ring_buffer.h"
 #include "audio_encoder.h"
+#include "transactional_save.h"
 #include <iostream>
 #include <chrono>
 #include <cstring>
@@ -648,7 +649,9 @@ namespace fthr {
             }
         }
 
-        encoder.Finalize();
+        if (!encoder.Finalize()) {
+            std::cerr << "[EncodeThread] Encoder finalization failed" << std::endl;
+        }
         std::cout << "[EncodeThread] Done." << std::endl;
     }
 
@@ -835,16 +838,51 @@ namespace fthr {
 
 
     // ===========================================================================
-    // ProcessSaveClipTask - dispatches to encoded or raw path
+    // ProcessSaveClipTask - transactional wrapper around both media writers
     // ===========================================================================
 
     bool CaptureEngine::ProcessSaveClipTask(const SaveClipTask& task) {
-        if (task.use_encoded_path) {
-            return MuxEncodedClip(task);
+        const auto result = transactional_save::Run(
+            task.output_path,
+            [this, &task](const std::filesystem::path& temporary_path,
+                          std::string&) {
+                const std::wstring output_path = temporary_path.wstring();
+                return task.use_encoded_path
+                    ? MuxEncodedClip(task, output_path)
+                    : EncodeRawClip(task, output_path);
+            });
+
+        if (result.cleanup_error) {
+            std::wcerr << L"[SaveClip] Secondary cleanup failure for "
+                << result.temporary_path.wstring() << L": "
+                << result.cleanup_error.value() << std::endl;
         }
-        else {
-            return EncodeRawClip(task);
+
+        if (result.success) return true;
+
+        // Normal writer failures already published their precise FFmpeg/encoder
+        // diagnostic. Preflight/rename failures happen outside the writer and
+        // therefore need a message here. A thrown writer exception also carries
+        // text in writer_error and is published here.
+        if (result.failure != transactional_save::Failure::Writer
+                || !result.writer_error.empty()) {
+            const std::string detail = transactional_save::DescribeFailure(result);
+            const int required = MultiByteToWideChar(
+                CP_UTF8, 0, detail.c_str(), -1, nullptr, 0);
+            std::wstring wide_detail;
+            if (required > 0) {
+                wide_detail.resize(static_cast<size_t>(required));
+                MultiByteToWideChar(
+                    CP_UTF8, 0, detail.c_str(), -1,
+                    wide_detail.data(), required);
+            }
+            SetEngineError(
+                task.shared_memory,
+                wide_detail.empty()
+                    ? L"The temporary clip could not be finalized."
+                    : wide_detail.c_str());
         }
+        return false;
     }
 
 
@@ -862,7 +900,8 @@ namespace fthr {
     //   5. Write trailer + close
     // ===========================================================================
 
-    bool CaptureEngine::MuxEncodedClip(const SaveClipTask& task) {
+    bool CaptureEngine::MuxEncodedClip(
+        const SaveClipTask& task, const std::wstring& output_path) {
         const auto& snap = task.encoded_snapshot;
 
         if (snap.packets.empty()) {
@@ -1189,14 +1228,14 @@ namespace fthr {
         // UTF-16 -> UTF-8 worst-case expansion is 3x; MAX_PATH is 260 chars but
         // long-path-aware builds can exceed that. 1024 bytes covers typical paths.
         char output_utf8[1024] = {};
-        WideCharToMultiByte(CP_UTF8, 0, task.output_path.c_str(), -1,
+        WideCharToMultiByte(CP_UTF8, 0, output_path.c_str(), -1,
             output_utf8, sizeof(output_utf8) - 1, nullptr, nullptr);
 
         // ------------------------------------------------------------------
         // Step 1: Allocate format context
         // ------------------------------------------------------------------
         AVFormatContext* fmt_ctx = nullptr;
-        avformat_alloc_output_context2(&fmt_ctx, nullptr, nullptr, output_utf8);
+        avformat_alloc_output_context2(&fmt_ctx, nullptr, "mp4", output_utf8);
         if (!fmt_ctx) {
             std::cerr << "[MuxEncodedClip] avformat_alloc_output_context2 failed" << std::endl;
             SetEngineError(task.shared_memory,
@@ -1439,13 +1478,33 @@ namespace fthr {
             return false;
         }
 
+        auto fail_media_write = [&](const wchar_t* operation, int error_code) {
+            av_packet_free(&av_pkt);
+            const int close_error = avio_closep(&fmt_ctx->pb);
+            if (close_error < 0) {
+                std::cerr << "[MuxEncodedClip] Secondary close failure: "
+                    << close_error << std::endl;
+            }
+            avformat_free_context(fmt_ctx);
+            wchar_t message[512];
+            _snwprintf_s(
+                message,
+                _TRUNCATE,
+                L"Failed while %ls the temporary clip (error %d). "
+                L"The incomplete file was not published.",
+                operation,
+                error_code);
+            SetEngineError(task.shared_memory, message);
+            return false;
+        };
+
         for (size_t i = keyframe_start; i < snap.packets.size(); i++) {
             const auto& pkt = snap.packets[i];
             if (pkt.data.empty()) continue;
 
-            if (av_new_packet(av_pkt, static_cast<int>(pkt.data.size())) < 0) {
-                continue;
-            }
+            ret = av_new_packet(av_pkt, static_cast<int>(pkt.data.size()));
+            if (ret < 0)
+                return fail_media_write(L"allocating a video packet for", ret);
 
             memcpy(av_pkt->data, pkt.data.data(), pkt.data.size());
 
@@ -1480,13 +1539,18 @@ namespace fthr {
             }
 
             last_video_pts = av_pkt->pts;
-            av_interleaved_write_frame(fmt_ctx, av_pkt);
+            ret = av_interleaved_write_frame(fmt_ctx, av_pkt);
             // av_interleaved_write_frame transfers buffer ownership to the
             // muxer. av_packet_unref clears any residual state on av_pkt so
             // the next iteration can call av_new_packet on a clean struct.
             av_packet_unref(av_pkt);
+            if (ret < 0)
+                return fail_media_write(L"writing video data to", ret);
             video_packet_count++;
         }
+
+        if (video_packet_count == 0)
+            return fail_media_write(L"writing video data to", -1);
 
         // ------------------------------------------------------------------
         // Step 4b: Write pre-encoded AAC packets
@@ -1504,9 +1568,9 @@ namespace fthr {
                 const auto& pkt_data = aac_packets[i];
                 if (pkt_data.empty()) continue;
 
-                if (av_new_packet(av_pkt, static_cast<int>(pkt_data.size())) < 0) {
-                    continue;
-                }
+                ret = av_new_packet(av_pkt, static_cast<int>(pkt_data.size()));
+                if (ret < 0)
+                    return fail_media_write(L"allocating an audio packet for", ret);
 
                 memcpy(av_pkt->data, pkt_data.data(), pkt_data.size());
                 av_pkt->pts = aac_pts_list[i];
@@ -1515,8 +1579,10 @@ namespace fthr {
                 av_pkt->stream_index = audio_stream->index;
                 av_pkt->flags = 0;
 
-                av_interleaved_write_frame(fmt_ctx, av_pkt);
+                ret = av_interleaved_write_frame(fmt_ctx, av_pkt);
                 av_packet_unref(av_pkt);
+                if (ret < 0)
+                    return fail_media_write(L"writing audio data to", ret);
                 audio_packet_count++;
             }
 
@@ -1531,7 +1597,9 @@ namespace fthr {
         av_packet_free(&av_pkt);
 
         // Flush muxer's internal interleave buffer
-        av_interleaved_write_frame(fmt_ctx, nullptr);
+        ret = av_interleaved_write_frame(fmt_ctx, nullptr);
+        if (ret < 0)
+            return fail_media_write(L"flushing interleaved data for", ret);
 
         const double actual_duration_s = (last_video_pts >= 0 && task.fps > 0)
             ? (static_cast<double>(last_video_pts) / 90000.0) + (1.0 / task.fps)
@@ -1554,11 +1622,26 @@ namespace fthr {
         // ------------------------------------------------------------------
         // Step 5: Write trailer + close
         // ------------------------------------------------------------------
-        av_write_trailer(fmt_ctx);
-        avio_closep(&fmt_ctx->pb);
+        ret = av_write_trailer(fmt_ctx);
+        if (ret < 0)
+            return fail_media_write(L"finalizing the container for", ret);
+
+        ret = avio_closep(&fmt_ctx->pb);
+        if (ret < 0) {
+            avformat_free_context(fmt_ctx);
+            wchar_t message[512];
+            _snwprintf_s(
+                message,
+                _TRUNCATE,
+                L"Failed while closing the temporary clip (error %d). "
+                L"The incomplete file was not published.",
+                ret);
+            SetEngineError(task.shared_memory, message);
+            return false;
+        }
         avformat_free_context(fmt_ctx);
 
-        std::wcout << L"[MuxEncodedClip] Done: " << task.output_path
+        std::wcout << L"[MuxEncodedClip] Done: " << output_path
             << L" (" << video_packet_count << L" video, "
             << audio_packet_count << L" audio, "
             << actual_duration_s << L"s)" << std::endl;
@@ -1570,7 +1653,8 @@ namespace fthr {
     // EncodeRawClip (x264 fallback path - formerly ProcessSaveClipTask)
     // ===========================================================================
 
-    bool CaptureEngine::EncodeRawClip(const SaveClipTask& task) {
+    bool CaptureEngine::EncodeRawClip(
+        const SaveClipTask& task, const std::wstring& output_path) {
         EncoderConfig enc_cfg;
         enc_cfg.src_width = task.src_width;
         enc_cfg.src_height = task.src_height;
@@ -1621,7 +1705,7 @@ namespace fthr {
             }
         }
 
-        if (!encoder.Initialize(task.output_path.c_str(), enc_cfg)) {
+        if (!encoder.Initialize(output_path.c_str(), enc_cfg)) {
             std::cerr << "[EncodeRawClip] Encoder initialization failed" << std::endl;
             SetEngineError(task.shared_memory,
                 L"Failed to initialise the video encoder. The selected codec "
@@ -1629,13 +1713,29 @@ namespace fthr {
             return false;
         }
 
+        bool encode_ok = true;
         for (size_t i = 0; i < task.frame_count; i++) {
             size_t slot_idx = (task.start_frame_idx + i) % max_frames_;
-            encoder.EncodeFrame(frame_pool_.GetSlot(slot_idx));
+            if (!encoder.EncodeFrame(frame_pool_.GetSlot(slot_idx))) {
+                encode_ok = false;
+                break;
+            }
         }
 
-        encoder.Finalize();
-        std::wcout << L"[EncodeRawClip] Done: " << task.output_path << std::endl;
+        const bool finalize_ok = encoder.Finalize();
+        if (!encode_ok) {
+            SetEngineError(task.shared_memory,
+                L"The software encoder failed while writing video frames. "
+                L"The incomplete clip was not published.");
+            return false;
+        }
+        if (!finalize_ok) {
+            SetEngineError(task.shared_memory,
+                L"The software encoder could not finalize or close the clip. "
+                L"The incomplete clip was not published.");
+            return false;
+        }
+        std::wcout << L"[EncodeRawClip] Done: " << output_path << std::endl;
         return true;
     }
 

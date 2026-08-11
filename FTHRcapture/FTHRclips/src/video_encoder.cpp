@@ -124,7 +124,7 @@ namespace fthr {
     }
 
     VideoEncoder::~VideoEncoder() {
-        Finalize();
+        (void)Finalize();
     }
 
     // ---------------------------------------------------------------------------
@@ -134,10 +134,11 @@ namespace fthr {
     bool VideoEncoder::Initialize(const wchar_t* output_path, const EncoderConfig& config) {
         if (initialized_) {
             std::cerr << "[VideoEncoder] Already initialized - call Finalize() first" << std::endl;
-            Finalize();
+            (void)Finalize();
         }
 
         pts_ = 0;
+        disk_write_error_.store(0);
 
         // Resolve dimensions
         src_width_ = config.src_width;
@@ -216,7 +217,9 @@ namespace fthr {
         packet_pool_ = std::make_unique<PacketBufferPool>();
 
         // Allocate format context
-        avformat_alloc_output_context2(&format_ctx_, nullptr, nullptr, output_path_utf8);
+        // The transactional path ends in .mp4.partial, so format inference from
+        // the filename would fail. The final container is always MP4.
+        avformat_alloc_output_context2(&format_ctx_, nullptr, "mp4", output_path_utf8);
         if (!format_ctx_) {
             std::cerr << "[VideoEncoder] Failed to allocate format context" << std::endl;
             return false;
@@ -485,22 +488,40 @@ namespace fthr {
     // Finalize
     // ---------------------------------------------------------------------------
 
-    void VideoEncoder::Finalize() {
-        if (!initialized_) return;
+    bool VideoEncoder::Finalize() {
+        if (!initialized_) {
+            ReleaseResources();
+            return true;
+        }
 
         std::cout << "[VideoEncoder] Finalizing..." << std::endl;
+        bool ok = true;
 
         // Flush encoder
         if (codec_ctx_) {
-            avcodec_send_frame(codec_ctx_, nullptr);
+            int ret = avcodec_send_frame(codec_ctx_, nullptr);
+            if (ret < 0 && ret != AVERROR_EOF) {
+                std::cerr << "[VideoEncoder] avcodec_send_frame (flush) failed: "
+                    << ret << std::endl;
+                ok = false;
+            }
 
             int flush_count = 0;
-            while (avcodec_receive_packet(codec_ctx_, packet_) == 0) {
-                av_packet_rescale_ts(packet_, codec_ctx_->time_base, video_stream_->time_base);
+            while (ok) {
+                ret = avcodec_receive_packet(codec_ctx_, packet_);
+                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+                if (ret < 0) {
+                    std::cerr << "[VideoEncoder] avcodec_receive_packet (flush) failed: "
+                        << ret << std::endl;
+                    ok = false;
+                    break;
+                }
+                av_packet_rescale_ts(
+                    packet_, codec_ctx_->time_base, video_stream_->time_base);
                 packet_->stream_index = video_stream_->index;
                 PushPacket(packet_);
                 av_packet_unref(packet_);
-                flush_count++;
+                ++flush_count;
             }
             std::cout << "[VideoEncoder] Flushed " << flush_count << " packets" << std::endl;
         }
@@ -515,6 +536,7 @@ namespace fthr {
         if (disk_thread_.joinable()) {
             disk_thread_.join();
         }
+        if (disk_write_error_.load() != 0) ok = false;
 
         // Write pre-encoded AAC packets after all video is on disk.
         // av_interleaved_write_frame is fine here because the video disk thread
@@ -525,20 +547,34 @@ namespace fthr {
                 for (size_t i = 0; i < aac_packets_.size(); i++) {
                     const auto& pkt_data = aac_packets_[i];
                     if (pkt_data.empty()) continue;
-                    if (av_new_packet(apkt, static_cast<int>(pkt_data.size())) < 0)
-                        continue;
+                    int ret = av_new_packet(apkt, static_cast<int>(pkt_data.size()));
+                    if (ret < 0) {
+                        std::cerr << "[VideoEncoder] Audio packet allocation failed: "
+                            << ret << std::endl;
+                        ok = false;
+                        break;
+                    }
                     memcpy(apkt->data, pkt_data.data(), pkt_data.size());
                     apkt->pts          = aac_pts_list_[i];
                     apkt->dts          = aac_pts_list_[i];
                     apkt->duration     = 1024;
                     apkt->stream_index = audio_stream_->index;
                     apkt->flags        = 0;
-                    av_interleaved_write_frame(format_ctx_, apkt);
+                    ret = av_interleaved_write_frame(format_ctx_, apkt);
                     av_packet_unref(apkt);
+                    if (ret < 0) {
+                        std::cerr << "[VideoEncoder] Audio packet write failed: "
+                            << ret << std::endl;
+                        ok = false;
+                        break;
+                    }
                 }
                 av_packet_free(&apkt);
                 std::cout << "[VideoEncoder] Wrote " << aac_packets_.size()
                           << " AAC packets to file" << std::endl;
+            } else {
+                std::cerr << "[VideoEncoder] Audio packet allocation failed" << std::endl;
+                ok = false;
             }
             aac_packets_.clear();
             aac_pts_list_.clear();
@@ -547,13 +583,41 @@ namespace fthr {
 
         // Write trailer and close file
         if (format_ctx_) {
-            av_write_trailer(format_ctx_);
+            const int trailer_error = av_write_trailer(format_ctx_);
+            if (trailer_error < 0) {
+                std::cerr << "[VideoEncoder] av_write_trailer failed: "
+                    << trailer_error << std::endl;
+                ok = false;
+            }
             if (!(format_ctx_->oformat->flags & AVFMT_NOFILE)) {
-                avio_closep(&format_ctx_->pb);
+                const int close_error = avio_closep(&format_ctx_->pb);
+                if (close_error < 0) {
+                    std::cerr << "[VideoEncoder] avio_closep failed: "
+                        << close_error << std::endl;
+                    ok = false;
+                }
             }
         }
 
-        // Free FFmpeg resources
+        ReleaseResources();
+        std::cout << "[VideoEncoder] Finalized ("
+            << (ok ? "success" : "failure") << ")." << std::endl;
+        return ok;
+    }
+
+    void VideoEncoder::ReleaseResources() {
+        disk_running_.store(false);
+        packet_cv_.notify_all();
+        if (disk_thread_.joinable()) disk_thread_.join();
+
+        if (format_ctx_ && format_ctx_->pb
+                && !(format_ctx_->oformat->flags & AVFMT_NOFILE)) {
+            const int close_error = avio_closep(&format_ctx_->pb);
+            if (close_error < 0) {
+                std::cerr << "[VideoEncoder] Secondary resource-close failure: "
+                    << close_error << std::endl;
+            }
+        }
         if (sws_ctx_) {
             sws_freeContext(sws_ctx_);
             sws_ctx_ = nullptr;
@@ -575,11 +639,19 @@ namespace fthr {
             format_ctx_ = nullptr;
         }
 
-        // Release packet pool
+        {
+            std::lock_guard<std::mutex> lock(packet_mutex_);
+            while (!packet_queue_.empty()) packet_queue_.pop();
+        }
+        // EncodedPacket destructors above return their buffers to this pool, so
+        // the pool must outlive the queue drain.
         packet_pool_.reset();
+        audio_pcm_.clear();
+        aac_packets_.clear();
+        aac_pts_list_.clear();
+        audio_stream_ = nullptr;
 
         initialized_ = false;
-        std::cout << "[VideoEncoder] Finalized." << std::endl;
     }
 
     // ---------------------------------------------------------------------------
@@ -721,10 +793,19 @@ namespace fthr {
                 packet_queue_.pop();
                 lock.unlock();
 
-                // Write to disk
-                AVPacket* write_pkt = av_packet_alloc();
+                // Write to disk. Preserve the first error; draining the queue
+                // still returns pooled buffers without spamming repeated writes.
+                AVPacket* write_pkt = nullptr;
+                if (disk_write_error_.load() == 0)
+                    write_pkt = av_packet_alloc();
+                if (!write_pkt && disk_write_error_.load() == 0) {
+                    disk_write_error_.store(-1);
+                    std::cerr << "[DiskWriter] av_packet_alloc failed" << std::endl;
+                }
                 if (write_pkt) {
-                    if (av_new_packet(write_pkt, static_cast<int>(ep.size)) == 0) {
+                    const int allocation_error =
+                        av_new_packet(write_pkt, static_cast<int>(ep.size));
+                    if (allocation_error == 0) {
                         std::memcpy(write_pkt->data, ep.buffer->data(), ep.size);
                         write_pkt->pts = ep.pts;
                         write_pkt->dts = ep.dts;
@@ -734,9 +815,14 @@ namespace fthr {
 
                         int ret = av_interleaved_write_frame(format_ctx_, write_pkt);
                         if (ret < 0) {
+                            disk_write_error_.store(ret);
                             std::cerr << "[DiskWriter] av_interleaved_write_frame failed: "
                                 << ret << std::endl;
                         }
+                    } else {
+                        disk_write_error_.store(allocation_error);
+                        std::cerr << "[DiskWriter] av_new_packet failed: "
+                            << allocation_error << std::endl;
                     }
                     av_packet_free(&write_pkt);
                 }

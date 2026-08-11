@@ -300,7 +300,8 @@ static void write_pcm_wav(const std::string& path,
 // ---------------------------------------------------------------------------
 
 bool CaptureEngine::SaveClip(const std::string& path, uint32_t duration_sec,
-                               SharedMemoryLayout* shm) {
+                               SharedMemoryLayout* shm,
+                               std::string* error_message) {
     const uint32_t health = capture_health_flags_.load();
     if (!ring_ || !running_.load() || paused_.load() ||
             (health & (CAPTURE_HEALTH_BACKEND_FAILED |
@@ -308,6 +309,8 @@ bool CaptureEngine::SaveClip(const std::string& path, uint32_t duration_sec,
                        CAPTURE_HEALTH_PAUSED))) {
         std::cerr << "[SaveClip] Refused because capture is not producing frames"
                   << std::endl;
+        if (error_message)
+            *error_message = "Capture is not receiving new frames; restart capture before saving";
         return false;
     }
 
@@ -316,6 +319,8 @@ bool CaptureEngine::SaveClip(const std::string& path, uint32_t duration_sec,
 
     if (video_packets.empty()) {
         std::cerr << "[SaveClip] No video packets in buffer" << std::endl;
+        if (error_message)
+            *error_message = "Nothing to save: the replay buffer contains no video packets";
         return false;
     }
 
@@ -358,7 +363,8 @@ bool CaptureEngine::SaveClip(const std::string& path, uint32_t duration_sec,
         uint32_t width,
         uint32_t height,
         AVCodecID video_codec_id,
-        SharedMemoryLayout* shm
+        SharedMemoryLayout* shm,
+        std::string* error_message
     );
 
     return save_clip_to_file(
@@ -372,7 +378,8 @@ bool CaptureEngine::SaveClip(const std::string& path, uint32_t duration_sec,
         encoder_.GetWidth(),
         encoder_.GetHeight(),
         encoder_.GetCodecID(),
-        shm
+        shm,
+        error_message
     );
 }
 

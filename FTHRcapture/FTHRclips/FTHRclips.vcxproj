@@ -29,6 +29,7 @@
     <ClInclude Include="include\save_clip_task.h" />
     <ClInclude Include="include\shared_memory.h" />
     <ClInclude Include="include\video_encoder.h" />
+    <ClInclude Include="..\..\FTHRcapture_common\transactional_save.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\audio_capture.cpp" />
@@ -134,7 +135,7 @@
       <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
-      <AdditionalIncludeDirectories>$(ProjectDir)third_party\ffmpeg\include;$(ProjectDir)include;$(ProjectDir)include\nvenc\;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)third_party\ffmpeg\include;$(ProjectDir)include;$(ProjectDir)include\nvenc\;$(ProjectDir)..\..\FTHRcapture_common;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
     <Link>
@@ -157,7 +158,7 @@
       <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
-      <AdditionalIncludeDirectories>$(ProjectDir)third_party\ffmpeg\include;$(ProjectDir)include;$(ProjectDir)include\nvenc\;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)third_party\ffmpeg\include;$(ProjectDir)include;$(ProjectDir)include\nvenc\;$(ProjectDir)..\..\FTHRcapture_common;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
     <Link>

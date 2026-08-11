@@ -45,6 +45,9 @@
     <ClInclude Include="include\audio_ring_buffer.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\FTHRcapture_common\transactional_save.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\shared_memory.cpp">

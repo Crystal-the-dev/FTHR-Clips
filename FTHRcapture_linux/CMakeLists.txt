@@ -8,6 +8,11 @@ if(BUILD_TESTING)
     add_executable(fthr_capture_recovery_test tests/capture_recovery_test.cpp)
     target_include_directories(fthr_capture_recovery_test PRIVATE src)
     add_test(NAME capture_recovery_policy COMMAND fthr_capture_recovery_test)
+
+    add_executable(fthr_transactional_save_test tests/transactional_save_test.cpp)
+    target_include_directories(fthr_transactional_save_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/../FTHRcapture_common)
+    add_test(NAME transactional_save_contract COMMAND fthr_transactional_save_test)
 endif()
 
 find_package(PkgConfig REQUIRED)
@@ -207,6 +212,7 @@ add_executable(FTHRclips
 target_include_directories(FTHRclips PRIVATE
     src/
     ${PROTO_DIR}/
+    ${CMAKE_SOURCE_DIR}/../FTHRcapture_common
 )
 
 target_link_libraries(FTHRclips PRIVATE

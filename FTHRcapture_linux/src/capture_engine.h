@@ -43,7 +43,7 @@ public:
     // Captures a clip of duration_sec seconds and writes it to path.
     // Updates shm status fields during save. Blocking call.
     bool SaveClip(const std::string& path, uint32_t duration_sec,
-                  SharedMemoryLayout* shm);
+                  SharedMemoryLayout* shm, std::string* error_message);
 
     bool     IsNvencActive()  const { return nvenc_active_.load(); }
     bool     IsCapturing()    const { return running_.load(); }

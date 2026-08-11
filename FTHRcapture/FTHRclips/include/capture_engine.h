@@ -179,9 +179,11 @@ namespace fthr {
         // reason via SetEngineError() before returning. SaveClipThread used to
         // ignore the outcome and report CLIP_SAVED unconditionally, so every
         // Windows save failure reached the user as success (AUDIT-021).
-        bool ProcessSaveClipTask(const SaveClipTask& task); // branches on use_encoded_path
-        bool MuxEncodedClip(const SaveClipTask& task);      // NVENC path: mux only
-        bool EncodeRawClip(const SaveClipTask& task);       // x264 path: encode + mux
+        bool ProcessSaveClipTask(const SaveClipTask& task); // transactional wrapper
+        bool MuxEncodedClip(const SaveClipTask& task,
+            const std::wstring& output_path);               // NVENC path: mux only
+        bool EncodeRawClip(const SaveClipTask& task,
+            const std::wstring& output_path);               // x264 path: encode + mux
 
         // -----------------------------------------------------------------------
         // D3D11 / DXGI / WGC helpers

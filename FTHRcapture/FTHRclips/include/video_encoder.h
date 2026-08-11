@@ -145,7 +145,7 @@ namespace fthr {
         // Flush the encoder, drain the disk queue, write the container trailer,
         // join the DiskWriter thread, and release all FFmpeg resources.
         // Safe to call even if Initialize() was never called.
-        void Finalize();
+        bool Finalize();
 
         // Scale and encode one BGRA frame from the frame pool.
         // bgra_data must point to (src_width * src_height * 4) bytes.
@@ -166,6 +166,10 @@ namespace fthr {
         // Disk writer thread
         // -----------------------------------------------------------------------
         void DiskWriterThread();
+
+        // Close/free resources left by either a completed encode or a partial
+        // Initialize() failure. Does not write a trailer.
+        void ReleaseResources();
 
         // Push an encoded packet to the disk queue.
         // Called from EncodeFrame() after avcodec_receive_packet().
@@ -218,6 +222,7 @@ namespace fthr {
         std::condition_variable   packet_cv_;
         std::thread               disk_thread_;
         std::atomic<bool>         disk_running_{ false };
+        std::atomic<int>          disk_write_error_{ 0 };
 
         // -----------------------------------------------------------------------
         // Phase 1: Packet buffer pool (eliminates malloc/free in encode path)
