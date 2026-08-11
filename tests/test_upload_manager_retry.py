@@ -55,3 +55,42 @@ def test_upload_failed_emits_path(qapp, tmp_path):
     failed = [r for r in received if r[0] == 'UPLOAD FAILED']
     assert failed, 'UPLOAD FAILED not emitted'
     assert failed[0][3] == str(clip), 'clip_path missing from signal'
+
+
+def test_partial_file_is_rejected_by_all_upload_entrypoints(qapp, tmp_path):
+    from core.upload_manager import UploadManager
+    sm = MagicMock()
+    sm.get.side_effect = lambda key, default=None: {
+        'upload_enabled': True,
+        'upload_mode': 'immediate',
+        'upload_server_url': 'https://example.invalid/upload',
+    }.get(key, default)
+    um = UploadManager(sm)
+    partial = tmp_path / 'clip.mp4.partial'
+    partial.write_bytes(b'partial')
+
+    ready = um.notify_clip_saved(str(partial))
+    um.enqueue_upload(str(partial))
+    success, message = um._do_single_upload(str(partial))
+
+    assert ready.is_set()
+    assert um._queue.empty()
+    assert not success
+    assert 'Incomplete clip' in message
+
+
+def test_interval_scan_does_not_enqueue_partial_files(qapp, tmp_path, monkeypatch):
+    import core.upload_manager as upload_module
+    sm = MagicMock()
+    sm.get.side_effect = lambda key, default=None: {
+        'upload_enabled': True,
+        'upload_mode': 'interval',
+    }.get(key, default)
+    um = upload_module.UploadManager(sm)
+    partial = tmp_path / 'desktop_clip_from_11Aug2026_12-00-00.mp4.partial'
+    partial.write_bytes(b'partial')
+    monkeypatch.setattr(upload_module, '_CLIPS_DIR', tmp_path)
+
+    um._interval_scan()
+
+    assert um._queue.empty()

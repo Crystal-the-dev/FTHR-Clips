@@ -116,6 +116,7 @@ from core.capture_health import (
     evaluate_save_admission,
 )
 from core.diagnostics import get_logger
+from core.clip_files import cleanup_stale_partial_clips, is_completed_video_path
 from core.save_state import (SaveStateMachine, EngineEvent, OutcomeKind)
 from core.hotkey_manager import HotkeyManager
 from core.game_detector import GameDetector
@@ -1624,6 +1625,15 @@ class MainWindow(QMainWindow):
         for _folder in ('Desktop', 'Exported', 'Shared', 'Screenshots'):
             (Path.home() / 'FTHR_Clips' / _folder).mkdir(parents=True, exist_ok=True)
 
+        # A hard kill can leave the engine's same-directory transaction file.
+        # Only old, FTHR-named partials are removed; fresh files may belong to a
+        # still-running save and unrelated *.mp4.partial files are user-owned.
+        partial_recovery = cleanup_stale_partial_clips(Path.home() / 'FTHR_Clips')
+        if partial_recovery.removed:
+            print(f'[Startup] Removed {len(partial_recovery.removed)} stale partial clip(s)')
+        for partial_path, error in partial_recovery.failures:
+            print(f'[Startup] Could not remove stale partial {partial_path.name}: {error}')
+
         self.hotkey_manager  = HotkeyManager()
 
         self._pending_game_window: dict | None = None
@@ -2924,6 +2934,18 @@ class MainWindow(QMainWindow):
         """
         output_path = Path(op.output_path)
 
+        if not is_completed_video_path(output_path):
+            print(f'[Save] Refused non-final clip path from engine: {output_path.name}')
+            self.capture_card.show_error()
+            self._set_status('SAVE FAILED', status_warning_qss())
+            self.push_error(
+                'CLIP WAS NOT SAVED',
+                'The capture engine returned an incomplete clip path. The file '
+                'was not added to the library or post-processing pipeline.',
+                level='error',
+            )
+            return
+
         # The engine said it wrote the file. Verify before telling the user —
         # a CLIP_SAVED for a file that is not there is a bug we want to see,
         # not a broken grid entry the user discovers days later.
@@ -3018,6 +3040,16 @@ class MainWindow(QMainWindow):
 
     # -- Mic post-mux --
 
+    @staticmethod
+    def _allow_completed_clip_pipeline(clip_path: str, clip_ready=None) -> bool:
+        """Reject partial paths before any post-processing worker is started."""
+        if is_completed_video_path(clip_path):
+            return True
+        print(f'[Post] Refused incomplete clip path: {os.path.basename(clip_path)}')
+        if clip_ready is not None:
+            clip_ready.set()
+        return False
+
     def _mux_mic_into_clip(self, clip_path: str,
                            duration_seconds: int,
                            mic_end_time: float,
@@ -3031,6 +3063,8 @@ class MainWindow(QMainWindow):
         The mux worker sets it after os.replace() so the upload can start.
         If there is no mic to mux, the event is set here before returning.
         """
+        if not self._allow_completed_clip_pipeline(clip_path, clip_ready):
+            return
         # When multiband is active, _multiband_mux_worker owns clip_ready.
         # Don't touch the event here — it will be set in that worker's finally block.
         if self.settings_manager.get('multiband_audio_enabled', False):
@@ -3159,6 +3193,8 @@ class MainWindow(QMainWindow):
     def _mux_multiband_into_clip(self, clip_path: str, duration_seconds: int,
                                   audio_end_time: float, clip_ready=None):
         """Start a background thread to mix per-category WAVs into the clip."""
+        if not self._allow_completed_clip_pipeline(clip_path, clip_ready):
+            return
         self._spawn_mux_thread(
             target=self._multiband_mux_worker,
             args=(clip_path, duration_seconds, audio_end_time, clip_ready),
@@ -3470,6 +3506,8 @@ class MainWindow(QMainWindow):
 
     def _finalize_clip(self, clip_path: str, duration_seconds: int,
                        clip_end_time: float = 0.0, clip_ready=None):
+        if not self._allow_completed_clip_pipeline(clip_path, clip_ready):
+            return
         if not (self.settings_manager.get('watermark_enabled', False)
                 or self.settings_manager.get('auto_crop_enabled', False)
                 or self.settings_manager.get('camera_enabled', False)):

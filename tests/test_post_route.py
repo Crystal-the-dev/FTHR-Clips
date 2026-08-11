@@ -11,6 +11,7 @@ no window, so this stays cheap.
 
 import itertools
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'FTHR_UI'))
 
 pytest.importorskip('PyQt6.QtCore')
-from main import select_post_route
+from main import MainWindow, select_post_route
 
 ROUTES = {'mic', 'multiband', 'finalize'}
 FLAGS = ('audio_on', 'multiband_enabled', 'mic_running',
@@ -129,3 +130,22 @@ def test_only_one_call_site_starts_post_processing():
             f'{call} is invoked from more than one place — a clip could be '
             f'post-processed twice')
     assert src.count('self.upload_manager.notify_clip_saved(') == 1
+
+
+def test_partial_file_cannot_enter_post_processing():
+    ready = threading.Event()
+
+    assert not MainWindow._allow_completed_clip_pipeline(
+        '/clips/foo.mp4.partial', ready)
+    assert ready.is_set()
+    assert MainWindow._allow_completed_clip_pipeline('/clips/foo.mp4')
+
+
+def test_every_post_processing_entrypoint_has_the_completed_clip_guard():
+    src = (Path(__file__).resolve().parent.parent / 'FTHR_UI' / 'main.py'
+           ).read_text(encoding='utf-8', errors='replace')
+    entrypoints = ('_mux_mic_into_clip', '_mux_multiband_into_clip', '_finalize_clip')
+    for name in entrypoints:
+        start = src.index(f'def {name}')
+        body = src[start:start + 1200]
+        assert '_allow_completed_clip_pipeline' in body

@@ -9,6 +9,8 @@ import subprocess
 import sys
 import tempfile
 
+from core.clip_files import is_completed_video_path
+
 _NO_WINDOW = {'creationflags': subprocess.CREATE_NO_WINDOW} if sys.platform == 'win32' else {}
 
 
@@ -23,6 +25,9 @@ def mix_multiband_clip(
     Overwrites clip_path in-place on success.
     Returns True on success, False on any failure.
     """
+    if not is_completed_video_path(clip_path):
+        print(f'[AudioMixer] Refused incomplete clip path: {os.path.basename(clip_path)}')
+        return False
     if not category_wavs:
         return False
 

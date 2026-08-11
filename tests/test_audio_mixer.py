@@ -39,9 +39,21 @@ def test_mix_missing_wav_skipped(tmp_path):
     assert result is False  # no valid inputs → False
 
 
+def test_partial_clip_is_rejected_before_ffmpeg(tmp_path):
+    from core.audio_mixer import mix_multiband_clip
+    partial = tmp_path / 'clip.mp4.partial'
+    partial.write_bytes(b'partial')
+
+    result = mix_multiband_clip(
+        str(partial), {'Game': str(tmp_path / 'game.wav')}, {'Game': 1.0},
+        '/definitely/not/ffmpeg')
+
+    assert result is False
+
+
 def test_mix_runs_with_ffmpeg(tmp_path):
     """Integration: mix two silent WAVs into a WAV 'clip'."""
-    clip = str(tmp_path / 'clip.wav')
+    clip = str(tmp_path / 'clip.mp4')
     _make_wav(clip)
     game_wav = str(tmp_path / 'game.wav')
     disc_wav = str(tmp_path / 'disc.wav')
@@ -81,7 +93,7 @@ def test_mix_subprocess_has_timeout(tmp_path, monkeypatch):
 
     monkeypatch.setattr(subprocess, 'run', mock_run)
 
-    clip = str(tmp_path / 'clip.wav')
+    clip = str(tmp_path / 'clip.mp4')
     _make_wav(clip)
     game_wav = str(tmp_path / 'game.wav')
     _make_wav(game_wav)

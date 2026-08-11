@@ -32,6 +32,13 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import QPixmap, QPainter
 
+from core.clip_files import (
+    IMAGE_SUFFIXES,
+    VIDEO_SUFFIXES,
+    is_completed_video_path,
+    is_library_media_path,
+)
+
 
 class _DropdownCombo(QComboBox):
     """QComboBox that shows icons/dropdown.png as its arrow, rotated when open."""
@@ -90,8 +97,8 @@ THUMB_CACHE_DIR = os.path.join(os.path.expanduser('~'), '.fthr', 'thumbnails')
 
 # These folders hold processed/shared clips — not shown in the main library grid
 _GRID_EXCLUDED_DIRS = {'Exported', 'Shared'}
-_VIDEO_EXTS = ('.mp4', '.mkv', '.avi')
-_IMAGE_EXTS = ('.png', '.jpg', '.jpeg')
+_VIDEO_EXTS = VIDEO_SUFFIXES
+_IMAGE_EXTS = IMAGE_SUFFIXES
 
 
 # ─── Card geometry ──────────────────────────────────────────────────
@@ -242,6 +249,9 @@ class _ThumbnailWorker(QRunnable):
         self.signals = _ThumbnailSignals()
 
     def run(self):
+        if not is_completed_video_path(self.file_path):
+            self.signals.finished.emit(self.file_path, '', 0)
+            return
         cache_path = _get_cached_thumb_path(self.file_path)
         dur_path   = _get_cached_duration_path(cache_path)
 
@@ -309,14 +319,14 @@ class _FileCollectWorker(QRunnable):
             entries = []
         for name in entries:
             full = os.path.join(self.clips_dir, name)
-            if os.path.isfile(full) and name.lower().endswith(_VIDEO_EXTS + _IMAGE_EXTS):
+            if os.path.isfile(full) and is_library_media_path(name):
                 found.add(full)
             elif os.path.isdir(full) and name not in _GRID_EXCLUDED_DIRS:
                 subdirs.append(full)
                 try:
                     for sub in os.listdir(full):
                         sf = os.path.join(full, sub)
-                        if os.path.isfile(sf) and sub.lower().endswith(_VIDEO_EXTS + _IMAGE_EXTS):
+                        if os.path.isfile(sf) and is_library_media_path(sub):
                             found.add(sf)
                 except OSError:
                     pass
@@ -328,7 +338,7 @@ class _FileCollectWorker(QRunnable):
             try:
                 for name in os.listdir(folder):
                     full = os.path.join(folder, name)
-                    if os.path.isfile(full) and name.lower().endswith(_VIDEO_EXTS + _IMAGE_EXTS):
+                    if os.path.isfile(full) and is_library_media_path(name):
                         found.add(full)
                         imported.add(full)
                     elif os.path.isdir(full):
@@ -336,7 +346,7 @@ class _FileCollectWorker(QRunnable):
                         try:
                             for sub in os.listdir(full):
                                 sf = os.path.join(full, sub)
-                                if os.path.isfile(sf) and sub.lower().endswith(_VIDEO_EXTS + _IMAGE_EXTS):
+                                if os.path.isfile(sf) and is_library_media_path(sub):
                                     found.add(sf)
                                     imported.add(sf)
                         except OSError:
@@ -346,7 +356,7 @@ class _FileCollectWorker(QRunnable):
 
         files: list = list(found)
         if self.filter_ == 'clips':
-            files = [f for f in files if f.lower().endswith(_VIDEO_EXTS)]
+            files = [f for f in files if is_completed_video_path(f)]
         elif self.filter_ == 'screenshots':
             files = [f for f in files if f.lower().endswith(_IMAGE_EXTS)]
         elif self.filter_ == 'imported':
@@ -1184,15 +1194,14 @@ class ClipGrid(QWidget):
         for name in entries:
             full = os.path.join(self.clips_dir, name)
             if os.path.isfile(full):
-                if name.lower().endswith(_VIDEO_EXTS + _IMAGE_EXTS):
+                if is_library_media_path(name):
                     found.add(full)
             elif os.path.isdir(full) and name not in _GRID_EXCLUDED_DIRS:
                 self._watch_subdir(full)
                 try:
                     for sub in os.listdir(full):
                         sub_full = os.path.join(full, sub)
-                        if os.path.isfile(sub_full) and \
-                                sub.lower().endswith(_VIDEO_EXTS + _IMAGE_EXTS):
+                        if os.path.isfile(sub_full) and is_library_media_path(sub):
                             found.add(sub_full)
                 except OSError:
                     pass
@@ -1206,7 +1215,7 @@ class ClipGrid(QWidget):
             try:
                 for name in os.listdir(folder):
                     full = os.path.join(folder, name)
-                    if os.path.isfile(full) and name.lower().endswith(_VIDEO_EXTS + _IMAGE_EXTS):
+                    if os.path.isfile(full) and is_library_media_path(name):
                         found.add(full)
                         self._imported_files.add(full)
                     elif os.path.isdir(full):
@@ -1214,8 +1223,7 @@ class ClipGrid(QWidget):
                         try:
                             for sub in os.listdir(full):
                                 sub_full = os.path.join(full, sub)
-                                if os.path.isfile(sub_full) and \
-                                        sub.lower().endswith(_VIDEO_EXTS + _IMAGE_EXTS):
+                                if os.path.isfile(sub_full) and is_library_media_path(sub):
                                     found.add(sub_full)
                                     self._imported_files.add(sub_full)
                         except OSError:
@@ -1254,7 +1262,7 @@ class ClipGrid(QWidget):
         # Apply filter
         files = list(current_files)
         if self._filter == 'clips':
-            files = [f for f in files if f.lower().endswith(_VIDEO_EXTS)]
+            files = [f for f in files if is_completed_video_path(f)]
         elif self._filter == 'screenshots':
             files = [f for f in files if f.lower().endswith(_IMAGE_EXTS)]
         elif self._filter == 'imported':
@@ -1355,7 +1363,7 @@ class ClipGrid(QWidget):
 
         upload_enabled = bool(self._upload_enabled and self._upload_enabled())
         for i, fp in enumerate(files):
-            is_video = fp.lower().endswith(_VIDEO_EXTS)
+            is_video = is_completed_video_path(fp)
             uploaded = bool(self._upload_checker and self._upload_checker(fp))
             thumb = ClipThumbnail(
                 fp, is_video=is_video,

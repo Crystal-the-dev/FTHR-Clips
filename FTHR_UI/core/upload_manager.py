@@ -34,10 +34,11 @@ from typing import Optional
 
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
+from core.clip_files import is_completed_video_path
+
 
 _HISTORY_FILE = Path.home() / '.fthr' / 'upload_history.json'
 _CLIPS_DIR    = Path.home() / 'FTHR_Clips'
-_VIDEO_EXTS   = ('.mp4', '.mkv', '.avi')
 _PRUNE_DAYS   = 90
 _RETRY_DELAYS = (5, 15, 45)          # seconds between upload attempts
 _WRITE_SETTLE_S = 30                 # interval scan skips files younger than this
@@ -102,6 +103,10 @@ class UploadManager(QObject):
         event is pre-set so the upload worker starts without waiting.
         """
         event = threading.Event()
+        if not is_completed_video_path(path):
+            print(f'[Upload] Refused incomplete clip path: {os.path.basename(path)}')
+            event.set()
+            return event
         if not has_mic_mux:
             event.set()
 
@@ -120,6 +125,9 @@ class UploadManager(QObject):
 
     def enqueue_upload(self, path: str):
         """Manual or interval-triggered upload. Assumes file is already complete."""
+        if not is_completed_video_path(path):
+            print(f'[Upload] Refused incomplete clip path: {os.path.basename(path)}')
+            return
         if not self._sm.get('upload_enabled', False):
             return
         with self._in_flight_lock:
@@ -155,6 +163,8 @@ class UploadManager(QObject):
     # ── Upload logic ──────────────────────────────────────────────────────
 
     def _do_single_upload(self, path: str) -> tuple[bool, str]:
+        if not is_completed_video_path(path):
+            return False, 'Incomplete clip files cannot be uploaded'
         url = self._sm.get('upload_server_url', '').strip()
         if not url:
             self.upload_error.emit(
@@ -274,7 +284,7 @@ class UploadManager(QObject):
             now = time.time()
             paths = []
             for p in _CLIPS_DIR.rglob('*'):
-                if p.suffix.lower() not in _VIDEO_EXTS or not p.is_file():
+                if not is_completed_video_path(p) or not p.is_file():
                     continue
                 # Skip files still being written (engine save / mic mux in
                 # progress). A clip whose mtime is fresher than the settle
