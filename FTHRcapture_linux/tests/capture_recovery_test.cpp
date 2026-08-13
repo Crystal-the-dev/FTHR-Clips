@@ -27,6 +27,34 @@ uint64_t RunGeneration(FakeBackend& backend) {
     return frames;
 }
 
+class LifecycleBackend {
+public:
+    explicit LifecycleBackend(uint64_t frames) : backend_(frames) {}
+
+    bool Initialize() {
+        ++initialize_calls;
+        initialized_ = true;
+        return true;
+    }
+
+    uint64_t Run() {
+        assert(initialized_ && shutdown_calls == 0);
+        return RunGeneration(backend_);
+    }
+
+    void Shutdown() {
+        assert(initialized_);
+        ++shutdown_calls;
+    }
+
+    uint32_t initialize_calls = 0;
+    uint32_t shutdown_calls = 0;
+
+private:
+    FakeBackend backend_;
+    bool initialized_ = false;
+};
+
 } // namespace
 
 int main() {
@@ -62,5 +90,35 @@ int main() {
         });
     assert(!completed);
     assert(sleep_calls == 1);
+
+    // A timed-out generation is torn down before a replacement starts. Real
+    // frame progress in the replacement resets the incident retry budget.
+    fthr::CaptureRecoveryPolicy reconnect_policy(300);
+    LifecycleBackend stale(0);
+    assert(stale.Initialize());
+    const auto stalled_frames = stale.Run();
+    stale.Shutdown();
+    assert(stalled_frames == 0 && stale.shutdown_calls == 1);
+    decision = reconnect_policy.OnGenerationFailed(stalled_frames);
+    assert(decision.retry && decision.attempt == 1);
+
+    LifecycleBackend replacement(300);
+    assert(replacement.Initialize());
+    const auto replacement_frames = replacement.Run();
+    assert(replacement_frames == 300);
+    replacement.Shutdown();
+    decision = reconnect_policy.OnGenerationFailed(replacement_frames);
+    assert(decision.retry && decision.attempt == 1);
+
+    // Shutdown during a cancellable backoff cannot begin another reconnect.
+    running = true;
+    uint32_t reconnect_starts = 0;
+    const bool start_reconnect = fthr::WaitForRecoveryBackoff(
+        std::chrono::milliseconds(750),
+        [&running] { return running; },
+        [&running](std::chrono::milliseconds) { running = false; });
+    if (start_reconnect) ++reconnect_starts;
+    assert(!start_reconnect);
+    assert(reconnect_starts == 0);
     return 0;
 }
