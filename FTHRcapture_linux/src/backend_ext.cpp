@@ -140,19 +140,51 @@ void ExtBackend::DestroyWayland() {
     if (shm_)     { wl_shm_destroy(shm_);           shm_      = nullptr; }
     if (registry_){ wl_registry_destroy(registry_);  registry_ = nullptr; }
     if (display_) { wl_display_disconnect(display_); display_  = nullptr; }
+    output_ = nullptr;
+}
+
+bool ExtBackend::KeepRunning() const noexcept {
+    return !running_ || running_->load();
+}
+
+bool ExtBackend::WaitUntil(WaylandDeadline deadline,
+                           const WaylandPredicate& complete,
+                           const char* operation) {
+    const auto result = DispatchWaylandUntil(
+        display_,
+        deadline,
+        [this] { return KeepRunning(); },
+        complete);
+    if (result == WaylandWaitResult::EventReceived) return true;
+    std::cerr << "[ExtBackend] Wayland " << operation << " "
+              << WaylandWaitResultName(result) << std::endl;
+    return false;
+}
+
+bool ExtBackend::Roundtrip(WaylandDeadline deadline, const char* operation) {
+    const auto result = BoundedWaylandRoundtrip(
+        display_, deadline, [this] { return KeepRunning(); });
+    if (result == WaylandWaitResult::EventReceived) return true;
+    std::cerr << "[ExtBackend] Wayland " << operation << " "
+              << WaylandWaitResultName(result) << std::endl;
+    return false;
 }
 
 // ── ICaptureBackend impl ────────────────────────────────────────────────────
 bool ExtBackend::Initialize(const CaptureConfig& cfg) {
     target_output_ = cfg.target_output;
+    const auto deadline = std::chrono::steady_clock::now() + kInitializationTimeout;
     display_ = wl_display_connect(nullptr);
     if (!display_) return false;
 
     static const wl_registry_listener kRegListener = { RegistryGlobal, RegistryRemove };
     registry_ = wl_display_get_registry(display_);
     wl_registry_add_listener(registry_, &kRegListener, this);
-    wl_display_roundtrip(display_);
-    wl_display_roundtrip(display_);
+    if (!Roundtrip(deadline, "registry discovery") ||
+            !Roundtrip(deadline, "output discovery")) {
+        Shutdown();
+        return false;
+    }
 
     if (!mgr_ || !src_mgr_) {
         std::cerr << "[ExtBackend] ext-image-copy-capture not available" << std::endl;
@@ -166,15 +198,37 @@ bool ExtBackend::Initialize(const CaptureConfig& cfg) {
     if (!sel && !all_outputs_.empty()) sel = all_outputs_[0];
     if (!sel) { std::cerr << "[ExtBackend] No wl_output\n"; DestroyWayland(); return false; }
     output_ = sel->handle;
-    while (!sel->done) wl_display_dispatch(display_);
+    if (!WaitUntil(
+            deadline,
+            [sel] { return sel->done; },
+            "output discovery")) {
+        Shutdown();
+        return false;
+    }
     std::cerr << "[ExtBackend] Using output: "
               << (sel->name.empty() ? "(unnamed)" : sel->name) << std::endl;
 
     source_  = ext_output_image_capture_source_manager_v1_create_source(src_mgr_, output_);
+    if (!source_) {
+        std::cerr << "[ExtBackend] Failed to create capture source\n";
+        Shutdown();
+        return false;
+    }
     session_ = ext_image_copy_capture_manager_v1_create_session(mgr_, source_, 0);
+    if (!session_) {
+        std::cerr << "[ExtBackend] Failed to create capture session\n";
+        Shutdown();
+        return false;
+    }
     ext_image_copy_capture_session_v1_add_listener(session_, &kSessionListener, this);
 
-    while (!buf_done_ && !session_stopped_) wl_display_dispatch(display_);
+    if (!WaitUntil(
+            deadline,
+            [this] { return buf_done_ || session_stopped_; },
+            "session negotiation")) {
+        Shutdown();
+        return false;
+    }
     if (session_stopped_ || buf_width_ == 0 || shm_format_ == 0) {
         std::cerr << "[ExtBackend] Session failed to negotiate buffer\n";
         DestroyWayland(); return false;
@@ -189,21 +243,27 @@ bool ExtBackend::Initialize(const CaptureConfig& cfg) {
 
 bool ExtBackend::CaptureFrame(RawFrame& out) {
     if (session_stopped_) return false;
+    const auto deadline = std::chrono::steady_clock::now() + kFrameTimeout;
     frame_ready_ = frame_failed_ = false;
 
     auto* frame = ext_image_copy_capture_session_v1_create_frame(session_);
+    if (!frame) {
+        std::cerr << "[ExtBackend] Failed to create frame request\n";
+        return false;
+    }
     ext_image_copy_capture_frame_v1_add_listener(frame, &kFrameListener, this);
     ext_image_copy_capture_frame_v1_attach_buffer(frame, wl_buf_);
     ext_image_copy_capture_frame_v1_damage_buffer(frame, 0, 0,
         static_cast<int32_t>(buf_width_), static_cast<int32_t>(buf_height_));
     ext_image_copy_capture_frame_v1_capture(frame);
-    wl_display_flush(display_);
 
-    while (!frame_ready_ && !frame_failed_ && !session_stopped_)
-        wl_display_dispatch(display_);
+    const bool completed = WaitUntil(
+        deadline,
+        [this] { return frame_ready_ || frame_failed_ || session_stopped_; },
+        "frame request");
     ext_image_copy_capture_frame_v1_destroy(frame);
 
-    if (frame_failed_ || session_stopped_) return false;
+    if (!completed || frame_failed_ || session_stopped_) return false;
 
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);

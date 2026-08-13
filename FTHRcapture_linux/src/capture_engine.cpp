@@ -111,7 +111,7 @@ void CaptureEngine::CaptureLoop() {
 }
 
 bool CaptureEngine::RunCaptureGeneration() {
-    backend_ = CreateBestBackend(cfg_);
+    backend_ = CreateBestBackend(cfg_, &running_);
     if (!backend_) {
         std::cerr << "[Capture] No capture backend available — exiting" << std::endl;
         return false;

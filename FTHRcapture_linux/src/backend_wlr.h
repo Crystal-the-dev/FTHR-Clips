@@ -1,5 +1,8 @@
 #pragma once
 #include "capture_backend.h"
+#include "wayland_dispatch.h"
+#include <atomic>
+#include <chrono>
 #include <string>
 #include <vector>
 #include <wayland-client.h>
@@ -10,7 +13,7 @@ namespace fthr {
 
 class WlrBackend final : public ICaptureBackend {
 public:
-    WlrBackend() = default;
+    explicit WlrBackend(const std::atomic<bool>* running) : running_(running) {}
     ~WlrBackend() override { Shutdown(); }
 
     bool Initialize(const CaptureConfig& cfg) override;
@@ -28,6 +31,10 @@ public:
     };
 
 private:
+    inline static constexpr auto kInitializationTimeout = std::chrono::seconds(5);
+    inline static constexpr auto kFrameTimeout = std::chrono::seconds(2);
+
+    const std::atomic<bool>*       running_    = nullptr;
     wl_display*                 display_    = nullptr;
     wl_registry*                registry_   = nullptr;
     wl_compositor*              compositor_ = nullptr;
@@ -60,7 +67,13 @@ private:
 
     bool AllocFramebuffer();
     void FreeFramebuffer();
+    void DestroyPendingFrame();
     void DestroyWayland();
+    bool KeepRunning() const noexcept;
+    bool WaitUntil(WaylandDeadline deadline,
+                   const WaylandPredicate& complete,
+                   const char* operation);
+    bool Roundtrip(WaylandDeadline deadline, const char* operation);
 
 public:
     static void RegistryGlobal(void*, wl_registry*, uint32_t, const char*, uint32_t);

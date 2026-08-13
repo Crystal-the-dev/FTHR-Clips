@@ -7,11 +7,15 @@ include(CTest)
 if(BUILD_TESTING)
     add_executable(fthr_capture_recovery_test tests/capture_recovery_test.cpp)
     target_include_directories(fthr_capture_recovery_test PRIVATE src)
+    target_compile_options(fthr_capture_recovery_test PRIVATE
+        -Wall -Wextra -Wpedantic -UNDEBUG)
     add_test(NAME capture_recovery_policy COMMAND fthr_capture_recovery_test)
 
     add_executable(fthr_transactional_save_test tests/transactional_save_test.cpp)
     target_include_directories(fthr_transactional_save_test PRIVATE
         ${CMAKE_SOURCE_DIR}/../FTHRcapture_common)
+    target_compile_options(fthr_transactional_save_test PRIVATE
+        -Wall -Wextra -Wpedantic -UNDEBUG)
     add_test(NAME transactional_save_contract COMMAND fthr_transactional_save_test)
 endif()
 
@@ -121,6 +125,18 @@ pkg_check_modules(WAYLAND REQUIRED IMPORTED_TARGET
 pkg_check_modules(PULSE REQUIRED IMPORTED_TARGET
     libpulse-simple libpulse)
 
+if(BUILD_TESTING)
+    add_executable(fthr_wayland_dispatch_test
+        tests/wayland_dispatch_test.cpp
+        src/wayland_dispatch.cpp)
+    target_include_directories(fthr_wayland_dispatch_test PRIVATE src)
+    target_link_libraries(fthr_wayland_dispatch_test PRIVATE
+        PkgConfig::WAYLAND pthread)
+    target_compile_options(fthr_wayland_dispatch_test PRIVATE
+        -Wall -Wextra -Wpedantic -UNDEBUG)
+    add_test(NAME wayland_bounded_dispatch COMMAND fthr_wayland_dispatch_test)
+endif()
+
 find_program(WAYLAND_SCANNER wayland-scanner REQUIRED)
 set(PROTO_DIR ${CMAKE_SOURCE_DIR}/protocols)
 
@@ -195,6 +211,7 @@ add_executable(FTHRclips
     src/capture_engine.cpp
     src/backend_wlr.cpp
     src/backend_ext.cpp
+    src/wayland_dispatch.cpp
     src/backend_x11.cpp
     src/capture_backend.cpp
     src/audio_capture.cpp

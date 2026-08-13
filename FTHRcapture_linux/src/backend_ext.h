@@ -1,5 +1,8 @@
 #pragma once
 #include "capture_backend.h"
+#include "wayland_dispatch.h"
+#include <atomic>
+#include <chrono>
 #include <wayland-client.h>
 #include "ext-image-copy-capture-client-protocol.h"
 #include "ext-image-capture-source-client-protocol.h"
@@ -10,7 +13,7 @@ namespace fthr {
 
 class ExtBackend final : public ICaptureBackend {
 public:
-    ExtBackend() = default;
+    explicit ExtBackend(const std::atomic<bool>* running) : running_(running) {}
     ~ExtBackend() override { Shutdown(); }
 
     bool Initialize(const CaptureConfig& cfg) override;
@@ -45,6 +48,10 @@ public:
     static void FramePresentationTime(void*, ext_image_copy_capture_frame_v1*, uint32_t, uint32_t, uint32_t);
 
 private:
+    inline static constexpr auto kInitializationTimeout = std::chrono::seconds(5);
+    inline static constexpr auto kFrameTimeout = std::chrono::seconds(2);
+
+    const std::atomic<bool>* running_ = nullptr;
     wl_display*    display_    = nullptr;
     wl_registry*   registry_   = nullptr;
     wl_shm*        shm_        = nullptr;
@@ -78,6 +85,11 @@ private:
     bool AllocShmBuffer();
     void FreeShmBuffer();
     void DestroyWayland();
+    bool KeepRunning() const noexcept;
+    bool WaitUntil(WaylandDeadline deadline,
+                   const WaylandPredicate& complete,
+                   const char* operation);
+    bool Roundtrip(WaylandDeadline deadline, const char* operation);
 };
 
 } // namespace fthr

@@ -1,5 +1,6 @@
 #pragma once
 #include "capture_engine.h"
+#include <atomic>
 #include <cstdint>
 #include <memory>
 
@@ -25,7 +26,8 @@ public:
     // One-time setup. Returns false and logs on failure.
     virtual bool Initialize(const CaptureConfig& cfg) = 0;
 
-    // Blocking: waits for next frame, fills out. Returns false on unrecoverable error.
+    // Synchronously waits within the backend's bounded frame deadline. Returns
+    // false on timeout, cancellation, disconnect, or another backend error.
     virtual bool CaptureFrame(RawFrame& out) = 0;
 
     virtual void Shutdown() = 0;
@@ -36,7 +38,9 @@ public:
 };
 
 // Factory: tries wlr-screencopy → ext-image-copy-capture → x11grab.
-// Returns nullptr if no backend works on the current session.
-std::unique_ptr<ICaptureBackend> CreateBestBackend(const CaptureConfig& cfg);
+// Returns nullptr if no backend works or capture cancellation is requested.
+std::unique_ptr<ICaptureBackend> CreateBestBackend(
+    const CaptureConfig& cfg,
+    const std::atomic<bool>* running);
 
 } // namespace fthr

@@ -176,7 +176,15 @@ void WlrBackend::FreeFramebuffer() {
     if (fb_.fd >= 0) { close(fb_.fd); fb_.fd = -1; }
 }
 
+void WlrBackend::DestroyPendingFrame() {
+    if (sc_frame_) {
+        zwlr_screencopy_frame_v1_destroy(sc_frame_);
+        sc_frame_ = nullptr;
+    }
+}
+
 void WlrBackend::DestroyWayland() {
+    DestroyPendingFrame();
     if (sc_mgr_)    { zwlr_screencopy_manager_v1_destroy(sc_mgr_);  sc_mgr_    = nullptr; }
     if (xdg_mgr_)   { zxdg_output_manager_v1_destroy(xdg_mgr_);     xdg_mgr_   = nullptr; }
     for (auto* e : all_outputs_) { wl_output_destroy(e->handle); delete e; }
@@ -188,12 +196,40 @@ void WlrBackend::DestroyWayland() {
     output_ = nullptr;
 }
 
+bool WlrBackend::KeepRunning() const noexcept {
+    return !running_ || running_->load();
+}
+
+bool WlrBackend::WaitUntil(WaylandDeadline deadline,
+                           const WaylandPredicate& complete,
+                           const char* operation) {
+    const auto result = DispatchWaylandUntil(
+        display_,
+        deadline,
+        [this] { return KeepRunning(); },
+        complete);
+    if (result == WaylandWaitResult::EventReceived) return true;
+    std::cerr << "[WlrBackend] Wayland " << operation << " "
+              << WaylandWaitResultName(result) << std::endl;
+    return false;
+}
+
+bool WlrBackend::Roundtrip(WaylandDeadline deadline, const char* operation) {
+    const auto result = BoundedWaylandRoundtrip(
+        display_, deadline, [this] { return KeepRunning(); });
+    if (result == WaylandWaitResult::EventReceived) return true;
+    std::cerr << "[WlrBackend] Wayland " << operation << " "
+              << WaylandWaitResultName(result) << std::endl;
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // Initialize
 // ---------------------------------------------------------------------------
 
 bool WlrBackend::Initialize(const CaptureConfig& cfg) {
     target_output_ = cfg.target_output;
+    const auto deadline = std::chrono::steady_clock::now() + kInitializationTimeout;
 
     display_ = wl_display_connect(nullptr);
     if (!display_) {
@@ -203,8 +239,11 @@ bool WlrBackend::Initialize(const CaptureConfig& cfg) {
 
     registry_ = wl_display_get_registry(display_);
     wl_registry_add_listener(registry_, &kRegistryListener, this);
-    wl_display_roundtrip(display_);  // discovers all globals + outputs
-    wl_display_roundtrip(display_);  // flushes output name/done events
+    if (!Roundtrip(deadline, "registry discovery") ||
+            !Roundtrip(deadline, "output discovery")) {
+        Shutdown();
+        return false;
+    }
 
     // Select the target wl_output by name; fall back to first available.
     {
@@ -234,19 +273,24 @@ bool WlrBackend::Initialize(const CaptureConfig& cfg) {
         for (auto* e : all_outputs_) {
             if (e->handle == output_) { selected = e; break; }
         }
-        while (selected && !selected->done)
-            wl_display_dispatch(display_);
+        if (selected && !WaitUntil(
+                deadline,
+                [selected] { return selected->done; },
+                "output discovery")) {
+            Shutdown();
+            return false;
+        }
     }
 
     if (!sc_mgr_) {
         std::cerr << "[WlrBackend] zwlr_screencopy_manager_v1 not available — "
                      "compositor must support wlr-screencopy" << std::endl;
-        DestroyWayland();
+        Shutdown();
         return false;
     }
     if (!output_) {
         std::cerr << "[WlrBackend] No wl_output found" << std::endl;
-        DestroyWayland();
+        Shutdown();
         return false;
     }
 
@@ -259,32 +303,47 @@ bool WlrBackend::Initialize(const CaptureConfig& cfg) {
         fb_.fd = -1;
 
         sc_frame_ = zwlr_screencopy_manager_v1_capture_output(sc_mgr_, 0, output_);
+        if (!sc_frame_) {
+            std::cerr << "[WlrBackend] Failed to create resolution probe" << std::endl;
+            Shutdown();
+            return false;
+        }
         zwlr_screencopy_frame_v1_add_listener(sc_frame_, &kScFrameListener, this);
-        while (!buffer_done_ && !frame_failed_)
-            wl_display_dispatch(display_);
+        if (!WaitUntil(
+                deadline,
+                [this] { return buffer_done_ || frame_failed_; },
+                "resolution probe buffer")) {
+            Shutdown();
+            return false;
+        }
 
         if (frame_failed_ || fb_.width == 0) {
             std::cerr << "[WlrBackend] Failed to probe output resolution" << std::endl;
-            zwlr_screencopy_frame_v1_destroy(sc_frame_);
-            sc_frame_ = nullptr;
-            DestroyWayland();
+            Shutdown();
             return false;
         }
 
         if (!AllocFramebuffer()) {
             std::cerr << "[WlrBackend] Failed to allocate probe framebuffer" << std::endl;
-            zwlr_screencopy_frame_v1_destroy(sc_frame_);
-            sc_frame_ = nullptr;
-            DestroyWayland();
+            Shutdown();
             return false;
         }
 
         zwlr_screencopy_frame_v1_copy(sc_frame_, fb_.buffer);
-        while (!frame_ready_ && !frame_failed_)
-            wl_display_dispatch(display_);
+        if (!WaitUntil(
+                deadline,
+                [this] { return frame_ready_ || frame_failed_; },
+                "resolution probe frame")) {
+            Shutdown();
+            return false;
+        }
 
-        zwlr_screencopy_frame_v1_destroy(sc_frame_);
-        sc_frame_ = nullptr;
+        DestroyPendingFrame();
+        if (frame_failed_) {
+            std::cerr << "[WlrBackend] Resolution probe frame failed" << std::endl;
+            Shutdown();
+            return false;
+        }
     }
 
     std::cout << "[WlrBackend] Output resolution: " << native_w_ << "x" << native_h_ << std::endl;
@@ -296,6 +355,7 @@ bool WlrBackend::Initialize(const CaptureConfig& cfg) {
 // ---------------------------------------------------------------------------
 
 bool WlrBackend::CaptureFrame(RawFrame& out) {
+    const auto deadline = std::chrono::steady_clock::now() + kFrameTimeout;
     frame_ready_  = false;
     frame_failed_ = false;
     buffer_done_  = false;
@@ -304,14 +364,22 @@ bool WlrBackend::CaptureFrame(RawFrame& out) {
     uint32_t prev_h = fb_.height;
 
     sc_frame_ = zwlr_screencopy_manager_v1_capture_output(sc_mgr_, 0, output_);
+    if (!sc_frame_) {
+        std::cerr << "[WlrBackend] Failed to create frame request" << std::endl;
+        return false;
+    }
     zwlr_screencopy_frame_v1_add_listener(sc_frame_, &kScFrameListener, this);
 
-    while (!buffer_done_ && !frame_failed_)
-        wl_display_dispatch(display_);
+    if (!WaitUntil(
+            deadline,
+            [this] { return buffer_done_ || frame_failed_; },
+            "frame buffer request")) {
+        DestroyPendingFrame();
+        return false;
+    }
 
     if (frame_failed_) {
-        zwlr_screencopy_frame_v1_destroy(sc_frame_);
-        sc_frame_ = nullptr;
+        DestroyPendingFrame();
         return false;
     }
 
@@ -319,21 +387,21 @@ bool WlrBackend::CaptureFrame(RawFrame& out) {
     if (fb_.width != prev_w || fb_.height != prev_h || !fb_.buffer) {
         FreeFramebuffer();
         if (!AllocFramebuffer()) {
-            zwlr_screencopy_frame_v1_destroy(sc_frame_);
-            sc_frame_ = nullptr;
+            DestroyPendingFrame();
             return false;
         }
     }
 
     zwlr_screencopy_frame_v1_copy(sc_frame_, fb_.buffer);
 
-    while (!frame_ready_ && !frame_failed_)
-        wl_display_dispatch(display_);
+    const bool completed = WaitUntil(
+        deadline,
+        [this] { return frame_ready_ || frame_failed_; },
+        "frame request");
 
-    zwlr_screencopy_frame_v1_destroy(sc_frame_);
-    sc_frame_ = nullptr;
+    DestroyPendingFrame();
 
-    if (frame_failed_)
+    if (!completed || frame_failed_)
         return false;
 
     struct timespec ts;
@@ -355,6 +423,7 @@ bool WlrBackend::CaptureFrame(RawFrame& out) {
 // ---------------------------------------------------------------------------
 
 void WlrBackend::Shutdown() {
+    DestroyPendingFrame();
     FreeFramebuffer();
     DestroyWayland();
 }
