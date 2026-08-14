@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 verify_release_licenses.py — fail the build if a release artifact carries
-GPL-licensed FFmpeg components, or is missing its licence paperwork.
+unapproved GPL components, the wrong Qt binding, or incomplete paperwork.
 
 Background: FTHR Clips used to bundle a GPLv3 FFmpeg build (with libx264 and
 libx265) while presenting itself as MIT, and shipped no third-party licence
@@ -61,9 +61,17 @@ REQUIRED_TREE_FILES = (
     'LICENSE',
     'THIRD_PARTY_NOTICES.md',
     'licenses/FFmpeg-LICENSE.txt',
-    'licenses/PyQt6-LICENSE.txt',
+    'licenses/NVIDIA-NVENC-SDK-LICENSE.txt',
+    'licenses/OpenH264-LICENSE.txt',
+    'licenses/PySide6-NOTICE.txt',
     'licenses/Qt6-LICENSE.txt',
+    'licenses/Qt6-SOURCE.txt',
+    'licenses/Qt6-THIRD-PARTY-NOTICES.txt',
+    'licenses/Wayland-Protocols-NOTICES.txt',
+    'licenses/cffi-LICENSE.txt',
+    'licenses/pycparser-LICENSE.txt',
     'tools/ffmpeg_manifest.json',
+    'tools/qt_runtime_manifest.json',
 )
 
 # Linux ships its own pinned LGPL FFmpeg (AUDIT-014) with its own manifest.
@@ -88,6 +96,10 @@ SYSTEM_FFMPEG_SONAMES = frozenset((
 
 # What an installed/packaged artifact must carry for the end user.
 REQUIRED_ARTIFACT_FILES = ('LICENSE', 'THIRD_PARTY_NOTICES.md', 'licenses')
+
+QT_MANIFEST_REL = 'tools/qt_runtime_manifest.json'
+QT_DLL_RE = re.compile(r'^Qt6([A-Za-z0-9_]+)\.dll$', re.I)
+QT_SO_RE = re.compile(r'^libQt6([A-Za-z0-9_]+)\.so(?:\..*)?$', re.I)
 
 
 class Report:
@@ -269,6 +281,196 @@ def check_manifest(root: Path, rep: Report) -> None:
         rep.fail(f'ffmpeg_manifest.json: license is "{lic}", expected LGPL')
     else:
         rep.ok(f'manifest licence: {lic}')
+
+
+def _normalise_package_name(name: str) -> str:
+    return re.sub(r'[-_.]+', '-', name).lower()
+
+
+def _locked_packages(path: Path) -> dict[str, str]:
+    pins: dict[str, str] = {}
+    for raw in path.read_text(encoding='utf-8').splitlines():
+        line = raw.split('#', 1)[0].strip()
+        if not line or line.startswith(('-', '--')) or '==' not in line:
+            continue
+        name, version = line.split('==', 1)
+        pins[_normalise_package_name(name.strip())] = version.strip()
+    return pins
+
+
+def check_qt_source_selection(root: Path, rep: Report) -> None:
+    """Verify that source, lock, and packaging select one approved Qt binding."""
+    print('\n-- Qt binding source and lock --')
+    data = _read_manifest(root, QT_MANIFEST_REL, rep)
+    if data is None:
+        return
+
+    binding = data.get('binding') or {}
+    selected = str(binding.get('name') or '')
+    version = str(binding.get('version') or '')
+    forbidden = str(data.get('forbidden_binding') or '')
+    if selected != 'PySide6' or not version:
+        rep.fail(f'{QT_MANIFEST_REL}: approved binding/version is incomplete')
+        return
+    rep.ok(f'approved Qt binding is {selected} {version}')
+
+    ui = root / 'FTHR_UI'
+    selected_imports: list[str] = []
+    forbidden_imports: list[str] = []
+    for py in sorted(ui.rglob('*.py')) if ui.is_dir() else []:
+        text = py.read_text(encoding='utf-8', errors='replace')
+        if re.search(rf'^\s*(?:from|import)\s+{re.escape(selected)}(?:\.|\b)',
+                     text, re.M):
+            selected_imports.append(str(py.relative_to(root)))
+        if forbidden and re.search(
+                rf'^\s*(?:from|import)\s+{re.escape(forbidden)}(?:\.|\b)',
+                text, re.M):
+            forbidden_imports.append(str(py.relative_to(root)))
+    if forbidden_imports:
+        rep.fail(f'{forbidden} production imports found: '
+                 f'{", ".join(forbidden_imports)}')
+    else:
+        rep.ok(f'no production imports use forbidden {forbidden}')
+    if selected_imports:
+        rep.ok(f'{len(selected_imports)} production files import {selected}')
+    else:
+        rep.fail(f'no production source imports approved binding {selected}')
+
+    lock = root / 'requirements-alpha.txt'
+    if not lock.is_file():
+        rep.fail('requirements-alpha.txt missing')
+    else:
+        pins = _locked_packages(lock)
+        expected = {
+            _normalise_package_name(name): str(pin)
+            for name, pin in (binding.get('packages') or {}).items()
+        }
+        mismatches = [
+            f'{name} expected {pin}, got {pins.get(name, "missing")}'
+            for name, pin in expected.items() if pins.get(name) != pin
+        ]
+        forbidden_pins = sorted(
+            name for name in pins
+            if forbidden and name.startswith(_normalise_package_name(forbidden)))
+        if mismatches:
+            rep.fail('Qt lock mismatch: ' + '; '.join(mismatches))
+        else:
+            rep.ok(f'{len(expected)} approved Qt packages pinned exactly')
+        if forbidden_pins:
+            rep.fail(f'forbidden Qt packages in lock: {", ".join(forbidden_pins)}')
+        else:
+            rep.ok(f'no {forbidden} package is present in the release lock')
+
+    packaging_files = (
+        'requirements.in', 'FTHR.spec', 'FTHR_linux.spec', 'build_linux.sh',
+    )
+    stale: list[str] = []
+    for rel in packaging_files:
+        path = root / rel
+        if not path.is_file():
+            rep.fail(f'{rel} missing from Qt packaging selection')
+            continue
+        text = path.read_text(encoding='utf-8', errors='replace')
+        if forbidden and forbidden in text:
+            stale.append(rel)
+        if selected not in text:
+            rep.fail(f'{rel}: approved binding {selected} is not selected')
+    if stale:
+        rep.fail(f'forbidden binding {forbidden} remains in packaging: '
+                 f'{", ".join(stale)}')
+    else:
+        rep.ok(f'packaging selects {selected} and contains no {forbidden}')
+
+
+def _qt_runtime_modules(files: list[Path], platform: str) -> set[str]:
+    pattern = QT_DLL_RE if platform == 'windows' else QT_SO_RE
+    return {
+        match.group(1)
+        for path in files
+        if (match := pattern.match(path.name)) is not None
+    }
+
+
+def check_qt_artifact(root: Path, rep: Report, platform: str,
+                      manifest_root: Path | None = None) -> None:
+    """Inspect the binding, Qt modules, plugins, and paperwork actually shipped."""
+    print(f'\n-- Qt runtime in {platform} artifact --')
+    source_root = manifest_root or _repo_root()
+    data = _read_manifest(source_root, QT_MANIFEST_REL, rep)
+    if data is None:
+        return
+
+    binding = data.get('binding') or {}
+    selected = str(binding.get('name') or '')
+    forbidden = str(data.get('forbidden_binding') or '')
+    files = [path for path in root.rglob('*') if path.is_file()]
+
+    def has_package(name: str) -> bool:
+        folded = name.casefold()
+        return any(any(part.casefold() == folded for part in path.parts)
+                   or path.name.casefold().startswith(folded + '-')
+                   for path in files)
+
+    selected_found = has_package(selected)
+    forbidden_found = has_package(forbidden) if forbidden else False
+    if selected_found and not forbidden_found:
+        rep.ok(f'artifact contains approved binding {selected} only')
+    elif selected_found and forbidden_found:
+        rep.fail(f'artifact contains both {selected} and forbidden {forbidden}')
+    elif forbidden_found:
+        rep.fail(f'artifact contains forbidden binding {forbidden}; expected {selected}')
+    else:
+        rep.fail(f'artifact is missing approved binding {selected}')
+
+    obsolete = [p for p in files if p.name.casefold() == 'pyqt6-license.txt']
+    if obsolete:
+        rep.fail('artifact contains obsolete PyQt6 licence paperwork')
+    else:
+        rep.ok('artifact contains no obsolete PyQt6 licence paperwork')
+
+    required = tuple(data.get('required_license_files') or ())
+    check_files(root, required, rep, f'{platform} Qt artifact')
+
+    modules = _qt_runtime_modules(files, platform)
+    approved = set((data.get('approved_runtime_qt_modules') or {}).get(platform) or ())
+    denied = set(data.get('forbidden_gpl_only_qt_modules') or ())
+
+    gpl_modules = sorted(
+        module for module in modules
+        if any(module.casefold() == item.casefold()
+               or module.casefold().startswith(item.casefold())
+               for item in denied)
+    )
+    unexpected = sorted(modules - approved)
+    missing_direct = sorted(set(data.get('direct_qt_modules') or ()) - modules)
+    if gpl_modules:
+        rep.fail('GPL-only Qt modules found: ' + ', '.join(gpl_modules))
+    else:
+        rep.ok('no reviewed GPL-only Qt module is bundled')
+    if unexpected:
+        rep.fail('unreviewed Qt runtime modules found: ' + ', '.join(unexpected))
+    else:
+        rep.ok(f'all {len(modules)} Qt runtime modules match the approved manifest')
+    if missing_direct:
+        rep.fail('required Qt runtime modules missing: ' + ', '.join(missing_direct))
+    else:
+        rep.ok('all directly used Qt modules are bundled')
+
+    names = {path.name.casefold() for path in files}
+    if platform == 'windows':
+        if 'qwindows.dll' in names:
+            rep.ok('Windows Qt platform plugin is bundled')
+        else:
+            rep.fail('qwindows.dll missing from Windows artifact')
+    else:
+        if 'libqxcb.so' in names:
+            rep.ok('Linux XCB Qt platform plugin is bundled')
+        else:
+            rep.fail('libqxcb.so missing from Linux artifact')
+        if any(name.startswith('libqwayland') and name.endswith('.so') for name in names):
+            rep.ok('Linux Wayland Qt platform plugin is bundled')
+        else:
+            rep.fail('Wayland Qt platform plugin missing from Linux artifact')
 
 
 def check_python_sources(root: Path, rep: Report) -> None:
@@ -516,6 +718,7 @@ def main() -> int:
         check_manifest(root, rep)
         check_linux_manifest(root, rep)
         check_python_sources(root, rep)
+        check_qt_source_selection(root, rep)
         vendored = root / 'FTHRcapture' / 'FTHRclips' / 'third_party' / 'ffmpeg'
         if vendored.is_dir():
             scan_dir(vendored, rep, 'vendored ffmpeg')
@@ -532,21 +735,25 @@ def main() -> int:
             rep.warn('no vendored linux ffmpeg (run tools/fetch_third_party.py '
                      '--ffmpeg-linux before a Linux release build)')
         if args.all:
-            for cand, kind in ((root / 'dist' / 'FTHRClips', 'windows dist'),
-                               (root / 'build' / 'AppDir', 'appdir')):
+            for cand, kind, platform in (
+                    (root / 'dist' / 'FTHRClips', 'windows dist', 'windows'),
+                    (root / 'build' / 'AppDir', 'appdir', 'linux')):
                 if cand.is_dir():
                     check_files(cand, REQUIRED_ARTIFACT_FILES, rep, kind)
                     scan_dir(cand, rep, kind)
+                    check_qt_artifact(cand, rep, platform, manifest_root=root)
 
     if args.windows_dist:
         d = args.windows_dist.resolve()
         check_files(d, REQUIRED_ARTIFACT_FILES, rep, 'windows dist')
         scan_dir(d, rep, 'windows dist')
+        check_qt_artifact(d, rep, 'windows', manifest_root=_repo_root())
 
     if args.appdir:
         d = args.appdir.resolve()
         check_files(d, REQUIRED_ARTIFACT_FILES, rep, 'appdir')
         scan_dir(d, rep, 'appdir')
+        check_qt_artifact(d, rep, 'linux', manifest_root=_repo_root())
         # AUDIT-014: the artifact is where it actually matters. A GPL library
         # the engine never loads is still a GPL library being distributed, and
         # PyInstaller collects the system FFmpeg through cv2 and Qt.
@@ -568,7 +775,8 @@ def main() -> int:
         for f in rep.failures:
             print(f'  - {f}')
         return 1
-    print('\nPASS — no GPL FFmpeg components, licence paperwork present.')
+    print('\nPASS — approved Qt binding/runtime, no GPL FFmpeg components, '
+          'licence paperwork present.')
     print('Note: technical verification only, not legal advice.')
     return 0
 

@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "decision": "AUDIT-013",
+  "binding": {
+    "name": "PySide6",
+    "version": "6.11.1",
+    "license_option": "LGPL-3.0-only",
+    "packages": {
+      "PySide6": "6.11.1",
+      "PySide6-Addons": "6.11.1",
+      "PySide6-Essentials": "6.11.1",
+      "shiboken6": "6.11.1"
+    }
+  },
+  "forbidden_binding": "PyQt6",
+  "direct_qt_modules": [
+    "Core",
+    "Gui",
+    "Widgets",
+    "Multimedia",
+    "MultimediaWidgets"
+  ],
+  "approved_runtime_qt_modules": {
+    "windows": [
+      "Core",
+      "Gui",
+      "Multimedia",
+      "MultimediaWidgets",
+      "Network",
+      "OpenGL",
+      "OpenGLWidgets",
+      "Pdf",
+      "Svg",
+      "Widgets"
+    ],
+    "linux": [
+      "Concurrent",
+      "Core",
+      "DBus",
+      "EglFSDeviceIntegration",
+      "EglFsKmsSupport",
+      "Gui",
+      "Multimedia",
+      "MultimediaWidgets",
+      "Network",
+      "OpenGL",
+      "OpenGLWidgets",
+      "Pdf",
+      "Svg",
+      "WaylandClient",
+      "WaylandEglClientHwIntegration",
+      "Widgets",
+      "WlShellIntegration",
+      "XcbQpa"
+    ]
+  },
+  "forbidden_gpl_only_qt_modules": [
+    "CanvasPainter",
+    "Coap",
+    "Graphs",
+    "Grpc",
+    "HttpServer",
+    "Lottie",
+    "Mqtt",
+    "NetworkAuth",
+    "QmlCompiler",
+    "Quick3D",
+    "Quick3DPhysics",
+    "QuickTimeline",
+    "VirtualKeyboard",
+    "WaylandCompositor"
+  ],
+  "required_license_files": [
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses/FFmpeg-LICENSE.txt",
+    "licenses/NVIDIA-NVENC-SDK-LICENSE.txt",
+    "licenses/OpenH264-LICENSE.txt",
+    "licenses/PySide6-NOTICE.txt",
+    "licenses/Qt6-LICENSE.txt",
+    "licenses/Qt6-SOURCE.txt",
+    "licenses/Qt6-THIRD-PARTY-NOTICES.txt",
+    "licenses/Wayland-Protocols-NOTICES.txt",
+    "licenses/cffi-LICENSE.txt",
+    "licenses/pycparser-LICENSE.txt"
+  ],
+  "official_sources": {
+    "qt": "https://download.qt.io/official_releases/qt/6.11/6.11.1/single/qt-everywhere-src-6.11.1.tar.xz",
+    "qt_for_python": "https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.11.1-src/pyside-setup-everywhere-src-6.11.1.tar.xz"
+  }
+}
