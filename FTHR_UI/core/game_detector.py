@@ -2,7 +2,7 @@ import sys
 import json
 import subprocess
 import threading
-from PyQt6.QtCore import QObject, QTimer, pyqtSignal
+from PySide6.QtCore import QObject, QTimer, Signal
 from core.compositor import detect_compositor
 from core import linux_tools
 
@@ -81,9 +81,9 @@ def _enumerate_linux_windows() -> list:
 
 
 class GameDetector(QObject):
-    game_appeared = pyqtSignal(dict)   # new is_game=True window
-    game_closed   = pyqtSignal(int)    # hwnd of a game that disappeared
-    _windows_enumerated = pyqtSignal(list)  # worker thread → main thread
+    game_appeared = Signal(dict)   # new is_game=True window
+    game_closed   = Signal(int)    # hwnd of a game that disappeared
+    _windows_enumerated = Signal(list)  # worker thread → main thread
 
     def __init__(self, enumerate_fn=None, parent=None):
         super().__init__(parent)
@@ -122,7 +122,7 @@ class GameDetector(QObject):
             except Exception as e:
                 print(f'[GameDetector] enumeration failed: {e}')
                 windows = []
-            # Cross-thread emit — PyQt queues this to the main thread.
+            # Cross-thread emit — Qt queues this to the main thread.
             self._windows_enumerated.emit(windows)
 
         threading.Thread(target=_work, daemon=True,

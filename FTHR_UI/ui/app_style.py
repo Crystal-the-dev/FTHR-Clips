@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import os
 
-from PyQt6.QtGui import QColor, QFont, QPalette
-from PyQt6.QtWidgets import QApplication, QStyleFactory
+from PySide6.QtGui import QColor, QFont, QPalette
+from PySide6.QtWidgets import QApplication, QStyleFactory
 
 from ui.style import Colors, Fonts
 

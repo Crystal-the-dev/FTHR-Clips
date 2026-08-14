@@ -9,17 +9,17 @@ _NO_WINDOW = {'creationflags': subprocess.CREATE_NO_WINDOW} if sys.platform == '
 
 import cv2
 
-from PyQt6.QtWidgets import (
+from PySide6.QtWidgets import (
     QApplication, QDialog, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QSlider, QFrame, QSizePolicy, QGraphicsOpacityEffect, QLineEdit,
 )
-from PyQt6.QtCore import (
-    Qt, pyqtSignal, QUrl, QTimer, QSize, QRect, QPoint, QEvent,
+from PySide6.QtCore import (
+    Qt, Signal, QUrl, QTimer, QSize, QRect, QPoint, QEvent,
     QPropertyAnimation, QEasingCurve, QMimeData,
 )
-from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
-from PyQt6.QtMultimediaWidgets import QVideoWidget
-from PyQt6.QtGui import (
+from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PySide6.QtMultimediaWidgets import QVideoWidget
+from PySide6.QtGui import (
     QPainter, QBrush, QPen, QColor, QFont, QPixmap, QImage, QPolygon, QDrag, QIcon,
 )
 
@@ -32,8 +32,8 @@ from ui.style import Colors, Fonts, Sizes
 
 class TrimSlider(QFrame):
     """Two-handle trim bar with live, draggable playhead indicator."""
-    range_changed  = pyqtSignal(float, float)
-    seek_requested = pyqtSignal(float)
+    range_changed  = Signal(float, float)
+    seek_requested = Signal(float)
 
     def __init__(self, duration_ms: int, parent=None):
         super().__init__(parent)
@@ -157,7 +157,7 @@ class CropOverlay(QWidget):
     8 drag handles (corners + edge midpoints), rule-of-thirds grid,
     click-and-drag to create a new crop.
     """
-    crop_changed = pyqtSignal(QRect)
+    crop_changed = Signal(QRect)
 
     _HS = 9    # handle square size px
     _HZ = 14   # hit-zone radius px
@@ -692,7 +692,7 @@ class ShareModeDialog(QDialog):
     Small frameless dialog that appears centered over the ClipViewer.
     User picks FULL QUALITY or 10 MB · DISCORD; emits mode_selected then closes.
     """
-    mode_selected = pyqtSignal(bool)   # True = discord 10 MB, False = full quality
+    mode_selected = Signal(bool)   # True = discord 10 MB, False = full quality
 
     def __init__(self, parent=None):
         super().__init__(parent,
@@ -792,8 +792,8 @@ class ShareWindow(QDialog):
     A FTHRClips watermark slides in and out twice when the clip is ready.
     """
 
-    _export_sig  = pyqtSignal(bool, str)
-    export_error = pyqtSignal(str, str, str)   # title, detail, level
+    _export_sig  = Signal(bool, str)
+    export_error = Signal(str, str, str)   # title, detail, level
 
     def __init__(self, clip_path: str, start_s: float, end_s: float,
                  crop_rect, settings_info: dict, discord_mode: bool = False,
@@ -1252,8 +1252,8 @@ class VolumePopup(QDialog):
     clips exist.
     """
 
-    master_changed = pyqtSignal(int)            # 0–100
-    source_changed = pyqtSignal(str, int)       # (source_key, 0–100)
+    master_changed = Signal(int)            # 0–100
+    source_changed = Signal(str, int)       # (source_key, 0–100)
 
     # Windows shows per-app WASAPI sources; Linux shows Desktop + Mic.
     _SOURCES = (
@@ -1393,9 +1393,9 @@ class VolumePopup(QDialog):
 class ClipViewer(QDialog):
     """Full FTHR clip editor — video preview, trim bar, export/delete/crop sidebar."""
 
-    _export_done     = pyqtSignal(bool, str)
-    upload_requested = pyqtSignal(str)
-    export_error     = pyqtSignal(str, str, str)   # title, detail, level
+    _export_done     = Signal(bool, str)
+    upload_requested = Signal(str)
+    export_error     = Signal(str, str, str)   # title, detail, level
 
     def __init__(self, clip_path: str, bridge, parent=None,
                  thumb_pixmap: QPixmap = None, settings_manager=None,
@@ -1465,7 +1465,7 @@ class ClipViewer(QDialog):
         self._refresh_quick_crop_btn()
 
         # setWindowOpacity not supported on Wayland — skip fade there
-        from PyQt6.QtWidgets import QApplication as _App
+        from PySide6.QtWidgets import QApplication as _App
         _app = _App.instance()
         _wayland = _app and _app.platformName() == 'wayland'
         self._fade_in_anim = None
@@ -1900,7 +1900,7 @@ class ClipViewer(QDialog):
         self.player.playbackStateChanged.connect(self._on_state_changed)
         # Surface backend errors instead of letting them propagate up as a
         # hard crash. This connects QMediaPlayer.errorOccurred where available
-        # (PyQt 6.5+); older bindings simply ignore the AttributeError.
+        # (Qt 6.5+); older bindings simply ignore the AttributeError.
         try:
             self.player.errorOccurred.connect(self._on_player_error)
         except AttributeError:
@@ -2314,7 +2314,7 @@ class ClipViewer(QDialog):
 
     # Signal carries the result of background multi-track detection back to
     # the UI thread (Qt widget mutation must always happen on the UI thread).
-    _multitrack_detected = pyqtSignal(bool)
+    _multitrack_detected = Signal(bool)
 
     def _detect_multitrack_audio_async(self):
         """Kick off ffmpeg-stderr probing on a worker thread.
@@ -2683,7 +2683,7 @@ class ClipViewer(QDialog):
     # =========================================================================
 
     def _delete_clip(self):
-        from PyQt6.QtWidgets import QMessageBox
+        from PySide6.QtWidgets import QMessageBox
         reply = QMessageBox.question(
             self, 'Delete Clip',
             f'Delete {os.path.basename(self.clip_path)}?\nThis cannot be undone.',
@@ -2699,7 +2699,7 @@ class ClipViewer(QDialog):
         # Without this, os.remove() fails with WinError 32 immediately.
         self._teardown_player()
         try:
-            from PyQt6.QtCore import QUrl as _QUrl
+            from PySide6.QtCore import QUrl as _QUrl
             self.player.setSource(_QUrl())
         except Exception:
             pass
@@ -2854,7 +2854,7 @@ class ClipViewer(QDialog):
                             if right:            return True, 11  # HTRIGHT
 
                         if cy < g.top() + self._editor_header_h:
-                            from PyQt6.QtWidgets import QPushButton
+                            from PySide6.QtWidgets import QPushButton
                             local = self.mapFromGlobal(QPoint(cx, cy))
                             w = self.childAt(local)
                             if w is None or not isinstance(w, QPushButton):

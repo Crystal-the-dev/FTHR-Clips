@@ -18,7 +18,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'FTHR_UI'))
 
-pytest.importorskip('PyQt6.QtCore')
+pytest.importorskip('PySide6.QtCore')
 from main import MainWindow, select_post_route
 
 ROUTES = {'mic', 'multiband', 'finalize'}

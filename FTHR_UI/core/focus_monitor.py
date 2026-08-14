@@ -1,7 +1,7 @@
 import json
 import subprocess
 import threading
-from PyQt6.QtCore import QObject, QTimer, pyqtSignal
+from PySide6.QtCore import QObject, QTimer, Signal
 from core.compositor import detect_compositor
 from core import linux_tools
 
@@ -45,9 +45,9 @@ def _get_active_window_title() -> str | None:
 
 
 class FocusMonitor(QObject):
-    focus_lost     = pyqtSignal()
-    focus_regained = pyqtSignal()
-    _title_polled  = pyqtSignal(object)  # worker thread → main thread
+    focus_lost     = Signal()
+    focus_regained = Signal()
+    _title_polled  = Signal(object)  # worker thread → main thread
 
     def __init__(self, target_name: str = '', parent=None):
         super().__init__(parent)

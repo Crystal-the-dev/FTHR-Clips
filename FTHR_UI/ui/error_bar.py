@@ -1,7 +1,7 @@
 from __future__ import annotations
 from collections import deque
 
-from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton
 
 from ui.style import Colors, Fonts, Sizes
 

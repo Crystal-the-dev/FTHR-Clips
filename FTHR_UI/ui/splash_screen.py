@@ -4,11 +4,11 @@ teal progress bar. Echoes the inverted top-bar design of the main window.
 """
 from pathlib import Path
 
-from PyQt6.QtWidgets import (
+from PySide6.QtWidgets import (
     QSplashScreen, QVBoxLayout, QLabel, QProgressBar, QWidget,
 )
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QPixmap, QColor
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QPixmap, QColor
 
 from ui.style import Colors, Fonts, Sizes
 
@@ -19,7 +19,7 @@ _W, _H = 500, 300
 class SplashScreen(QSplashScreen):
     """White-card splash with logo, progress, and a quiet build slug."""
 
-    finished = pyqtSignal()
+    finished = Signal()
 
     def __init__(self):
         # The pixmap fills any area the container doesn't cover; pure black so

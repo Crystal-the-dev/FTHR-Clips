@@ -25,8 +25,8 @@ from __future__ import annotations
 
 import threading
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtWidgets import (
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, QLineEdit,
     QPushButton, QRadioButton, QButtonGroup, QComboBox, QScrollArea,
     QFrame,
@@ -78,7 +78,7 @@ class UploadSettingsWidget(QWidget):
     # Worker thread → main thread. QTimer.singleShot from a plain
     # threading.Thread never fires (no event loop there) — the test button
     # would stay disabled on 'Testing…' forever.
-    _test_finished = pyqtSignal(bool, str)
+    _test_finished = Signal(bool, str)
 
     def __init__(self, settings_manager, parent=None, no_scroll=False):
         super().__init__(parent)
@@ -319,7 +319,7 @@ class UploadSettingsWidget(QWidget):
                 ok, msg = test_server_connection(url, auth)
             except Exception as e:
                 ok, msg = False, str(e)
-            # Cross-thread signal — queued to the main thread by PyQt.
+            # Cross-thread signal — queued to the main thread by Qt.
             self._test_finished.emit(ok, msg)
 
         self._test_thread = threading.Thread(target=_run, daemon=True)

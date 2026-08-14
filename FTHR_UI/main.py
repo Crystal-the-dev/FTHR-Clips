@@ -90,19 +90,19 @@ def _setup_file_logging():
 
 _setup_file_logging()
 
-from PyQt6.QtWidgets import (
+from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QScrollArea, QFrame, QMessageBox, QComboBox,
     QGraphicsOpacityEffect, QSizePolicy, QStackedWidget,
     QCheckBox, QSlider,
     QToolButton, QButtonGroup, QFileDialog, QLineEdit,
 )
-from PyQt6.QtCore import (
-    QTimer, pyqtSignal, Qt, QPoint, QPointF, QSize, QRect,
+from PySide6.QtCore import (
+    QTimer, Signal, Qt, QPoint, QPointF, QSize, QRect,
     QPropertyAnimation, QAbstractAnimation, QEasingCurve,
     QParallelAnimationGroup,
 )
-from PyQt6.QtGui import QPixmap, QFontDatabase, QCursor, QPainter, QPen, QColor, QIcon, QBrush, QPolygonF, QPalette, QKeySequence
+from PySide6.QtGui import QPixmap, QFontDatabase, QCursor, QPainter, QPen, QColor, QIcon, QBrush, QPolygonF, QPalette, QKeySequence
 
 from version import (
     __version__ as APP_VERSION, APP_NAME, BUILD_DATE,
@@ -176,7 +176,7 @@ def _resolution_to_dims(name: str) -> tuple[int, int]:
 def _load_logo_inverted(path: Path) -> QPixmap:
     """Load the logo PNG and invert RGB so the original black-on-white art
     becomes white-on-transparent — matches the dark top bar."""
-    from PyQt6.QtGui import QImage
+    from PySide6.QtGui import QImage
     img = QImage(str(path))
     if img.isNull():
         return QPixmap(str(path))
@@ -374,7 +374,7 @@ def _load_icon(name: str, size: int = 20) -> QIcon:
 
     # Performance icon = updates.png flipped vertically (arrow points up instead of down)
     if name == 'performance.png':
-        from PyQt6.QtGui import QTransform
+        from PySide6.QtGui import QTransform
         src = Path(__file__).parent / 'assets' / 'icons' / 'updates.png'
         if src.exists():
             pix = QPixmap(str(src)).scaled(
@@ -576,7 +576,7 @@ class _DropdownCombo(QComboBox):
 class _MicLevelMeter(QWidget):
     """Live mic-loudness bar. Updates at ~30Hz from an InputStream callback."""
 
-    _level_changed = pyqtSignal(float)
+    _level_changed = Signal(float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -770,13 +770,13 @@ class _PopupPanel(QFrame):
 class CaptureSettingsPopup(_PopupPanel):
     """Dropdown panel: clip length, fps, resolution, quality."""
 
-    clip_length_changed   = pyqtSignal(int)
-    extended_clip_changed = pyqtSignal(int)
-    framerate_changed     = pyqtSignal(int)
-    resolution_changed  = pyqtSignal(int, int)
-    bitrate_changed     = pyqtSignal(int)
-    restart_needed      = pyqtSignal()
-    summary_changed     = pyqtSignal(str)   # emitted whenever any value changes
+    clip_length_changed   = Signal(int)
+    extended_clip_changed = Signal(int)
+    framerate_changed     = Signal(int)
+    resolution_changed  = Signal(int, int)
+    bitrate_changed     = Signal(int)
+    restart_needed      = Signal()
+    summary_changed     = Signal(str)   # emitted whenever any value changes
 
     _CLIP_VALUES  = [5, 10, 15, 30, 45, 60, 120, 180, 300, 600, 900]
     _CLIP_LABELS  = ['5s','10s','15s','30s','45s','1m','2m','3m','5m','10m','15m']
@@ -974,9 +974,9 @@ class CaptureSettingsPopup(_PopupPanel):
 class SourcePopup(_PopupPanel):
     """Dropdown panel: desktop / window selector."""
 
-    source_changed = pyqtSignal(str, int)   # (mode, hwnd)
-    restart_needed = pyqtSignal()
-    summary_changed = pyqtSignal(str)
+    source_changed = Signal(str, int)   # (mode, hwnd)
+    restart_needed = Signal()
+    summary_changed = Signal(str)
 
     def __init__(self, settings_manager: SettingsManager, parent=None):
         super().__init__(parent)
@@ -1152,7 +1152,7 @@ class SourcePopup(_PopupPanel):
 class _KeyCaptureButton(QPushButton):
     """Button that records a keypress as a hotkey when clicked."""
 
-    key_captured = pyqtSignal(str)   # emits normalized key string e.g. 'F9', 'ctrl+shift+s'
+    key_captured = Signal(str)   # emits normalized key string e.g. 'F9', 'ctrl+shift+s'
 
     _BTN_NORMAL   = None  # set lazily from Colors
     _BTN_LISTEN   = None
@@ -1529,11 +1529,11 @@ class _StatsStrip(QFrame):
 
 class MainWindow(QMainWindow):
 
-    clip_saved = pyqtSignal(str)
+    clip_saved = Signal(str)
     # Cross-thread UI dispatcher. QTimer.singleShot(0, fn) from a plain
     # threading.Thread does NOT fire (no event loop in that thread) — emitting
     # this signal instead is guaranteed to queue fn onto the main thread.
-    _ui_call = pyqtSignal(object)
+    _ui_call = Signal(object)
 
     def __init__(self):
         super().__init__()
@@ -2025,9 +2025,8 @@ class MainWindow(QMainWindow):
             pass
 
     def nativeEvent(self, eventType, message):
-        # NOTE: do NOT call super().nativeEvent() — sip 6.15.1 crashes passing
-        # the voidptr back to C++.  Returning (False, 0) lets Qt's WndProc
-        # continue with default processing, which is identical in effect.
+        # Returning (False, 0) lets Qt's WndProc continue with default
+        # processing after the read-only message inspection below.
         if eventType == b'windows_generic_MSG':
             try:
                 import ctypes, ctypes.wintypes
@@ -2074,7 +2073,7 @@ class MainWindow(QMainWindow):
         return False, 0  # not handled — Qt WndProc continues normally
 
     def eventFilter(self, obj, event):
-        from PyQt6.QtCore import QEvent
+        from PySide6.QtCore import QEvent
         if obj.objectName() == 'dragArea':
             if event.type() == QEvent.Type.MouseButtonPress:
                 self._bar_mouse_press(event)
@@ -2206,7 +2205,7 @@ class MainWindow(QMainWindow):
     # =======================================================================
 
     def _warn_input_group(self):
-        from PyQt6.QtWidgets import QMessageBox
+        from PySide6.QtWidgets import QMessageBox
         msg = QMessageBox(self)
         msg.setWindowTitle('Hotkeys Disabled')
         msg.setText(
@@ -2253,14 +2252,14 @@ class MainWindow(QMainWindow):
         # Warn if key features are limited on the current compositor
         from core.compositor import detect_compositor as _dc, has_xtools as _hx
         if _dc() not in ('hyprland', 'x11') and not _hx():
-            from PyQt6.QtCore import QTimer as _QT
+            from PySide6.QtCore import QTimer as _QT
             _QT.singleShot(2000, self._show_compositor_warning)
 
     def _on_hotkey_save_clip(self):          self._save_clip(self.clip_duration)
     def _on_hotkey_save_extended_clip(self): self._save_clip(self.extended_clip_duration)
     def _on_hotkey_save_screenshot(self):
         from ui.screenshot_editor import ScreenshotEditor
-        from PyQt6.QtCore import QDialog
+        from PySide6.QtCore import QDialog
 
         timestamp = datetime.now().strftime('%d%b%Y_%H-%M-%S')
         screenshots_dir = Path.home() / 'FTHR_Clips' / 'Screenshots'
@@ -2305,7 +2304,7 @@ class MainWindow(QMainWindow):
             raw_path.unlink(missing_ok=True)
 
     def _show_compositor_warning(self):
-        from PyQt6.QtWidgets import QMessageBox
+        from PySide6.QtWidgets import QMessageBox
         from core.compositor import detect_compositor
         comp = detect_compositor()
         comp_name = {
@@ -4100,10 +4099,10 @@ class SlidingStackedWidget(QWidget):
 # ---------------------------------------------------------------------------
 
 class _SettingsPage(QWidget):
-    close_requested           = pyqtSignal()
-    imported_folders_changed  = pyqtSignal()
-    notification_monitor_changed = pyqtSignal()
-    encoder_config_changed    = pyqtSignal()
+    close_requested           = Signal()
+    imported_folders_changed  = Signal()
+    notification_monitor_changed = Signal()
+    encoder_config_changed    = Signal()
 
     _AUTOSTART_KEY  = r'Software\Microsoft\Windows\CurrentVersion\Run'
     _AUTOSTART_NAME = 'FTHRClips'
@@ -4704,6 +4703,7 @@ class _SettingsPage(QWidget):
         dev_lbl.setFixedWidth(100)
         dev_row.addWidget(dev_lbl)
         self.mic_combo = _DropdownCombo()
+        self._mic_combo_connected = False
         dev_row.addWidget(self.mic_combo, 1)
         refresh = QPushButton()
         refresh.setObjectName('micRefreshBtn')
@@ -5069,7 +5069,7 @@ class _SettingsPage(QWidget):
         if frame is None:
             return
         import cv2 as _cv2
-        from PyQt6.QtGui import QImage, QPixmap as _QPixmap
+        from PySide6.QtGui import QImage, QPixmap as _QPixmap
         rgb = _cv2.cvtColor(frame, _cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         # Use bytes() to copy the data — QImage constructed from a memoryview
@@ -5094,7 +5094,7 @@ class _SettingsPage(QWidget):
         self.preset_combo.blockSignals(False)
 
     def _on_preset_save(self):
-        from PyQt6.QtWidgets import QInputDialog
+        from PySide6.QtWidgets import QInputDialog
         name, ok = QInputDialog.getText(
             self, 'Save Preset', 'Name:',
             text=self.preset_combo.currentText() if self._presets_mgr.names() else '')
@@ -5209,11 +5209,10 @@ class _SettingsPage(QWidget):
             if idx >= 0:
                 self.mic_combo.setCurrentIndex(idx)
         self.mic_combo.blockSignals(False)
-        try:
-            self.mic_combo.currentIndexChanged.disconnect(self._on_mic_device_changed)
-        except (TypeError, RuntimeError):
-            pass
-        self.mic_combo.currentIndexChanged.connect(self._on_mic_device_changed)
+        if not self._mic_combo_connected:
+            self.mic_combo.currentIndexChanged.connect(
+                self._on_mic_device_changed)
+            self._mic_combo_connected = True
 
     def _load_audio_settings(self):
         if self.sm is None:
@@ -5607,9 +5606,8 @@ class _SettingsPage(QWidget):
 
         # LGPL/GPL components are bundled; the notices must be reachable from
         # inside the app, not only from the repository.
-        # Two different licences, and conflating them would be a false claim:
-        # FTHR's own source is MIT, but the shipped bundle contains PyQt6
-        # (GPL-3.0-only), which makes the build as a whole GPLv3 — AUDIT-013.
+        # FTHR's source stays MIT; bundled PySide6/Qt and media components keep
+        # their own licences, documented in the installed notices.
         lic_lbl = QLabel(
             f'FTHR Clips source: {SOURCE_LICENSE} · this build as distributed: '
             f'{DISTRIBUTION_LICENSE} — bundled components: see '
@@ -5767,7 +5765,7 @@ def _prewarm_heavy_modules():
 
     if sys.platform == 'win32':
         try:
-            from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+            from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
             # Pays the one-time cost of MediaFoundation init on Windows.
             _warm_player = QMediaPlayer()
             _warm_audio  = QAudioOutput()
@@ -5803,7 +5801,7 @@ def main():
         # QApplication has to exist before any widget, including QMessageBox.
         configure_qt_for_linux_ui()
         _app = QApplication(sys.argv)
-        from PyQt6.QtWidgets import QMessageBox
+        from PySide6.QtWidgets import QMessageBox
         QMessageBox.warning(
             None,
             'FTHR Clips is already running',

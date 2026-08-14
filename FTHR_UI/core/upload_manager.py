@@ -32,7 +32,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import QObject, QTimer, pyqtSignal
+from PySide6.QtCore import QObject, QTimer, Signal
 
 from core.clip_files import is_completed_video_path
 
@@ -45,9 +45,9 @@ _WRITE_SETTLE_S = 30                 # interval scan skips files younger than th
 
 
 class UploadManager(QObject):
-    upload_started  = pyqtSignal(str)              # clip_path
-    upload_finished = pyqtSignal(str, bool, str)   # path, success, message
-    upload_error    = pyqtSignal(str, str, str, str)  # title, detail, level, clip_path
+    upload_started  = Signal(str)              # clip_path
+    upload_finished = Signal(str, bool, str)   # path, success, message
+    upload_error    = Signal(str, str, str, str)  # title, detail, level, clip_path
 
     def __init__(self, settings_manager):
         super().__init__()

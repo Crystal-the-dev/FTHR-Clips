@@ -35,12 +35,11 @@ PRERELEASE = 'alpha'
 # hardcoded literal in main.py and had drifted four months out of date.
 BUILD_DATE = '2026-08-06'
 
-# Effective licence of a *distributed build*, as opposed to the licence of
-# FTHR's own source (MIT, see LICENSE). PyQt6 is GPL-3.0-only, so any bundle
-# containing it is GPLv3 as a whole — AUDIT-013. The UI and the release
-# paperwork must say this; advertising a download as "MIT" would be false.
+# A distributed build contains the MIT application plus separately licensed
+# third-party components. PySide6 and the reviewed Qt modules use their LGPLv3
+# option; the complete inventory remains in THIRD_PARTY_NOTICES.md.
 SOURCE_LICENSE = 'MIT'
-DISTRIBUTION_LICENSE = 'GPL-3.0-only'
+DISTRIBUTION_LICENSE = 'MIT + third-party licences'
 
 APP_NAME = 'FTHR Clips'
 APP_ID = 'FTHRClips'

@@ -9,7 +9,7 @@ import pytest
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'FTHR_UI'))
-pytest.importorskip('PyQt6.QtCore')
+pytest.importorskip('PySide6.QtCore')
 
 from ui import clip_grid
 

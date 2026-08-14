@@ -18,17 +18,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'FTHR_UI'))
 
-pytest.importorskip('PyQt6.QtCore')
-from PyQt6.QtCore import QCoreApplication, QTimer, QEventLoop, QElapsedTimer
+pytest.importorskip('PySide6.QtCore')
+from PySide6.QtCore import QTimer, QEventLoop, QElapsedTimer
 
 from core.capture_bridge import CaptureBridge, SharedMemoryLayout, ResponseType
 from core.save_state import SaveStateMachine, EngineEvent, OutcomeKind
-
-
-@pytest.fixture(scope='module')
-def qapp():
-    app = QCoreApplication.instance() or QCoreApplication(sys.argv[:1])
-    yield app
 
 
 class SilentEngineBridge(CaptureBridge):

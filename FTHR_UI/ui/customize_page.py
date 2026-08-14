@@ -12,19 +12,19 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import (
-    Qt, QPropertyAnimation, QEasingCurve, pyqtSignal, QUrl, QRect,
+from PySide6.QtCore import (
+    Qt, QPropertyAnimation, QEasingCurve, Signal, QUrl, QRect,
     QPoint,
 )
-from PyQt6.QtGui import (
+from PySide6.QtGui import (
     QPixmap, QColor, QPainter, QPen, QBrush, QFont, QCursor,
     QMouseEvent, QPaintEvent,
 )
-from PyQt6.QtWidgets import (
+from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea,
     QFrame, QColorDialog, QFileDialog, QSizePolicy, QGridLayout,
 )
-from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 from ui.style import (
     Colors, Fonts, label_uppercase, label_body,
@@ -210,7 +210,7 @@ def _inject_custom_titlebar(dlg, title: str):
 def _fthr_message_box(parent, title: str, message: str,
                        ok_cancel: bool = True) -> bool:
     """Custom styled message dialog matching the FTHR design language."""
-    from PyQt6.QtWidgets import QDialog
+    from PySide6.QtWidgets import QDialog
 
     dlg = QDialog(parent)
     dlg.setWindowFlags(
@@ -324,7 +324,7 @@ def _fthr_message_box(parent, title: str, message: str,
     title_bar.mouseMoveEvent = _move
     title_bar.mouseReleaseEvent = _release
 
-    from PyQt6.QtWidgets import QDialog as _D
+    from PySide6.QtWidgets import QDialog as _D
     return dlg.exec() == _D.DialogCode.Accepted
 
 
@@ -457,7 +457,7 @@ class _AccordionSection(QFrame):
 class _ColorSwatch(QWidget):
     """Small clickable color tile that opens a QColorDialog on click."""
 
-    color_changed = pyqtSignal(str, str)  # (token, new_hex)
+    color_changed = Signal(str, str)  # (token, new_hex)
 
     def __init__(self, token: str, label: str, hex_color: str, parent=None):
         super().__init__(parent)
@@ -890,7 +890,7 @@ class _IconCropWidget(QWidget):
 class _IconRow(QFrame):
     """Row for customizing one icon: shows reference + current + import button."""
 
-    icon_changed = pyqtSignal(str)  # filename
+    icon_changed = Signal(str)  # filename
 
     def __init__(self, filename: str, label: str, theme_mgr: ThemeManager, parent=None):
         super().__init__(parent)
@@ -1054,7 +1054,7 @@ class _IconRow(QFrame):
         self.icon_changed.emit(self._filename)
 
     def _show_crop_dialog(self, source_pix: QPixmap, target_size: int) -> Optional[QPixmap]:
-        from PyQt6.QtWidgets import QDialog, QDialogButtonBox
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox
 
         dlg = QDialog(self)
         dlg.setWindowFlags(
@@ -1151,7 +1151,7 @@ def _tint_pixmap(pixmap: QPixmap, color: QColor) -> QPixmap:
 class _IconTintRow(QFrame):
     """Row for setting the tint color of one default icon."""
 
-    tint_changed = pyqtSignal(str)  # filename
+    tint_changed = Signal(str)  # filename
 
     def __init__(self, filename: str, label: str, theme_mgr: ThemeManager,
                  parent=None):
@@ -1270,7 +1270,7 @@ class _IconTintRow(QFrame):
 class _SoundRow(QFrame):
     """Row for customizing one sound: shows current + import + preview buttons."""
 
-    sound_changed = pyqtSignal(str)  # key
+    sound_changed = Signal(str)  # key
 
     def __init__(self, key: str, label: str, theme_mgr: ThemeManager, parent=None):
         super().__init__(parent)
@@ -1419,7 +1419,7 @@ class _SoundRow(QFrame):
 class CustomizePage(QWidget):
     """Complete Customize settings tab with accordion sections."""
 
-    theme_applied = pyqtSignal()  # Emitted when user clicks Apply
+    theme_applied = Signal()  # Emitted when user clicks Apply
 
     def __init__(self, parent=None):
         super().__init__(parent)

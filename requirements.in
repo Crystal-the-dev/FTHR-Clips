@@ -15,11 +15,9 @@
 # and UI bug reports were not reproducible.
 
 # --- GUI -------------------------------------------------------------------
-# PyQt6 is GPL-3.0-only. This is the outstanding release blocker AUDIT-013:
-# the shipped build is therefore GPLv3 regardless of the FFmpeg work in
-# AUDIT-005. See THIRD_PARTY_NOTICES.md before advertising a licence.
-PyQt6>=6.11,<6.12
-PyQt6-Qt6>=6.11,<6.12
+# PySide6 keeps the Python binding and the reviewed Qt runtime on the LGPLv3
+# path selected by AUDIT-013. Do not add a second Qt binding.
+PySide6>=6.11,<6.12
 
 # --- Capture / media -------------------------------------------------------
 # Headless build on purpose: the GUI is Qt, and full opencv-python would drag

@@ -2,13 +2,7 @@
 sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parent.parent / 'FTHR_UI'))
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
-import pytest
 from unittest.mock import patch, MagicMock
-from PyQt6.QtWidgets import QApplication
-
-@pytest.fixture(scope='session')
-def qapp():
-    return QApplication.instance() or QApplication(sys.argv)
 
 
 def test_upload_error_signal_has_four_args(qapp):

@@ -5,10 +5,10 @@ and capture source (desktop / window) selector.
 """
 import sys
 import ctypes
-from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel,
+from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel,
                               QComboBox, QPushButton, QFrame, QSizePolicy, QFileIconProvider)
-from PyQt6.QtCore import Qt, QSize, QFileInfo, pyqtSignal
-from PyQt6.QtGui import QIcon, QCursor
+from PySide6.QtCore import Qt, QSize, QFileInfo, Signal
+from PySide6.QtGui import QIcon, QCursor
 from ui.style import Colors
 
 if sys.platform == 'win32':
@@ -250,8 +250,8 @@ class SettingBlock(QWidget):
     by connecting to `opened` and calling `collapse()` on siblings.
     """
 
-    value_changed = pyqtSignal(str)   # emits the selected option string
-    opened        = pyqtSignal(object)  # emits self so siblings can collapse
+    value_changed = Signal(str)   # emits the selected option string
+    opened        = Signal(object)  # emits self so siblings can collapse
 
     _BLOCK_W = 110  # fixed width for each tile
 
@@ -409,15 +409,15 @@ class CaptureSettingsWidget(QWidget):
     """Single-row compact settings bar with hardware encoding status
     and capture source (Desktop / Window) selector."""
 
-    clip_length_changed      = pyqtSignal(int)
-    framerate_changed        = pyqtSignal(int)
-    resolution_changed       = pyqtSignal(int, int)
-    bitrate_changed          = pyqtSignal(int)
-    restart_engine_requested = pyqtSignal()
-    retry_hardware_encoding  = pyqtSignal()
+    clip_length_changed      = Signal(int)
+    framerate_changed        = Signal(int)
+    resolution_changed       = Signal(int, int)
+    bitrate_changed          = Signal(int)
+    restart_engine_requested = Signal()
+    retry_hardware_encoding  = Signal()
     # Emitted when the user picks a new capture source and applies it.
     # Carries (capture_mode_str, hwnd_int) — e.g. ('desktop', 0) or ('window', 12345678)
-    capture_source_changed   = pyqtSignal(str, int)
+    capture_source_changed   = Signal(str, int)
 
     BITRATE_PRESETS = {
         '480p':   {'low': 2500,  'medium': 5000,  'high': 10000},
@@ -791,7 +791,7 @@ class CaptureSettingsWidget(QWidget):
         self.hw_status_bar.setVisible(True)
         
         # Hide after 3 seconds
-        from PyQt6.QtCore import QTimer
+        from PySide6.QtCore import QTimer
         QTimer.singleShot(3000, self.hide_hardware_encoding_error)
 
     # ------------------------------------------------------------------

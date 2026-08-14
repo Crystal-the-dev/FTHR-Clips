@@ -1,7 +1,7 @@
 # screenshot_editor.py - Screenshot crop tool
-from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel
-from PyQt6.QtCore import Qt, QRect
-from PyQt6.QtGui import QPixmap, QPainter, QPen
+from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel
+from PySide6.QtCore import Qt, QRect
+from PySide6.QtGui import QPixmap, QPainter, QPen
 from ui.style import Colors
 from pathlib import Path
 import os

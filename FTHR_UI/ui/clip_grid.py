@@ -21,16 +21,16 @@ import hashlib
 import cv2
 from datetime import datetime
 
-from PyQt6.QtWidgets import (
+from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QGridLayout,
     QGraphicsOpacityEffect, QMenu, QMessageBox, QApplication,
     QPushButton, QComboBox, QSizePolicy,
 )
-from PyQt6.QtCore import (
-    Qt, pyqtSignal, QTimer, QRunnable, QThreadPool, QObject,
+from PySide6.QtCore import (
+    Qt, Signal, QTimer, QRunnable, QThreadPool, QObject,
     QFileSystemWatcher, QPropertyAnimation, QEasingCurve, QRect, QPoint,
 )
-from PyQt6.QtGui import QPixmap, QPainter
+from PySide6.QtGui import QPixmap, QPainter
 
 from core.clip_files import (
     IMAGE_SUFFIXES,
@@ -237,7 +237,7 @@ def _clip_title_from_filename(file_path: str) -> str:
 
 
 class _ThumbnailSignals(QObject):
-    finished = pyqtSignal(str, str, int)  # file_path, cache_path, duration_sec
+    finished = Signal(str, str, int)  # file_path, cache_path, duration_sec
 
 
 class _ThumbnailWorker(QRunnable):
@@ -293,7 +293,7 @@ class _ThumbnailWorker(QRunnable):
 
 class _FileCollectSignals(QObject):
     # raw_files: set[str], sorted_pairs: list[(mtime, path)], imported: set[str], subdirs: list[str]
-    finished = pyqtSignal(object, object, object, object)
+    finished = Signal(object, object, object, object)
 
 
 class _FileCollectWorker(QRunnable):
@@ -380,10 +380,10 @@ class _FileCollectWorker(QRunnable):
 # ──────────────────────────────────────────────────────────────────────
 
 class ClipThumbnail(QFrame):
-    clicked          = pyqtSignal(str)
-    opened           = pyqtSignal(str, QPixmap, QRect)   # video-only: path, thumb, global card rect
-    deleted          = pyqtSignal(str)
-    upload_requested = pyqtSignal(str)
+    clicked          = Signal(str)
+    opened           = Signal(str, QPixmap, QRect)   # video-only: path, thumb, global card rect
+    deleted          = Signal(str)
+    upload_requested = Signal(str)
 
     def __init__(self, file_path: str, is_video: bool = True, imported: bool = False,
                  upload_enabled: bool = False, uploaded: bool = False, parent=None):
@@ -797,10 +797,10 @@ class ClipThumbnail(QFrame):
 # ──────────────────────────────────────────────────────────────────────
 
 class ClipGrid(QWidget):
-    clip_clicked          = pyqtSignal(str)
-    clip_opened           = pyqtSignal(str, QPixmap, QRect)
-    screenshot_clicked    = pyqtSignal(str)
-    clip_upload_requested = pyqtSignal(str)
+    clip_clicked          = Signal(str)
+    clip_opened           = Signal(str, QPixmap, QRect)
+    screenshot_clicked    = Signal(str)
+    clip_upload_requested = Signal(str)
 
     # Left+right margins from _setup_ui (28+28) — used for column calculation.
     _H_MARGIN = 56

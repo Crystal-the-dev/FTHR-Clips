@@ -22,8 +22,8 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from PyQt6.QtWidgets import QApplication
-from PyQt6.QtCore import QThread, pyqtSignal
+from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QThread, Signal
 
 from ui.app_style import apply_app_style, configure_qt_for_linux_ui
 from ui.capture_card import CaptureCard
@@ -31,8 +31,8 @@ from ui.capture_card import CaptureCard
 
 class _StdinReader(QThread):
     """Reads lines from stdin on a background thread and emits them as signals."""
-    command   = pyqtSignal(str)
-    eof_ready = pyqtSignal()   # fired when stdin closes (parent process died)
+    command   = Signal(str)
+    eof_ready = Signal()   # fired when stdin closes (parent process died)
 
     def run(self):
         try:

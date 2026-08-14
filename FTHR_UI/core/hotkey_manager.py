@@ -21,7 +21,7 @@ import os
 import sys
 import subprocess
 import threading
-from PyQt6.QtCore import QObject, pyqtSignal
+from PySide6.QtCore import QObject, Signal
 import json
 from pathlib import Path
 
@@ -35,12 +35,12 @@ class HotkeyManager(QObject):
     """Manages global hotkeys for the application"""
     
     # Signals
-    save_clip_triggered = pyqtSignal()
-    save_extended_clip_triggered = pyqtSignal()
-    save_screenshot_triggered = pyqtSignal()
-    confirm_game_detection_triggered  = pyqtSignal()
-    dismiss_game_detection_triggered  = pyqtSignal()
-    error_occurred = pyqtSignal(str, str, str)   # title, detail, level
+    save_clip_triggered = Signal()
+    save_extended_clip_triggered = Signal()
+    save_screenshot_triggered = Signal()
+    confirm_game_detection_triggered  = Signal()
+    dismiss_game_detection_triggered  = Signal()
+    error_occurred = Signal(str, str, str)   # title, detail, level
     
     def __init__(self):
         super().__init__()
@@ -467,7 +467,7 @@ class HotkeyManager(QObject):
                         data = conn.recv(256).decode().strip()
                         print(f"[Hotkey] Received: {data!r}")
                         if data in _dispatch:
-                            # Direct emit is safe: PyQt6 AutoConnection detects
+                            # Direct emit is safe: PySide6 AutoConnection detects
                             # the cross-thread call and queues it to the main
                             # thread automatically. QTimer.singleShot does NOT
                             # work from a plain threading.Thread (no event loop).

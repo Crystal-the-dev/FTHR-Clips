@@ -31,14 +31,14 @@ import sys
 import subprocess as _subprocess
 from pathlib import Path
 
-from PyQt6.QtCore import (
+from PySide6.QtCore import (
     Qt, QTimer, QPropertyAnimation, QSequentialAnimationGroup,
     QPauseAnimation, QEasingCurve, QPoint, QRect, QElapsedTimer,
 )
-from PyQt6.QtGui import (
+from PySide6.QtGui import (
     QColor, QPainter, QPen, QFont, QLinearGradient, QPainterPath,
 )
-from PyQt6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import QApplication, QWidget
 
 from core.settings_manager import SettingsManager
 from core.theme_manager import ThemeManager
