@@ -23,6 +23,8 @@ Without it most reports are not actionable.
 | ~~**Hotkey socket in world-writable /tmp**~~ (AUDIT-003b) | Resolved 2026-08-06. AUDIT-003 fixed the socket *mode*; the *path* was still `/tmp/fthr_hotkey.sock`, which any local user could squat — and the old code then ran an unconditional `unlink()` on it, either deleting a stranger's file or (under the sticky bit) failing and leaving hotkeys dead indefinitely. The socket moved to `$XDG_RUNTIME_DIR/fthr/` and now refuses to remove anything that is not a dead socket owned by you. 16 new tests, verified on Linux. |
 | ~~**No Linux AppImage could be built**~~ (AUDIT-014) | Resolved 2026-08-06. The Linux engine is now compiled against, and ships with, a pinned **LGPL** FFmpeg (BtbN `n8.1.2-34-g9b6c8969e0`, glibc 2.28 baseline) instead of the distribution's GPL build. CMake refuses a Release build without `-DFTHR_FFMPEG_ROOT`; the engine carries a `$ORIGIN` RPATH so it loads the bundled libraries; every shipped library is sha256-verified against `tools/ffmpeg_manifest_linux.json`. `build_linux.sh` now runs to completion: **83 licence checks, 0 failed**, and a 219 MB AppImage that starts. |
 | ~~**Bare-name external tool calls**~~ | Resolved 2026-08-06. `hyprctl`, `xdotool`, `xprop`, `grim`, `nc` and `xdg-open` were invoked by bare name, so `PATH` decided which binary ran and a missing tool surfaced as a swallowed `FileNotFoundError`. Now resolved once to an absolute path through `core/linux_tools.py`, cached, logged at startup, with required/optional classification. 13 new tests including `PATH` shadowing. |
+| ~~**Short replay saves**~~ (AUDIT-042) | Resolved 2026-08-14. Timestamp-driven selection retains the preceding keyframe and uses MP4 edit-list presentation instead of discarding footage through the next keyframe. Real WGC/NVENC saves at 30 s and 60 s were exact and fully decoded; see `docs/AUDIT-042-SHORT-SAVE-DURATION.md`. |
+| ~~**Linux FFmpeg header/library ABI mismatch**~~ (AUDIT-046) | Resolved 2026-08-14. Release linked pinned FFmpeg 8.1 libraries but could compile against system headers. CMake now gives the engine and FFmpeg-backed tests the pinned include directory; the actual-MP4 test exposed and verifies the fix. |
 
 ## Unverified — treat as unknown, not as working
 
@@ -40,16 +42,19 @@ Without it most reports are not actionable.
   (`~/.config/hypr/fthr-hotkeys.conf` + `hyprctl reload`) is untested.
 - **The GUI has not been launched** on either platform this cycle. The test
   suite covers logic; nobody has seen a window.
-- **The Windows engine has not been re-verified at runtime**, and no clip has
-  been saved on Windows this cycle.
+- **Windows duration was re-verified only for WGC/NVENC video-only saves.** Five
+  real 30/60-second clips were exact and fully decoded. Audio devices, raw
+  fallback, games/fullscreen, and soak remain unverified this cycle.
 - **The installer** has not been tested for install / update / uninstall, and
   **no AppImage has been produced** (the licence gate blocks it — see below).
 - Untested on Linux: multi-monitor, monitor switching, resolution changes,
   fractional scaling, fullscreen games, lock/unlock, suspend/resume, device
   removal during capture.
-- **No performance or soak testing** was done on either platform. Any
-  performance claim you read elsewhere is not backed by measurement.
-- **The C++ engines (~12k LOC) have zero automated tests** and were not reviewed.
+- **Only replay snapshot/save latency was measured; no soak test was done.**
+  AUDIT-042 records the scoped measurements. Broader performance remains unknown.
+- **The C++ engines now have focused native tests**, but not comprehensive engine
+  coverage. AUDIT-042 adds ten CTest targets around replay timing, audio,
+  transactional save, recovery and actual MP4 output.
 
 ## Platform limitations
 
@@ -92,6 +97,9 @@ Without it most reports are not actionable.
   unresponsive. Known (AUDIT-011), not yet fixed.
 - **Failures are often silent.** 34 code paths swallow their errors, so a
   feature can stop working with nothing in the log. Being fixed.
+- **AUDIT-045 (P2): Linux encoded snapshot copies hold the ring mutex.** A
+  synthetic 60-second/16-Mbps snapshot held it for about 54 ms; a future change
+  should move the deep copy outside the global producer lock.
 
 ## Privacy
 

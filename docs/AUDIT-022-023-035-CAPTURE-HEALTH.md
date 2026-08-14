@@ -234,9 +234,11 @@ real-world black/frozen matrix remain unrun.
 * **AUDIT-041 (P2 gate defect) — RESOLVED:** credential-shaped redaction fixtures made the
   mandatory hygiene gate fail. Fixtures now assemble test URLs at runtime; the
   scanner remains strict.
-* **AUDIT-042 (P1 footage loss) — OPEN:** the healthy Windows runtime probe requested five seconds
-  but produced 3.533 seconds / 91 frames after keyframe/timestamp trimming.
-  This is outside the capture-health fix and needs save-duration investigation.
+* **AUDIT-042 (P1 footage loss) — RESOLVED 2026-08-14:** this probe's five-second
+  request produced 3.533 seconds / 91 frames because packet-count selection
+  discarded media through the next keyframe. Timestamp selection, preceding
+  keyframe pre-roll and MP4 edit-list presentation are verified in
+  `docs/AUDIT-042-SHORT-SAVE-DURATION.md`.
 * **AUDIT-043 (P1 gate false-pass) — RESOLVED:** Linux `ffmpeg`/`ffprobe`
   capability probes ran without their sibling libraries, treated loader exit
   127 as clean configuration, and emitted misleading fallback warnings. The
