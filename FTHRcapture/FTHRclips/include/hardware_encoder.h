@@ -205,6 +205,7 @@ namespace fthr {
         uint32_t bitrate_kbps_;
         bool     initialized_;
         int64_t  pts_;
+        int64_t  last_forced_idr_pts_;
 
         // -----------------------------------------------------------------------
         // Wall-clock PTS (QPC-based)

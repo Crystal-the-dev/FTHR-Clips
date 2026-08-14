@@ -1,188 +1,147 @@
 // audio_ring_buffer.cpp
-// FTHR Capture Engine - Raw PCM audio ring buffer implementation
+// FTHR Capture Engine - raw PCM replay ring
 
 #include "audio_ring_buffer.h"
-#include <iostream>
+
 #include <algorithm>
 #include <cassert>
 #include <cstring>
-
+#include <iostream>
 
 namespace fthr {
 
+AudioRingBuffer::AudioRingBuffer(
+    uint32_t capacity_frames,
+    uint32_t sample_rate,
+    uint32_t channels,
+    uint32_t safety_frames)
+    : capacity_frames_(capacity_frames),
+      sample_rate_(sample_rate),
+      channels_(channels),
+      safety_frames_(safety_frames) {
+    assert(capacity_frames_ > 0);
+    assert(channels_ > 0);
+    storage_.resize(static_cast<size_t>(capacity_frames_) * channels_, 0.0f);
+    qpc_ring_.resize(capacity_frames_, 0ULL);
+    std::cout << "[AudioRingBuffer] Initialized: "
+              << capacity_frames_ << " frames x " << channels_ << "ch @ "
+              << sample_rate_ << "Hz ("
+              << storage_.size() * sizeof(float) / 1024 / 1024 << " MB)"
+              << std::endl;
+}
 
-    // ---------------------------------------------------------------------------
-    // Constructor
-    // ---------------------------------------------------------------------------
+void AudioRingBuffer::Push(
+    const float* interleaved_data,
+    uint32_t frame_count,
+    uint64_t qpc_100ns,
+    float volume) {
+    if (!interleaved_data || frame_count == 0) return;
+    std::lock_guard<std::mutex> lock(ring_mutex_);
+    const uint64_t write_head = head_.load(std::memory_order_relaxed);
+    const uint64_t ticks_per_frame = sample_rate_ > 0
+        ? 10'000'000ULL / sample_rate_
+        : 208ULL;
 
-    AudioRingBuffer::AudioRingBuffer(uint32_t capacity_frames,
-                                     uint32_t sample_rate,
-                                     uint32_t channels,
-                                     uint32_t safety_frames)
-        : capacity_frames_(capacity_frames)
-        , sample_rate_(sample_rate)
-        , channels_(channels)
-        , safety_frames_(safety_frames)
-    {
-        assert(capacity_frames_ > 0);
-        assert(channels_ > 0);
-
-        storage_.resize(static_cast<size_t>(capacity_frames_) * channels_, 0.0f);
-        qpc_ring_.resize(capacity_frames_, 0ULL);
-
-        std::cout << "[AudioRingBuffer] Initialized: "
-            << capacity_frames_ << " frames x "
-            << channels_ << "ch @ "
-            << sample_rate_ << "Hz ("
-            << (storage_.size() * sizeof(float) / 1024 / 1024) << " MB)"
-            << std::endl;
-    }
-
-
-    // ---------------------------------------------------------------------------
-    // Push
-    //
-    // Write interleaved float32 PCM frames into the ring with a QPC timestamp.
-    // qpc_100ns: the WASAPI pu64QPCPosition for the FIRST frame in this packet
-    //            (100-nanosecond units). We stamp each frame slot so TakeSnapshot
-    //            can read back the exact wall-clock time of any frame.
-    //
-    // Interpolation: qpc[frame f] = qpc_100ns + f * (10_000_000 / sample_rate)
-    // At 48kHz: each frame = 208.3 100ns-ticks. Integer approx is fine here
-    // because the residual error (~0.3 ticks/frame) over 30s is only ~0.4ms.
-    // ---------------------------------------------------------------------------
-
-    void AudioRingBuffer::Push(const float*  interleaved_data,
-                               uint32_t      frame_count,
-                               uint64_t      qpc_100ns,
-                               float         volume)
-    {
-        if (!interleaved_data || frame_count == 0) return;
-
-        std::lock_guard<std::mutex> lock(ring_mutex_);
-
-        const uint64_t write_head = head_.load(std::memory_order_relaxed);
-
-        // 100ns ticks per audio frame
-        const uint64_t ticks_per_frame = (sample_rate_ > 0)
-            ? (10000000ULL / static_cast<uint64_t>(sample_rate_))
-            : 208ULL;
-
-        for (uint32_t f = 0; f < frame_count; f++) {
-            const size_t slot       = static_cast<size_t>((write_head + f) % capacity_frames_);
-            const size_t src_offset = static_cast<size_t>(f) * channels_;
-            const size_t dst_offset = slot * channels_;
-
-            if (volume == 1.0f) {
-                std::memcpy(storage_.data() + dst_offset,
-                            interleaved_data + src_offset,
-                            channels_ * sizeof(float));
+    for (uint32_t frame = 0; frame < frame_count; ++frame) {
+        const size_t slot = static_cast<size_t>(
+            (write_head + frame) % capacity_frames_);
+        const size_t source = static_cast<size_t>(frame) * channels_;
+        const size_t destination = slot * channels_;
+        if (volume == 1.0f) {
+            std::memcpy(
+                storage_.data() + destination,
+                interleaved_data + source,
+                channels_ * sizeof(float));
+        } else {
+            for (uint32_t channel = 0; channel < channels_; ++channel) {
+                storage_[destination + channel] =
+                    interleaved_data[source + channel] * volume;
             }
-            else {
-                for (uint32_t c = 0; c < channels_; c++) {
-                    storage_[dst_offset + c] = interleaved_data[src_offset + c] * volume;
-                }
+        }
+        qpc_ring_[slot] = qpc_100ns > 0
+            ? qpc_100ns + static_cast<uint64_t>(frame) * ticks_per_frame
+            : 0ULL;
+    }
+
+    head_.fetch_add(frame_count, std::memory_order_release);
+    const uint64_t previous = frames_written_.load(std::memory_order_relaxed);
+    frames_written_.store(
+        std::min(
+            previous + frame_count,
+            static_cast<uint64_t>(capacity_frames_)),
+        std::memory_order_relaxed);
+}
+
+AudioPCMSnapshot AudioRingBuffer::TakeSnapshot(
+    double duration_s, double end_qpc_s) const {
+    AudioPCMSnapshot snapshot;
+    snapshot.sample_rate = sample_rate_;
+    snapshot.channels = channels_;
+    if (duration_s <= 0.0) return snapshot;
+
+    std::lock_guard<std::mutex> lock(ring_mutex_);
+    const uint64_t current_head = head_.load(std::memory_order_acquire);
+    const uint64_t frames_written = frames_written_.load(
+        std::memory_order_relaxed);
+    if (frames_written == 0) return snapshot;
+
+    const uint64_t oldest = current_head - frames_written;
+    uint64_t end_exclusive = current_head;
+    if (end_qpc_s > 0.0) {
+        const uint64_t newest_qpc = qpc_ring_[static_cast<size_t>(
+            (current_head - 1) % capacity_frames_)];
+        if (newest_qpc > 0) {
+            const uint64_t target = static_cast<uint64_t>(
+                end_qpc_s * 10'000'000.0 + 0.5);
+            while (end_exclusive > oldest) {
+                const uint64_t position = end_exclusive - 1;
+                const uint64_t qpc = qpc_ring_[static_cast<size_t>(
+                    position % capacity_frames_)];
+                if (qpc > 0 && qpc <= target) break;
+                --end_exclusive;
             }
-
-            qpc_ring_[slot] = (qpc_100ns > 0)
-                ? (qpc_100ns + static_cast<uint64_t>(f) * ticks_per_frame)
-                : 0ULL;
         }
+    } else if (safety_frames_ > 0) {
+        const uint64_t safety = std::min<uint64_t>(
+            safety_frames_, frames_written);
+        end_exclusive -= safety;
+    }
+    if (end_exclusive <= oldest) return snapshot;
 
-        head_.fetch_add(frame_count, std::memory_order_release);
+    const uint64_t wanted = static_cast<uint64_t>(
+        duration_s * sample_rate_ + 0.5);
+    const uint64_t available = end_exclusive - oldest;
+    const uint64_t count = std::min(wanted, available);
+    if (count == 0) return snapshot;
+    const uint64_t start = end_exclusive - count;
 
-        uint64_t prev = frames_written_.load(std::memory_order_relaxed);
-        uint64_t next = std::min(prev + frame_count,
-                                 static_cast<uint64_t>(capacity_frames_));
-        frames_written_.store(next, std::memory_order_relaxed);
+    snapshot.samples.resize(static_cast<size_t>(count) * channels_);
+    for (uint64_t frame = 0; frame < count; ++frame) {
+        const size_t source_slot = static_cast<size_t>(
+            (start + frame) % capacity_frames_);
+        std::memcpy(
+            snapshot.samples.data() + static_cast<size_t>(frame) * channels_,
+            storage_.data() + source_slot * channels_,
+            channels_ * sizeof(float));
     }
 
+    const uint64_t first_qpc = qpc_ring_[static_cast<size_t>(
+        start % capacity_frames_)];
+    const uint64_t last_qpc = qpc_ring_[static_cast<size_t>(
+        (end_exclusive - 1) % capacity_frames_)];
+    snapshot.qpc_start_s = first_qpc > 0
+        ? static_cast<double>(first_qpc) / 10'000'000.0
+        : 0.0;
+    snapshot.qpc_end_s = last_qpc > 0
+        ? static_cast<double>(last_qpc) / 10'000'000.0
+        : snapshot.qpc_start_s + static_cast<double>(count) / sample_rate_;
+    snapshot.valid = true;
 
-    // ---------------------------------------------------------------------------
-    // TakeSnapshot
-    // ---------------------------------------------------------------------------
-
-    AudioPCMSnapshot AudioRingBuffer::TakeSnapshot(double duration_s) const {
-        AudioPCMSnapshot snap;
-        snap.sample_rate = sample_rate_;
-        snap.channels    = channels_;
-
-        std::lock_guard<std::mutex> lock(ring_mutex_);
-
-        const uint64_t current_head   = head_.load(std::memory_order_acquire);
-        const uint64_t frames_written = frames_written_.load(std::memory_order_relaxed);
-
-        if (frames_written == 0) {
-            std::cerr << "[AudioRingBuffer] TakeSnapshot: buffer is empty" << std::endl;
-            return snap;
-        }
-
-        // Guard: current_head - safety_frames_ would underflow if the buffer hasn't
-        // accumulated enough audio yet (first ~0.5 s after engine start).
-        if (current_head <= static_cast<uint64_t>(safety_frames_)) {
-            std::cerr << "[AudioRingBuffer] TakeSnapshot: not enough audio buffered yet ("
-                      << current_head << " frames, " << safety_frames_
-                      << " minimum) — returning empty snapshot" << std::endl;
-            return snap;
-        }
-
-        const uint64_t safe_end    = current_head - static_cast<uint64_t>(safety_frames_);
-        const uint64_t safe_frames = (frames_written > safety_frames_)
-            ? (frames_written - safety_frames_)
-            : 0;
-
-        const uint64_t wanted_frames = static_cast<uint64_t>(
-            duration_s * static_cast<double>(sample_rate_) + 0.5);
-
-        const uint64_t frames_to_copy = std::min(wanted_frames, safe_frames);
-
-        if (frames_to_copy == 0) {
-            std::cerr << "[AudioRingBuffer] TakeSnapshot: no safe frames" << std::endl;
-            return snap;
-        }
-
-        if (frames_to_copy < wanted_frames) {
-            std::cerr << "[AudioRingBuffer] TakeSnapshot: only "
-                << frames_to_copy << " frames available" << std::endl;
-        }
-
-        const uint64_t start_pos = safe_end - frames_to_copy;
-        const uint64_t end_pos   = safe_end - 1;
-
-        snap.samples.resize(static_cast<size_t>(frames_to_copy) * channels_);
-
-        for (uint64_t f = 0; f < frames_to_copy; f++) {
-            const size_t src_slot   = static_cast<size_t>((start_pos + f) % capacity_frames_);
-            const size_t src_offset = src_slot * channels_;
-            const size_t dst_offset = static_cast<size_t>(f) * channels_;
-            std::memcpy(snap.samples.data() + dst_offset,
-                        storage_.data() + src_offset,
-                        channels_ * sizeof(float));
-        }
-
-        // Read QPC timestamps of first and last frames (100ns -> seconds)
-        const size_t first_slot = static_cast<size_t>(start_pos % capacity_frames_);
-        const size_t last_slot  = static_cast<size_t>(end_pos   % capacity_frames_);
-        const uint64_t qpc_first = qpc_ring_[first_slot];
-        const uint64_t qpc_last  = qpc_ring_[last_slot];
-
-        snap.qpc_start_s = (qpc_first > 0)
-            ? static_cast<double>(qpc_first) / 10000000.0
-            : 0.0;
-        snap.qpc_end_s = (qpc_last > 0)
-            ? static_cast<double>(qpc_last) / 10000000.0
-            : snap.qpc_start_s + static_cast<double>(frames_to_copy) / sample_rate_;
-
-        snap.valid = true;
-
-        std::cout << "[AudioRingBuffer] TakeSnapshot: "
-            << frames_to_copy << " frames ("
-            << (static_cast<double>(frames_to_copy) / sample_rate_) << "s), "
-            << "QPC " << snap.qpc_start_s << "s - " << snap.qpc_end_s << "s"
-            << std::endl;
-
-        return snap;
-    }
-
+    std::cout << "[AudioRingBuffer] TakeSnapshot: " << count << " frames ("
+              << static_cast<double>(count) / sample_rate_ << "s), QPC "
+              << snapshot.qpc_start_s << "s - " << snapshot.qpc_end_s << "s"
+              << std::endl;
+    return snapshot;
+}
 
 } // namespace fthr

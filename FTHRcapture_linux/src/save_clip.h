@@ -19,6 +19,7 @@ namespace fthr {
 bool save_clip_to_file(
     const std::string&               path,
     const std::vector<EncodedPacket>& video_packets,
+    int64_t                          presentation_start_pts,
     const std::vector<float>&        audio_pcm,
     int                              audio_sample_rate,
     int                              audio_channels,

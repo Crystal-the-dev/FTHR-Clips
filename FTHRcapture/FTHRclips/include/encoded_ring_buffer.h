@@ -6,20 +6,11 @@
 // from ~8GB to ~60MB for a 30-second buffer at 1080p/60fps/16Mbps.
 //
 // Threading model:
-//   Push()         - called from CaptureThread (via HardwareEncoder callback)
-//                    Fully lock-free: per-slot atomic state flags replace ring_mutex_.
-//                    Each slot transitions EMPTY -> WRITING -> READY atomically.
-//   TakeSnapshot() - called from SaveClipThread (rare)
-//                    No mutex. Reads head_ with acquire, checks each slot's state
-//                    flag before copying. The 1-second safety margin guarantees
-//                    Push() is never inside a slot that TakeSnapshot() is reading;
-//                    the READY check is defense-in-depth only.
-//
-// Safety margin:
-//   TakeSnapshot() excludes the newest fps_ packets (1 second) from the
-//   snapshot, identical to the raw ring buffer strategy. This ensures
-//   CaptureThread cannot overwrite slots we are reading before the copy
-//   completes.
+//   Push()         - single producer; publishes one sequence-numbered slot.
+//   TakeSnapshot() - save thread; takes short per-slot locks while copying.
+// This avoids a global capture lock while preventing a wrapped slot from being
+// overwritten during its deep copy. Selection is by capture timestamp, not by
+// packet count, and includes the keyframe immediately before the visible start.
 //
 // Data format:
 //   Packets are stored in AVCC format (4-byte big-endian length prefix per
@@ -35,6 +26,9 @@
 #include <memory>
 #include <vector>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <limits>
 #include <mutex>
 
 
@@ -44,7 +38,7 @@ namespace fthr {
     // ---------------------------------------------------------------------------
     // SlotState
     //
-    // Per-slot lifecycle flags used by the lock-free Push / TakeSnapshot protocol.
+    // Per-slot lifecycle flags used by the published-slot protocol.
     //   EMPTY   - slot has never been written (ring not yet full)
     //   WRITING - Push() is actively writing to this slot
     //   READY   - slot data is complete and safe to read
@@ -72,6 +66,8 @@ namespace fthr {
         int64_t              wall_qpc = 0; // Raw QPC ticks at capture time (same clock as WASAPI)
         bool                 is_keyframe = false;
         bool                 valid = false; // False on uninitialized slots
+        uint64_t             absolute_position =
+            std::numeric_limits<uint64_t>::max();
     };
 
 
@@ -90,6 +86,11 @@ namespace fthr {
         // Same clock domain as AudioPCMSnapshot::qpc_start_s / qpc_end_s.
         double qpc_start_s = 0.0;
         double qpc_end_s   = 0.0;
+        int64_t presentation_start_pts = 0;
+        double presentation_start_qpc_s = 0.0;
+        double presentation_end_qpc_s = 0.0;
+        double media_end_qpc_s = 0.0;
+        bool full_history = false;
     };
 
 
@@ -99,7 +100,7 @@ namespace fthr {
     class EncodedRingBuffer {
     public:
         // capacity:  number of packet slots to pre-allocate.
-        // fps:       capture framerate, used for safety margin in TakeSnapshot.
+        // fps:       capture framerate / encoded packet timebase.
         // qpc_freq:  QueryPerformanceFrequency value, used to convert wall_qpc to seconds.
         // Recommended capacity = buffer_seconds * fps * 2 (generous headroom).
         explicit EncodedRingBuffer(size_t capacity, uint32_t fps, int64_t qpc_freq = 0);
@@ -136,12 +137,15 @@ namespace fthr {
         // -----------------------------------------------------------------------
         // TakeSnapshot
         //
-        // Copy up to frame_count packets (oldest first) into a Snapshot struct.
-        // Applies a 1-second safety margin to avoid racing with Push().
+        // Copy the requested wall-clock interval plus decoder keyframe pre-roll.
         //
         // Called from SaveClipThread - blocking is acceptable here.
         // -----------------------------------------------------------------------
-        EncodedRingSnapshot TakeSnapshot(size_t frame_count) const;
+        EncodedRingSnapshot TakeSnapshotByTime(
+            uint32_t duration_seconds, int64_t target_end_qpc) const;
+
+        bool WaitUntilPublished(
+            int64_t target_qpc, std::chrono::milliseconds timeout) const;
 
         // Invalidate replay across a backend recovery. Slot storage is retained
         // to avoid reallocations; atomic state/count publication makes a
@@ -169,6 +173,7 @@ namespace fthr {
         // which would prevent std::vector<EncodedRingPacket> from compiling.
         // Indexed identically to slots_: state for slot i is slot_states_[i].
         std::unique_ptr<std::atomic<uint32_t>[]> slot_states_;
+        std::unique_ptr<std::mutex[]> slot_mutexes_;
 
         // Monotonically increasing push counter.
         // Slot index = head_ % capacity_.
@@ -176,6 +181,10 @@ namespace fthr {
 
         // Number of valid slots, capped at capacity_.
         std::atomic<size_t>    count_{ 0 };
+        std::atomic<int64_t>   latest_wall_qpc_{ 0 };
+
+        mutable std::mutex publication_mutex_;
+        mutable std::condition_variable publication_cv_;
 
         // SPS/PPS decoder config record for the MP4 muxer.
         std::vector<uint8_t>   extradata_;

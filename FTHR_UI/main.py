@@ -2782,15 +2782,10 @@ class MainWindow(QMainWindow):
         # Capture the mic-window timestamp before requesting the save so the
         # post-mux thread can pull the matching mic segment from the ring.
         #
-        # The C++ engine's audio ring excludes the newest 0.5 s (safety margin)
-        # from every snapshot, so the system audio in the saved clip ends ~0.5 s
-        # before the hotkey. Shift mic_end_time back by the same amount so the
-        # mic WAV covers the identical wall-clock window as the system audio.
-        # Without this correction the mic audio drifts ~0.5 s late relative to
-        # the game audio and the last 0.5 s of mic before the hotkey ends up
-        # spilling into the next clip's mix window.
-        _AUDIO_SAFETY_S = 0.5
-        mic_end_time = time.monotonic() - _AUDIO_SAFETY_S
+        # Engine and microphone rings now use the accepted save instant as the
+        # common end boundary. The engine's PCM ring is mutex-protected, so no
+        # artificial 0.5-second audio tail trim is needed.
+        mic_end_time = time.monotonic()
 
         try:
             # A response left over from the previous save may still be sitting

@@ -1,60 +1,79 @@
 #include "ring_buffer.h"
 
+#include "replay_interval.h"
+
 namespace fthr {
 
-void EncodedRingBuffer::Push(EncodedPacket pkt) {
-    std::lock_guard<std::mutex> lk(mutex_);
-    packets_.push_back(std::move(pkt));
-
-    // Prune packets older than max_duration_ms_
-    while (packets_.size() > 1) {
-        int64_t newest   = packets_.back().wall_time_ns;
-        int64_t oldest   = packets_.front().wall_time_ns;
-        int64_t span_ms  = (newest - oldest) / 1'000'000;
-        if (span_ms <= static_cast<int64_t>(max_duration_ms_))
-            break;
-        packets_.pop_front();
+void EncodedRingBuffer::Push(EncodedPacket packet) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        packets_.push_back(std::move(packet));
+        while (packets_.size() > 1) {
+            const int64_t span_ms =
+                (packets_.back().wall_time_ns - packets_.front().wall_time_ns)
+                / 1'000'000;
+            if (span_ms <= static_cast<int64_t>(max_duration_ms_)) break;
+            packets_.pop_front();
+        }
+        latest_wall_time_ns_.store(
+            packets_.back().wall_time_ns, std::memory_order_release);
     }
+    publication_cv_.notify_all();
 }
 
-std::vector<EncodedPacket> EncodedRingBuffer::TakeSnapshot(uint32_t duration_ms) const {
-    std::lock_guard<std::mutex> lk(mutex_);
-    if (packets_.empty())
-        return {};
+EncodedRingSnapshot EncodedRingBuffer::TakeSnapshot(
+    uint32_t duration_ms, int64_t target_end_ns) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (packets_.empty() || duration_ms == 0 || fps_ == 0) return {};
+    if (target_end_ns <= 0) target_end_ns = packets_.back().wall_time_ns;
 
-    int64_t newest = packets_.back().wall_time_ns;
-    int64_t cutoff = newest - static_cast<int64_t>(duration_ms) * 1'000'000LL;
+    std::vector<replay_interval::Sample> samples;
+    samples.reserve(packets_.size());
+    for (const auto& packet : packets_)
+        samples.push_back({packet.wall_time_ns, packet.is_keyframe});
+    const auto selection = replay_interval::Select(
+        samples,
+        target_end_ns,
+        static_cast<int64_t>(duration_ms) * 1'000'000LL);
+    if (!selection.valid) return {};
 
-    // Find last keyframe at or before cutoff — snapshot starts there so
-    // the MP4 decoder has a clean IDR at the beginning of the clip.
-    size_t start_idx = 0;
-    for (size_t i = 0; i < packets_.size(); ++i) {
-        if (packets_[i].wall_time_ns <= cutoff && packets_[i].is_keyframe)
-            start_idx = i;
-    }
+    EncodedRingSnapshot snapshot;
+    snapshot.packets.assign(
+        packets_.begin() + static_cast<ptrdiff_t>(selection.decode_start),
+        packets_.begin() + static_cast<ptrdiff_t>(selection.end + 1));
+    snapshot.full_history = selection.full_history;
+    snapshot.presentation_start_pts = replay_interval::PresentationStartPts(
+        snapshot.packets.back().pts,
+        static_cast<int64_t>(duration_ms) * fps_ / 1000,
+        snapshot.full_history,
+        snapshot.packets.front().pts);
+    snapshot.presentation_end_ns = target_end_ns;
+    snapshot.presentation_start_ns = snapshot.full_history
+        ? target_end_ns - static_cast<int64_t>(duration_ms) * 1'000'000LL
+        : snapshot.packets.front().wall_time_ns;
+    snapshot.media_end_ns = snapshot.packets.back().wall_time_ns;
+    return snapshot;
+}
 
-    // If start_idx doesn't point to a keyframe (e.g. no keyframe exists
-    // before cutoff right after engine start), scan forward to the first
-    // keyframe so the clip never begins on a non-IDR frame. If none exists,
-    // start_idx reaches packets_.size() and the snapshot is empty — better
-    // than returning corrupted/green frames.
-    while (start_idx < packets_.size() && !packets_[start_idx].is_keyframe)
-        ++start_idx;
-
-    return std::vector<EncodedPacket>(
-        packets_.begin() + static_cast<ptrdiff_t>(start_idx),
-        packets_.end()
-    );
+bool EncodedRingBuffer::WaitUntilPublished(
+    int64_t target_end_ns, std::chrono::milliseconds timeout) const {
+    if (target_end_ns <= 0) return true;
+    std::unique_lock<std::mutex> lock(mutex_);
+    return publication_cv_.wait_for(lock, timeout, [this, target_end_ns] {
+        return latest_wall_time_ns_.load(std::memory_order_acquire)
+            >= target_end_ns;
+    });
 }
 
 size_t EncodedRingBuffer::PacketCount() const {
-    std::lock_guard<std::mutex> lk(mutex_);
+    std::lock_guard<std::mutex> lock(mutex_);
     return packets_.size();
 }
 
 void EncodedRingBuffer::Clear() {
-    std::lock_guard<std::mutex> lk(mutex_);
+    std::lock_guard<std::mutex> lock(mutex_);
     packets_.clear();
+    latest_wall_time_ns_.store(0, std::memory_order_release);
 }
 
 } // namespace fthr

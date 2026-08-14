@@ -17,9 +17,10 @@
 //   TakeSnapshot() - called from SaveClipThread (rare, at clip save time)
 //                    Locks, copies the requested window, returns PCM snapshot.
 //
-// Safety margin:
-//   TakeSnapshot excludes the newest 0.5s of samples to avoid racing
-//   with concurrent Push() calls from the audio thread.
+// Save alignment:
+//   TakeSnapshot can end at an explicit QPC boundary shared with video. The
+//   configured safety margin remains only as a compatibility fallback when no
+//   endpoint is supplied; the mutex already makes copying race-free.
 
 #pragma once
 #ifndef FTHR_AUDIO_RING_BUFFER_H
@@ -39,9 +40,8 @@ namespace fthr {
     //
     // Returned by TakeSnapshot(). Caller owns all data.
     // samples: interleaved float32 [L0,R0,L1,R1,...] covering ~duration_s.
-    // actual_newest_wall_s: the ring's absolute newest timestamp in seconds
-    //   (before safety margin). Used by MuxEncodedClip Step D to align with
-    //   the video ring's newest_video_pts without any safety-margin bias.
+    // qpc_start_s/qpc_end_s preserve the selected PCM wall-clock interval so
+    // MuxEncodedClip can intersect it with the video presentation interval.
     // ---------------------------------------------------------------------------
     struct AudioPCMSnapshot {
         std::vector<float> samples;               // Interleaved float32 stereo
@@ -94,12 +94,13 @@ namespace fthr {
         // -----------------------------------------------------------------------
         // TakeSnapshot
         //
-        // Copy the last duration_s seconds of PCM into an AudioPCMSnapshot.
-        // Applies safety_frames margin from the newest end.
+        // Copy duration_s seconds ending at end_qpc_s. If no endpoint is
+        // supplied, apply the configured legacy safety margin to the live end.
         //
         // Called from SaveClipThread - blocking is acceptable.
         // -----------------------------------------------------------------------
-        AudioPCMSnapshot TakeSnapshot(double duration_s) const;
+        AudioPCMSnapshot TakeSnapshot(
+            double duration_s, double end_qpc_s = 0.0) const;
 
 
         // -----------------------------------------------------------------------

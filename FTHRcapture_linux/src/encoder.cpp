@@ -1,6 +1,8 @@
 #include "encoder.h"
+#include <algorithm>
 #include <iostream>
 #include <cstring>
+#include <iterator>
 
 extern "C" {
 #include <libavutil/imgutils.h>
@@ -23,6 +25,7 @@ bool ApplyPreset(AVCodecContext* ctx, const char* codec_name, int p) {
         av_opt_set(ctx->priv_data, "tune",   "ll",   0);
         av_opt_set(ctx->priv_data, "rc",     "vbr",  0);
         av_opt_set(ctx->priv_data, "cbr",    "0",    0);
+        av_opt_set(ctx->priv_data, "forced-idr", "1", 0);
     } else if (strstr(codec_name, "amf")) {
         static const char* kAmf[] = {
             "speed","speed","balanced","balanced","balanced","quality","quality"};
@@ -184,7 +187,11 @@ bool Encoder::Open(const EncoderConfig& cfg, std::string& codec_used_out) {
     pkt_ = av_packet_alloc();
     if (!pkt_) { Close(); return false; }
 
-    next_pts_ = 0;
+    have_pts_epoch_ = false;
+    pts_epoch_ns_ = 0;
+    last_input_pts_ = -1;
+    last_forced_keyframe_pts_ = -1;
+    pending_timings_.clear();
     return true;
 }
 
@@ -197,6 +204,11 @@ void Encoder::Close() {
     if (yuv_frame_) { av_frame_free(&yuv_frame_);  }
     if (sws_ctx_)   { sws_freeContext(sws_ctx_);   sws_ctx_   = nullptr; }
     if (codec_ctx_) { avcodec_free_context(&codec_ctx_); }
+    have_pts_epoch_ = false;
+    pts_epoch_ns_ = 0;
+    last_input_pts_ = -1;
+    last_forced_keyframe_pts_ = -1;
+    pending_timings_.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -219,7 +231,34 @@ bool Encoder::EncodeFrame(const uint8_t* bgra, uint32_t stride,
               0, static_cast<int>(cfg_.src_height),
               yuv_frame_->data, yuv_frame_->linesize);
 
-    yuv_frame_->pts = next_pts_++;
+    // Derive presentation time from CLOCK_MONOTONIC capture time. A frame
+    // counter makes a five-second replay shorter whenever capture drops or is
+    // delayed, because the muxer still interprets every increment as 1/fps.
+    int64_t frame_pts = 0;
+    if (!have_pts_epoch_) {
+        have_pts_epoch_ = true;
+        pts_epoch_ns_ = wall_time_ns;
+    } else {
+        const int64_t elapsed_ns = std::max<int64_t>(0, wall_time_ns - pts_epoch_ns_);
+        const int64_t whole_seconds = elapsed_ns / 1'000'000'000LL;
+        const int64_t remainder_ns = elapsed_ns % 1'000'000'000LL;
+        frame_pts = whole_seconds * static_cast<int64_t>(cfg_.fps)
+            + (remainder_ns * static_cast<int64_t>(cfg_.fps) + 500'000'000LL)
+                / 1'000'000'000LL;
+    }
+    frame_pts = std::max(frame_pts, last_input_pts_ + 1);
+    last_input_pts_ = frame_pts;
+    yuv_frame_->pts = frame_pts;
+    const bool force_keyframe = last_forced_keyframe_pts_ < 0
+        || frame_pts - last_forced_keyframe_pts_
+            >= static_cast<int64_t>(cfg_.fps) * 2;
+    yuv_frame_->pict_type = force_keyframe
+        ? AV_PICTURE_TYPE_I
+        : AV_PICTURE_TYPE_NONE;
+    if (force_keyframe)
+        yuv_frame_->flags |= AV_FRAME_FLAG_KEY;
+    else
+        yuv_frame_->flags &= ~AV_FRAME_FLAG_KEY;
 
     int ret = avcodec_send_frame(codec_ctx_, yuv_frame_);
     if (ret < 0) {
@@ -228,6 +267,8 @@ bool Encoder::EncodeFrame(const uint8_t* bgra, uint32_t stride,
         std::cerr << "[Encoder] avcodec_send_frame: " << errbuf << std::endl;
         return false;
     }
+    pending_timings_.push_back({frame_pts, wall_time_ns});
+    if (force_keyframe) last_forced_keyframe_pts_ = frame_pts;
 
     while (true) {
         ret = avcodec_receive_packet(codec_ctx_, pkt_);
@@ -245,7 +286,15 @@ bool Encoder::EncodeFrame(const uint8_t* bgra, uint32_t stride,
         ep.pts          = pkt_->pts;
         ep.dts          = pkt_->dts;
         ep.is_keyframe  = (pkt_->flags & AV_PKT_FLAG_KEY) != 0;
+        // Encoders may delay output. Associate the packet with the input frame
+        // carrying its PTS instead of the most recently submitted frame.
         ep.wall_time_ns = wall_time_ns;
+        for (auto it = pending_timings_.begin(); it != pending_timings_.end(); ++it) {
+            if (it->pts != pkt_->pts) continue;
+            ep.wall_time_ns = it->wall_time_ns;
+            pending_timings_.erase(pending_timings_.begin(), std::next(it));
+            break;
+        }
 
         av_packet_unref(pkt_);
         push_fn(std::move(ep));

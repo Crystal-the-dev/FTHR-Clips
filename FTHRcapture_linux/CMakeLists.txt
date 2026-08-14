@@ -233,6 +233,7 @@ target_include_directories(FTHRclips PRIVATE
     ${PROTO_GEN_DIR}/
     ${CMAKE_SOURCE_DIR}/../FTHRcapture_common
 )
+target_include_directories(FTHRclips SYSTEM PRIVATE ${FFMPEG_INCLUDE_DIRS})
 
 target_link_libraries(FTHRclips PRIVATE
     $<$<BOOL:${FTHR_FFMPEG_BUNDLED}>:${FTHR_FFMPEG_LINK_LIBRARIES}>

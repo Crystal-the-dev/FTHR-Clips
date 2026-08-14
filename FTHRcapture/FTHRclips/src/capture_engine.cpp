@@ -58,6 +58,7 @@
 #include "audio_ring_buffer.h"
 #include "audio_encoder.h"
 #include "transactional_save.h"
+#include "replay_interval.h"
 #include <iostream>
 #include <chrono>
 #include <cstring>
@@ -437,7 +438,7 @@ namespace fthr {
                 static_cast<uint32_t>((buffer_seconds_ + 4) * 48000);
 
             audio_ring_ = std::make_unique<AudioRingBuffer>(
-                audio_capacity, 48000, 2, 24000);  // 0.5s safety margin
+                audio_capacity, 48000, 2, 0);
 
             AudioCaptureConfig audio_cfg;
             audio_cfg.bitrate_kbps = 128;
@@ -677,13 +678,30 @@ namespace fthr {
         }
         std::cout << "[CaptureEngine] SaveClip: " << duration_seconds << "s" << std::endl;
 
+        LARGE_INTEGER save_qpc{};
+        LARGE_INTEGER save_qpc_frequency{};
+        QueryPerformanceCounter(&save_qpc);
+        QueryPerformanceFrequency(&save_qpc_frequency);
+        const double save_qpc_s = save_qpc_frequency.QuadPart > 0
+            ? static_cast<double>(save_qpc.QuadPart)
+                / static_cast<double>(save_qpc_frequency.QuadPart)
+            : 0.0;
+
         // ------------------------------------------------------------------
         // NVENC path - mux only, no encoding
         // ------------------------------------------------------------------
         if (nvenc_active_) {
-            const size_t needed = static_cast<size_t>(duration_seconds) * fps_;
-
-            EncodedRingSnapshot snapshot = encoded_ring_->TakeSnapshot(needed);
+            const auto publish_timeout = std::chrono::milliseconds(
+                std::max<uint32_t>(100, 3000 / std::max<uint32_t>(fps_, 1)));
+            if (!encoded_ring_->WaitUntilPublished(
+                    save_qpc.QuadPart, publish_timeout)) {
+                std::cerr << "[SaveClip] Encoder publication did not reach the "
+                             "save boundary within "
+                          << publish_timeout.count() << "ms; using the latest "
+                             "published packet" << std::endl;
+            }
+            EncodedRingSnapshot snapshot = encoded_ring_->TakeSnapshotByTime(
+                duration_seconds, save_qpc.QuadPart);
 
             if (snapshot.packets.empty()) {
                 std::cerr << "[SaveClip] Encoded ring buffer empty - nothing to save" << std::endl;
@@ -707,13 +725,14 @@ namespace fthr {
 
             // Snapshot the PCM ring buffer.
             // Raw PCM is copied here; AAC encoding happens on SaveClipThread.
-            // Request 2s extra audio to cover the safety margin difference between
-            // video (fps_ frames ≈ 1s) and audio (24000 frames ≈ 0.5s), plus
-            // headroom for keyframe trimming. MuxEncodedClip trims the audio
-            // to match the actual video time window using QPC alignment.
+            // Request 2s of audio headroom for timestamp alignment between
+            // the video packet and WASAPI sample clocks.
+            // capture clocks. MuxEncodedClip intersects the result with the
+            // requested video presentation window using QPC alignment.
             if (audio_active_ && audio_ring_ && !audio_capture_.IsDeviceLost()) {
                 task.audio_snapshot = audio_ring_->TakeSnapshot(
-                    static_cast<double>(duration_seconds) + 2.0);
+                    static_cast<double>(duration_seconds) + 2.0,
+                    task.encoded_snapshot.presentation_end_qpc_s);
                 task.has_audio = task.audio_snapshot.valid
                     && !task.audio_snapshot.samples.empty();
                 task.audio_bitrate_kbps = 128;
@@ -754,14 +773,10 @@ namespace fthr {
         }
 
         const size_t safety_frames = fps_;
-        const size_t safe_count = (snap_count > safety_frames)
-            ? (snap_count - safety_frames) : snap_count;
-        const size_t frames_to_encode = std::min(needed, safe_count);
-        // Guard against unsigned underflow: if the ring hasn't buffered enough
-        // history yet, clamp start_pos to 0 instead of wrapping.
-        const size_t start_pos = (snap_head >= frames_to_encode + safety_frames)
-            ? (snap_head - frames_to_encode - safety_frames)
-            : 0;
+        const auto raw_selection = replay_interval::SelectFixedRateFrames(
+            snap_head, snap_count, needed, safety_frames);
+        const size_t frames_to_encode = raw_selection.frame_count;
+        const size_t start_pos = static_cast<size_t>(raw_selection.decode_start);
 
         if (frames_to_encode < needed) {
             std::cerr << "[SaveClip] Only " << frames_to_encode << " frames available "
@@ -786,8 +801,11 @@ namespace fthr {
 
         // Audio snapshot - same logic as NVENC path (2s extra for alignment headroom)
         if (audio_active_ && audio_ring_ && !audio_capture_.IsDeviceLost()) {
+            // The raw ring keeps its existing one-second overwrite guard.
+            // Align audio to that same safe end instead of the live audio head.
             task.audio_snapshot = audio_ring_->TakeSnapshot(
-                static_cast<double>(duration_seconds) + 2.0);
+                static_cast<double>(duration_seconds) + 2.0,
+                std::max(0.0, save_qpc_s - 1.0));
             task.has_audio = task.audio_snapshot.valid
                 && !task.audio_snapshot.samples.empty();
             task.audio_bitrate_kbps = 128;
@@ -915,10 +933,9 @@ namespace fthr {
         // ------------------------------------------------------------------
         // Step A: Find the first keyframe in the snapshot.
         //
-        // Clips MUST start on a keyframe (IDR) for decoders to produce
-        // correct output. The safety margin in TakeSnapshot may land us
-        // between keyframes. With IDR period = fps (60) the worst case is
-        // discarding up to 59 non-keyframe leading frames.
+        // Clips MUST physically start on a keyframe (IDR) for decoders to
+        // produce correct output. Timestamp snapshots normally guarantee this;
+        // the scan remains as defensive validation for legacy snapshots.
         // ------------------------------------------------------------------
         size_t keyframe_start = snap.packets.size();  // sentinel = not found
         for (size_t i = 0; i < snap.packets.size(); i++) {
@@ -952,7 +969,11 @@ namespace fthr {
         // The new keyframe_start is the EARLIEST keyframe whose PTS puts
         // the remaining clip within the requested duration.
         // ------------------------------------------------------------------
-        if (!snap.packets.empty()) {
+        // Timestamp snapshots already carry the last keyframe at/before the
+        // requested start. The legacy trim is retained only for an old-style
+        // snapshot without a presentation boundary; normal saves must never
+        // advance to the keyframe after the requested start.
+        if (!snap.packets.empty() && snap.presentation_start_qpc_s <= 0.0) {
             const int64_t max_pts_span = static_cast<int64_t>(task.duration_seconds)
                 * static_cast<int64_t>(task.fps);
             const int64_t newest_pts = snap.packets.back().pts;
@@ -1000,7 +1021,11 @@ namespace fthr {
         // the audio ring. Uses the same QPC clock as the audio timestamps
         // (WASAPI pu64QPCPosition = same domain as QueryPerformanceCounter).
         // ------------------------------------------------------------------
-        if (task.audio_snapshot.valid
+        // Timestamp-aware snapshots never shorten video to match an incomplete
+        // audio ring. Missing audio remains a shorter/late audio stream instead
+        // of deleting valid requested footage. This block is a legacy fallback.
+        if (snap.presentation_start_qpc_s <= 0.0
+            && task.audio_snapshot.valid
             && task.audio_snapshot.qpc_start_s > 0.0
             && keyframe_start < snap.packets.size()
             && (snap.qpc_start_s > 0.0 || (task.video_qpc_epoch != 0 && task.video_qpc_freq != 0))) {
@@ -1060,8 +1085,9 @@ namespace fthr {
         // ------------------------------------------------------------------
         // Step C: Compute PTS normalization offset.
         //
-        // Subtracting pts_offset makes all PTS relative to clip start (t=0),
-        // which eliminates the MP4 edit list atom and gives clean playback.
+        // The physical decode start can precede the requested presentation
+        // start. Subtract the logical boundary so pre-roll packets retain
+        // negative PTS and the MP4 edit list hides them without re-encoding.
         // ------------------------------------------------------------------
 
         // Declare write_audio early - used in Step D (alignment) and Step 2b (stream).
@@ -1069,24 +1095,18 @@ namespace fthr {
             && task.audio_snapshot.valid
             && !task.audio_snapshot.samples.empty();
 
-        int64_t pts_offset = 0;
-        for (size_t i = keyframe_start; i < snap.packets.size(); i++) {
-            if (!snap.packets[i].data.empty()) {
-                pts_offset = snap.packets[i].pts;
-                break;
-            }
-        }
+        const int64_t pts_offset = snap.presentation_start_pts;
 
         // Trimmed video clip duration in seconds.
         // Uses the PTS span of the packets that will actually be written
-        // (oldest = pts_offset, newest = back().pts), divided by fps to
-        // convert from PTS-ticks to seconds. This is used by both the
+        // (visible start = pts_offset, newest = back().pts), divided by fps to
+        // convert from PTS ticks to seconds. This is used by both the
         // duration-fallback alignment path and the diagnostic output.
         const int64_t newest_video_pts     = snap.packets.back().pts;
         const int64_t video_clip_pts_span  = newest_video_pts - pts_offset;
         const double  video_clip_duration_s =
             (task.fps > 0)
-            ? static_cast<double>(video_clip_pts_span) / static_cast<double>(task.fps)
+            ? static_cast<double>(video_clip_pts_span + 1) / static_cast<double>(task.fps)
             : static_cast<double>(task.duration_seconds);
 
         // ------------------------------------------------------------------
@@ -1097,15 +1117,15 @@ namespace fthr {
         // time of the first video frame being written (after keyframe/duration
         // trimming), then locate the matching audio sample in the snapshot.
         //
-        // SaveClip requests 2s of extra audio beyond the clip duration, so the
-        // audio snapshot always covers the full video time window regardless of
-        // safety margin differences (video=1s, audio=0.5s).
+        // SaveClip requests 2s of extra audio beyond the clip duration, then
+        // this step intersects it with the exact video presentation interval.
         //
         // Fallback: if QPC data is unavailable (shouldn't happen on Win10+),
         // align from the audio end, taking video_duration of audio.
         // ------------------------------------------------------------------
 
         int64_t audio_aligned_start_sample = 0;
+        int64_t audio_output_pts_offset = 0;
 
         if (write_audio) {
             const int64_t total_snap_frames = static_cast<int64_t>(
@@ -1125,14 +1145,17 @@ namespace fthr {
             //   Video: raw QPC ticks / qpc_freq → seconds
             //   Audio: WASAPI pu64QPCPosition (100ns units) / 10_000_000 → seconds
 
-            // Compute video start wall time from the first packet being written.
-            // Prefer per-packet QPC (snap.qpc_start_s) if available; fall back to
-            // epoch + PTS derivation.
+            // Presentation starts at the requested cutoff, not at the older
+            // keyframe retained solely for decoder pre-roll.
             double video_start_wall_s = 0.0;
             bool have_video_wall_time = false;
 
-            // Method 1: Use per-packet QPC from the trimmed first packet
-            if (snap.qpc_start_s > 0.0) {
+            if (snap.presentation_start_qpc_s > 0.0) {
+                video_start_wall_s = snap.presentation_start_qpc_s;
+                have_video_wall_time = true;
+            }
+            // Legacy fallback: use per-packet QPC from the physical first packet.
+            else if (snap.qpc_start_s > 0.0) {
                 // snap.qpc_start_s is from the FULL snapshot. We need the QPC of
                 // the first packet after keyframe_start trimming.
                 for (size_t i = keyframe_start; i < snap.packets.size(); i++) {
@@ -1172,15 +1195,20 @@ namespace fthr {
             }
 
             if (have_video_wall_time && task.audio_snapshot.qpc_start_s > 0.0) {
-                // Find the audio sample that corresponds to the video start time.
-                const double audio_offset_s =
-                    video_start_wall_s - task.audio_snapshot.qpc_start_s;
-                const int64_t candidate = static_cast<int64_t>(
-                    audio_offset_s
-                    * static_cast<double>(task.audio_snapshot.sample_rate) + 0.5);
+                const double overlap_start_s = std::max(
+                    video_start_wall_s, task.audio_snapshot.qpc_start_s);
+                const double overlap_end_s = std::min(
+                    video_end_wall_s, task.audio_snapshot.qpc_end_s);
 
-                if (candidate >= 0 && candidate <= total_snap_frames) {
-                    audio_aligned_start_sample = candidate;
+                if (overlap_start_s < overlap_end_s) {
+                    audio_aligned_start_sample = static_cast<int64_t>(
+                        (overlap_start_s - task.audio_snapshot.qpc_start_s)
+                        * static_cast<double>(task.audio_snapshot.sample_rate) + 0.5);
+                    audio_output_pts_offset = static_cast<int64_t>(
+                        (overlap_start_s - video_start_wall_s)
+                        * static_cast<double>(task.audio_snapshot.sample_rate) + 0.5);
+                    audio_aligned_start_sample = std::clamp<int64_t>(
+                        audio_aligned_start_sample, 0, total_snap_frames);
                     qpc_aligned = true;
 
                     std::cout << "[MuxEncodedClip] A/V sync (QPC overlap):" << std::endl;
@@ -1188,16 +1216,19 @@ namespace fthr {
                     std::cout << "  Video end wall time      : " << video_end_wall_s << "s" << std::endl;
                     std::cout << "  Audio snap QPC start     : " << task.audio_snapshot.qpc_start_s << "s" << std::endl;
                     std::cout << "  Audio snap QPC end       : " << task.audio_snapshot.qpc_end_s << "s" << std::endl;
-                    std::cout << "  Audio offset from snap   : " << audio_offset_s << "s" << std::endl;
+                    std::cout << "  Audio overlap start      : " << overlap_start_s << "s" << std::endl;
                     std::cout << "  Audio snap frames        : " << total_snap_frames << std::endl;
                     std::cout << "  Audio start sample       : " << audio_aligned_start_sample
                         << " (skip " << (static_cast<double>(audio_aligned_start_sample)
                             / task.audio_snapshot.sample_rate) << "s)" << std::endl;
+                    std::cout << "  Audio timeline offset    : " << audio_output_pts_offset
+                        << " samples" << std::endl;
                 }
                 else {
-                    std::cerr << "[MuxEncodedClip] QPC alignment out of range ("
-                        << candidate << " / " << total_snap_frames
-                        << "), using end-aligned fallback" << std::endl;
+                    audio_aligned_start_sample = total_snap_frames;
+                    qpc_aligned = true;
+                    std::cerr << "[MuxEncodedClip] Audio has no overlap with the "
+                        "requested video interval; writing video-only" << std::endl;
                 }
             }
 
@@ -1243,6 +1274,7 @@ namespace fthr {
                 L"be invalid or on an unsupported filesystem.");
             return false;
         }
+        fmt_ctx->avoid_negative_ts = AVFMT_AVOID_NEG_TS_DISABLED;
 
         // ------------------------------------------------------------------
         // Step 2: Create video stream
@@ -1418,8 +1450,10 @@ namespace fthr {
         std::cout << "Total packets in snapshot : " << snap.packets.size() << std::endl;
         std::cout << "Keyframe start index      : " << keyframe_start << std::endl;
         std::cout << "Usable packets            : " << usable_count << std::endl;
-        std::cout << "PTS offset (subtracted)   : " << pts_offset
+        std::cout << "Presentation PTS boundary : " << pts_offset
             << " (" << (static_cast<double>(pts_offset) / task.fps) << "s absolute)" << std::endl;
+        std::cout << "History classification   : "
+            << (snap.full_history ? "full" : "partial") << std::endl;
         std::cout << "Task FPS                  : " << task.fps << std::endl;
         std::cout << "Task duration             : " << task.duration_seconds << " seconds" << std::endl;
         std::cout << "Expected frame count      : " << (task.duration_seconds * task.fps) << std::endl;
@@ -1508,7 +1542,8 @@ namespace fthr {
 
             memcpy(av_pkt->data, pkt.data.data(), pkt.data.size());
 
-            // Normalize PTS to clip-relative (t=0 at first keyframe).
+            // Keep decoder pre-roll negative; MP4 presents from the logical
+            // replay cutoff at t=0 via an edit list.
             av_pkt->pts = pkt.pts - pts_offset;
             av_pkt->dts = pkt.pts - pts_offset;
             av_pkt->duration = 1;
@@ -1556,8 +1591,8 @@ namespace fthr {
         // Step 4b: Write pre-encoded AAC packets
         //
         // aac_packets were encoded in Step 2b from the aligned PCM window.
-        // PTS starts at 0 (AudioEncoder resets pts_samples_ = 0 on init)
-        // and increments by 1024 per packet - already clip-relative t=0.
+        // PTS starts at 0 in AudioEncoder. Add the wall-clock overlap offset
+        // when audio began after the requested video presentation boundary.
         // audio_stream->time_base = {1, sample_rate} so no rescaling needed.
         // Reuses the same AVPacket struct as the video loop above.
         // ------------------------------------------------------------------
@@ -1573,8 +1608,8 @@ namespace fthr {
                     return fail_media_write(L"allocating an audio packet for", ret);
 
                 memcpy(av_pkt->data, pkt_data.data(), pkt_data.size());
-                av_pkt->pts = aac_pts_list[i];
-                av_pkt->dts = aac_pts_list[i];
+                av_pkt->pts = aac_pts_list[i] + audio_output_pts_offset;
+                av_pkt->dts = aac_pts_list[i] + audio_output_pts_offset;
                 av_pkt->duration = 1024;
                 av_pkt->stream_index = audio_stream->index;
                 av_pkt->flags = 0;
@@ -1613,10 +1648,9 @@ namespace fthr {
                 / video_stream->time_base.den) << "s)" << std::endl;
         std::cout << "  Calculated clip duration: " << actual_duration_s << "s" << std::endl;
         std::cout << "  Requested duration      : " << task.duration_seconds << "s" << std::endl;
-        if (video_packet_count < static_cast<int>(task.duration_seconds * task.fps)) {
-            std::cout << "  NOTE: fewer frames than requested - engine had not "
-                << "buffered " << task.duration_seconds << "s yet." << std::endl;
-        }
+        if (!snap.full_history)
+            std::cout << "  NOTE: partial history after startup/recovery; saved "
+                "all decodable media currently available." << std::endl;
         std::cout << "========================================\n" << std::endl;
 
         // ------------------------------------------------------------------

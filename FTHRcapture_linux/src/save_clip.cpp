@@ -28,6 +28,7 @@ static void set_shm_bytes(SharedMemoryLayout* shm, uint64_t bytes) {
 static bool write_clip_to_temporary_file(
     const std::string&               path,
     const std::vector<EncodedPacket>& video_packets,
+    int64_t                          presentation_start_pts,
     const std::vector<float>&        audio_pcm,
     int                              audio_sample_rate,
     int                              audio_channels,
@@ -57,6 +58,7 @@ static bool write_clip_to_temporary_file(
         error_message = "Failed to create the MP4 output container for the temporary clip";
         return false;
     }
+    fmt_ctx->avoid_negative_ts = AVFMT_AVOID_NEG_TS_DISABLED;
 
     // -------------------------------------------------------------------------
     // Video stream
@@ -201,8 +203,10 @@ skip_audio_setup:
     // Write video packets
     // -------------------------------------------------------------------------
     {
-        // Compute PTS offset so clip starts at 0
-        int64_t pts_offset = video_packets.front().pts;
+        // The physical keyframe may precede the visible replay boundary.
+        // Preserve its negative PTS so MP4 can hide decoder pre-roll with an
+        // edit list while presenting the requested interval from t=0.
+        const int64_t pts_offset = presentation_start_pts;
 
         uint64_t bytes_out = 0;
         for (const auto& ep : video_packets) {
@@ -211,6 +215,7 @@ skip_audio_setup:
             pkt->size = static_cast<int>(ep.data.size());
             pkt->pts  = ep.pts - pts_offset;
             pkt->dts  = ep.dts - pts_offset;
+            pkt->duration = 1;
             pkt->stream_index = vid_stream->index;
             if (ep.is_keyframe) pkt->flags |= AV_PKT_FLAG_KEY;
 
@@ -369,6 +374,7 @@ cleanup:
 bool save_clip_to_file(
     const std::string&               path,
     const std::vector<EncodedPacket>& video_packets,
+    int64_t                          presentation_start_pts,
     const std::vector<float>&        audio_pcm,
     int                              audio_sample_rate,
     int                              audio_channels,
@@ -386,6 +392,7 @@ bool save_clip_to_file(
             return write_clip_to_temporary_file(
                 temporary_path.string(),
                 video_packets,
+                presentation_start_pts,
                 audio_pcm,
                 audio_sample_rate,
                 audio_channels,

@@ -404,6 +404,7 @@ namespace fthr {
         , bitrate_kbps_(16000)
         , initialized_(false)
         , pts_(0)
+        , last_forced_idr_pts_(-1)
         , first_frame_(true)
         , encode_start_qpc_(0)
         , qpc_freq_(0)
@@ -447,6 +448,7 @@ namespace fthr {
         fps_ = config.fps;
         bitrate_kbps_ = config.bitrate_kbps;
         pts_ = 0;
+        last_forced_idr_pts_ = -1;
         first_frame_ = true;
         current_buf_idx_ = 0;
         pending_count_ = 0;
@@ -926,6 +928,9 @@ namespace fthr {
         pic.inputHeight     = src_height_;
         pic.pictureStruct   = NV_ENC_PIC_STRUCT_FRAME;
         pic.inputTimeStamp  = static_cast<uint64_t>(pts_);
+        const bool force_idr = last_forced_idr_pts_ < 0
+            || pts_ - last_forced_idr_pts_ >= static_cast<int64_t>(fps_) * 4;
+        if (force_idr) pic.encodePicFlags |= NV_ENC_PIC_FLAG_FORCEIDR;
 
         status = api->nvEncEncodePicture(nvenc_session_, &pic);
 
@@ -937,6 +942,7 @@ namespace fthr {
             std::cerr << "[EncodeFrame] nvEncEncodePicture: " << NvencStatusToString(status) << std::endl;
             return false;
         }
+        if (force_idr) last_forced_idr_pts_ = pts_;
 
         {
             std::lock_guard<std::mutex> lk(drain_mutex_);
@@ -1017,6 +1023,9 @@ namespace fthr {
         pic.inputHeight     = src_height_;
         pic.pictureStruct   = NV_ENC_PIC_STRUCT_FRAME;
         pic.inputTimeStamp  = static_cast<uint64_t>(pts_);
+        const bool force_idr = last_forced_idr_pts_ < 0
+            || pts_ - last_forced_idr_pts_ >= static_cast<int64_t>(fps_) * 4;
+        if (force_idr) pic.encodePicFlags |= NV_ENC_PIC_FLAG_FORCEIDR;
 
         status = api->nvEncEncodePicture(nvenc_session_, &pic);
 
@@ -1024,6 +1033,7 @@ namespace fthr {
             std::cerr << "[EncodeFrameCPU] nvEncEncodePicture: " << NvencStatusToString(status) << std::endl;
             return false;
         }
+        if (force_idr) last_forced_idr_pts_ = pts_;
 
         {
             std::lock_guard<std::mutex> lk(drain_mutex_);
@@ -1220,6 +1230,7 @@ namespace fthr {
         current_buf_idx_ = 0;
         pending_count_ = 0;
         pts_ = 0;
+        last_forced_idr_pts_ = -1;
         first_frame_ = true;
         drain_stop_.store(false);
         drain_queue_.clear();

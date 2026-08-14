@@ -1,6 +1,7 @@
 #pragma once
 #include "ring_buffer.h"
 #include <functional>
+#include <deque>
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -60,7 +61,15 @@ private:
     SwsContext*     sws_ctx_   = nullptr;
     AVFrame*        yuv_frame_ = nullptr;
     AVPacket*       pkt_       = nullptr;
-    int64_t         next_pts_  = 0;
+    struct FrameTiming {
+        int64_t pts;
+        int64_t wall_time_ns;
+    };
+    bool            have_pts_epoch_ = false;
+    int64_t         pts_epoch_ns_ = 0;
+    int64_t         last_input_pts_ = -1;
+    int64_t         last_forced_keyframe_pts_ = -1;
+    std::deque<FrameTiming> pending_timings_;
     EncoderConfig   cfg_       = {};
 };
 

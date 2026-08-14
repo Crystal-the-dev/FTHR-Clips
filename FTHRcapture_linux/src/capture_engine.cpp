@@ -1,6 +1,7 @@
 #include "capture_engine.h"
 #include "capture_backend.h"
 #include "recovery_policy.h"
+#include "save_clip.h"
 #include <chrono>
 #include <iostream>
 #include <cstring>
@@ -28,7 +29,7 @@ bool CaptureEngine::Initialize(const CaptureConfig& cfg) {
 
     // Allocate ring buffer (buffer_seconds + small margin)
     size_t ring_ms = (static_cast<size_t>(cfg.buffer_seconds) + 5) * 1000;
-    ring_ = new EncodedRingBuffer(ring_ms);
+    ring_ = new EncodedRingBuffer(ring_ms, cfg.fps);
 
     // Start audio capture (loopback via PulseAudio monitor)
     if (cfg.audio_enabled) {
@@ -314,8 +315,16 @@ bool CaptureEngine::SaveClip(const std::string& path, uint32_t duration_sec,
         return false;
     }
 
-    uint32_t duration_ms = duration_sec * 1000;
-    auto video_packets   = ring_->TakeSnapshot(duration_ms);
+    const uint32_t duration_ms = duration_sec * 1000;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    const int64_t save_end_ns =
+        static_cast<int64_t>(ts.tv_sec) * 1'000'000'000LL + ts.tv_nsec;
+    const auto publish_timeout = std::chrono::milliseconds(
+        std::max<uint32_t>(100, 3000 / std::max<uint32_t>(cfg_.fps, 1)));
+    ring_->WaitUntilPublished(save_end_ns, publish_timeout);
+    auto video_snapshot = ring_->TakeSnapshot(duration_ms, save_end_ns);
+    const auto& video_packets = video_snapshot.packets;
 
     if (video_packets.empty()) {
         std::cerr << "[SaveClip] No video packets in buffer" << std::endl;
@@ -325,17 +334,21 @@ bool CaptureEngine::SaveClip(const std::string& path, uint32_t duration_sec,
     }
 
     // Get audio segment
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    int64_t now_ns = static_cast<int64_t>(ts.tv_sec) * 1'000'000'000LL + ts.tv_nsec;
-    std::vector<float> audio_pcm = audio_.ExtractSegment(now_ns, duration_ms);
+    const uint32_t audio_duration_ms = static_cast<uint32_t>(std::max<int64_t>(
+        1,
+        (video_snapshot.presentation_end_ns
+            - video_snapshot.presentation_start_ns + 999'999) / 1'000'000));
+    std::vector<float> audio_pcm = audio_.ExtractSegment(
+        video_snapshot.presentation_end_ns, audio_duration_ms);
 
     // Write per-category WAVs when multiband is active.
     // Python reads these, mixes with preset volumes, and deletes them.
     if (cfg_.multiband_enabled) {
         for (const auto& cat_cfg : cfg_.audio_categories) {
             std::vector<float> pcm = multi_audio_.ExtractSegment(
-                cat_cfg.name, now_ns, duration_ms);
+                cat_cfg.name,
+                video_snapshot.presentation_end_ns,
+                audio_duration_ms);
             if (pcm.empty()) continue;
             // Derive WAV path: strip extension, append _<sinkname>.wav
             // cat_cfg.sink_name already starts with "fthr_" (e.g. "fthr_game"),
@@ -351,25 +364,10 @@ bool CaptureEngine::SaveClip(const std::string& path, uint32_t duration_sec,
         }
     }
 
-    // Delegate to save_clip module
-    extern bool save_clip_to_file(
-        const std::string& path,
-        const std::vector<EncodedPacket>& video_packets,
-        const std::vector<float>& audio_pcm,
-        int audio_sample_rate,
-        int audio_channels,
-        const std::vector<uint8_t>& extradata,
-        uint32_t fps,
-        uint32_t width,
-        uint32_t height,
-        AVCodecID video_codec_id,
-        SharedMemoryLayout* shm,
-        std::string* error_message
-    );
-
     return save_clip_to_file(
         path,
         video_packets,
+        video_snapshot.presentation_start_pts,
         audio_pcm,
         AudioCapture::kSampleRate,
         AudioCapture::kChannels,
@@ -395,7 +393,7 @@ void CaptureEngine::Reconfigure(uint32_t codec_pref, int preset) {
     if (cfg_.preset > 7) cfg_.preset = 7;
     // Re-allocate ring (Shutdown() freed it)
     size_t ring_ms = (static_cast<size_t>(cfg_.buffer_seconds) + 5) * 1000;
-    ring_ = new EncodedRingBuffer(ring_ms);
+    ring_ = new EncodedRingBuffer(ring_ms, cfg_.fps);
     // Restart audio (Shutdown() stopped it)
     if (cfg_.audio_enabled) {
         if (cfg_.multiband_enabled && !cfg_.audio_categories.empty()) {
