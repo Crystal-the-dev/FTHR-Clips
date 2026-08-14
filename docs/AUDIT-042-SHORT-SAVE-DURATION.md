@@ -240,7 +240,7 @@ to `CLIP_SAVED` in 42–82 ms while capture stayed active.
 
 Linux still holds its existing ring mutex across the deep copy. The measured
 54 ms 60-second case can block several 60 FPS pushes, so this is recorded as
-**AUDIT-045 (P2, OPEN): Linux encoded snapshot copy can stall capture**. It is
+**AUDIT-047 (P2, OPEN): Linux encoded snapshot copy can stall capture**. It is
 not required for duration correctness and is intentionally not redesigned in
 AUDIT-042.
 
@@ -268,4 +268,4 @@ on Linux MP4 evidence.
 - Real Linux desktop duration/picture, Windows audio-device runtime, and long
   performance soak remain unverified.
 - No new unresolved P0/P1 finding was introduced. AUDIT-046 was found and
-  resolved; AUDIT-045 is P2 and remains open.
+  resolved; AUDIT-047 is P2 and remains open.

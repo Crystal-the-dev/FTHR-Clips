@@ -97,7 +97,7 @@ Without it most reports are not actionable.
   unresponsive. Known (AUDIT-011), not yet fixed.
 - **Failures are often silent.** 34 code paths swallow their errors, so a
   feature can stop working with nothing in the log. Being fixed.
-- **AUDIT-045 (P2): Linux encoded snapshot copies hold the ring mutex.** A
+- **AUDIT-047 (P2): Linux encoded snapshot copies hold the ring mutex.** A
   synthetic 60-second/16-Mbps snapshot held it for about 54 ms; a future change
   should move the deep copy outside the global producer lock.
 
