@@ -106,7 +106,7 @@ Run `FTHRClips_Setup.exe` and click through the installer. Global hotkeys work o
 
 ### Linux
 
-Dependencies: `cmake`, `gcc`, `ffmpeg`, `libpulse`, `wayland-protocols`, `python3 >= 3.11`, `PyQt6`
+Dependencies: `cmake`, `gcc`, `ffmpeg`, `libpulse`, `wayland-protocols`, `python3 >= 3.11`, `PySide6`
 
 > FTHR uses the FFmpeg bundled next to the capture engine, falling back to
 > `ffmpeg` on your `PATH`. It no longer uses `imageio-ffmpeg`, whose bundled
@@ -131,7 +131,7 @@ Visual Studio 2022 + Python 3.14. See [`BUILDING.md`](BUILDING.md) for the full 
 ```
 ┌─────────────────────┐     Shared Memory (v4)     ┌────────────────────────┐
 │   FTHR_UI (Python)  │ ◄─────────────────────────► │  FTHRcapture (C++)     │
-│   PyQt6 frontend    │                              │  wlr-screencopy engine │
+│   PySide6 frontend  │                              │  wlr-screencopy engine │
 │   Settings / Upload │     Unix Socket (hotkeys)    │  FFmpeg encoder        │
 │   Clip browser      │ ◄────────────────────────    │  PulseAudio multi-cap  │
 └─────────────────────┘                              └────────────────────────┘
@@ -156,17 +156,18 @@ Issues and PRs are welcome. Please open an issue first for significant changes s
 **FTHR Clips' own source code is [MIT](LICENSE)** — do whatever you want with it.
 
 **The downloadable builds are not MIT-only.** They bundle third-party
-components with their own licences, and two of them are copyleft:
+components with their own licences, including LGPL components:
 
 | Component | Licence | Effect on the download |
 |---|---|---|
 | FFmpeg (dynamically linked) | LGPLv3 | Compatible with MIT app code. Notices required. |
-| PyQt6 (Riverbank bindings) | **GPL-3.0-only** | **Makes the distributed build GPLv3.** |
+| PySide6 / Shiboken (separate extension modules) | LGPLv3 option selected | Compatible with MIT app code when the LGPL obligations are met. |
+| Qt 6 (separate shared libraries) | LGPLv3 option selected | Compatible with MIT app code when the LGPL obligations are met. |
 
-Qt itself is LGPLv3 and is fine; it is the PyQt bindings that are GPL. Until
-this is resolved — by porting the UI to PySide6 (LGPLv3), by shipping the build
-under the GPLv3, or by buying a commercial PyQt licence — **the download must
-not be described as MIT**.
+The build uses PySide6 6.11.1 as its sole Qt binding and includes the LGPL text,
+notices, exact source locations, and separately replaceable libraries. Public
+release approval still requires provenance for the bundled project assets; see
+the explicit note in `THIRD_PARTY_NOTICES.md`.
 
 Full details and every bundled component: [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 Licence texts: [`licenses/`](licenses/), also installed alongside the app.

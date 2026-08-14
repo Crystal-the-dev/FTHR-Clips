@@ -12,7 +12,7 @@ Full licence texts live in [`licenses/`](licenses/), and are installed
 alongside the application (Windows: `licenses\` in the install directory;
 Linux: `licenses/` inside the AppImage).
 
-Last verified: **2026-08-05**.
+Last verified: **2026-08-14**.
 
 ---
 
@@ -20,33 +20,27 @@ Last verified: **2026-08-05**.
 
 > **Read this before publishing a build.**
 
-Two bundled components are copyleft, and they lead to different conclusions:
+The Qt binding/runtime and FFmpeg are distributed under LGPL options:
 
 | Component | Licence | Consequence for the distributed binary |
 |---|---|---|
-| FFmpeg (LGPLv3, dynamically linked) | LGPLv3 | ✅ Compatible with keeping FTHR's own code MIT. Requires notices + the ability to relink, which dynamic linking satisfies. |
-| **PyQt6** (Riverbank bindings) | **GPL-3.0-only** | ⚠️ **The combined distributed work is GPLv3.** |
+| FFmpeg (dynamically linked) | LGPLv3-or-later | FTHR's application code remains MIT; the LGPL notices, source availability, and relinking conditions apply. |
+| PySide6 / Shiboken (separate extension modules) | LGPL-3.0-only option selected | FTHR's application code remains MIT; recipients may replace the LGPL components and reverse engineer for debugging modifications to them. |
+| Qt 6 (separate shared libraries) | LGPL-3.0-only option selected | FTHR's application code remains MIT; notices, corresponding source, and replaceability/relinking conditions apply. |
 
-**FFmpeg is resolved.** As of 2026-08-05 the bundled build is LGPLv3 with no
+The engine FFmpeg build is LGPLv3 with no
 GPL components (see below). It is loaded as separate DLLs/shared libraries, so
 the LGPL relinking requirement is met.
 
-**PyQt6 is not resolved.** Riverbank ships PyQt6 under `GPL-3.0-only` (or a paid
-commercial licence). Bundling it into a distributed application makes that
-distribution subject to the GPLv3 as a whole. Note this is the *bindings*, not
-Qt: Qt itself (`PyQt6-Qt6`) is LGPLv3 and would be fine on its own.
+FTHR selects the LGPLv3 option offered for PySide6, Shiboken, and Qt 6.11.1.
+The application does not statically link or modify those components. Exact
+upstream source locations are recorded in
+[`licenses/Qt6-SOURCE.txt`](licenses/Qt6-SOURCE.txt). The full LGPLv3 text is
+[`licenses/Qt6-LICENSE.txt`](licenses/Qt6-LICENSE.txt).
 
-The three ways out, none of which is a code change this file can make:
-
-1. **Migrate the UI to PySide6** (LGPLv3, from the Qt Company). The API is close
-   to PyQt6 and most of a port is mechanical, but it touches all ~17k lines of
-   UI code. Keeps the distributed build free of GPL.
-2. **Ship under GPLv3.** Keep the repository MIT (MIT is GPL-compatible), but
-   label the *download* GPLv3, include the GPLv3 text, and publish a complete
-   corresponding source offer.
-3. **Buy a commercial PyQt licence** from Riverbank.
-
-Until one of these is chosen, do not describe the download as "MIT".
+This is a technical compliance inventory, not legal advice. Release approval
+also requires project-owner confirmation of the asset provenance described
+under [Project assets](#project-assets).
 
 ---
 
@@ -83,7 +77,7 @@ switched off without compiling FFmpeg from source.
 
 | Codec | Software encoder | Licence |
 |---|---|---|
-| H.264 | `libopenh264` (Cisco OpenH264) | BSD-2-Clause |
+| H.264 | `libopenh264` (Cisco OpenH264) | BSD-2-Clause; [`licenses/OpenH264-LICENSE.txt`](licenses/OpenH264-LICENSE.txt) |
 | H.265 | `libkvazaar` | LGPLv2.1 |
 | AV1 | `libsvtav1`, `libaom-av1`, `librav1e` | BSD-3-Clause / BSD-2-Clause |
 | AAC | FFmpeg native `aac` | LGPL (part of FFmpeg) |
@@ -103,16 +97,17 @@ remain fully available.
 
 | | |
 |---|---|
-| **Version** | 6.11.1 (via `PyQt6-Qt6` wheel) |
-| **Source** | [pypi.org/project/PyQt6-Qt6](https://pypi.org/project/PyQt6-Qt6/) |
-| **Licence** | LGPL v3 |
+| **Version** | 6.11.1 (official Qt runtime supplied with PySide6 6.11.1) |
+| **Source** | [Qt 6.11.1 source](https://download.qt.io/official_releases/qt/6.11/6.11.1/single/qt-everywhere-src-6.11.1.tar.xz) |
+| **Licence** | LGPL-3.0-only option selected |
 | **Linkage** | Dynamic (shared libraries bundled by PyInstaller) |
 | **Used for** | Entire GUI, multimedia playback |
-| **Licence text** | [`licenses/Qt6-LICENSE.txt`](licenses/Qt6-LICENSE.txt) |
+| **Licence/source notice** | [`licenses/Qt6-LICENSE.txt`](licenses/Qt6-LICENSE.txt), [`licenses/Qt6-SOURCE.txt`](licenses/Qt6-SOURCE.txt), [`licenses/Qt6-THIRD-PARTY-NOTICES.txt`](licenses/Qt6-THIRD-PARTY-NOTICES.txt) |
 
 ### FFmpeg bundled inside Qt Multimedia
 
-A **second, independent** FFmpeg comes in with the `PyQt6-Qt6` wheel: Qt
+A **second, independent** FFmpeg comes in with the official PySide6 Qt runtime:
+Qt
 Multimedia uses it for media playback (the clip preview player). It is separate
 from the engine's copy and carries different SONAMEs, so both coexist without
 conflict.
@@ -120,32 +115,23 @@ conflict.
 | | |
 |---|---|
 | **Files** | `avcodec-61.dll`, `avformat-61.dll`, `avutil-59.dll`, `swresample-5.dll`, `swscale-8.dll`, `ffmpegmediaplugin.dll` |
-| **Location** | `_internal/PyQt6/Qt6/bin/` and `.../plugins/multimedia/` |
+| **Location** | `_internal/PySide6/` under the Qt runtime/plugin directories |
 | **Licence** | **LGPL v2.1 or later** — self-reported by the binaries as `libavcodec license: LGPL version 2.1 or later` |
 | **Origin** | Built and shipped by the Qt Company as part of Qt 6 |
 | **Used for** | `QMediaPlayer` playback in the clip viewer |
 | **Licence text** | Covered by [`licenses/Qt6-LICENSE.txt`](licenses/Qt6-LICENSE.txt); the LGPL text also applies — see [`licenses/FFmpeg-LICENSE.txt`](licenses/FFmpeg-LICENSE.txt) |
 | **Verified** | Contains no `--enable-gpl` and no x264/x265 |
 
-### PyQt6
+### PySide6 and Shiboken
 
 | | |
 |---|---|
-| **Version** | 6.11.0 |
-| **Source** | [pypi.org/project/PyQt6](https://pypi.org/project/PyQt6/) (Riverbank Computing) |
-| **Licence** | **GPL-3.0-only** (or commercial) |
-| **Linkage** | Python extension modules, bundled |
+| **Version** | PySide6, PySide6-Addons, PySide6-Essentials, and shiboken6 6.11.1 |
+| **Source** | [Qt for Python 6.11.1 source](https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.11.1-src/pyside-setup-everywhere-src-6.11.1.tar.xz) |
+| **Licence** | LGPL-3.0-only option selected from the offered LGPL/GPL/commercial choices |
+| **Linkage** | Separate Python extension modules, bundled |
 | **Used for** | Python bindings for Qt — the UI framework |
-| **Licence text** | [`licenses/PyQt6-LICENSE.txt`](licenses/PyQt6-LICENSE.txt) |
-| **Note** | See [Licence of the distributed build](#licence-of-the-distributed-build). This is the component that currently makes the download GPLv3. |
-
-### PyQt6-sip
-
-| | |
-|---|---|
-| **Version** | 13.11.1 · **Licence** BSD-2-Clause |
-| **Used for** | Runtime support for the PyQt6 bindings |
-| **Licence text** | [`licenses/PyQt6_sip-LICENSE.txt`](licenses/PyQt6_sip-LICENSE.txt) |
+| **Licence/source notice** | [`licenses/PySide6-NOTICE.txt`](licenses/PySide6-NOTICE.txt), [`licenses/Qt6-LICENSE.txt`](licenses/Qt6-LICENSE.txt), [`licenses/Qt6-SOURCE.txt`](licenses/Qt6-SOURCE.txt) |
 
 ### NumPy
 
@@ -180,6 +166,15 @@ conflict.
 | **Used for** | Global hotkeys (the only hotkey path on Windows) |
 | **Licence text** | [`licenses/keyboard-LICENSE.txt`](licenses/keyboard-LICENSE.txt) |
 
+### cffi and pycparser
+
+| | |
+|---|---|
+| **Versions** | cffi 2.0.0; pycparser 3.0 |
+| **Licences** | cffi: MIT No Attribution; pycparser: BSD-3-Clause |
+| **Used for** | Transitive runtime dependencies of python-sounddevice |
+| **Licence texts** | [`licenses/cffi-LICENSE.txt`](licenses/cffi-LICENSE.txt), [`licenses/pycparser-LICENSE.txt`](licenses/pycparser-LICENSE.txt) |
+
 ### NVIDIA Video Codec SDK header
 
 | | |
@@ -188,6 +183,17 @@ conflict.
 | **Copyright** | © 2010–2024 NVIDIA Corporation |
 | **Licence** | MIT-style permissive grant, stated in the header itself |
 | **Linkage** | **None at build time.** NVENC is resolved at runtime via `LoadLibraryA("nvEncodeAPI64.dll")` against the user's installed driver. The header is source-only and the NVIDIA runtime is **not** redistributed. |
+| **Licence text** | [`licenses/NVIDIA-NVENC-SDK-LICENSE.txt`](licenses/NVIDIA-NVENC-SDK-LICENSE.txt) |
+
+### Wayland protocol definitions and generated bindings
+
+| | |
+|---|---|
+| **Files** | `FTHRcapture_linux/protocols/*.xml` and generated client bindings compiled into the Linux engine |
+| **Copyright** | The wlroots, Chromium OS, and Wayland contributors named in the source notices |
+| **Licence** | MIT-style permissive grants stated in the protocol sources |
+| **Used for** | Linux compositor capture and related Wayland protocol integration |
+| **Licence notices** | [`licenses/Wayland-Protocols-NOTICES.txt`](licenses/Wayland-Protocols-NOTICES.txt) |
 
 ### Microsoft Visual C++ Redistributable
 
@@ -196,6 +202,16 @@ conflict.
 | **File** | `redist/vc_redist.x64.exe`, executed by the Windows installer |
 | **Licence** | Microsoft Visual Studio redistributable terms |
 | **Note** | Redistributed unmodified as permitted for VC++ runtime redistribution. |
+
+---
+
+## Project assets
+
+The release currently includes FTHR logos/icons, four MP3 notification sounds,
+and `Oswald-Bold.ttf`. The repository contains no provenance record or explicit
+licence for those files. They are not asserted here to be third-party, but the
+project owner must document authorship/licensing or replace/remove them before
+approving a public release. The automated gate cannot prove asset ownership.
 
 ---
 
@@ -217,8 +233,9 @@ Listed so future audits do not have to re-derive it:
 ## Verifying this file
 
 [`tools/verify_release_licenses.py`](tools/verify_release_licenses.py) checks
-the shipped artifacts for GPL build flags, x264/x265, and the presence of the
-licence files described here. Run it before every release:
+the selected Qt binding and runtime modules, shipped artifacts for GPL build
+flags/x264/x265, and the required licence files described here. Run it before
+every release:
 
 ```bash
 python tools/verify_release_licenses.py --tree .

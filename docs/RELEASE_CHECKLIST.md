@@ -11,31 +11,32 @@ Legend: `PASS` verified · `FAIL` verified broken · `NOT RUN` never executed �
 
 ## Current status: 🚫 DO NOT TAG
 
-**Blocker: AUDIT-013 — PyQt6 is `GPL-3.0-only`.**
+**Decision required: AUDIT-013 — bundled asset provenance.**
 
-Qt itself is LGPLv3; the *bindings* are GPLv3. Any bundle containing PyQt6 is
-therefore GPLv3 **as a whole**, regardless of the FFmpeg relicensing done in
-AUDIT-005. FTHR's own source stays MIT (`LICENSE`), but a download must never
-be advertised as MIT.
+The Qt blocker has been technically closed by selecting PySide6 6.11.1 under
+its LGPLv3 option and gating both Windows and Linux artifacts. FTHR's own source
+remains MIT and the downloadable bundle includes separately licensed LGPL and
+permissive components.
 
-Three ways forward — this is a product decision, not an engineering one:
+The repository does not prove authorship or redistribution rights for the FTHR
+logos/icons, four MP3 sounds, and `Oswald-Bold.ttf`. Before a public tag, the
+owner must choose one of these routes:
 
 | Option | Consequence |
 |---|---|
-| Port the UI to **PySide6** (LGPLv3) | Bundle becomes LGPL-compatible; MIT claim about the source stays honest. Largest amount of work. |
-| Release deliberately as **GPLv3** | Zero code work. All README/RELEASE_NOTES/About/store copy must say GPLv3, and full corresponding source must be offered. |
-| Buy a **commercial PyQt licence** | Zero code work, recurring cost, removes the copyleft obligation. |
+| Document authorship and licence | Add durable provenance showing FTHR may redistribute every asset. |
+| Replace/remove the files | Use newly authored or clearly licensed assets and record their terms. |
 
 **AUDIT-014 is resolved (2026-08-06).** The Linux engine is compiled against and
 ships a pinned LGPL FFmpeg; a Release build cannot fall back to the
 distribution's GPL one. An AppImage now exists and passes the licence gate.
 
-What that does **not** fix: PyQt6 is still GPL-3.0-only, so the bundle as a
-whole is still GPLv3. AUDIT-014 removed one of the two reasons, not both.
+AUDIT-013's Qt migration is complete, but its status remains **DECISION
+REQUIRED** until the asset evidence above exists.
 
 ### Linux release recommendation: 🟡 LINUX CONDITIONAL GO
 
-Conditional on: (a) AUDIT-013 resolved (AUDIT-014 now is), and (b) at least one
+Conditional on: (a) AUDIT-013 asset provenance resolved, and (b) at least one
 bare-metal desktop session — Hyprland *and* one of KDE/GNOME — actually
 recording a clip with visible content and firing a hotkey. What has been proven
 is the build, the IPC, the encode and the file. What has **not** been proven is
@@ -51,10 +52,10 @@ Everything else below is either already green or is honest, tracked work.
 |---|---|---|
 | 1.1 | AUDIT-005 — no GPL FFmpeg anywhere in the tree or the bundle | **PASS** — LGPL `n8.1.2-21-gce3c09c101`, all 10 shipped binaries verified against `tools/ffmpeg_manifest.json` sha256 |
 | 1.2 | `imageio-ffmpeg` absent from the lock files, the environment and the bundle | **PASS** — excluded in `FTHR.spec`, asserted in CI, verified absent from the rebuilt bundle |
-| 1.3 | `tools/verify_release_licenses.py --tree .` | **PASS** |
+| 1.3 | `tools/verify_release_licenses.py --tree .` | **PASS in clean Linux staging; LOCAL FAIL in this worktree** — the gate correctly rejects a pre-existing ignored stale `FTHRcapture_linux/build/FTHRclips`; delete/rebuild that local artifact before tagging |
 | 1.4 | Third-party licence texts ship *inside* the artifact | **PASS** — `LICENSE`, `THIRD_PARTY_NOTICES.md`, `licenses/` are bundled by both specs and copied into the AppDir |
 | 1.5 | No distributable described as MIT | **PASS** — README, About dialog and `LICENSE` all state the split; CI greps for regressions |
-| 1.6 | **AUDIT-013 — PyQt6 GPLv3 decision made and reflected everywhere** | **FAIL — RELEASE BLOCKER** |
+| 1.6 | **AUDIT-013 — approved Qt binding/runtime and complete ownership evidence** | **DECISION REQUIRED** — PySide6/LGPL artifact gates pass; owner must prove or replace bundled assets |
 
 ## 2. Source control and hygiene
 
@@ -72,11 +73,11 @@ Everything else below is either already green or is honest, tracked work.
 | # | Gate | Status |
 |---|---|---|
 | 3.1 | Alpha lock pins the full transitive closure, no `>=` | **PASS** — `requirements-alpha.txt` |
-| 3.2 | Two clean installs produce identical package sets | **PASS** — 2026-08-06, two fresh venvs, 25 packages, `Compare-Object` empty |
+| 3.2 | Clean installs contain only the approved Qt binding | **PASS** — fresh Windows CPython 3.14.3 and Linux CPython 3.12.3 environments contain PySide6 6.11.1 and no PyQt package |
 | 3.3 | `pip check` reports no conflicts | **PASS** |
 | 3.4 | Imports succeed from a clean install | **PASS** — both venvs |
-| 3.5 | Identical test results across clean installs | **PASS** — identical in system Python, venv1 and venv2 on Windows; the lock also resolves and passes on CPython 3.12 under Linux |
-| 3.6 | PyInstaller analysis succeeds from the locked environment | **PASS** — full Windows build from venv1, exit 0 |
+| 3.5 | Tests run from clean selected-binding environments | **PARTIAL** — Windows 378 passed / 30 skipped; Linux 406 passed / 1 skipped / 1 pre-existing no-display lifecycle failure |
+| 3.6 | PyInstaller analysis succeeds from the locked environment | **PASS** — clean Windows onedir and Linux AppImage builds, exit 0 |
 
 ## 4. Version consistency
 
@@ -94,20 +95,20 @@ Everything else below is either already green or is honest, tracked work.
 
 | # | Gate | Status |
 |---|---|---|
-| 5.1 | `python -m pytest tests/` green | **PASS** — Windows **331 passed / 29 skipped** (2026-08-10); Linux native recovery CTest **1/1 passed** under Ubuntu 24.04 / WSL2 |
+| 5.1 | `python -m pytest tests/` green | **FAIL (Linux only)** — Windows **378 passed / 30 skipped**; Linux **406 passed / 1 skipped / 1 failed** because the no-display engine remains alive after recovery exhaustion; AUDIT-013 changed no C++/recovery code |
 | 5.2 | `python -m ruff check .` clean | **PASS** |
 | 5.3 | `python -m compileall FTHR_UI tests tools` clean | **PASS** |
 | 5.4 | `tools/verify_shared_memory_contract.py` | **PASS** — 23 fields, 2712 B (win32) / 4248 B (linux), enums and reserved slots 4–9 intact |
-| 5.5 | C++ engines have automated tests | **NOT RUN** — the engines (~12k LOC) still have zero tests. Accepted for alpha, tracked. |
+| 5.5 | C++ engines have automated tests | **PASS (Linux-scoped)** — native CTest **10/10 passed**, including recovery, duration, transactional save, Wayland bounded dispatch, timestamps, and actual short-MP4 integration |
 
 ## 6. Builds
 
 | # | Gate | Status |
 |---|---|---|
 | 6.1 | Windows engine builds clean (MSBuild, Release x64) | **PASS** — rebuilt 2026-08-05 with VS 2022 |
-| 6.2 | Windows bundle builds clean (PyInstaller) | **PASS** — rebuilt 2026-08-06 from the locked venv |
-| 6.3 | Linux engine builds clean (CMake, Release) | **PASS** — clean configure + build from an empty build dir on Ubuntu 24.04: 0 errors, 2 warnings, 0 missing shared libraries |
-| 6.4 | Linux AppImage builds | **PASS** — AUDIT-014 resolved. Engine compiled against the pinned LGPL FFmpeg, licence gate 83 checks / 0 failed, AppImage produced (219 MB) and it starts. |
+| 6.2 | Windows bundle builds clean (PyInstaller) | **PASS** — rebuilt 2026-08-14 from the locked PySide-only venv; 546,312,457-byte onedir, 60/60 artifact gates |
+| 6.3 | Linux engine builds clean (CMake, Release) | **PASS** — clean Release rebuild on Ubuntu 24.04; bundle-relative pinned-FFmpeg RPATH/DT_NEEDED gate passes |
+| 6.4 | Linux AppImage builds | **PASS** — 215,524,544-byte AppImage; AppDir and extracted AppImage each pass 109/109 licence/runtime gates |
 | 6.5 | CI green on all jobs | **NOT RUN** — the workflow has never executed; there is no remote yet |
 
 ## 7. Runtime verification — the part no CI can do for you
@@ -120,7 +121,7 @@ Everything else below is either already green or is honest, tracked work.
 | 7.4 | Windows: uninstall removes what it claims to | **NOT RUN** |
 | 7.5 | Linux: engine starts and captures on a real compositor | **PARTIAL** — engine starts, maps shared memory, captures and encodes on Ubuntu 24.04/WSL2 via the **x11grab fallback** with `av1_nvenc`. **No real compositor was involved**: WSLg's Weston implements neither `wlr-screencopy` nor `ext-image-copy-capture`, and the engine says so clearly. Hyprland/KDE/GNOME remain `NOT RUN`. |
 | 7.5b | Linux: a clip is saved, decodes, and contains a picture | **PARTIAL** — clips save and are valid (AV1 1280×720@30 + AAC 48 kHz stereo, both `start_time=0`, full decode 0 errors, unicode paths OK, invalid paths refused cleanly). **The frames are all black** (luma min 0, max 0, 1 distinct value) — XWayland under WSLg has no content to grab. The pipeline is proven; the picture is not. |
-| 7.6 | Linux: AppImage launches and captures | **NOT RUN** — no AppImage exists (6.4) |
+| 7.6 | Linux: AppImage launches and captures | **PARTIAL** — packaged offscreen `--card-process` starts/exits successfully; real X11/Wayland desktop capture remains NOT RUN |
 | 7.7 | Linux: the Linux-only fixes are exercised | **PASS** — single-instance `flock` verified with real processes (acquire → second refused → SIGKILL holder → third acquires; lock `~/.fthr/fthr.lock` uid=you mode=600). Hotkey socket verified at `$XDG_RUNTIME_DIR/fthr/hotkey.sock`, dir 0700, socket 0600, 16 new tests. |
 | 7.7b | Linux: hotkeys actually fire from a compositor bind | **NOT RUN** — no compositor available |
 | 7.7c | Linux: audio capture | **PASS (headless)** — PulseAudio capture starts (48 kHz stereo float32) and a clip with a real AAC track was produced. Device switching, disconnection and "no microphone" remain `NOT RUN`. |
@@ -138,7 +139,7 @@ Everything else below is either already green or is honest, tracked work.
 
 | # | Gate | Status |
 |---|---|---|
-| 8.1 | `KNOWN_ISSUES.md` reflects reality | **PASS** — updated 2026-08-06; AUDIT-005/008/009 moved to resolved, AUDIT-013 is the standing blocker |
+| 8.1 | `KNOWN_ISSUES.md` reflects reality | **PASS** — updated 2026-08-14; AUDIT-013 owner asset-provenance decision remains the licensing blocker |
 | 8.2 | `RELEASE_NOTES.md` matches what actually ships | review at tag time |
 | 8.3 | `THIRD_PARTY_NOTICES.md` complete and current | **PASS** |
 | 8.4 | `CONTRIBUTING.md` describes the real layout and build | **PASS** |

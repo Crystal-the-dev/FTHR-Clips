@@ -4,6 +4,11 @@
 **Status:** `AUDIT-014 CONDITIONALLY RESOLVED`
 **Worked in:** Ubuntu 24.04.3 LTS under WSL2 + WSLg · CPython 3.12.3 · GCC 13.3.0 · CMake 3.28.3 · NVIDIA RTX 4060 Ti (driver 610.62)
 
+> **Qt licensing update (2026-08-14):** references below to the then-current
+> PyQt6 runtime are historical. The release path now uses PySide6 6.11.1 and
+> its official Qt runtime; see
+> [AUDIT-013-QT-LICENSING.md](AUDIT-013-QT-LICENSING.md).
+
 > **Historical layout note (2026-08-10):** the v3 mapping and 4248-byte size
 > below were accurate for this audit run. Capture-health fields later moved the
 > live IPC contract to `FTHR_SharedMemory_v4` (4272 bytes on Linux); see the

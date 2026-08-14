@@ -62,7 +62,8 @@ python -m ruff check .
 ```
 
 All must pass. See [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md) for
-the full gate list — one release blocker remains (AUDIT-013, PyQt6 is GPLv3).
+the full gate list. AUDIT-013 selected PySide6/LGPLv3; public release still
+requires owner confirmation or replacement of the unprovenanced bundled assets.
 
 ---
 
@@ -278,7 +279,7 @@ FFmpeg at all:
 * The engine carries an `$ORIGIN` RPATH, so it loads the bundled libraries even
   where a system FFmpeg exists.
 * The gate hash-verifies every shipped library and checks the licence of the
-  FFmpeg copies that arrive inside the PyQt6-Qt6 and opencv wheels.
+  FFmpeg copies that arrive inside the PySide6 Qt runtime and OpenCV wheels.
 
 If it does fail, it is telling you something real. Do not add exceptions to it.
 

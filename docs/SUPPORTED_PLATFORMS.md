@@ -34,7 +34,7 @@ exercised, and it is an unusual one.
 | GPU | NVIDIA GeForce RTX 4060 Ti, driver 610.62 (WSL passthrough) |
 | Encoder used | `av1_nvenc` (hardware) |
 | Python | CPython 3.12.3 |
-| Qt / PyQt6 | Qt 6.11.0 / PyQt6 6.11.0 |
+| Qt / PySide6 | Qt 6.11.1 / PySide6 6.11.1 |
 | Compiler | GCC 13.3.0 |
 | CMake | 3.28.3 |
 | FFmpeg | 6.1.1 (Ubuntu, **GPL build** — see licence note) |
@@ -157,7 +157,8 @@ build:
 | Provenance | `tools/ffmpeg_manifest_linux.json`, archive and per-library sha256 |
 
 Two further FFmpeg copies live inside Python wheels — Qt Multimedia's
-(PyQt6-Qt6, LGPLv2.1) and OpenCV's (opencv-python-headless, LGPLv2.1). Neither
+(the official PySide6 Qt runtime, LGPLv2.1) and OpenCV's
+(opencv-python-headless, LGPLv2.1). Neither
 is loaded by the engine; both are documented in the manifest and licence-checked
 on every build.
 
@@ -174,4 +175,3 @@ engine and the PyInstaller runtime were compiled on Ubuntu 24.04 (glibc 2.39).
 So the AppImage currently needs **glibc ≥ 2.39** — Ubuntu 24.04, Debian 13,
 Fedora 40 or newer. Building on an older base image would lower this
 considerably; that has not been done and is `NOT RUN`.
-

@@ -4,6 +4,13 @@
 **Authoritative tree:** `C:\Users\Tom\Desktop\FTHR_Clips_source\FTHR_Clips`
 **Last updated:** 2026-08-07
 
+> **Qt licensing update (2026-08-14):** the PyQt6 findings below describe the
+> original audit snapshot. The live source and packages now use PySide6 6.11.1
+> under the LGPLv3 option; Windows and Linux artifact gates reject PyQt6 and
+> GPL-only Qt modules. See [AUDIT-013-QT-LICENSING.md](AUDIT-013-QT-LICENSING.md).
+> AUDIT-013 remains `DECISION REQUIRED` only because asset provenance is not
+> documented.
+
 > **Historical layout note (2026-08-10):** measurements below that name
 > `FTHR_SharedMemory_v3` describe the layout at the time of this audit. The
 > capture-health remediation later extended the contract and moved the live

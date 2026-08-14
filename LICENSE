@@ -31,13 +31,14 @@ builds. Those keep their own licences, some of which are copyleft:
 
   * FFmpeg .............. LGPL v3 or later   (dynamically linked)
   * Qt 6 ................ LGPL v3
-  * PyQt6 ............... GPL-3.0-only       <-- makes the distributed
-                                                  binary GPLv3
+  * PySide6 / Shiboken .. LGPL v3            (dynamically linked)
   * OpenCV .............. Apache-2.0
   * NumPy ............... BSD-3-Clause
   * sounddevice, keyboard  MIT
+  * cffi ................. MIT No Attribution
+  * pycparser ............ BSD-3-Clause
 
 See THIRD_PARTY_NOTICES.md for the complete list, versions, and the location
-of every licence text. Do not describe a downloadable build as "MIT-licensed"
-while PyQt6 is bundled.
+of every licence text. A downloadable build is the MIT-licensed FTHR code plus
+separately licensed third-party components; it is not an MIT-only artifact.
 --------------------------------------------------------------------------

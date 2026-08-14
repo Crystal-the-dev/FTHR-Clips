@@ -11,7 +11,7 @@ Thanks for wanting to contribute. Here's everything you need to know.
 
 ```
 FTHR_Clips/
-├── FTHR_UI/                    Python frontend (PyQt6) — the entry point
+├── FTHR_UI/                    Python frontend (PySide6) — the entry point
 │   ├── main.py                 MainWindow, top bar, hotkey wiring, save flow
 │   ├── version.py              SINGLE SOURCE OF TRUTH for the product version
 │   ├── core/                   Non-visual logic

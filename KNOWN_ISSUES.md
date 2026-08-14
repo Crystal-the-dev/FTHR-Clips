@@ -11,7 +11,7 @@ Without it most reports are not actionable.
 
 | Issue | Detail |
 |---|---|
-| **PyQt6 is GPL-3.0-only** (AUDIT-013) | Qt itself is LGPLv3, but the *bindings* are GPLv3, so any bundle containing PyQt6 is GPLv3 **as a whole** — including this one. FTHR's own source stays MIT (`LICENSE`), but a download must never be advertised as MIT. Three ways out: port to PySide6 (LGPLv3), release deliberately as GPLv3, or buy a commercial PyQt licence. Until one is chosen, this blocks a public release. |
+| **Bundled asset provenance is unproven** (AUDIT-013) | The Qt binding has been migrated to PySide6 6.11.1 under its LGPLv3 option, and both artifact gates reject PyQt/GPL-only Qt modules. The repository still contains no durable authorship/licence evidence for its logos/icons, four MP3 sounds, or `Oswald-Bold.ttf`. The owner must document those rights or replace/remove the files before public release. |
 
 ## Resolved since the audit
 
@@ -21,7 +21,7 @@ Without it most reports are not actionable.
 | ~~**No version control**~~ (AUDIT-008) | Resolved 2026-08-06. The authoritative tree is a git repository with `.gitignore`, `.gitattributes`, a documented source of truth (`docs/SOURCE_OF_TRUTH.md`) and release gates (`docs/RELEASE_CHECKLIST.md`). No tag exists yet — see the blocker above. |
 | ~~**Unpinned dependencies**~~ (AUDIT-009) | Resolved 2026-08-06. `requirements-alpha.txt` pins the full transitive closure; `requirements.in` holds the direct list. Verified by two clean installs. |
 | ~~**Hotkey socket in world-writable /tmp**~~ (AUDIT-003b) | Resolved 2026-08-06. AUDIT-003 fixed the socket *mode*; the *path* was still `/tmp/fthr_hotkey.sock`, which any local user could squat — and the old code then ran an unconditional `unlink()` on it, either deleting a stranger's file or (under the sticky bit) failing and leaving hotkeys dead indefinitely. The socket moved to `$XDG_RUNTIME_DIR/fthr/` and now refuses to remove anything that is not a dead socket owned by you. 16 new tests, verified on Linux. |
-| ~~**No Linux AppImage could be built**~~ (AUDIT-014) | Resolved 2026-08-06. The Linux engine is now compiled against, and ships with, a pinned **LGPL** FFmpeg (BtbN `n8.1.2-34-g9b6c8969e0`, glibc 2.28 baseline) instead of the distribution's GPL build. CMake refuses a Release build without `-DFTHR_FFMPEG_ROOT`; the engine carries a `$ORIGIN` RPATH so it loads the bundled libraries; every shipped library is sha256-verified against `tools/ffmpeg_manifest_linux.json`. `build_linux.sh` now runs to completion: **83 licence checks, 0 failed**, and a 219 MB AppImage that starts. |
+| ~~**No Linux AppImage could be built**~~ (AUDIT-014) | Resolved 2026-08-06 and revalidated 2026-08-14. The Linux engine is compiled against, and ships with, a pinned **LGPL** FFmpeg (BtbN `n8.1.2-34-g9b6c8969e0`, glibc 2.28 baseline) instead of the distribution's GPL build. CMake refuses a Release build without `-DFTHR_FFMPEG_ROOT`; the engine carries a `$ORIGIN` RPATH so it loads the bundled libraries; every shipped library is sha256-verified against `tools/ffmpeg_manifest_linux.json`. The final PySide6 AppImage passes **109 licence/runtime checks, 0 failed**, and is 206 MiB. |
 | ~~**Bare-name external tool calls**~~ | Resolved 2026-08-06. `hyprctl`, `xdotool`, `xprop`, `grim`, `nc` and `xdg-open` were invoked by bare name, so `PATH` decided which binary ran and a missing tool surfaced as a swallowed `FileNotFoundError`. Now resolved once to an absolute path through `core/linux_tools.py`, cached, logged at startup, with required/optional classification. 13 new tests including `PATH` shadowing. |
 | ~~**Short replay saves**~~ (AUDIT-042) | Resolved 2026-08-14. Timestamp-driven selection retains the preceding keyframe and uses MP4 edit-list presentation instead of discarding footage through the next keyframe. Real WGC/NVENC saves at 30 s and 60 s were exact and fully decoded; see `docs/AUDIT-042-SHORT-SAVE-DURATION.md`. |
 | ~~**Linux FFmpeg header/library ABI mismatch**~~ (AUDIT-046) | Resolved 2026-08-14. Release linked pinned FFmpeg 8.1 libraries but could compile against system headers. CMake now gives the engine and FFmpeg-backed tests the pinned include directory; the actual-MP4 test exposed and verifies the fix. |
@@ -34,19 +34,27 @@ Without it most reports are not actionable.
   measured **all black** (luma min 0, max 0, one distinct value). XWayland under
   WSLg has no root-window content to grab. The plumbing works; the picture is
   unproven. See `docs/SUPPORTED_PLATFORMS.md`.
+- **The Linux engine does not exit promptly when no display backend exists.**
+  With both `DISPLAY` and `WAYLAND_DISPLAY` removed it reports the missing
+  backend and exhausts three recovery attempts, but the host process remains
+  alive beyond the test's eight-second bound. The full Linux Python suite
+  therefore has one failure; AUDIT-013 did not modify that C++ lifecycle path.
 - **No real Linux desktop was tested**: Hyprland, KDE Plasma, GNOME and bare
   metal X11 are all `NOT RUN`. Neither Wayland capture backend
   (`wlr-screencopy`, `ext-image-copy-capture`) has ever succeeded — WSLg's
   Weston implements neither, so only the x11grab fallback was exercised.
 - **No Linux hotkey has ever fired.** The Hyprland auto-config path
   (`~/.config/hypr/fthr-hotkeys.conf` + `hyprctl reload`) is untested.
-- **The GUI has not been launched** on either platform this cycle. The test
-  suite covers logic; nobody has seen a window.
+- **No visible desktop GUI walkthrough was performed** this cycle. The real
+  MainWindow widget tree and packaged capture-card entrypoint were exercised
+  offscreen with PySide6 on Windows and Linux, but nobody manually inspected a
+  rendered window, tray integration, dialogs, or media playback.
 - **Windows duration was re-verified only for WGC/NVENC video-only saves.** Five
   real 30/60-second clips were exact and fully decoded. Audio devices, raw
   fallback, games/fullscreen, and soak remain unverified this cycle.
-- **The installer** has not been tested for install / update / uninstall, and
-  **no AppImage has been produced** (the licence gate blocks it — see below).
+- **The installer** has not been tested for install / update / uninstall. A
+  206 MiB PySide6 AppImage was produced and its extracted contents passed the
+  licence gate, but it was not run on a bare-metal desktop.
 - Untested on Linux: multi-monitor, monitor switching, resolution changes,
   fractional scaling, fullscreen games, lock/unlock, suspend/resume, device
   removal during capture.

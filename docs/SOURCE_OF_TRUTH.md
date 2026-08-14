@@ -124,4 +124,4 @@ To find out what a downloaded build actually is:
 |---|---|
 | Git repository | Yes — initialised 2026-08-06, honest import of the existing alpha source |
 | Tag `v1.0.0-alpha` | **Not created.** Release gates are not met — see `RELEASE_CHECKLIST.md` |
-| Outstanding release blocker | AUDIT-013: PyQt6 is GPL-3.0-only, so the distributed build is GPLv3 |
+| Outstanding release blocker | AUDIT-013: PySide6/LGPL artifact path is gated; owner must prove or replace the bundled logos/icons/sounds/font |
