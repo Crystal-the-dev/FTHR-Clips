@@ -173,16 +173,9 @@ def _resolution_to_dims(name: str) -> tuple[int, int]:
     return _RESOLUTION_DIMS.get(name, (0, 0))
 
 
-def _load_logo_inverted(path: Path) -> QPixmap:
-    """Load the logo PNG and invert RGB so the original black-on-white art
-    becomes white-on-transparent — matches the dark top bar."""
-    from PySide6.QtGui import QImage
-    img = QImage(str(path))
-    if img.isNull():
-        return QPixmap(str(path))
-    img = img.convertToFormat(QImage.Format.Format_ARGB32)
-    img.invertPixels(QImage.InvertMode.InvertRgb)
-    return QPixmap.fromImage(img)
+def _load_logo_asset(path: Path) -> QPixmap:
+    """Load the provenance-gated project logo without altering its colors."""
+    return QPixmap(str(path))
 
 
 def _make_settings_icon(size: int = 18, color: str = Colors.TEXT) -> QIcon:
@@ -2513,9 +2506,9 @@ class MainWindow(QMainWindow):
                             QTimer.singleShot(2000, self._check_hardware_encoding_status)
                             if not self._startup_sound_played:
                                 self._startup_sound_played = True
-                                from ui.capture_card import _play_mp3, _SND_STARTUP
+                                from ui.capture_card import _play_sound, _SND_STARTUP
                                 vol = self.settings_manager.get('sound_volume_startup', 100)
-                                _play_mp3(_SND_STARTUP, vol)
+                                _play_sound(_SND_STARTUP, vol)
                         self._ui_call.emit(_on_connected)
                         print("Connected to capture engine.")
                         return
@@ -3863,7 +3856,7 @@ class MainWindow(QMainWindow):
             return
         logo_path = Path(__file__).parent / 'assets' / 'fthr_logo.png'
         if logo_path.exists():
-            pix = _load_logo_inverted(logo_path)
+            pix = _load_logo_asset(logo_path)
             self._logo_label.setPixmap(
                 pix.scaledToHeight(28, Qt.TransformationMode.SmoothTransformation))
         else:

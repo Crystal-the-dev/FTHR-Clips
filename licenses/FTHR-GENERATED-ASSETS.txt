@@ -1,0 +1,20 @@
+FTHR Clips generated release assets
+===================================
+
+Copyright (c) 2026 FTHR-Community
+
+The project logos, application icon, UI icons, installer artwork, repository
+social preview, and notification WAV files listed in
+tools/release_asset_manifest.json are generated solely by
+tools/generate_release_assets.py.
+
+The generator uses simple geometric primitives, an original compact bitmap
+alphabet, and synthesized sine tones. It does not use an external image, icon
+set, sound sample, system font, or other third-party creative-media input.
+
+These generated assets are licensed under the MIT License stated in the root
+LICENSE file. Permission includes use, copying, modification, sublicensing,
+and redistribution subject to that licence's notice condition.
+
+This notice does not apply to Oswald-Bold.ttf, which is distributed separately
+under the SIL Open Font License 1.1; see Oswald-OFL-1.1.txt.

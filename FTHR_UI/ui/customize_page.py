@@ -1374,10 +1374,10 @@ class _SoundRow(QFrame):
     def _find_default_sound(self) -> Optional[Path]:
         sounds_dir = Path(__file__).parent.parent / 'assets' / 'sounds'
         mapping = {
-            'clip_captured': 'clip_captured.mp3',
-            'error': 'error.mp3',
-            'screenshot_captured': 'screenshot_saved.mp3',
-            'screenshot_saved': 'screenshot_saved.mp3',
+            'clip_captured': 'clip_captured.wav',
+            'error': 'error.wav',
+            'screenshot_captured': 'screenshot_saved.wav',
+            'screenshot_saved': 'screenshot_saved.wav',
             'startup': None,
         }
         filename = mapping.get(self._key)
