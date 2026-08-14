@@ -5,6 +5,58 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(fthr_replay_interval_test
+        ../FTHRcapture_common/tests/replay_interval_test.cpp)
+    target_include_directories(fthr_replay_interval_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/../FTHRcapture_common)
+    target_compile_options(fthr_replay_interval_test PRIVATE
+        -Wall -Wextra -Wpedantic -UNDEBUG)
+    add_test(NAME replay_interval_contract COMMAND fthr_replay_interval_test)
+
+    add_executable(fthr_raw_fixed_rate_duration_test
+        ../FTHRcapture_common/tests/raw_fixed_rate_duration_test.cpp)
+    target_include_directories(fthr_raw_fixed_rate_duration_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/../FTHRcapture_common)
+    target_compile_options(fthr_raw_fixed_rate_duration_test PRIVATE
+        -Wall -Wextra -Wpedantic -UNDEBUG)
+    add_test(NAME windows_raw_fixed_rate_duration
+        COMMAND fthr_raw_fixed_rate_duration_test)
+
+    add_executable(fthr_windows_encoded_ring_duration_test
+        tests/windows_encoded_ring_duration_test.cpp
+        ../FTHRcapture/FTHRclips/src/encoded_ring_buffer.cpp)
+    target_include_directories(fthr_windows_encoded_ring_duration_test PRIVATE
+        ../FTHRcapture/FTHRclips/include
+        ../FTHRcapture_common)
+    target_compile_options(fthr_windows_encoded_ring_duration_test PRIVATE
+        -Wall -Wextra -Wpedantic -UNDEBUG)
+    target_link_libraries(fthr_windows_encoded_ring_duration_test PRIVATE pthread)
+    add_test(NAME windows_encoded_ring_duration
+        COMMAND fthr_windows_encoded_ring_duration_test)
+
+    add_executable(fthr_windows_audio_interval_test
+        tests/windows_audio_interval_test.cpp
+        ../FTHRcapture/FTHRclips/src/audio_ring_buffer.cpp)
+    target_include_directories(fthr_windows_audio_interval_test PRIVATE
+        ../FTHRcapture/FTHRclips/include)
+    target_compile_options(fthr_windows_audio_interval_test PRIVATE
+        -Wall -Wextra -Wpedantic -UNDEBUG)
+    target_link_libraries(fthr_windows_audio_interval_test PRIVATE pthread)
+    add_test(NAME windows_audio_interval
+        COMMAND fthr_windows_audio_interval_test)
+
+    add_executable(fthr_linux_encoded_ring_duration_test
+        tests/linux_encoded_ring_duration_test.cpp
+        src/ring_buffer.cpp)
+    target_include_directories(fthr_linux_encoded_ring_duration_test PRIVATE
+        src
+        ../FTHRcapture_common)
+    target_compile_options(fthr_linux_encoded_ring_duration_test PRIVATE
+        -Wall -Wextra -Wpedantic -UNDEBUG)
+    target_link_libraries(fthr_linux_encoded_ring_duration_test PRIVATE pthread)
+    add_test(NAME linux_encoded_ring_duration
+        COMMAND fthr_linux_encoded_ring_duration_test)
+
     add_executable(fthr_capture_recovery_test tests/capture_recovery_test.cpp)
     target_include_directories(fthr_capture_recovery_test PRIVATE src)
     target_compile_options(fthr_capture_recovery_test PRIVATE
@@ -282,6 +334,52 @@ if(FTHR_FFMPEG_BUNDLED)
     # static linker the same closed pinned search set used by the runtime RPATH.
     target_link_options(FTHRclips PRIVATE
         "-Wl,-rpath-link,${FTHR_FFMPEG_ROOT}/lib")
+endif()
+
+if(BUILD_TESTING)
+    add_executable(fthr_linux_encoder_timestamp_test
+        tests/linux_encoder_timestamp_test.cpp
+        src/encoder.cpp)
+    target_include_directories(fthr_linux_encoder_timestamp_test PRIVATE src)
+    target_include_directories(fthr_linux_encoder_timestamp_test SYSTEM PRIVATE
+        ${FFMPEG_INCLUDE_DIRS})
+    target_link_libraries(fthr_linux_encoder_timestamp_test PRIVATE
+        $<$<BOOL:${FTHR_FFMPEG_BUNDLED}>:${FTHR_FFMPEG_LINK_LIBRARIES}>
+        $<$<NOT:$<BOOL:${FTHR_FFMPEG_BUNDLED}>>:PkgConfig::FFMPEG>
+        pthread)
+    target_compile_options(fthr_linux_encoder_timestamp_test PRIVATE
+        -Wall -Wextra -Wpedantic -UNDEBUG)
+    target_link_options(fthr_linux_encoder_timestamp_test PRIVATE
+        "-Wl,--disable-new-dtags")
+    set_target_properties(fthr_linux_encoder_timestamp_test PROPERTIES
+        BUILD_WITH_INSTALL_RPATH TRUE
+        INSTALL_RPATH "$ORIGIN/../third_party/ffmpeg/lib")
+    add_test(NAME linux_encoder_timestamps
+        COMMAND fthr_linux_encoder_timestamp_test)
+
+    add_executable(fthr_short_save_mp4_integration_test
+        tests/short_save_mp4_integration_test.cpp
+        src/ring_buffer.cpp
+        src/save_clip.cpp)
+    target_include_directories(fthr_short_save_mp4_integration_test PRIVATE
+        src
+        ../FTHRcapture_common)
+    target_include_directories(fthr_short_save_mp4_integration_test SYSTEM PRIVATE
+        ${FFMPEG_INCLUDE_DIRS})
+    target_link_libraries(fthr_short_save_mp4_integration_test PRIVATE
+        $<$<BOOL:${FTHR_FFMPEG_BUNDLED}>:${FTHR_FFMPEG_LINK_LIBRARIES}>
+        $<$<NOT:$<BOOL:${FTHR_FFMPEG_BUNDLED}>>:PkgConfig::FFMPEG>
+        pthread)
+    target_compile_options(fthr_short_save_mp4_integration_test PRIVATE
+        -Wall -Wextra -Wpedantic -UNDEBUG)
+    target_link_options(fthr_short_save_mp4_integration_test PRIVATE
+        "-Wl,--disable-new-dtags")
+    set_target_properties(fthr_short_save_mp4_integration_test PROPERTIES
+        BUILD_WITH_INSTALL_RPATH TRUE
+        INSTALL_RPATH "$ORIGIN/../third_party/ffmpeg/lib")
+    add_test(NAME short_save_actual_mp4
+        COMMAND fthr_short_save_mp4_integration_test
+            /tmp/fthr-audit042-short-save.mp4)
 endif()
 
 install(TARGETS FTHRclips RUNTIME DESTINATION bin)
