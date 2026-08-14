@@ -87,14 +87,6 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: python -m pytest tests/ -v --tb=short
 
-      - name: PyInstaller analysis (Windows)
-        # Full bundling needs the compiled engine, which this job does not have.
-        # The Analysis phase alone still proves the spec parses, the version
-        # resource generates, and every hidden import resolves.
-        if: runner.os == 'Windows'
-        run: python -m PyInstaller FTHR.spec --clean --noconfirm --log-level WARN
-        continue-on-error: false
-
   # ==========================================================================
   # Linux capture engine
   # ==========================================================================
@@ -105,18 +97,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements-alpha.txt
+
       - name: Install build dependencies
         run: |
           sudo apt-get update -q
           sudo apt-get install -q -y \
             cmake g++ pkg-config \
-            libavcodec-dev libavformat-dev libavutil-dev \
-            libswscale-dev libswresample-dev \
             libpulse-dev libx11-dev libxext-dev libxfixes-dev \
             libwayland-dev wayland-protocols
 
+      - name: Fetch pinned Linux FFmpeg
+        run: python tools/fetch_third_party.py --ffmpeg-linux
+
       - name: Configure
-        run: cmake -B FTHRcapture_linux/build -S FTHRcapture_linux -DCMAKE_BUILD_TYPE=Release
+        run: >
+          cmake -B FTHRcapture_linux/build -S FTHRcapture_linux
+          -DCMAKE_BUILD_TYPE=Release
+          -DFTHR_FFMPEG_ROOT=${{ github.workspace }}/FTHRcapture_linux/third_party/ffmpeg
 
       - name: Build
         # Warnings are surfaced but not fatal yet: the engine has never been
@@ -137,6 +139,14 @@ jobs:
       - name: Verify the binary exists
         run: test -x FTHRcapture_linux/build/FTHRclips
 
+      - name: Native contract tests
+        run: ctest --test-dir FTHRcapture_linux/build --output-on-failure
+
+      - name: Verify licences and a clean source tree
+        run: |
+          python tools/verify_release_licenses.py --tree .
+          git diff --exit-code
+
       # Deliberately NOT run: the engine's own capture path. A GitHub runner
       # has no compositor, no DRM device and no audio server. Starting it here
       # would test the failure path and prove nothing about capture.
@@ -154,6 +164,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
+          cache: pip
+          cache-dependency-path: |
+            requirements-alpha.txt
+            requirements-dev.txt
 
       - uses: microsoft/setup-msbuild@v2
 
@@ -202,6 +216,20 @@ jobs:
           if ($machine -ne 0x8664) { throw ("wrong architecture: 0x{0:X}" -f $machine) }
           "engine OK, x64"
 
+      - name: Install pinned bundle dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-alpha.txt -r requirements-dev.txt
+          python -m pip check
+
+      - name: Build and verify the Windows bundle
+        shell: pwsh
+        run: |
+          python -m PyInstaller FTHR.spec --clean --noconfirm --log-level WARN
+          if (-not (Test-Path "dist\FTHRClips\FTHRClips.exe")) { throw "UI binary not produced" }
+          if (-not (Test-Path "dist\FTHRClips\_internal\engine\FTHRClips.exe")) { throw "bundled engine not produced" }
+          python tools/verify_release_licenses.py --windows-dist dist\FTHRClips
+
   # ==========================================================================
   # Release verification — the gates that decide whether a tag is allowed.
   # ==========================================================================
@@ -228,6 +256,12 @@ jobs:
 
       - name: Shared-memory contract
         run: python tools/verify_shared_memory_contract.py
+
+      - name: Engine response contract
+        run: python tools/verify_engine_response_contract.py
+
+      - name: Exception-handling ratchet
+        run: python tools/verify_exception_handling.py
 
       - name: Secrets, user data and oversized binaries
         run: python tools/scan_repo_hygiene.py

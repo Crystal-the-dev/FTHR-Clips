@@ -1,0 +1,50 @@
+"""Clean-clone contracts for the release CI workflow."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+
+
+def _workflow() -> str:
+    return WORKFLOW.read_text(encoding="utf-8")
+
+
+def test_linux_release_ci_fetches_and_uses_pinned_ffmpeg() -> None:
+    workflow = _workflow()
+    linux_job = workflow[workflow.index("  linux-engine:") : workflow.index(
+        "  windows-engine:"
+    )]
+
+    assert "fetch_third_party.py --ffmpeg-linux" in linux_job
+    assert "-DFTHR_FFMPEG_ROOT=${{ github.workspace }}" in linux_job
+    assert "ctest --test-dir" in linux_job
+    assert "verify_release_licenses.py --tree ." in linux_job
+    assert "git diff --exit-code" in linux_job
+
+
+def test_windows_bundle_is_built_only_after_the_engine() -> None:
+    workflow = _workflow()
+    python_job = workflow[workflow.index("  python:") : workflow.index(
+        "  linux-engine:"
+    )]
+    windows_job = workflow[workflow.index("  windows-engine:") : workflow.index(
+        "  release-verification:"
+    )]
+
+    assert "PyInstaller" not in python_job
+    assert windows_job.index("msbuild FTHRcapture") < windows_job.index(
+        "python -m PyInstaller"
+    )
+    assert "verify_release_licenses.py --windows-dist" in windows_job
+
+
+def test_release_ci_runs_response_and_exception_contracts() -> None:
+    workflow = _workflow()
+    release_job = workflow[workflow.index("  release-verification:") :]
+
+    assert "verify_engine_response_contract.py" in release_job
+    assert "verify_exception_handling.py" in release_job
