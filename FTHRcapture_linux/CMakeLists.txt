@@ -138,71 +138,73 @@ if(BUILD_TESTING)
 endif()
 
 find_program(WAYLAND_SCANNER wayland-scanner REQUIRED)
-set(PROTO_DIR ${CMAKE_SOURCE_DIR}/protocols)
+set(PROTO_XML_DIR ${CMAKE_CURRENT_SOURCE_DIR}/protocols)
+set(PROTO_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/protocols)
+file(MAKE_DIRECTORY ${PROTO_GEN_DIR})
 
 # wlr-screencopy
 add_custom_command(
-    OUTPUT ${PROTO_DIR}/wlr-screencopy-client-protocol.h
-           ${PROTO_DIR}/wlr-screencopy-protocol.c
+    OUTPUT ${PROTO_GEN_DIR}/wlr-screencopy-client-protocol.h
+           ${PROTO_GEN_DIR}/wlr-screencopy-protocol.c
     COMMAND ${WAYLAND_SCANNER} client-header
-            ${PROTO_DIR}/wlr-screencopy-unstable-v1.xml
-            ${PROTO_DIR}/wlr-screencopy-client-protocol.h
+            ${PROTO_XML_DIR}/wlr-screencopy-unstable-v1.xml
+            ${PROTO_GEN_DIR}/wlr-screencopy-client-protocol.h
     COMMAND ${WAYLAND_SCANNER} private-code
-            ${PROTO_DIR}/wlr-screencopy-unstable-v1.xml
-            ${PROTO_DIR}/wlr-screencopy-protocol.c
-    DEPENDS ${PROTO_DIR}/wlr-screencopy-unstable-v1.xml
+            ${PROTO_XML_DIR}/wlr-screencopy-unstable-v1.xml
+            ${PROTO_GEN_DIR}/wlr-screencopy-protocol.c
+    DEPENDS ${PROTO_XML_DIR}/wlr-screencopy-unstable-v1.xml
 )
 
 # xdg-output
 add_custom_command(
-    OUTPUT ${PROTO_DIR}/xdg-output-client-protocol.h
-           ${PROTO_DIR}/xdg-output-protocol.c
+    OUTPUT ${PROTO_GEN_DIR}/xdg-output-client-protocol.h
+           ${PROTO_GEN_DIR}/xdg-output-protocol.c
     COMMAND ${WAYLAND_SCANNER} client-header
-            ${PROTO_DIR}/xdg-output-unstable-v1.xml
-            ${PROTO_DIR}/xdg-output-client-protocol.h
+            ${PROTO_XML_DIR}/xdg-output-unstable-v1.xml
+            ${PROTO_GEN_DIR}/xdg-output-client-protocol.h
     COMMAND ${WAYLAND_SCANNER} private-code
-            ${PROTO_DIR}/xdg-output-unstable-v1.xml
-            ${PROTO_DIR}/xdg-output-protocol.c
-    DEPENDS ${PROTO_DIR}/xdg-output-unstable-v1.xml
+            ${PROTO_XML_DIR}/xdg-output-unstable-v1.xml
+            ${PROTO_GEN_DIR}/xdg-output-protocol.c
+    DEPENDS ${PROTO_XML_DIR}/xdg-output-unstable-v1.xml
 )
 
 # ext-image-copy-capture
 add_custom_command(
-    OUTPUT ${PROTO_DIR}/ext-image-copy-capture-client-protocol.h
-           ${PROTO_DIR}/ext-image-copy-capture-protocol.c
+    OUTPUT ${PROTO_GEN_DIR}/ext-image-copy-capture-client-protocol.h
+           ${PROTO_GEN_DIR}/ext-image-copy-capture-protocol.c
     COMMAND ${WAYLAND_SCANNER} client-header
-            ${PROTO_DIR}/ext-image-copy-capture-v1.xml
-            ${PROTO_DIR}/ext-image-copy-capture-client-protocol.h
+            ${PROTO_XML_DIR}/ext-image-copy-capture-v1.xml
+            ${PROTO_GEN_DIR}/ext-image-copy-capture-client-protocol.h
     COMMAND ${WAYLAND_SCANNER} private-code
-            ${PROTO_DIR}/ext-image-copy-capture-v1.xml
-            ${PROTO_DIR}/ext-image-copy-capture-protocol.c
-    DEPENDS ${PROTO_DIR}/ext-image-copy-capture-v1.xml
+            ${PROTO_XML_DIR}/ext-image-copy-capture-v1.xml
+            ${PROTO_GEN_DIR}/ext-image-copy-capture-protocol.c
+    DEPENDS ${PROTO_XML_DIR}/ext-image-copy-capture-v1.xml
 )
 
 # ext-image-capture-source
 add_custom_command(
-    OUTPUT ${PROTO_DIR}/ext-image-capture-source-client-protocol.h
-           ${PROTO_DIR}/ext-image-capture-source-protocol.c
+    OUTPUT ${PROTO_GEN_DIR}/ext-image-capture-source-client-protocol.h
+           ${PROTO_GEN_DIR}/ext-image-capture-source-protocol.c
     COMMAND ${WAYLAND_SCANNER} client-header
-            ${PROTO_DIR}/ext-image-capture-source-v1.xml
-            ${PROTO_DIR}/ext-image-capture-source-client-protocol.h
+            ${PROTO_XML_DIR}/ext-image-capture-source-v1.xml
+            ${PROTO_GEN_DIR}/ext-image-capture-source-client-protocol.h
     COMMAND ${WAYLAND_SCANNER} private-code
-            ${PROTO_DIR}/ext-image-capture-source-v1.xml
-            ${PROTO_DIR}/ext-image-capture-source-protocol.c
-    DEPENDS ${PROTO_DIR}/ext-image-capture-source-v1.xml
+            ${PROTO_XML_DIR}/ext-image-capture-source-v1.xml
+            ${PROTO_GEN_DIR}/ext-image-capture-source-protocol.c
+    DEPENDS ${PROTO_XML_DIR}/ext-image-capture-source-v1.xml
 )
 
 # ext-foreign-toplevel-list (required by ext-image-capture-source)
 add_custom_command(
-    OUTPUT ${PROTO_DIR}/ext-foreign-toplevel-list-client-protocol.h
-           ${PROTO_DIR}/ext-foreign-toplevel-list-protocol.c
+    OUTPUT ${PROTO_GEN_DIR}/ext-foreign-toplevel-list-client-protocol.h
+           ${PROTO_GEN_DIR}/ext-foreign-toplevel-list-protocol.c
     COMMAND ${WAYLAND_SCANNER} client-header
-            ${PROTO_DIR}/ext-foreign-toplevel-list-v1.xml
-            ${PROTO_DIR}/ext-foreign-toplevel-list-client-protocol.h
+            ${PROTO_XML_DIR}/ext-foreign-toplevel-list-v1.xml
+            ${PROTO_GEN_DIR}/ext-foreign-toplevel-list-client-protocol.h
     COMMAND ${WAYLAND_SCANNER} private-code
-            ${PROTO_DIR}/ext-foreign-toplevel-list-v1.xml
-            ${PROTO_DIR}/ext-foreign-toplevel-list-protocol.c
-    DEPENDS ${PROTO_DIR}/ext-foreign-toplevel-list-v1.xml
+            ${PROTO_XML_DIR}/ext-foreign-toplevel-list-v1.xml
+            ${PROTO_GEN_DIR}/ext-foreign-toplevel-list-protocol.c
+    DEPENDS ${PROTO_XML_DIR}/ext-foreign-toplevel-list-v1.xml
 )
 
 add_executable(FTHRclips
@@ -219,16 +221,16 @@ add_executable(FTHRclips
     src/encoder.cpp
     src/save_clip.cpp
     src/ring_buffer.cpp
-    ${PROTO_DIR}/wlr-screencopy-protocol.c
-    ${PROTO_DIR}/xdg-output-protocol.c
-    ${PROTO_DIR}/ext-image-copy-capture-protocol.c
-    ${PROTO_DIR}/ext-image-capture-source-protocol.c
-    ${PROTO_DIR}/ext-foreign-toplevel-list-protocol.c
+    ${PROTO_GEN_DIR}/wlr-screencopy-protocol.c
+    ${PROTO_GEN_DIR}/xdg-output-protocol.c
+    ${PROTO_GEN_DIR}/ext-image-copy-capture-protocol.c
+    ${PROTO_GEN_DIR}/ext-image-capture-source-protocol.c
+    ${PROTO_GEN_DIR}/ext-foreign-toplevel-list-protocol.c
 )
 
 target_include_directories(FTHRclips PRIVATE
     src/
-    ${PROTO_DIR}/
+    ${PROTO_GEN_DIR}/
     ${CMAKE_SOURCE_DIR}/../FTHRcapture_common
 )
 

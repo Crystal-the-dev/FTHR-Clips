@@ -39,3 +39,14 @@ def test_linux_release_link_is_confined_to_pinned_ffmpeg_tree() -> None:
     assert "NO_DEFAULT_PATH" in cmake
     assert "FTHR_FFMPEG_LINK_LIBRARIES" in cmake
     assert "-Wl,-rpath-link,${FTHR_FFMPEG_ROOT}/lib" in cmake
+
+
+def test_wayland_protocol_generation_stays_in_build_tree() -> None:
+    cmake = (ROOT / "FTHRcapture_linux" / "CMakeLists.txt").read_text(
+        encoding="utf-8"
+    )
+    assert "set(PROTO_XML_DIR ${CMAKE_CURRENT_SOURCE_DIR}/protocols)" in cmake
+    assert "set(PROTO_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/protocols)" in cmake
+    assert "OUTPUT ${PROTO_GEN_DIR}/wlr-screencopy-client-protocol.h" in cmake
+    assert "DEPENDS ${PROTO_XML_DIR}/wlr-screencopy-unstable-v1.xml" in cmake
+    assert "set(PROTO_DIR ${CMAKE_SOURCE_DIR}/protocols)" not in cmake
