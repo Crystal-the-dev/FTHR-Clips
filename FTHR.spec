@@ -86,8 +86,8 @@ a = Analysis(
         'urllib.request',
         'urllib.error',
         'urllib.parse',
-        'PyQt6.QtMultimedia',
-        'PyQt6.QtMultimediaWidgets',
+        'PySide6.QtMultimedia',
+        'PySide6.QtMultimediaWidgets',
         'sounddevice',
         'numpy',
         'cv2',
@@ -129,10 +129,16 @@ a = Analysis(
         # FTHR_UI/core/ffmpeg_tools.py.
         'imageio_ffmpeg',
         # Qt modules unused on Windows (no Wayland, no QML)
-        'PyQt6.QtQuick', 'PyQt6.QtQml', 'PyQt6.QtWebEngine',
-        'PyQt6.QtWebEngineCore', 'PyQt6.QtBluetooth', 'PyQt6.QtPositioning',
-        'PyQt6.QtSensors', 'PyQt6.QtLocation', 'PyQt6.Qt3D',
-        'PyQt6.QtPdf', 'PyQt6.QtPdfWidgets', 'PyQt6.QtNfc',
+        'PySide6.QtQuick', 'PySide6.QtQml', 'PySide6.QtWebEngine',
+        'PySide6.QtWebEngineCore', 'PySide6.QtBluetooth', 'PySide6.QtPositioning',
+        'PySide6.QtSensors', 'PySide6.QtLocation', 'PySide6.Qt3D',
+        'PySide6.QtPdf', 'PySide6.QtPdfWidgets', 'PySide6.QtNfc',
+        # GPL-only Qt modules are outside the reviewed LGPL runtime.
+        'PySide6.QtCanvasPainter', 'PySide6.QtCoap', 'PySide6.QtGraphs',
+        'PySide6.QtGrpc', 'PySide6.QtHttpServer', 'PySide6.QtLottie',
+        'PySide6.QtMqtt', 'PySide6.QtNetworkAuth', 'PySide6.QtQmlCompiler',
+        'PySide6.QtQuick3D', 'PySide6.QtVirtualKeyboard',
+        'PySide6.QtWaylandCompositor',
         # Standard library bloat
         'tkinter', 'unittest',
         'pydoc', 'doctest', 'difflib', 'ftplib', 'imaplib',
@@ -145,6 +151,24 @@ a = Analysis(
     win_private_assemblies=False,
     noarchive=False,
 )
+
+# PyInstaller's QtGui hook collects every platform-input-context plugin,
+# including Qt Virtual Keyboard. That module is GPL-only in Qt 6.11 and pulls
+# the otherwise unused QML/Quick runtime with it. Python-module exclusions do
+# not filter hook-added binaries, so prune that reviewed-unnecessary chain from
+# the actual TOCs before COLLECT.
+def _keep_reviewed_qt_runtime(entry):
+    dest = str(entry[0]).replace('\\', '/').casefold()
+    name = dest.rsplit('/', 1)[-1]
+    forbidden_prefixes = ('qt6qml', 'qt6quick', 'qt6virtualkeyboard')
+    return ('virtualkeyboard' not in dest
+            and not name.startswith(forbidden_prefixes))
+
+
+a.binaries = [entry for entry in a.binaries
+              if _keep_reviewed_qt_runtime(entry)]
+a.datas = [entry for entry in a.datas
+           if _keep_reviewed_qt_runtime(entry)]
 
 pyz = PYZ(a.pure)
 

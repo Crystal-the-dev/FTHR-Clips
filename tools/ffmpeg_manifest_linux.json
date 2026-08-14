@@ -146,7 +146,7 @@
         "libswscale.so.8",
         "libswresample.so.5"
       ],
-      "origin": "PyQt6-Qt6 wheel (site-packages/PyQt6/Qt6/lib), pinned to 6.11.1 in requirements-alpha.txt",
+      "origin": "official PySide6 6.11.1 Qt runtime (site-packages/PySide6), pinned in requirements-alpha.txt",
       "license": "LGPL v2.1 or later",
       "verified": "self-reported banner 'libavcodec license: LGPL version 2.1 or later'; no GPL configure flags",
       "used_by": "Qt Multimedia playback only. The FTHR engine never loads these; it needs the .so.62 generation.",
@@ -169,7 +169,7 @@
     }
   ],
 
-  "not_hash_pinned_because": "The additional providers are artifacts of their wheel versions, not FTHR decisions. Pinning their hashes here would create a second place to update on every PyQt6-Qt6 or OpenCV bump and would drift silently. The wheel pins in requirements-alpha.txt are the control; the licence gate verifies these libraries' licence on every build instead of their bytes.",
+  "not_hash_pinned_because": "The additional providers are artifacts of their wheel versions, not FTHR decisions. Pinning their hashes here would create a second place to update on every PySide6 or OpenCV bump and would drift silently. The wheel pins in requirements-alpha.txt are the control; the licence gate verifies these libraries' licence on every build instead of their bytes.",
 
   "not_ffmpeg_despite_the_name": {
     "libavif": "AV1 *image* codec used by Qt and OpenCV. Not FFmpeg. An earlier over-broad cleanup glob ('libav*.so*') deleted it and the bundle then failed at startup with 'ImportError: libavif-...so: cannot open shared object file'.",

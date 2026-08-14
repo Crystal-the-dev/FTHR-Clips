@@ -144,12 +144,13 @@ _have wayland-scanner && _kv 'wayland-scanner' "$(wayland-scanner --version 2>&1
 # ---------------------------------------------------------------------------
 _h 'Python'
 _kv 'python3' "$(python3 --version 2>&1)"
-python3 - <<'PY' 2>/dev/null | sed 's/^/  /' || echo '  (PyQt6 not importable)'
+python3 - <<'PY' 2>/dev/null | sed 's/^/  /' || echo '  (PySide6 not importable)'
 try:
-    from PyQt6.QtCore import QT_VERSION_STR, PYQT_VERSION_STR
-    print(f'Qt {QT_VERSION_STR} / PyQt6 {PYQT_VERSION_STR}')
+    import PySide6
+    from PySide6.QtCore import qVersion
+    print(f'Qt {qVersion()} / PySide6 {PySide6.__version__}')
 except Exception as e:
-    print(f'PyQt6 unavailable: {e}')
+    print(f'PySide6 unavailable: {e}')
 for m in ('numpy', 'cv2', 'sounddevice', 'keyboard'):
     try:
         mod = __import__(m)

@@ -1,0 +1,20 @@
+Qt 6.11.1 third-party code notice
+=================================
+
+The unmodified Qt 6.11.1 runtime bundled with FTHR Clips incorporates
+third-party components under their own open-source licences. The actual
+runtime includes Qt Core, GUI/platform plugins, Widgets, Network, Multimedia,
+PDF, SVG, OpenGL, Concurrent, and the Wayland client integration.
+
+The Qt Company publishes the authoritative component-by-component inventory
+and licence links for Qt 6.11.1 at:
+
+https://doc.qt.io/qt-6/licenses-used-in-qt.html
+
+The corresponding Qt source archive, including the source-level licence files
+and SPDX software-bill-of-materials records, is:
+
+https://download.qt.io/official_releases/qt/6.11/6.11.1/single/qt-everywhere-src-6.11.1.tar.xz
+
+Both locations were verified on 2026-08-14. See Qt6-SOURCE.txt for the complete
+Qt/PySide source-delivery notice and Qt6-LICENSE.txt for LGPLv3.

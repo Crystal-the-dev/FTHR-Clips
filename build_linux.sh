@@ -41,7 +41,7 @@ pkg-config --exists libavcodec libpulse-simple wayland-client || {
 # which no amount of pip installing will fix. Verified on Ubuntu 24.04.
 _missing_py=()
 _missing_sys=()
-for _m in PyQt6 keyboard cv2 numpy sounddevice; do
+for _m in PySide6 keyboard cv2 numpy sounddevice; do
     _err="$(python3 -c "import $_m" 2>&1)" && continue
     case "$_err" in
         *PortAudio*)          _missing_sys+=("$_m: PortAudio runtime library") ;;
@@ -158,6 +158,7 @@ _rm "libQt6WebEngine*.so*"
 _rm "libQt6Location*.so*"
 _rm "libQt6Positioning*.so*"
 _rm "libQt6VirtualKeyboard*.so*"
+_rm "*virtualkeyboard*"
 _rm "libQt6Charts*.so*"
 _rm "libQt6DataVisualization*.so*"
 
@@ -186,7 +187,7 @@ _FFMPEG_LIB_RE='.*/lib(avcodec|avformat|avutil|avdevice|avfilter|swscale|swresam
 
 # Kept on purpose:
 #   *.so.62/.60/.11/.9/.6  the pinned LGPL runtime the engine links (manifest)
-#   *.so.61/.59/.8/.5      Qt Multimedia's own FFmpeg from the PyQt6-Qt6 wheel,
+#   *.so.61/.59/.8/.5      Qt Multimedia's own FFmpeg from the PySide6 wheel,
 #                          LGPLv2.1, documented in ffmpeg_manifest_linux.json.
 #                          Removing it would break Qt Multimedia playback.
 _keep_regex='libavcodec\.so\.6[12]|libavformat\.so\.6[12]|libavutil\.so\.(59|60)|libavdevice\.so\.62|libavfilter\.so\.11|libswscale\.so\.[89]|libswresample\.so\.[56]'
@@ -228,9 +229,9 @@ cp -r "$PYINST_DIR/." "$APPDIR/"
 cp "$SCRIPT_DIR/AppDir/fthr-clips.desktop" "$APPDIR/"
 cp "$SCRIPT_DIR/AppDir/fthr-clips.png"     "$APPDIR/"
 
-# Licence paperwork (AUDIT-005). The bundled FFmpeg is LGPLv3 and PyQt6 is
-# GPLv3; both require the licence texts to travel with the binary. The user
-# must be able to find them locally after unpacking, not only on GitHub.
+# Licence paperwork (AUDIT-005/AUDIT-013). Bundled FFmpeg, PySide6, and Qt use
+# LGPL options and require local licence/notices plus the documented source
+# route; the user must not have to visit the repository to find them.
 cp "$SCRIPT_DIR/LICENSE"                "$APPDIR/"
 cp "$SCRIPT_DIR/THIRD_PARTY_NOTICES.md" "$APPDIR/"
 cp -r "$SCRIPT_DIR/licenses"            "$APPDIR/"

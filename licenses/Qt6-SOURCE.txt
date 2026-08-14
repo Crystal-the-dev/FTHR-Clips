@@ -1,0 +1,20 @@
+Corresponding source for the Qt 6.11.1 runtime
+==============================================
+
+FTHR Clips distributes unmodified Qt 6.11.1 shared libraries supplied by the
+official PySide6 6.11.1 wheels. The corresponding upstream source is available
+from The Qt Company at:
+
+https://download.qt.io/official_releases/qt/6.11/6.11.1/single/qt-everywhere-src-6.11.1.tar.xz
+
+The corresponding Qt for Python / PySide6 and Shiboken 6.11.1 source is:
+
+https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.11.1-src/pyside-setup-everywhere-src-6.11.1.tar.xz
+
+These URLs and versions were verified on 2026-08-14. FTHR Clips has not
+modified either source distribution. The LGPLv3 text is Qt6-LICENSE.txt in
+this directory.
+
+Qt also incorporates third-party code under separate open-source licences.
+The authoritative component inventory and the exact source archive are linked
+from Qt6-THIRD-PARTY-NOTICES.txt, distributed beside this file.

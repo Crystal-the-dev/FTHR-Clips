@@ -13,28 +13,27 @@ ENGINE_BIN = ROOT / 'FTHRcapture_linux' / 'build' / 'FTHRclips'
 _sys.path.insert(0, str(UI_DIR))
 from version import APP_ID  # noqa: E402
 
-# Qt6 plugin dirs — bundle Wayland + XCB so the app works on both.
-# Arch puts them in /usr/lib/qt6; Debian/Ubuntu use a multiarch path.
-def _first_existing(*candidates):
-    for c in candidates:
-        p = Path(c)
-        if p.exists():
-            return p
-    return Path(candidates[0])          # keep a stable value for error messages
-
-
 import sysconfig as _sysconfig  # noqa: E402
+import PySide6 as _pyside6  # noqa: E402
+from PySide6.QtCore import QLibraryInfo  # noqa: E402
 
 _MULTIARCH = _sysconfig.get_config_var('MULTIARCH') or 'x86_64-linux-gnu'
 
-_QT6_PLUG = _first_existing(
-    '/usr/lib/qt6/plugins',
-    f'/usr/lib/{_MULTIARCH}/qt6/plugins',
-    '/usr/lib64/qt6/plugins',
-)
+# Use plugins from the pinned PySide6 wheel, never a host Qt installation with
+# a potentially different minor version or licensing inventory.
+_PYSIDE_ROOT = Path(_pyside6.__file__).resolve().parent
+_QT6_PLUG = Path(QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath)).resolve()
+try:
+    _QT6_PLUG_REL = _QT6_PLUG.relative_to(_PYSIDE_ROOT)
+except ValueError as exc:
+    raise SystemExit(
+        f'FTHR_linux.spec: PySide6 plugin path {_QT6_PLUG} is outside '
+        f'the pinned wheel at {_PYSIDE_ROOT}') from exc
+_QT6_PLUGIN_DEST = Path('PySide6') / _QT6_PLUG_REL
 
-def _so(subdir, dest):
+def _so(subdir):
     d = _QT6_PLUG / subdir
+    dest = (_QT6_PLUGIN_DEST / subdir).as_posix()
     return [(str(p), dest) for p in d.glob('*.so')] if d.exists() else []
 
 
@@ -111,11 +110,11 @@ a = Analysis(
         (_PORTAUDIO, '.'),
         # The verified LGPL FFmpeg the engine was built against.
         *[(str(p), '.') for p in _FFMPEG_LIBS],
-        *_so('platforms',                           'PyQt6/Qt6/plugins/platforms'),
-        *_so('wayland-decoration-client',           'PyQt6/Qt6/plugins/wayland-decoration-client'),
-        *_so('wayland-shell-integration',           'PyQt6/Qt6/plugins/wayland-shell-integration'),
-        *_so('wayland-graphics-integration-client', 'PyQt6/Qt6/plugins/wayland-graphics-integration-client'),
-        *_so('imageformats',                        'PyQt6/Qt6/plugins/imageformats'),
+        *_so('platforms'),
+        *_so('wayland-decoration-client'),
+        *_so('wayland-shell-integration'),
+        *_so('wayland-graphics-integration-client'),
+        *_so('imageformats'),
     ],
     datas=[
         (str(ASSETS_DIR / 'fthr_logo.png'),  'assets'),
@@ -134,8 +133,8 @@ a = Analysis(
         (str(ASSETS_DIR / 'sounds'),         'assets/sounds'),
     ],
     hiddenimports=[
-        'PyQt6.QtMultimedia',
-        'PyQt6.QtMultimediaWidgets',
+        'PySide6.QtMultimedia',
+        'PySide6.QtMultimediaWidgets',
         'sounddevice',
         'numpy',
         'cv2',
@@ -177,10 +176,16 @@ a = Analysis(
         # FTHR_UI/core/ffmpeg_tools.py.
         'imageio_ffmpeg',
         # Qt modules we don't use (Widgets-only app)
-        'PyQt6.QtQuick', 'PyQt6.QtQml', 'PyQt6.QtWebEngine',
-        'PyQt6.QtWebEngineCore', 'PyQt6.QtBluetooth', 'PyQt6.QtPositioning',
-        'PyQt6.QtSensors', 'PyQt6.QtLocation', 'PyQt6.Qt3D',
-        'PyQt6.QtPdf', 'PyQt6.QtPdfWidgets', 'PyQt6.QtNfc',
+        'PySide6.QtQuick', 'PySide6.QtQml', 'PySide6.QtWebEngine',
+        'PySide6.QtWebEngineCore', 'PySide6.QtBluetooth', 'PySide6.QtPositioning',
+        'PySide6.QtSensors', 'PySide6.QtLocation', 'PySide6.Qt3D',
+        'PySide6.QtPdf', 'PySide6.QtPdfWidgets', 'PySide6.QtNfc',
+        # GPL-only Qt modules are outside the reviewed LGPL runtime.
+        'PySide6.QtCanvasPainter', 'PySide6.QtCoap', 'PySide6.QtGraphs',
+        'PySide6.QtGrpc', 'PySide6.QtHttpServer', 'PySide6.QtLottie',
+        'PySide6.QtMqtt', 'PySide6.QtNetworkAuth', 'PySide6.QtQmlCompiler',
+        'PySide6.QtQuick3D', 'PySide6.QtVirtualKeyboard',
+        'PySide6.QtWaylandCompositor',
         # Standard library bloat
         'tkinter', 'unittest', 'html', 'xmlrpc',
         'xml', 'pydoc', 'doctest', 'difflib', 'ftplib', 'imaplib',
@@ -191,6 +196,24 @@ a = Analysis(
     ],
     noarchive=False,
 )
+
+# QtGui's generic hook also sees the optional Virtual Keyboard plugin. It is a
+# GPL-only Qt module and drags in unused QML/Quick libraries. Excludes stop
+# Python imports but not hook-added binaries, so filter the actual artifact
+# TOCs as a second, deterministic boundary.
+def _keep_reviewed_qt_runtime(entry):
+    dest = str(entry[0]).replace('\\', '/').casefold()
+    name = dest.rsplit('/', 1)[-1]
+    forbidden_prefixes = ('libqt6qml', 'libqt6quick',
+                          'libqt6virtualkeyboard')
+    return ('virtualkeyboard' not in dest
+            and not name.startswith(forbidden_prefixes))
+
+
+a.binaries = [entry for entry in a.binaries
+              if _keep_reviewed_qt_runtime(entry)]
+a.datas = [entry for entry in a.datas
+           if _keep_reviewed_qt_runtime(entry)]
 
 pyz = PYZ(a.pure)
 

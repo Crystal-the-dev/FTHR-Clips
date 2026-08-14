@@ -62,9 +62,8 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 [Files]
 ; Windows bundle — produced by: pyinstaller FTHR.spec --clean
 Source: "dist\FTHRClips\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-; Licence paperwork (AUDIT-005). The bundled FFmpeg is LGPLv3 and PyQt6 is
-; GPLv3 - both oblige us to put the licence texts in front of the user, and
-; the installed app must carry them locally, not only on GitHub.
+; Licence paperwork (AUDIT-005/AUDIT-013). The installed app carries the
+; project licence and all bundled third-party notices locally.
 Source: "LICENSE";                DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 Source: "THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion recursesubdirs createallsubdirs
