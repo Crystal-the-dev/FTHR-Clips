@@ -123,6 +123,7 @@ a = Analysis(
         (str(ROOT / 'LICENSE'), '.'),
         (str(ROOT / 'THIRD_PARTY_NOTICES.md'), '.'),
         (str(ROOT / 'licenses'), 'licenses'),
+        (str(ROOT / 'tools' / 'release_asset_manifest.json'), 'licenses'),
         # LGPLv3 obliges us to ship FFmpeg's licence text with the binaries,
         # and the manifest is what tools/verify_release_licenses.py checks the
         # shipped libraries against.

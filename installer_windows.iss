@@ -9,6 +9,10 @@
 #define MyAppExeName   "FTHRClips.exe"
 #define MyAppURL       "https://github.com/fthr/clips"
 
+#ifndef BundleDir
+#define BundleDir "dist\FTHRClips"
+#endif
+
 [Setup]
 AppId={{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}
 AppName={#MyAppName}
@@ -61,7 +65,7 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 
 [Files]
 ; Windows bundle — produced by: pyinstaller FTHR.spec --clean
-Source: "dist\FTHRClips\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#BundleDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; Licence paperwork (AUDIT-005/AUDIT-013). The installed app carries the
 ; project licence and all bundled third-party notices locally.
 Source: "LICENSE";                DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion

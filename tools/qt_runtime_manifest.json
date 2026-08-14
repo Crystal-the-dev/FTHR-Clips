@@ -74,15 +74,18 @@
     "LICENSE",
     "THIRD_PARTY_NOTICES.md",
     "licenses/FFmpeg-LICENSE.txt",
+    "licenses/FTHR-GENERATED-ASSETS.txt",
     "licenses/NVIDIA-NVENC-SDK-LICENSE.txt",
     "licenses/OpenH264-LICENSE.txt",
+    "licenses/Oswald-OFL-1.1.txt",
     "licenses/PySide6-NOTICE.txt",
     "licenses/Qt6-LICENSE.txt",
     "licenses/Qt6-SOURCE.txt",
     "licenses/Qt6-THIRD-PARTY-NOTICES.txt",
     "licenses/Wayland-Protocols-NOTICES.txt",
     "licenses/cffi-LICENSE.txt",
-    "licenses/pycparser-LICENSE.txt"
+    "licenses/pycparser-LICENSE.txt",
+    "licenses/release_asset_manifest.json"
   ],
   "official_sources": {
     "qt": "https://download.qt.io/official_releases/qt/6.11/6.11.1/single/qt-everywhere-src-6.11.1.tar.xz",

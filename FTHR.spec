@@ -72,6 +72,7 @@ a = Analysis(
         (str(ROOT / 'LICENSE'), '.'),
         (str(ROOT / 'THIRD_PARTY_NOTICES.md'), '.'),
         (str(ROOT / 'licenses'), 'licenses'),
+        (str(ROOT / 'tools' / 'release_asset_manifest.json'), 'licenses'),
         (str(ASSETS_DIR / 'fonts'),            'assets/fonts'),
         (str(ASSETS_DIR / 'icons'),            'assets/icons'),
         (str(ASSETS_DIR / 'sounds'),           'assets/sounds'),

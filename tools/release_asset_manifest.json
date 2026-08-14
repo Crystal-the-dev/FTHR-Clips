@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "last_verified": "2026-08-14",
+  "allowed_redistribution_status": "approved",
+  "scanned_source_roots": [
+    ".github",
+    "AppDir",
+    "FTHR_UI/assets",
+    "installer_assets"
+  ],
+  "asset_extensions": [
+    ".bmp",
+    ".flac",
+    ".gif",
+    ".ico",
+    ".jpeg",
+    ".jpg",
+    ".mp3",
+    ".ogg",
+    ".otf",
+    ".png",
+    ".svg",
+    ".ttf",
+    ".wav",
+    ".webp",
+    ".woff",
+    ".woff2"
+  ],
+  "origins": {
+    "fthr-generator-v1": {
+      "type": "project-generated",
+      "generator": "tools/generate_release_assets.py",
+      "generator_version": 1,
+      "external_creative_inputs": [],
+      "description": "Simple geometry, an original bitmap alphabet, and synthesized sine tones; generated with the Python standard library only.",
+      "notice": "licenses/FTHR-GENERATED-ASSETS.txt"
+    },
+    "oswald-4.103": {
+      "type": "upstream-unmodified",
+      "publisher": "The Oswald Project Authors / Google Fonts",
+      "version": "4.103",
+      "source_revision": "89795261ac9eeb9aa8cd99f43982c4e4b0e53261",
+      "source_file": "https://raw.githubusercontent.com/googlefonts/OswaldFont/89795261ac9eeb9aa8cd99f43982c4e4b0e53261/fonts/ttf/Oswald-Bold.ttf",
+      "source_license": "https://raw.githubusercontent.com/googlefonts/OswaldFont/89795261ac9eeb9aa8cd99f43982c4e4b0e53261/OFL.txt",
+      "notice": "licenses/Oswald-OFL-1.1.txt"
+    }
+  },
+  "assets": [
+    {"path": ".github/social_preview.png", "sha256": "5c0cddd4c940e7fbe0afd5dce88c1dca4d163c1f062ea9fb2feb06efdb332519", "media_type": "image/png", "usage": ["repository social preview"], "distributions": ["repository-only"], "artifact_paths": {}, "license": "MIT", "copyright": "Copyright (c) 2026 FTHR-Community", "origin": "fthr-generator-v1", "redistribution_status": "approved"},
+    {"path": "AppDir/fthr-clips.png", "sha256": "0266ea11270d48a927c09805d59a2fd957e2cceb035f6793bff29fd7d8b50e08", "media_type": "image/png", "usage": ["AppImage desktop icon"], "distributions": ["linux"], "artifact_paths": {"linux": ["fthr-clips.png"]}, "license": "MIT", "copyright": "Copyright (c) 2026 FTHR-Community", "origin": "fthr-generator-v1", "redistribution_status": "approved"},
+    {"path": "FTHR_UI/assets/fonts/Oswald-Bold.ttf", "sha256": "eb7d46f856dd57f18a8c03d033c57802692bf127f01dbd95ba8984338e6b5135", "media_type": "font/ttf", "usage": ["application display font"], "distributions": ["windows", "linux"], "artifact_paths": {"windows": ["_internal/assets/fonts/Oswald-Bold.ttf"], "linux": ["_internal/assets/fonts/Oswald-Bold.ttf"]}, "license": "OFL-1.1", "copyright": "Copyright 2016 The Oswald Project Authors (https://github.com/googlefonts/OswaldFont)", "origin": "oswald-4.103", "redistribution_status": "approved"},
+    {"path": "FTHR_UI/assets/fthr_logo.ico", "sha256": "c65be06b37e8cea459f579edede74379a8eed427b6bbefd5f14c17e29e9245cb", "media_type": "image/vnd.microsoft.icon", "usage": ["Windows executable icon", "Windows installer icon"], "distributions": ["windows-executable-embedded", "windows-installer-embedded"], "artifact_paths": {}, "packaging_references": ["FTHR.spec", "installer_windows.iss"], "license": "MIT", "copyright": "Copyright (c) 2026 FTHR-Community", "origin": "fthr-generator-v1", "redistribution_status": "approved"},
+    {"path": "FTHR_UI/assets/fthr_logo.png", "sha256": "0266ea11270d48a927c09805d59a2fd957e2cceb035f6793bff29fd7d8b50e08", "media_type": "image/png", "usage": ["main window logo", "splash screen", "theme default"], "distributions": ["windows", "linux"], "artifact_paths": {"windows": ["_internal/assets/fthr_logo.png"], "linux": ["_internal/assets/fthr_logo.png"]}, "license": "MIT", "copyright": "Copyright (c) 2026 FTHR-Community", "origin": "fthr-generator-v1", "redistribution_status": "approved"},
+    {"path": "FTHR_UI/assets/icons/clip.png", "sha256": "4f4d1323393f1742d1af86561cda89798a17869ceba7ee7f94ac310ac5877d70", "media_type": "image/png", "usage": ["clip tab icon"], "distributions": ["windows", "linux"], "artifact_paths": {"windows": ["_internal/assets/icons/clip.png"], "linux": ["_internal/assets/icons/clip.png"]}, "license": "MIT", "copyright": "Copyright (c) 2026 FTHR-Community", "origin": "fthr-generator-v1", "redistribution_status": "approved"},
+    {"path": "FTHR_UI/assets/icons/close.png", "sha256": "0f9bf9fa7ae20a0e37f3465e44a1eadcb2178015fa1de3ef475734bd72e1ac33", "media_type": "image/png", "usage": ["close button icon"], "distributions": ["windows", "linux"], "artifact_paths": {"windows": ["_internal/assets/icons/close.png"], "linux": ["_internal/assets/icons/close.png"]}, "license": "MIT", "copyright": "Copyright (c) 2026 FTHR-Community", "origin": "fthr-generator-v1", "redistribution_status": "approved"},
+    {"path": "FTHR_UI/assets/icons/dropdown.png", "sha256": "980c87cbe1d235085118850df7b48f7561f4230b95a758818e39b116294d2d1e", "media_type": "image/png", "usage": ["combo-box arrow"], "distributions": ["windows", "linux"], "artifact_paths": {"windows": ["_internal/assets/icons/dropdown.png"], "linux": ["_internal/assets/icons/dropdown.png"]}, "license": "MIT", "copyright": "Copyright (c) 2026 FTHR-Community", "origin": "fthr-generator-v1", "redistribution_status": "approved"},
+    {"path": "FTHR_UI/assets/icons/home.png", "sha256": "4c5eb32d5e5c80545bfae2d56e58418ae06a6b05df7be16a77a287d51fe6a834", "media_type": "image/png", "usage": ["home button icon"], "distributions": ["windows", "linux"], "artifact_paths": {"windows": ["_internal/assets/icons/home.png"], "linux": ["_internal/assets/icons/home.png"]}, "license": "MIT", "copyright": "Copyright (c) 2026 FTHR-Community", "origin": "fthr-generator-v1", "redistribution_status": "approved"},
+    {"path": "FTHR_UI/assets/icons/maximize.png", "sha256": "dbe94c628d7e581e1c3f9633141877ed5ef0c40b152d4d96e96789584e26372f", "media_type": "image/png", "usage": ["maximize button icon"], "distributions": ["windows", "linux"], "artifact_paths": {"windows": ["_internal/assets/icons/maximize.png"], "linux": ["_internal/assets/icons/maximize.png"]}, "license": "MIT", "copyright": "Copyright (c) 2026 FTHR-Community", "origin": "fthr-generator-v1", "redistribution_status": "approved"},
+    {"path": "FTHR_UI/assets/icons/minimize.png", "sha256": "345fdd2d64b21c7ef01a2832eaa945b3eb74c5fcc70feec583b62aa841e9b5cc", "media_type": "image/png", "usage": ["minimize button icon"], "distributions": ["windows", "linux"], "artifact_paths": {"windows": ["_internal/assets/icons/minimize.png"], "linux": ["_internal/assets/icons/minimize.png"]}, "license": "MIT", "copyright": "Copyright (c) 2026 FTHR-Community", "origin": "fthr-generator-v1", "redistribution_status": "approved"},
+    {"path": "FTHR_UI/assets/icons/pause.png", "sha256": "cff60fec8645fb780756423e099b99b60578d927d63d6373d68c7abdf6276c70", "media_type": "image/png", "usage": ["media pause icon"], "distributions": ["windows", "linux"], "artifact_paths": {"windows": ["_internal/assets/icons/pause.png"], "linux": ["_internal/assets/icons/pause.png"]}, "license": "MIT", "copyright": "Copyright (c) 2026 FTHR-Community", "origin": "fthr-generator-v1", "redistribution_status": "approved"},
+    {"path": "FTHR_UI/assets/icons/personalize.png", "sha256": "abef114b9e29970904867cbcc878784326006a8fc2c15efdb5d9e8f283c64fd0", "media_type": "image/png", "usage": ["customization tab icon"], "distributions": ["windows", "linux"], "artifact_paths": {"windows": ["_internal/assets/icons/personalize.png"], "linux": ["_internal/assets/icons/personalize.png"]}, "license": "MIT", "copyright": "Copyright (c) 2026 FTHR-Community", "origin": "fthr-generator-v1", "redistribution_status": "approved"},
+    {"path": "FTHR_UI/assets/icons/play.png", "sha256": "37c1f760a086194bf18efc7e40c5f72c55607d13e675529e579e23e484cb6d02", "media_type": "image/png", "usage": ["media play icon"], "distributions": ["windows", "linux"], "artifact_paths": {"windows": ["_internal/assets/icons/play.png"], "linux": ["_internal/assets/icons/play.png"]}, "license": "MIT", "copyright": "Copyright (c) 2026 FTHR-Community", "origin": "fthr-generator-v1", "redistribution_status": "approved"},
+    {"path": "FTHR_UI/assets/icons/refresh.png", "sha256": "b0437ae6d937a9b86dc37827e4812ad8adea14280f54f17598162d1a3404c64c", "media_type": "image/png", "usage": ["refresh button icon"], "distributions": ["windows", "linux"], "artifact_paths": {"windows": ["_internal/assets/icons/refresh.png"], "linux": ["_internal/assets/icons/refresh.png"]}, "license": "MIT", "copyright": "Copyright (c) 2026 FTHR-Community", "origin": "fthr-generator-v1", "redistribution_status": "approved"},
+    {"path": "FTHR_UI/assets/icons/settings(general).png", "sha256": "488c5c0b26de258ee58e62e75889426f08a325757587d15a637ddf8fa66b5b84", "media_type": "image/png", "usage": ["settings tab icon"], "distributions": ["windows", "linux"], "artifact_paths": {"windows": ["_internal/assets/icons/settings(general).png"], "linux": ["_internal/assets/icons/settings(general).png"]}, "license": "MIT", "copyright": "Copyright (c) 2026 FTHR-Community", "origin": "fthr-generator-v1", "redistribution_status": "approved"},
+    {"path": "FTHR_UI/assets/icons/sound.png", "sha256": "857baad0a378e0735d783212a35f315fbaceb7171b3a8af6bff198b3184d4c73", "media_type": "image/png", "usage": ["audio tab icon"], "distributions": ["windows", "linux"], "artifact_paths": {"windows": ["_internal/assets/icons/sound.png"], "linux": ["_internal/assets/icons/sound.png"]}, "license": "MIT", "copyright": "Copyright (c) 2026 FTHR-Community", "origin": "fthr-generator-v1", "redistribution_status": "approved"},
+    {"path": "FTHR_UI/assets/icons/updates.png", "sha256": "88358d826386ef8a41a06472ce47e21969d500b87318240c78b20038a9875dd0", "media_type": "image/png", "usage": ["updates and performance icon"], "distributions": ["windows", "linux"], "artifact_paths": {"windows": ["_internal/assets/icons/updates.png"], "linux": ["_internal/assets/icons/updates.png"]}, "license": "MIT", "copyright": "Copyright (c) 2026 FTHR-Community", "origin": "fthr-generator-v1", "redistribution_status": "approved"},
+    {"path": "FTHR_UI/assets/icons/visuals.png", "sha256": "bb711fc28bee187a5b59bf136a1107cf5b110cd02708a1e38e06b62b628788de", "media_type": "image/png", "usage": ["visuals tab icon"], "distributions": ["windows", "linux"], "artifact_paths": {"windows": ["_internal/assets/icons/visuals.png"], "linux": ["_internal/assets/icons/visuals.png"]}, "license": "MIT", "copyright": "Copyright (c) 2026 FTHR-Community", "origin": "fthr-generator-v1", "redistribution_status": "approved"},
+    {"path": "FTHR_UI/assets/sounds/clip_captured.wav", "sha256": "650dccc7aa52ee1b1ebebf02389dac977b5b9ea08dc7dcaf6da4b4b98c35cff6", "media_type": "audio/wav", "usage": ["clip-captured notification"], "distributions": ["windows", "linux"], "artifact_paths": {"windows": ["_internal/assets/sounds/clip_captured.wav"], "linux": ["_internal/assets/sounds/clip_captured.wav"]}, "license": "MIT", "copyright": "Copyright (c) 2026 FTHR-Community", "origin": "fthr-generator-v1", "redistribution_status": "approved"},
+    {"path": "FTHR_UI/assets/sounds/error.wav", "sha256": "71e04b483dfd1fe3caccd5363ab087eed23ab29ffcca509eac428897de8a77bc", "media_type": "audio/wav", "usage": ["error notification"], "distributions": ["windows", "linux"], "artifact_paths": {"windows": ["_internal/assets/sounds/error.wav"], "linux": ["_internal/assets/sounds/error.wav"]}, "license": "MIT", "copyright": "Copyright (c) 2026 FTHR-Community", "origin": "fthr-generator-v1", "redistribution_status": "approved"},
+    {"path": "FTHR_UI/assets/sounds/screenshot_saved.wav", "sha256": "c386776e5c734b6e5ba6333cebb87d7b89e40f8a09650830cdf25cf527f63ae1", "media_type": "audio/wav", "usage": ["screenshot-saved notification"], "distributions": ["windows", "linux"], "artifact_paths": {"windows": ["_internal/assets/sounds/screenshot_saved.wav"], "linux": ["_internal/assets/sounds/screenshot_saved.wav"]}, "license": "MIT", "copyright": "Copyright (c) 2026 FTHR-Community", "origin": "fthr-generator-v1", "redistribution_status": "approved"},
+    {"path": "FTHR_UI/assets/sounds/startup.wav", "sha256": "244126e796c785903c58f3b4a0ac77520a57bf1d1c13c5c40cf43d5a5638a9cb", "media_type": "audio/wav", "usage": ["startup notification"], "distributions": ["windows", "linux"], "artifact_paths": {"windows": ["_internal/assets/sounds/startup.wav"], "linux": ["_internal/assets/sounds/startup.wav"]}, "license": "MIT", "copyright": "Copyright (c) 2026 FTHR-Community", "origin": "fthr-generator-v1", "redistribution_status": "approved"},
+    {"path": "installer_assets/wizard_banner.bmp", "sha256": "5e08581fb562d802024998dd85205bc332a474905900568c9b0b8f003756bf5d", "media_type": "image/bmp", "usage": ["Windows installer wizard banner"], "distributions": ["windows-installer-embedded"], "artifact_paths": {}, "packaging_references": ["installer_windows.iss"], "license": "MIT", "copyright": "Copyright (c) 2026 FTHR-Community", "origin": "fthr-generator-v1", "redistribution_status": "approved"},
+    {"path": "installer_assets/wizard_small.bmp", "sha256": "f2cd29b2f9c239abf676138a28a2f568097cedc8002b74ace92bcf99ec18a61b", "media_type": "image/bmp", "usage": ["Windows installer wizard small image"], "distributions": ["windows-installer-embedded"], "artifact_paths": {}, "packaging_references": ["installer_windows.iss"], "license": "MIT", "copyright": "Copyright (c) 2026 FTHR-Community", "origin": "fthr-generator-v1", "redistribution_status": "approved"}
+  ]
+}

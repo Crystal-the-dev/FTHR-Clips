@@ -61,8 +61,10 @@ REQUIRED_TREE_FILES = (
     'LICENSE',
     'THIRD_PARTY_NOTICES.md',
     'licenses/FFmpeg-LICENSE.txt',
+    'licenses/FTHR-GENERATED-ASSETS.txt',
     'licenses/NVIDIA-NVENC-SDK-LICENSE.txt',
     'licenses/OpenH264-LICENSE.txt',
+    'licenses/Oswald-OFL-1.1.txt',
     'licenses/PySide6-NOTICE.txt',
     'licenses/Qt6-LICENSE.txt',
     'licenses/Qt6-SOURCE.txt',
@@ -71,7 +73,9 @@ REQUIRED_TREE_FILES = (
     'licenses/cffi-LICENSE.txt',
     'licenses/pycparser-LICENSE.txt',
     'tools/ffmpeg_manifest.json',
+    'tools/generate_release_assets.py',
     'tools/qt_runtime_manifest.json',
+    'tools/release_asset_manifest.json',
 )
 
 # Linux ships its own pinned LGPL FFmpeg (AUDIT-014) with its own manifest.
@@ -98,6 +102,7 @@ SYSTEM_FFMPEG_SONAMES = frozenset((
 REQUIRED_ARTIFACT_FILES = ('LICENSE', 'THIRD_PARTY_NOTICES.md', 'licenses')
 
 QT_MANIFEST_REL = 'tools/qt_runtime_manifest.json'
+ASSET_MANIFEST_REL = 'tools/release_asset_manifest.json'
 QT_DLL_RE = re.compile(r'^Qt6([A-Za-z0-9_]+)\.dll$', re.I)
 QT_SO_RE = re.compile(r'^libQt6([A-Za-z0-9_]+)\.so(?:\..*)?$', re.I)
 
@@ -504,7 +509,7 @@ def check_python_sources(root: Path, rep: Report) -> None:
 def _read_manifest(root, rel, rep):
     mf = root / rel
     if not mf.is_file():
-        rep.fail(f'{rel} missing - the shipped FFmpeg origin is undocumented')
+        rep.fail(f'{rel} missing - release provenance is undocumented')
         return None
     try:
         return json.loads(mf.read_text(encoding='utf-8'))
@@ -513,6 +518,134 @@ def _read_manifest(root, rel, rep):
         return None
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def check_asset_manifest(root: Path, rep: Report) -> None:
+    """Require an approved, hash-locked provenance record for every asset."""
+    print('\n-- Release asset provenance --')
+    data = _read_manifest(root, ASSET_MANIFEST_REL, rep)
+    if data is None:
+        return
+    assets = data.get('assets') or []
+    origins = data.get('origins') or {}
+    allowed = data.get('allowed_redistribution_status')
+    extensions = {str(item).casefold()
+                  for item in data.get('asset_extensions') or ()}
+    if not assets or not origins or allowed != 'approved' or not extensions:
+        rep.fail(f'{ASSET_MANIFEST_REL}: schema fields are incomplete')
+        return
+
+    documented: set[str] = set()
+    for entry in assets:
+        rel = str(entry.get('path') or '').replace('\\', '/')
+        if (not rel or rel.startswith('/') or '..' in Path(rel).parts or
+                rel in documented):
+            rep.fail(f'{ASSET_MANIFEST_REL}: invalid/duplicate path {rel!r}')
+            continue
+        documented.add(rel)
+        path = root / rel
+        expected_hash = str(entry.get('sha256') or '').casefold()
+        origin = str(entry.get('origin') or '')
+        status = str(entry.get('redistribution_status') or '')
+        if not re.fullmatch(r'[0-9a-f]{64}', expected_hash):
+            rep.fail(f'{rel}: missing/invalid SHA-256')
+        elif not path.is_file():
+            rep.fail(f'{rel}: documented asset is missing')
+        elif _file_sha256(path) != expected_hash:
+            rep.fail(f'{rel}: SHA-256 differs from approved manifest')
+        else:
+            rep.ok(f'{rel}: approved hash')
+        if status != allowed:
+            rep.fail(f'{rel}: redistribution status is {status!r}, '
+                     f'expected {allowed!r}')
+        if not entry.get('license') or not entry.get('copyright'):
+            rep.fail(f'{rel}: licence/copyright evidence is incomplete')
+        if origin not in origins:
+            rep.fail(f'{rel}: unknown provenance origin {origin!r}')
+        for reference in entry.get('packaging_references') or ():
+            ref_path = root / str(reference)
+            if not ref_path.is_file():
+                rep.fail(f'{rel}: packaging reference {reference} is missing')
+            elif path.name not in ref_path.read_text(
+                    encoding='utf-8', errors='replace'):
+                rep.fail(f'{rel}: {reference} does not reference {path.name}')
+
+    discovered: set[str] = set()
+    for source_root in data.get('scanned_source_roots') or ():
+        scan = root / str(source_root)
+        if not scan.is_dir():
+            rep.fail(f'{ASSET_MANIFEST_REL}: scanned root missing: {source_root}')
+            continue
+        for path in scan.rglob('*'):
+            if path.is_file() and path.suffix.casefold() in extensions:
+                discovered.add(path.relative_to(root).as_posix())
+    undocumented = sorted(discovered - documented)
+    missing_from_scan = sorted(documented - discovered)
+    if undocumented:
+        rep.fail('undocumented assets found: ' + ', '.join(undocumented))
+    else:
+        rep.ok(f'all {len(discovered)} repository assets are documented')
+    if missing_from_scan:
+        rep.fail('manifest assets outside the scanned inventory: ' +
+                 ', '.join(missing_from_scan))
+
+    for name, origin in origins.items():
+        notice = str(origin.get('notice') or '')
+        if not notice or not (root / notice).is_file():
+            rep.fail(f'asset origin {name}: notice is missing')
+    if not rep.failures:
+        rep.ok(f'{len(assets)} assets have approved redistribution evidence')
+
+
+def check_asset_artifact(root: Path, rep: Report, platform: str,
+                         manifest_root: Path | None = None) -> None:
+    """Verify the exact approved asset bytes present in a release artifact."""
+    print(f'\n-- Release assets in {platform} artifact --')
+    data = _read_manifest(manifest_root or _repo_root(),
+                          ASSET_MANIFEST_REL, rep)
+    if data is None:
+        return
+    expected: dict[str, str] = {}
+    for entry in data.get('assets') or ():
+        digest = str(entry.get('sha256') or '').casefold()
+        paths = (entry.get('artifact_paths') or {}).get(platform) or ()
+        for rel in paths:
+            rel = str(rel).replace('\\', '/')
+            if rel in expected and expected[rel] != digest:
+                rep.fail(f'{ASSET_MANIFEST_REL}: conflicting artifact path {rel}')
+            expected[rel] = digest
+
+    for rel, digest in sorted(expected.items()):
+        path = root / rel
+        if not path.is_file():
+            rep.fail(f'{platform} artifact: approved asset missing: {rel}')
+        elif _file_sha256(path) != digest:
+            rep.fail(f'{platform} artifact: asset hash mismatch: {rel}')
+        else:
+            rep.ok(f'{platform} artifact asset: {rel}')
+
+    actual = set()
+    extensions = {str(item).casefold()
+                  for item in data.get('asset_extensions') or ()}
+    for path in root.rglob('*'):
+        if not path.is_file() or path.suffix.casefold() not in extensions:
+            continue
+        rel = path.relative_to(root).as_posix()
+        if rel.startswith('_internal/assets/') or rel == 'fthr-clips.png':
+            actual.add(rel)
+    unexpected = sorted(actual - set(expected))
+    if unexpected:
+        rep.fail(f'{platform} artifact contains unapproved assets: ' +
+                 ', '.join(unexpected))
+    else:
+        rep.ok(f'{platform} artifact contains exactly {len(expected)} '
+               'approved asset files')
 def check_linux_manifest(root, rep) -> None:
     """The Linux FFmpeg provenance manifest (AUDIT-014)."""
     print('\n-- Linux FFmpeg provenance manifest --')
@@ -719,6 +852,7 @@ def main() -> int:
         check_linux_manifest(root, rep)
         check_python_sources(root, rep)
         check_qt_source_selection(root, rep)
+        check_asset_manifest(root, rep)
         vendored = root / 'FTHRcapture' / 'FTHRclips' / 'third_party' / 'ffmpeg'
         if vendored.is_dir():
             scan_dir(vendored, rep, 'vendored ffmpeg')
@@ -742,18 +876,23 @@ def main() -> int:
                     check_files(cand, REQUIRED_ARTIFACT_FILES, rep, kind)
                     scan_dir(cand, rep, kind)
                     check_qt_artifact(cand, rep, platform, manifest_root=root)
+                    check_asset_artifact(
+                        cand, rep, platform, manifest_root=root)
 
     if args.windows_dist:
         d = args.windows_dist.resolve()
         check_files(d, REQUIRED_ARTIFACT_FILES, rep, 'windows dist')
         scan_dir(d, rep, 'windows dist')
         check_qt_artifact(d, rep, 'windows', manifest_root=_repo_root())
+        check_asset_artifact(
+            d, rep, 'windows', manifest_root=_repo_root())
 
     if args.appdir:
         d = args.appdir.resolve()
         check_files(d, REQUIRED_ARTIFACT_FILES, rep, 'appdir')
         scan_dir(d, rep, 'appdir')
         check_qt_artifact(d, rep, 'linux', manifest_root=_repo_root())
+        check_asset_artifact(d, rep, 'linux', manifest_root=_repo_root())
         # AUDIT-014: the artifact is where it actually matters. A GPL library
         # the engine never loads is still a GPL library being distributed, and
         # PyInstaller collects the system FFmpeg through cv2 and Qt.
@@ -775,8 +914,8 @@ def main() -> int:
         for f in rep.failures:
             print(f'  - {f}')
         return 1
-    print('\nPASS — approved Qt binding/runtime, no GPL FFmpeg components, '
-          'licence paperwork present.')
+    print('\nPASS — approved assets and Qt binding/runtime, no GPL FFmpeg '
+          'components, licence paperwork present.')
     print('Note: technical verification only, not legal advice.')
     return 0
 
