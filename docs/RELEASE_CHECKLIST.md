@@ -11,33 +11,31 @@ Legend: `PASS` verified · `FAIL` verified broken · `NOT RUN` never executed �
 
 ## Current status: 🚫 DO NOT TAG
 
-**Decision required: AUDIT-013 — bundled asset provenance.**
+**AUDIT-013 resolved — Qt and bundled asset licensing.**
 
 The Qt blocker has been technically closed by selecting PySide6 6.11.1 under
 its LGPLv3 option and gating both Windows and Linux artifacts. FTHR's own source
 remains MIT and the downloadable bundle includes separately licensed LGPL and
 permissive components.
 
-The repository does not prove authorship or redistribution rights for the FTHR
-logos/icons, four MP3 sounds, and `Oswald-Bold.ttf`. Before a public tag, the
-owner must choose one of these routes:
-
-| Option | Consequence |
-|---|---|
-| Document authorship and licence | Add durable provenance showing FTHR may redistribute every asset. |
-| Replace/remove the files | Use newly authored or clearly licensed assets and record their terms. |
+The predecessor media had no sufficient redistribution evidence. Every such
+image was replaced with deterministic project-generated artwork, all four MP3s
+were removed in favour of generated WAVs, and Oswald 4.103 was byte-matched to
+its pinned OFL-1.1 upstream. The source and both artifacts pass a per-file
+hash/licence/origin allowlist; see `AUDIT-013-ASSET-PROVENANCE.md`.
 
 **AUDIT-014 is resolved (2026-08-06).** The Linux engine is compiled against and
 ships a pinned LGPL FFmpeg; a Release build cannot fall back to the
 distribution's GPL one. An AppImage now exists and passes the licence gate.
 
-AUDIT-013's Qt migration is complete, but its status remains **DECISION
-REQUIRED** until the asset evidence above exists.
+AUDIT-013 is **RESOLVED**. The `DO NOT TAG` state above remains because real
+desktop/capture and installer lifecycle gates below are still `NOT RUN` or
+`PARTIAL`, not because of Qt or asset licensing.
 
 ### Linux release recommendation: 🟡 LINUX CONDITIONAL GO
 
-Conditional on: (a) AUDIT-013 asset provenance resolved, and (b) at least one
-bare-metal desktop session — Hyprland *and* one of KDE/GNOME — actually
+Conditional on at least one bare-metal desktop session — Hyprland *and* one of
+KDE/GNOME — actually
 recording a clip with visible content and firing a hotkey. What has been proven
 is the build, the IPC, the encode and the file. What has **not** been proven is
 that FTHR Clips records a Linux screen.
@@ -52,10 +50,10 @@ Everything else below is either already green or is honest, tracked work.
 |---|---|---|
 | 1.1 | AUDIT-005 — no GPL FFmpeg anywhere in the tree or the bundle | **PASS** — LGPL `n8.1.2-21-gce3c09c101`, all 10 shipped binaries verified against `tools/ffmpeg_manifest.json` sha256 |
 | 1.2 | `imageio-ffmpeg` absent from the lock files, the environment and the bundle | **PASS** — excluded in `FTHR.spec`, asserted in CI, verified absent from the rebuilt bundle |
-| 1.3 | `tools/verify_release_licenses.py --tree .` | **PASS in clean Linux staging; LOCAL FAIL in this worktree** — the gate correctly rejects a pre-existing ignored stale `FTHRcapture_linux/build/FTHRclips`; delete/rebuild that local artifact before tagging |
-| 1.4 | Third-party licence texts ship *inside* the artifact | **PASS** — `LICENSE`, `THIRD_PARTY_NOTICES.md`, `licenses/` are bundled by both specs and copied into the AppDir |
+| 1.3 | `tools/verify_release_licenses.py --tree .` | **PASS — 146 checks in clean Linux staging**; the gate also correctly rejects a pre-existing ignored stale Linux engine in the Windows worktree, so release automation must use a clean checkout |
+| 1.4 | Third-party licence texts ship *inside* the artifact | **PASS** — Windows carries 18 and Linux 17 files under `licenses/`, plus `LICENSE` and `THIRD_PARTY_NOTICES.md` |
 | 1.5 | No distributable described as MIT | **PASS** — README, About dialog and `LICENSE` all state the split; CI greps for regressions |
-| 1.6 | **AUDIT-013 — approved Qt binding/runtime and complete ownership evidence** | **DECISION REQUIRED** — PySide6/LGPL artifact gates pass; owner must prove or replace bundled assets |
+| 1.6 | **AUDIT-013 — approved Qt binding/runtime and complete redistribution evidence** | **PASS** — 25 source assets are hash/origin/licence gated; Windows contains exactly 20 and Linux exactly 21 approved asset files |
 
 ## 2. Source control and hygiene
 
@@ -67,6 +65,7 @@ Everything else below is either already green or is honest, tracked work.
 | 2.4 | No secrets, tokens, keys or user state in the tree or in history | **PASS** — `tools/scan_repo_hygiene.py` clean |
 | 2.5 | No blob over 2 MB in history | **PASS** — enforced in CI |
 | 2.6 | Working tree clean, everything committed | verify at tag time |
+| 2.7 | Public source delivery excludes unresolved predecessor asset blobs | **PASS for `git archive HEAD` only** — do not publish/mirror the pre-replacement Git history unless it is scrubbed or rights evidence is supplied |
 
 ## 3. Dependencies
 
@@ -76,7 +75,7 @@ Everything else below is either already green or is honest, tracked work.
 | 3.2 | Clean installs contain only the approved Qt binding | **PASS** — fresh Windows CPython 3.14.3 and Linux CPython 3.12.3 environments contain PySide6 6.11.1 and no PyQt package |
 | 3.3 | `pip check` reports no conflicts | **PASS** |
 | 3.4 | Imports succeed from a clean install | **PASS** — both venvs |
-| 3.5 | Tests run from clean selected-binding environments | **PARTIAL** — Windows 378 passed / 30 skipped; Linux 406 passed / 1 skipped / 1 pre-existing no-display lifecycle failure |
+| 3.5 | Tests run from clean selected-binding environments | **PARTIAL** — Windows 385 passed / 30 skipped; Linux 413 passed / 1 skipped / 1 pre-existing no-display lifecycle failure |
 | 3.6 | PyInstaller analysis succeeds from the locked environment | **PASS** — clean Windows onedir and Linux AppImage builds, exit 0 |
 
 ## 4. Version consistency
@@ -95,7 +94,7 @@ Everything else below is either already green or is honest, tracked work.
 
 | # | Gate | Status |
 |---|---|---|
-| 5.1 | `python -m pytest tests/` green | **FAIL (Linux only)** — Windows **378 passed / 30 skipped**; Linux **406 passed / 1 skipped / 1 failed** because the no-display engine remains alive after recovery exhaustion; AUDIT-013 changed no C++/recovery code |
+| 5.1 | `python -m pytest tests/` green | **FAIL (Linux only)** — Windows **385 passed / 30 skipped**; Linux **413 passed / 1 skipped / 1 failed** because the no-display engine remains alive after recovery exhaustion; AUDIT-013 changed no C++/recovery code |
 | 5.2 | `python -m ruff check .` clean | **PASS** |
 | 5.3 | `python -m compileall FTHR_UI tests tools` clean | **PASS** |
 | 5.4 | `tools/verify_shared_memory_contract.py` | **PASS** — 23 fields, 2712 B (win32) / 4248 B (linux), enums and reserved slots 4–9 intact |
@@ -106,9 +105,9 @@ Everything else below is either already green or is honest, tracked work.
 | # | Gate | Status |
 |---|---|---|
 | 6.1 | Windows engine builds clean (MSBuild, Release x64) | **PASS** — rebuilt 2026-08-05 with VS 2022 |
-| 6.2 | Windows bundle builds clean (PyInstaller) | **PASS** — rebuilt 2026-08-14 from the locked PySide-only venv; 546,312,457-byte onedir, 60/60 artifact gates |
+| 6.2 | Windows bundle builds clean (PyInstaller) | **PASS** — rebuilt 2026-08-14 from the locked PySide-only venv; 546,639,831-byte onedir, 84/84 artifact gates; Inno installer compiled successfully |
 | 6.3 | Linux engine builds clean (CMake, Release) | **PASS** — clean Release rebuild on Ubuntu 24.04; bundle-relative pinned-FFmpeg RPATH/DT_NEEDED gate passes |
-| 6.4 | Linux AppImage builds | **PASS** — 215,524,544-byte AppImage; AppDir and extracted AppImage each pass 109/109 licence/runtime gates |
+| 6.4 | Linux AppImage builds | **PASS** — 215,450,816-byte AppImage; AppDir and extracted AppImage each pass 134/134 licence/runtime/asset gates |
 | 6.5 | CI green on all jobs | **NOT RUN** — the workflow has never executed; there is no remote yet |
 
 ## 7. Runtime verification — the part no CI can do for you
@@ -139,7 +138,7 @@ Everything else below is either already green or is honest, tracked work.
 
 | # | Gate | Status |
 |---|---|---|
-| 8.1 | `KNOWN_ISSUES.md` reflects reality | **PASS** — updated 2026-08-14; AUDIT-013 owner asset-provenance decision remains the licensing blocker |
+| 8.1 | `KNOWN_ISSUES.md` reflects reality | **PASS** — updated 2026-08-14; AUDIT-013 is resolved and remaining runtime gaps are listed separately |
 | 8.2 | `RELEASE_NOTES.md` matches what actually ships | review at tag time |
 | 8.3 | `THIRD_PARTY_NOTICES.md` complete and current | **PASS** |
 | 8.4 | `CONTRIBUTING.md` describes the real layout and build | **PASS** |

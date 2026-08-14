@@ -7,18 +7,13 @@ Without it most reports are not actionable.
 
 ---
 
-## Blocking public release
-
-| Issue | Detail |
-|---|---|
-| **Bundled asset provenance is unproven** (AUDIT-013) | The Qt binding has been migrated to PySide6 6.11.1 under its LGPLv3 option, and both artifact gates reject PyQt/GPL-only Qt modules. The repository still contains no durable authorship/licence evidence for its logos/icons, four MP3 sounds, or `Oswald-Bold.ttf`. The owner must document those rights or replace/remove the files before public release. |
-
 ## Resolved since the audit
 
 | Issue | Resolution |
 |---|---|
+| ~~**Qt binding and bundled asset licensing**~~ (AUDIT-013) | Resolved 2026-08-14. PySide6 6.11.1 uses its LGPLv3 option with source/notices and replaceable libraries. Every unprovenanced image was replaced by deterministic project-generated media, the four unprovenanced MP3s were removed in favour of generated PCM WAVs, and Oswald Bold 4.103 was byte-matched to its pinned OFL-1.1 upstream. Source and package gates enforce the per-file SHA-256 allowlist. |
 | ~~**GPL FFmpeg**~~ (AUDIT-005) | Resolved 2026-08-05. The `--enable-gpl` build was replaced with the BtbN **LGPL** build `n8.1.2-21-gce3c09c101` (ABI-identical, avcodec-62). Software fallbacks moved x264 → libopenh264 and x265 → libkvazaar; NVENC/AMF/QSV untouched. `imageio-ffmpeg` (also GPL, and never actually bundled on Windows — which is why watermark, crop and export silently no-opped) was removed entirely in favour of `core/ffmpeg_tools.py`. Licence texts now ship inside the bundle; `tools/verify_release_licenses.py` gates it in CI. |
-| ~~**No version control**~~ (AUDIT-008) | Resolved 2026-08-06. The authoritative tree is a git repository with `.gitignore`, `.gitattributes`, a documented source of truth (`docs/SOURCE_OF_TRUTH.md`) and release gates (`docs/RELEASE_CHECKLIST.md`). No tag exists yet — see the blocker above. |
+| ~~**No version control**~~ (AUDIT-008) | Resolved 2026-08-06. The authoritative tree is a git repository with `.gitignore`, `.gitattributes`, a documented source of truth (`docs/SOURCE_OF_TRUTH.md`) and release gates (`docs/RELEASE_CHECKLIST.md`). No tag exists yet because runtime release gates remain incomplete. |
 | ~~**Unpinned dependencies**~~ (AUDIT-009) | Resolved 2026-08-06. `requirements-alpha.txt` pins the full transitive closure; `requirements.in` holds the direct list. Verified by two clean installs. |
 | ~~**Hotkey socket in world-writable /tmp**~~ (AUDIT-003b) | Resolved 2026-08-06. AUDIT-003 fixed the socket *mode*; the *path* was still `/tmp/fthr_hotkey.sock`, which any local user could squat — and the old code then ran an unconditional `unlink()` on it, either deleting a stranger's file or (under the sticky bit) failing and leaving hotkeys dead indefinitely. The socket moved to `$XDG_RUNTIME_DIR/fthr/` and now refuses to remove anything that is not a dead socket owned by you. 16 new tests, verified on Linux. |
 | ~~**No Linux AppImage could be built**~~ (AUDIT-014) | Resolved 2026-08-06 and revalidated 2026-08-14. The Linux engine is compiled against, and ships with, a pinned **LGPL** FFmpeg (BtbN `n8.1.2-34-g9b6c8969e0`, glibc 2.28 baseline) instead of the distribution's GPL build. CMake refuses a Release build without `-DFTHR_FFMPEG_ROOT`; the engine carries a `$ORIGIN` RPATH so it loads the bundled libraries; every shipped library is sha256-verified against `tools/ffmpeg_manifest_linux.json`. The final PySide6 AppImage passes **109 licence/runtime checks, 0 failed**, and is 206 MiB. |

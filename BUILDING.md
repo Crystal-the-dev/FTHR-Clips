@@ -62,8 +62,19 @@ python -m ruff check .
 ```
 
 All must pass. See [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md) for
-the full gate list. AUDIT-013 selected PySide6/LGPLv3; public release still
-requires owner confirmation or replacement of the unprovenanced bundled assets.
+the full gate list. AUDIT-013 selected PySide6/LGPLv3 and hash-locks every
+release asset in `tools/release_asset_manifest.json`. Before packaging, also
+verify that the committed generated media matches its reviewed source:
+
+```bash
+python tools/generate_release_assets.py --check
+```
+
+Regenerate those files only after intentionally reviewing a generator change:
+
+```bash
+python tools/generate_release_assets.py
+```
 
 ---
 

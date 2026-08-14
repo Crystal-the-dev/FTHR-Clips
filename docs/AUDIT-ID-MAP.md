@@ -21,7 +21,7 @@ existing audit. Historical IDs are not renumbered merely to close gaps.
 | AUDIT-010 | About screen version drift | Fixed |
 | AUDIT-011 | Clip-save handshake blocked the Qt event loop | Fixed |
 | AUDIT-012 | Upload credential storage / URL privacy hardening | Open |
-| AUDIT-013 | Qt Python binding licensing / bundled-asset provenance | **DECISION REQUIRED**; PySide6 migration and artifact gates complete, owner asset-rights evidence pending |
+| AUDIT-013 | Qt Python binding licensing / bundled-asset provenance | Resolved; PySide6/LGPL packaging and per-asset provenance gates verified |
 | AUDIT-014 | Linux FFmpeg/AppImage packaging and licensing | Conditionally resolved |
 | AUDIT-015 | Linux successful saves could miss the acknowledgement window | Fixed |
 | AUDIT-016 | Debian-family AppImage portability failures | Fixed |

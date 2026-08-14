@@ -326,9 +326,11 @@ It is not `RESOLVED` because the Definition of Done also requires the AppImage
 to start on a real Linux desktop and to produce a visible, playable clip.
 Neither has happened. Those need hardware or a VM with a genuine compositor.
 
-**This does not unblock a release.** AUDIT-013 stands: PyQt6 is `GPL-3.0-only`,
-so the bundle as a whole is still GPLv3. AUDIT-014 removed one of the two
-reasons there was no distributable Linux build, not both.
+**Current licensing update (2026-08-14):** AUDIT-013 subsequently replaced
+PyQt6 with PySide6 under its LGPLv3 option and closed the bundled-asset
+provenance gap. That removes the separate licensing blocker described by this
+historical paragraph. AUDIT-014 remains conditional on real Linux desktop
+runtime evidence, not on AUDIT-013.
 
 ### Reproducing this
 

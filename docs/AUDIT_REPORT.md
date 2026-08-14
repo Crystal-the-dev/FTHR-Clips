@@ -8,8 +8,12 @@
 > original audit snapshot. The live source and packages now use PySide6 6.11.1
 > under the LGPLv3 option; Windows and Linux artifact gates reject PyQt6 and
 > GPL-only Qt modules. See [AUDIT-013-QT-LICENSING.md](AUDIT-013-QT-LICENSING.md).
-> AUDIT-013 remains `DECISION REQUIRED` only because asset provenance is not
-> documented.
+> The remaining asset issue was resolved on the same date: predecessor media
+> without redistribution evidence was removed/replaced by deterministic
+> project-generated assets, and Oswald was byte-matched to its OFL-1.1 upstream.
+> AUDIT-013 is now `RESOLVED`; see
+> [AUDIT-013-ASSET-PROVENANCE.md](AUDIT-013-ASSET-PROVENANCE.md). Statements
+> below that call it open are retained as the original audit snapshot.
 
 > **Historical layout note (2026-08-10):** measurements below that name
 > `FTHR_SharedMemory_v3` describe the layout at the time of this audit. The
@@ -129,7 +133,7 @@ which desktop it detected and print the exact command to bind.
 | AUDIT-010 | P2 | Diagnostics | **FIXED** (I) · hardened (II) |
 | AUDIT-011 | P2 | UI responsiveness | **FIXED** (IV) |
 | AUDIT-012 | P2 | Privacy | **OPEN** |
-| AUDIT-013 | **P0** | Licensing | **OPEN — RELEASE BLOCKER** |
+| AUDIT-013 | **P0** | Licensing | **RESOLVED** (2026-08-14) |
 | AUDIT-014 | P0 | Linux packaging | **CONDITIONALLY RESOLVED** (2026-08-06) — see [AUDIT-014-LINUX-FFMPEG.md](AUDIT-014-LINUX-FFMPEG.md) |
 | AUDIT-015 | P1 | Linux save pipeline | **FIXED** (III) |
 | AUDIT-016 | P2 | Linux portability | **FIXED** (III) |
@@ -278,8 +282,14 @@ alpha, but it must be documented — it is, in `KNOWN_ISSUES.md`. Also:
 `test_server_connection()` passes a user-supplied URL to `urllib.request.urlopen`
 without scheme validation, so `file://` is accepted; restrict to http/https.
 
-### AUDIT-013 · P0 · Both · Licensing · **OPEN — RELEASE BLOCKER**
+### AUDIT-013 · P0 · Both · Licensing · **RESOLVED 2026-08-14**
 **PyQt6 is `GPL-3.0-only`, so the distributed build is a GPLv3 work**
+
+> **Resolution (2026-08-14):** the live source uses PySide6 6.11.1 under its
+> LGPLv3 option, packages notices/source locations and separately replaceable
+> libraries, and rejects PyQt/GPL-only Qt modules. Unprovenanced bundled media
+> was removed/replaced; the remaining Oswald font is exact, pinned OFL-1.1
+> upstream content. Per-file asset hashes and redistribution status are gated.
 
 Qt itself is LGPLv3 — it is the Python bindings that are GPL. This is
 independent of AUDIT-005 and is not fixed by it. FTHR's own source stays MIT
@@ -627,11 +637,10 @@ during capture · AppImage launch.
 
 ### Blocks any public download
 
-1. **Decide AUDIT-013** — PySide6, GPLv3, or a commercial PyQt licence. Whatever
-   is chosen, `README`, `LICENSE`, `RELEASE_NOTES` and the About dialog must
-   state the true licence of the *download*.
-2. **Resolve AUDIT-014** — bundle an LGPL FFmpeg for Linux, or accept GPLv3.
-   Follows automatically from option 2 of AUDIT-013.
+1. ~~**Decide AUDIT-013**~~ — resolved 2026-08-14 with PySide6/LGPLv3 and a
+   complete release-asset allowlist.
+2. ~~**Resolve the AUDIT-014 licence path**~~ — a pinned LGPL FFmpeg is bundled
+   and gated; real-desktop validation remains conditional.
 3. **Run the application.** At minimum: launch the GUI on both platforms, record
    one clip via hotkey on each, watch them back, and complete one installer
    lifecycle on Windows.

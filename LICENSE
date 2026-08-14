@@ -24,7 +24,8 @@ SOFTWARE.
 SCOPE OF THIS LICENCE
 
 The MIT licence above covers the FTHR Clips source code written by the FTHR
-Community.
+Community and the media outputs enumerated in
+licenses/FTHR-GENERATED-ASSETS.txt.
 
 It does NOT cover the third-party components redistributed in the binary
 builds. Those keep their own licences, some of which are copyleft:
@@ -37,6 +38,7 @@ builds. Those keep their own licences, some of which are copyleft:
   * sounddevice, keyboard  MIT
   * cffi ................. MIT No Attribution
   * pycparser ............ BSD-3-Clause
+  * Oswald Bold 4.103 .... SIL Open Font License 1.1
 
 See THIRD_PARTY_NOTICES.md for the complete list, versions, and the location
 of every licence text. A downloadable build is the MIT-licensed FTHR code plus

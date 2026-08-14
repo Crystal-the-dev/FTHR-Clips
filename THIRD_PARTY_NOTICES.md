@@ -38,9 +38,9 @@ upstream source locations are recorded in
 [`licenses/Qt6-SOURCE.txt`](licenses/Qt6-SOURCE.txt). The full LGPLv3 text is
 [`licenses/Qt6-LICENSE.txt`](licenses/Qt6-LICENSE.txt).
 
-This is a technical compliance inventory, not legal advice. Release approval
-also requires project-owner confirmation of the asset provenance described
-under [Project assets](#project-assets).
+This is a technical compliance inventory, not legal advice. Project-generated
+media and the separately licensed Oswald font are documented under
+[Project assets](#project-assets) and hash-locked in the release manifest.
 
 ---
 
@@ -207,11 +207,33 @@ conflict.
 
 ## Project assets
 
-The release currently includes FTHR logos/icons, four MP3 notification sounds,
-and `Oswald-Bold.ttf`. The repository contains no provenance record or explicit
-licence for those files. They are not asserted here to be third-party, but the
-project owner must document authorship/licensing or replace/remove them before
-approving a public release. The automated gate cannot prove asset ownership.
+### FTHR-generated media
+
+The shipped logos, icons, installer artwork, repository social preview, and
+four PCM WAV notification sounds are reproducibly generated from code in
+`tools/generate_release_assets.py`. The generator uses no external creative
+input, font, image, sound sample, or icon library. These outputs are FTHR
+project material under MIT; the notice and exact file list are in
+`licenses/FTHR-GENERATED-ASSETS.txt`.
+
+The predecessor images and four MP3 files had no usable authorship, source, or
+redistribution evidence. All predecessor image bytes were replaced, the MP3s
+were removed, and none is allowlisted for a release. The investigation is
+recorded in `docs/AUDIT-013-ASSET-PROVENANCE.md`.
+
+### Oswald Bold
+
+| | |
+|---|---|
+| **File/version** | `Oswald-Bold.ttf`, version 4.103 |
+| **Copyright** | Copyright 2016 The Oswald Project Authors |
+| **Source** | Google Fonts' `googlefonts/OswaldFont`, revision `89795261ac9eeb9aa8cd99f43982c4e4b0e53261` |
+| **Licence** | SIL Open Font License 1.1 |
+| **Verification** | Repository and pinned upstream files have SHA-256 `eb7d46f856dd57f18a8c03d033c57802692bf127f01dbd95ba8984338e6b5135` |
+| **Licence text** | `licenses/Oswald-OFL-1.1.txt` |
+
+The authoritative per-file paths, hashes, origins, usage, and platform mappings
+are in `tools/release_asset_manifest.json`.
 
 ---
 
@@ -234,8 +256,8 @@ Listed so future audits do not have to re-derive it:
 
 [`tools/verify_release_licenses.py`](tools/verify_release_licenses.py) checks
 the selected Qt binding and runtime modules, shipped artifacts for GPL build
-flags/x264/x265, and the required licence files described here. Run it before
-every release:
+flags/x264/x265, every approved release asset hash, and the required licence
+files described here. Run it before every release:
 
 ```bash
 python tools/verify_release_licenses.py --tree .
