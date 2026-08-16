@@ -740,3 +740,112 @@ The only configuration that can be considered for the next tightly controlled Wi
 alpha before implementation is an NVIDIA GPU with H.264, the captured monitor directly
 owned by that NVIDIA adapter, and an operator-confirmed expected primary monitor. This
 is not general Windows support. No claim is made that FTHR outperforms Medal.
+
+## Implementation addendum — 2026-08-16
+
+This addendum records the approved Stage 1 and Stage 2 implementation. It does not
+replace the investigation and decisions above. Stage 1 is commit `9bd16a0`; Stage 2 is
+commit `82207f9`.
+
+### AUDIT-048 implementation status — RESOLVED
+
+The UI now enumerates Windows display devices with `EnumDisplayDevicesW` and stores a
+normalized monitor device-interface path. The path is the persistent selection; raw
+`HMONITOR` values, adapter/output objects, enumeration positions and output indexes are
+never persisted. An old GDI/QScreen-name selection is migrated when it resolves
+unambiguously, and primary is selected and persisted only when no valid prior selection
+exists.
+
+The engine receives the device path through the existing process argument/config path,
+so shared-memory v4 is unchanged. `WindowsMonitorTopologySource` uses
+`QueryDisplayConfig` plus display-config device information to resolve the selected path
+to the current adapter LUID, source ID, target ID, GDI name and `HMONITOR`.
+`MonitorResolver` and the DXGI-output matcher contain the injectable/pure selection
+logic used by the native tests.
+
+WGC creates its capture item from exactly the resolved `HMONITOR`. DXGI opens the
+matching adapter LUID and output instead of adapter 0/output 0. A missing or stale
+selection does not fall back to primary or first output. Resolution and capture failures
+use the existing diagnostic channel with typed text including `MONITOR_NOT_FOUND`,
+`MONITOR_DISCONNECTED`, `MONITOR_TOPOLOGY_CHANGED`,
+`OUTPUT_RESOLUTION_FAILED`, and `CAPTURE_ITEM_CREATION_FAILED`.
+
+WGC item closure/size changes and DXGI access loss invalidate the capture generation,
+clear replay state, and enter the existing failed/recovery lifecycle. Recovery starts a
+fresh engine generation and resolves the same persistent monitor path again; it cannot
+silently capture another monitor. This preserves the existing recovery policy and avoids
+replacing a live D3D/NVENC device underneath native encoder textures.
+
+Deterministic native coverage comprises 13 monitor scenarios (14 checks), including
+same- and multi-adapter layouts, secondary selection, reordered enumeration, primary
+changes, normalization, missing/removed outputs, stale topology rejection and both
+no-fallback requirements. Three Python tests cover enumeration/selection migration.
+
+A real two-monitor test on the development machine captured an AOC display at
+1920x1080 and an LG UltraWide at 2560x1080 through WGC/native NVENC H.264. Independent
+solid red/blue test windows produced the expected distinct decoded pixel statistics in
+the corresponding clips. Switching the saved selection, restarting capture and saving
+again produced the selected monitor's resolution/content. A fabricated monitor path
+failed with `MONITOR_NOT_FOUND` in both WGC and DXGI instead of falling back.
+
+### AUDIT-049 Stage 2 foundation status — COMPLETE; overall finding remains OPEN
+
+`VideoCodec` explicitly represents H.264, HEVC and AV1. `EncodedVideoConfig` carries
+codec, dimensions, frame rate, stream time base, bitrate, maximum keyframe interval,
+maximum B-frame count, encoded packet format and codec extradata. Validation and MP4
+codec-ID mapping are codec-neutral, while a separate production gate currently accepts
+only H.264.
+
+`IReplayEncoder` is the small Windows replay seam. The existing native
+`HardwareEncoder` now implements it; the NVENC/D3D11 implementation itself was not
+replaced. It retains the same persistent encoder textures, `CopyResource` GPU path,
+native NVENC calls, H.264 AVCC output, timestamps, packet publication, no-B-frame
+contract and four-media-second forced-IDR maximum.
+
+The encoded ring now stores an `EncodedVideoConfig` with packets and snapshots instead
+of an H.264-specific extradata member. Save-time stream creation takes codec ID,
+dimensions, frame rate, time base and extradata from the snapshot config. The existing
+timestamp-driven AUDIT-042 interval selection and AUDIT-028 `.partial`/trailer/close/
+atomic-rename transaction remain in place. Structural H.264/HEVC/AV1 MP4 mappings exist,
+but no missing encoder is exposed as supported.
+
+Native coverage now totals 20 scenarios (27 checks): the 13 monitor scenarios plus
+codec mapping/config, production rejection, generic ring snapshot/extradata,
+PTS/keyframe and interval-selection contracts. The real RTX 4060 Ti regression used
+WGC on the 2560x1080 secondary display, native same-adapter NVENC H.264 at 60 target FPS
+and 16 Mbit/s. Both 30-second saves (including an immediate rapid save) and the
+60-second save reported `h264`, start time zero and exact 30.000/60.000-second container
+durations; full FFmpeg decode completed without errors. Save acknowledgement latency
+was approximately 82 ms.
+
+Matched 20-second samples against a build of the pre-refactor Stage-1 commit measured
+about 4.45% of one CPU core and 210.0 MiB working set before, versus 4.76–4.92% and
+206.7–210.8 MiB after. This small run-to-run delta is not evidence of a meaningful
+regression. More importantly, inspection confirms no new GPU-to-CPU readback,
+full-frame CPU copy, format conversion, CPU-to-GPU upload, per-frame heap allocation or
+packet copy. The seam adds lightweight virtual dispatch only. Shared-memory v4 exposes
+captured-frame progress but not encoder/capture-drop counters; 4,189 frames were
+reported after the final run and no failure/drop diagnostic appeared, so an exact drop
+count is not claimed.
+
+Production support after Stage 2 is deliberately unchanged:
+
+| Vendor | H.264 | HEVC | AV1 |
+|---|---|---|---|
+| NVIDIA | Integrated — native NVENC | Not yet integrated | Not yet integrated |
+| AMD | Not yet integrated | Not yet integrated | Not yet integrated |
+| Intel | Not yet integrated | Not yet integrated | Not yet integrated |
+
+AUDIT-049 therefore remains open. The codec-neutral foundation is complete, but the
+eight missing vendor/codec combinations, hybrid-adapter policy and their physical
+qualification remain release work. The next bounded implementation task is NVIDIA HEVC
+plus NVIDIA AV1.
+
+### Future shared-memory v5 proposal — not implemented
+
+Any future ABI revision should use fixed-width, versioned fields for the active codec,
+encoder vendor/backend, hardware/software classification, capture- and encoder-adapter
+LUIDs, actual replay capacity, normalized selected-monitor identity/status, and capture/
+encoder drop counters. Capability data should distinguish available, selected and
+active state so the UI cannot claim an encoder that initialization rejected. This work
+made no shared-memory layout, enum or version change.
