@@ -124,6 +124,10 @@ from core.focus_monitor import FocusMonitor
 from core.presets_manager import PresetsManager, PRESET_KEYS
 from core.settings_manager import SettingsManager
 from core.theme_manager import ThemeManager
+from core.windows_monitor import (
+    enumerate_windows_monitors,
+    normalize_monitor_device_path,
+)
 from core.mic_recorder import MicRecorder, write_wav
 from core.ffmpeg_tools import (
     get_ffmpeg_exe, software_video_args, FFmpegUnavailable)
@@ -1034,14 +1038,59 @@ class SourcePopup(_PopupPanel):
         # Monitor selector (desktop mode only)
         self.monitor_combo = _DropdownCombo()
         self.monitor_combo.setStyleSheet(_COMBO_STYLE)
-        self.monitor_combo.addItem('First Screen (Default)', userData='')
-        for s in QApplication.screens():
-            g = s.availableGeometry()
-            self.monitor_combo.addItem(
-                f'{s.name()}  ({g.width()}×{g.height()} @ {int(s.refreshRate())}Hz)',
-                userData=s.name(),
-            )
-        saved_mon = self.cur_monitor
+        if sys.platform == 'win32':
+            monitor_choices = enumerate_windows_monitors()
+            screens_by_name = {
+                screen.name().lower(): screen for screen in QApplication.screens()
+            }
+            for choice in monitor_choices:
+                screen = screens_by_name.get(choice.gdi_name.lower())
+                details = ''
+                if screen is not None:
+                    geometry = screen.availableGeometry()
+                    details = (
+                        f'  ({geometry.width()}×{geometry.height()} '
+                        f'@ {int(screen.refreshRate())}Hz)'
+                    )
+                primary = ' · Primary' if choice.primary else ''
+                self.monitor_combo.addItem(
+                    f'{choice.friendly_name}{details}{primary}',
+                    userData=choice.device_path,
+                )
+
+            saved_mon = normalize_monitor_device_path(self.cur_monitor)
+            if saved_mon and self.monitor_combo.findData(saved_mon) < 0:
+                # One-time migration from the former QScreen/GDI-name setting.
+                legacy = next(
+                    (choice for choice in monitor_choices
+                     if choice.gdi_name.lower() == self.cur_monitor.lower()),
+                    None,
+                )
+                saved_mon = legacy.device_path if legacy else saved_mon
+            if self.monitor_combo.count() and self.monitor_combo.findData(saved_mon) < 0:
+                primary_index = next(
+                    (index for index, choice in enumerate(monitor_choices)
+                     if choice.primary),
+                    0,
+                )
+                saved_mon = self.monitor_combo.itemData(primary_index)
+            if saved_mon != self.cur_monitor:
+                self.cur_monitor = saved_mon
+                self.sm.set('capture_monitor', saved_mon)
+                self.sm.save_settings()
+            if not monitor_choices:
+                self.monitor_combo.addItem('No active Windows monitor found', userData='')
+                self.monitor_combo.setEnabled(False)
+        else:
+            self.monitor_combo.addItem('First Screen (Default)', userData='')
+            for screen in QApplication.screens():
+                geometry = screen.availableGeometry()
+                self.monitor_combo.addItem(
+                    f'{screen.name()}  ({geometry.width()}×{geometry.height()} '
+                    f'@ {int(screen.refreshRate())}Hz)',
+                    userData=screen.name(),
+                )
+            saved_mon = self.cur_monitor
         idx = self.monitor_combo.findData(saved_mon)
         if idx >= 0:
             self.monitor_combo.setCurrentIndex(idx)

@@ -64,6 +64,7 @@
 #include "audio_capture.h"       // AudioCapture (WASAPI loopback -> PCM ring)
 #include "audio_ring_buffer.h"   // AudioRingBuffer (raw float32 PCM)
 #include "shared_memory.h"       // typed v4 capture-health flags
+#include "windows_monitor_resolver.h"
 
 
 namespace fthr {
@@ -100,6 +101,10 @@ namespace fthr {
         // argv[14]: 0 = disable WASAPI loopback audio capture entirely.
         // Useful when the user turns off audio in settings (no system audio in clips).
         bool audio_enabled = true;
+
+        // Stable Windows monitor device interface path from the UI. Resolved
+        // into transient HMONITOR/LUID/DXGI objects for each capture generation.
+        std::wstring monitor_device_path;
     };
 
 
@@ -188,16 +193,19 @@ namespace fthr {
         // -----------------------------------------------------------------------
         // D3D11 / DXGI / WGC helpers
         // -----------------------------------------------------------------------
-        bool InitializeWGC();             // WGC desktop capture (disabled — not implemented yet)
+        bool InitializeWGC();             // WGC capture of the resolved desktop monitor
         bool InitializeWindowCapture();   // WGC window/game capture
         void ShutdownWGC();
-        bool InitializeD3D11();           // DXGI desktop capture (active default)
+        bool InitializeD3D11();           // DXGI fallback for the resolved adapter/output
         void ShutdownD3D11();
         void SampleContentBGRA(const uint8_t* data, uint32_t stride,
             uint32_t width, uint32_t height, uint64_t produced_frame);
         void SampleContentTexture(ID3D11Texture2D* texture, uint64_t produced_frame);
         void PublishContentMetrics(uint64_t sum, uint64_t sum_sq, uint32_t count);
         void ClearReplayForRecovery();
+        bool ResolveSelectedMonitor(const char* backend_name);
+        bool InitializeMonitorCaptureDevice(
+            const char* backend_name, IDXGIOutput** selected_output);
 
         // -----------------------------------------------------------------------
         // D3D11 state (shared by WGC and DXGI paths)
@@ -222,6 +230,7 @@ namespace fthr {
         std::mutex              wgc_frame_mutex_;
         std::condition_variable wgc_frame_cv_;
         bool                    wgc_frame_ready_;
+        std::atomic<bool>       monitor_source_invalidated_{false};
 
         // -----------------------------------------------------------------------
         // Thread handles
@@ -255,6 +264,10 @@ namespace fthr {
         uint32_t target_height_;
         uint32_t bitrate_kbps_;
         uint32_t scaling_mode_;   // 0 = stretch, 1 = fit/letterbox
+        std::wstring monitor_device_path_;
+        monitor::WindowsMonitorTopologySource monitor_topology_source_;
+        monitor::MonitorResolver monitor_resolver_;
+        monitor::MonitorTopologyEntry resolved_monitor_;
 
         // -----------------------------------------------------------------------
         // NVENC path

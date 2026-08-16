@@ -59,7 +59,8 @@ class SettingsManager:
             'sound_volume_error':       100,
             'sound_volume_startup':     100,
             'notification_monitor': 'auto',  # 'auto' = highest refresh rate, or screen name e.g. 'DP-3'
-            'capture_monitor': '',           # wl_output name for desktop capture, '' = first output
+            # Windows: stable monitor device path. Linux: wl_output name.
+            'capture_monitor': '',
             'imported_clip_folders': [],  # additional folders from other clipping software
             # ── Upload ────────────────────────────────────────────────────
             'upload_enabled':          False,

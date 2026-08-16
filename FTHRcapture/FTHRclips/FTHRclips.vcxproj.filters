@@ -48,6 +48,9 @@
     <ClInclude Include="..\..\FTHRcapture_common\transactional_save.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="include\windows_monitor_resolver.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\shared_memory.cpp">
@@ -81,6 +84,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\capture_engine.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\windows_monitor_resolver.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

@@ -25,6 +25,7 @@
 //   argv[9]  scaling_mode   0 = stretch (default), 1 = fit (letterbox/pillarbox).
 //            Only meaningful when target_width/height are non-zero AND differ in
 //            aspect ratio from the captured source.
+//   argv[10] monitor_path   Stable normalized Windows monitor device path.
 //
 // Threading:
 //   This file runs entirely on the main thread.
@@ -54,6 +55,21 @@ static uintptr_t ParseArgU64(int argc, char* argv[], int index, uintptr_t defaul
     return static_cast<uintptr_t>(std::strtoull(argv[index], nullptr, 10));
 }
 
+static std::wstring ParseArgUtf8(int argc, char* argv[], int index) {
+    if (index >= argc || !argv[index] || argv[index][0] == '\0') return {};
+    const int length = MultiByteToWideChar(
+        CP_UTF8, MB_ERR_INVALID_CHARS, argv[index], -1, nullptr, 0);
+    if (length <= 1) return {};
+    std::wstring value(static_cast<size_t>(length), L'\0');
+    if (MultiByteToWideChar(
+            CP_UTF8, MB_ERR_INVALID_CHARS, argv[index], -1,
+            value.data(), length) == 0) {
+        return {};
+    }
+    value.pop_back();
+    return value;
+}
+
 static void PrintConfig(const fthr::CaptureConfig& cfg) {
     std::cout << "  Framerate    : " << cfg.framerate << " fps" << std::endl;
     std::cout << "  Buffer       : " << cfg.buffer_seconds << " sec" << std::endl;
@@ -80,6 +96,9 @@ static void PrintConfig(const fthr::CaptureConfig& cfg) {
     std::cout << "  Audio        : "
               << (cfg.audio_enabled ? "Enabled" : "Disabled (user setting)")
               << std::endl;
+    if (!cfg.monitor_device_path.empty()) {
+        std::wcout << L"  Monitor path : " << cfg.monitor_device_path << std::endl;
+    }
 }
 
 
@@ -120,11 +139,12 @@ int main(int argc, char* argv[]) {
             : fthr::CaptureConfig::ScalingModeEnum::STRETCH;
     }
 
-    // argv[10] = capture_monitor  (ignored on Windows — WGC selects monitor automatically)
+    // argv[10] = capture_monitor  (stable Windows monitor device path)
     // argv[11] = codec_pref       (communicated via shared memory RECONFIGURE_ENCODER)
     // argv[12] = encoder_preset   (same)
     // argv[13] = multiband_arg    (Windows uses per-app WASAPI; multiband handled in engine)
     // argv[14] = audio_enabled    (0 = disable WASAPI loopback capture)
+    config.monitor_device_path = ParseArgUtf8(argc, argv, 10);
     config.audio_enabled = (ParseArgU32(argc, argv, 14, 1) != 0);
 
     // ------------------------------------------------------------------

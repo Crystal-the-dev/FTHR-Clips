@@ -42,6 +42,8 @@ redist/
 .vs/
 FTHRcapture/x64/
 FTHRcapture/FTHRclips/x64/
+FTHRcapture/FTHRclips_tests/x64/
+FTHRcapture/FTHRclips_tests/FTHRclips_tests/
 *.obj
 *.iobj
 *.ipdb

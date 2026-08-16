@@ -86,6 +86,9 @@ namespace fthr {
         winrt::Windows::Graphics::Capture::GraphicsCaptureSession        session{ nullptr };
         winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice  winrt_device{ nullptr };
         winrt::event_token                                                frame_arrived_token{};
+        winrt::event_token                                                item_closed_token{};
+        bool                                                              item_closed_registered = false;
+        bool                                                              monitor_item = false;
     };
 
 
@@ -196,6 +199,7 @@ namespace fthr {
         , target_height_(0)
         , bitrate_kbps_(16000)
         , scaling_mode_(0)
+        , monitor_resolver_(monitor_topology_source_)
         , nvenc_active_(false)
         , nvidia_device_(false)
         , max_frames_(0)
@@ -226,6 +230,8 @@ namespace fthr {
         target_height_ = config.target_height;
         bitrate_kbps_ = config.bitrate_kbps;
         scaling_mode_ = (config.scaling_mode == CaptureConfig::ScalingModeEnum::FIT) ? 1u : 0u;
+        monitor_device_path_ = monitor::NormalizeMonitorDevicePath(
+            config.monitor_device_path);
 
         std::cout << "[CaptureEngine] Initializing..." << std::endl;
         std::cout << "  FPS        : " << fps_ << std::endl;
@@ -1969,21 +1975,23 @@ namespace fthr {
             if (hr == DXGI_ERROR_WAIT_TIMEOUT) continue;
 
             if (hr == DXGI_ERROR_ACCESS_LOST) {
-                std::cerr << "[CaptureThread] Access lost - reinitializing DXGI..." << std::endl;
-                capture_health_flags_.store(CAPTURE_HEALTH_RECOVERING);
+                // A new D3D11 device cannot be substituted under the live native
+                // NVENC session: its registered textures belong to the old device.
+                // Fail this generation and let the existing UI recovery policy
+                // restart the process, which re-resolves the same persistent path
+                // and initializes capture + encoder atomically.
                 ClearReplayForRecovery();
-                ShutdownD3D11();
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                if (!InitializeD3D11()) {
-                    std::cerr << "[CaptureThread] DXGI reinitialization failed." << std::endl;
-                    capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
-                    running_.store(false);
-                } else {
-                    capture_generation_.fetch_add(1);
-                    capture_health_flags_.store(CAPTURE_HEALTH_ACTIVE);
-                    consecutive_acquire_errors = 0;
-                }
-                continue;
+                const bool same_mapping = monitor_resolver_.IsCurrent(
+                    resolved_monitor_);
+                std::cerr << "[CaptureThread] "
+                          << monitor::ToString(same_mapping
+                              ? monitor::MonitorResolveError::OutputResolutionFailed
+                              : monitor::MonitorResolveError::MonitorTopologyChanged)
+                          << ": DXGI access lost; a fresh capture generation is required"
+                          << std::endl;
+                capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
+                running_.store(false);
+                break;
             }
 
             if (FAILED(hr)) {
@@ -2137,10 +2145,140 @@ namespace fthr {
     }
 
 
+    bool CaptureEngine::ResolveSelectedMonitor(const char* backend_name) {
+        const auto result = monitor_resolver_.Resolve(monitor_device_path_);
+        if (!result.ok()) {
+            std::cerr << '[' << backend_name << "] "
+                      << monitor::ToString(result.error) << ": "
+                      << result.diagnostic << std::endl;
+            return false;
+        }
+
+        if (!resolved_monitor_.monitor_device_path.empty()
+            && !(resolved_monitor_ == result.monitor)) {
+            std::cerr << '[' << backend_name << "] "
+                      << monitor::ToString(
+                             monitor::MonitorResolveError::MonitorTopologyChanged)
+                      << ": selected monitor transient mapping changed; "
+                         "starting a fresh capture generation" << std::endl;
+        }
+        resolved_monitor_ = result.monitor;
+        std::cout << '[' << backend_name << "] Monitor resolved: ";
+        std::wcout << resolved_monitor_.friendly_name << L"  "
+                   << resolved_monitor_.source_gdi_name << L"  "
+                   << resolved_monitor_.monitor_device_path << std::endl;
+        std::cout << '[' << backend_name << "] Topology: LUID="
+                  << resolved_monitor_.adapter_luid.high_part << ':'
+                  << resolved_monitor_.adapter_luid.low_part
+                  << " source=" << resolved_monitor_.source_id
+                  << " target=" << resolved_monitor_.target_id
+                  << " generation=" << resolved_monitor_.topology_generation
+                  << std::endl;
+        return true;
+    }
+
+    bool CaptureEngine::InitializeMonitorCaptureDevice(
+        const char* backend_name, IDXGIOutput** selected_output) {
+        if (!selected_output) return false;
+        *selected_output = nullptr;
+        if (!ResolveSelectedMonitor(backend_name)) return false;
+
+        IDXGIFactory1* factory = nullptr;
+        HRESULT hr = CreateDXGIFactory1(
+            __uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory));
+        if (FAILED(hr)) {
+            std::cerr << '[' << backend_name
+                      << "] CreateDXGIFactory1 failed: 0x"
+                      << std::hex << hr << std::dec << std::endl;
+            return false;
+        }
+
+        IDXGIAdapter1* capture_adapter = nullptr;
+        std::string output_diagnostic;
+        if (!monitor::OpenSelectedDxgiOutput(
+                factory, resolved_monitor_, &capture_adapter, selected_output,
+                output_diagnostic)) {
+            std::cerr << '[' << backend_name << "] "
+                      << monitor::ToString(
+                             monitor::MonitorResolveError::OutputResolutionFailed)
+                      << ": " << output_diagnostic << std::endl;
+            factory->Release();
+            return false;
+        }
+
+        DXGI_ADAPTER_DESC1 capture_desc{};
+        capture_adapter->GetDesc1(&capture_desc);
+        D3D_FEATURE_LEVEL feature_level{};
+        hr = D3D11CreateDevice(
+            capture_adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
+            nullptr, 0, D3D11_SDK_VERSION,
+            &device_, &feature_level, &context_);
+        if (FAILED(hr)) {
+            std::cerr << '[' << backend_name
+                      << "] D3D11CreateDevice on selected monitor adapter failed: 0x"
+                      << std::hex << hr << std::dec << std::endl;
+            (*selected_output)->Release();
+            *selected_output = nullptr;
+            capture_adapter->Release();
+            factory->Release();
+            return false;
+        }
+
+        nvidia_device_ = capture_desc.VendorId == 0x10DE;
+        if (!nvidia_device_ && !nvenc_device_) {
+            // Preserve the existing hybrid-GPU behavior: capture on the selected
+            // display-owning adapter, with a separate NVIDIA NVENC device and the
+            // already-existing CPU-input path. No new readback path is introduced.
+            IDXGIAdapter1* encoder_adapter = nullptr;
+            for (UINT index = 0;
+                 factory->EnumAdapters1(index, &encoder_adapter) != DXGI_ERROR_NOT_FOUND;
+                 ++index) {
+                DXGI_ADAPTER_DESC1 encoder_desc{};
+                encoder_adapter->GetDesc1(&encoder_desc);
+                if (encoder_desc.VendorId == 0x10DE) {
+                    hr = D3D11CreateDevice(
+                        encoder_adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
+                        nullptr, 0, D3D11_SDK_VERSION,
+                        &nvenc_device_, &feature_level, &nvenc_context_);
+                    encoder_adapter->Release();
+                    encoder_adapter = nullptr;
+                    if (SUCCEEDED(hr)) {
+                        std::cout << '[' << backend_name
+                                  << "] Separate NVIDIA NVENC device ready "
+                                     "(existing CPU-input path)" << std::endl;
+                    }
+                    break;
+                }
+                encoder_adapter->Release();
+                encoder_adapter = nullptr;
+            }
+        }
+
+        DXGI_OUTPUT_DESC output_desc{};
+        (*selected_output)->GetDesc(&output_desc);
+        width_ = static_cast<uint32_t>(
+            output_desc.DesktopCoordinates.right
+            - output_desc.DesktopCoordinates.left);
+        height_ = static_cast<uint32_t>(
+            output_desc.DesktopCoordinates.bottom
+            - output_desc.DesktopCoordinates.top);
+
+        capture_adapter->Release();
+        factory->Release();
+        std::cout << '[' << backend_name << "] Selected output ready: "
+                  << width_ << 'x' << height_
+                  << (nvidia_device_
+                      ? " [NVIDIA same-adapter GPU path]"
+                      : " [display-owning adapter]")
+                  << std::endl;
+        return true;
+    }
+
+
     // ===========================================================================
     // InitializeWGC
     //
-    // Sets up Windows Graphics Capture for the primary monitor.
+    // Sets up Windows Graphics Capture for the exact persistent monitor selection.
     //
     // Key advantage over DXGI OutputDuplication:
     //   - On Optimus, we create the D3D11 device on the NVIDIA adapter.
@@ -2165,108 +2303,17 @@ namespace fthr {
             return false;
         }
 
-        // --- Step 1: Enumerate adapters, detect Optimus ---
-        IDXGIFactory1* factory = nullptr;
-        HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory);
-        if (FAILED(hr)) {
-            std::cerr << "[WGC] CreateDXGIFactory1 failed: 0x" << std::hex << hr << std::dec << std::endl;
+        // Resolve the persistent monitor device path into the current topology,
+        // then create D3D11 on the adapter that actually owns that monitor.
+        IDXGIOutput* selected_output = nullptr;
+        if (!InitializeMonitorCaptureDevice("WGC", &selected_output)) {
             return false;
         }
-
-        IDXGIAdapter1* nvidia_adapter = nullptr;
-        bool has_intel = false;
-        {
-            IDXGIAdapter1* a = nullptr;
-            for (UINT i = 0; factory->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; ++i) {
-                DXGI_ADAPTER_DESC1 desc; a->GetDesc1(&desc);
-                char name[256] = {};
-                WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name)-1, nullptr, nullptr);
-                std::cout << "[WGC] Adapter " << i << ": " << name << std::endl;
-                if (desc.VendorId == 0x10DE && !nvidia_adapter) {
-                    nvidia_adapter = a; a->AddRef();
-                }
-                if (desc.VendorId == 0x8086) has_intel = true;
-                a->Release();
-            }
-        }
-        factory->Release();
-
-        bool is_optimus = nvidia_adapter && has_intel;
-
-        // --- Step 2: Create D3D11 device ---
-        //
-        // On Optimus laptops the display is driven by the Intel iGPU. WGC can
-        // only capture from the display-connected adapter, so the frame pool
-        // device MUST be the default (Intel) adapter. Using the NVIDIA adapter
-        // causes WGC to never deliver frames (FrameArrived never fires).
-        //
-        // On desktop NVIDIA (single GPU), the default adapter IS the NVIDIA GPU,
-        // so GPU zero-copy still works.
-        D3D_FEATURE_LEVEL feature_level;
-
-        if (nvidia_adapter && !is_optimus) {
-            // Desktop NVIDIA — use NVIDIA adapter for WGC + GPU zero-copy NVENC.
-            hr = D3D11CreateDevice(nvidia_adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
-                nullptr, 0, D3D11_SDK_VERSION, &device_, &feature_level, &context_);
-            nvidia_adapter->Release();
-            nvidia_adapter = nullptr;
-            if (SUCCEEDED(hr)) {
-                nvidia_device_ = true;
-                std::cout << "[WGC] Created D3D11 device on NVIDIA adapter (GPU zero-copy enabled)" << std::endl;
-            } else {
-                std::cerr << "[WGC] NVIDIA device creation failed (0x" << std::hex << hr << std::dec
-                          << ") — trying default adapter" << std::endl;
-            }
-        }
-        else if (is_optimus) {
-            // Optimus laptop — WGC frame pool on default (Intel) adapter,
-            // separate NVIDIA device stashed for NVENC CPU-input path.
-            std::cout << "[WGC] Optimus detected (Intel + NVIDIA) — using default adapter for WGC" << std::endl;
-
-            // Create the WGC device on the default adapter (Intel/display).
-            hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-                nullptr, 0, D3D11_SDK_VERSION, &device_, &feature_level, &context_);
-            if (FAILED(hr)) {
-                std::cerr << "[WGC] Default adapter D3D11CreateDevice failed: 0x"
-                          << std::hex << hr << std::dec << std::endl;
-                nvidia_adapter->Release();
-                return false;
-            }
-            std::cout << "[WGC] Created D3D11 device on default adapter (WGC capture)" << std::endl;
-
-            // Create a separate NVIDIA device for NVENC (CPU-input path).
-            hr = D3D11CreateDevice(nvidia_adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
-                nullptr, 0, D3D11_SDK_VERSION, &nvenc_device_, &feature_level, &nvenc_context_);
-            nvidia_adapter->Release();
-            nvidia_adapter = nullptr;
-            if (SUCCEEDED(hr)) {
-                std::cout << "[WGC] Created separate NVIDIA device for NVENC (CPU-input path)" << std::endl;
-            } else {
-                std::cerr << "[WGC] NVIDIA device for NVENC failed (0x" << std::hex << hr << std::dec
-                          << ") — will fall back to x264" << std::endl;
-            }
-            // nvidia_device_ stays false → Initialize() routes NVENC to CPU-input path
-        }
-
-        if (nvidia_adapter) { nvidia_adapter->Release(); nvidia_adapter = nullptr; }
-
-        if (!device_) {
-            hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-                nullptr, 0, D3D11_SDK_VERSION, &device_, &feature_level, &context_);
-            if (FAILED(hr)) {
-                std::cerr << "[WGC] D3D11CreateDevice failed: 0x" << std::hex << hr << std::dec << std::endl;
-                return false;
-            }
-            std::cout << "[WGC] Created D3D11 device on default adapter" << std::endl;
-        }
-
-        // --- Step 3: Primary monitor size ---
-        HMONITOR hmonitor = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
-        MONITORINFO mi = { sizeof(mi) };
-        GetMonitorInfo(hmonitor, &mi);
-        width_  = static_cast<uint32_t>(mi.rcMonitor.right  - mi.rcMonitor.left);
-        height_ = static_cast<uint32_t>(mi.rcMonitor.bottom - mi.rcMonitor.top);
-        std::cout << "[WGC] Monitor: " << width_ << "x" << height_ << std::endl;
+        selected_output->Release();
+        selected_output = nullptr;
+        const HMONITOR hmonitor = reinterpret_cast<HMONITOR>(
+            resolved_monitor_.hmonitor);
+        HRESULT hr = S_OK;
 
         // --- Step 3b: Staging texture for Optimus CPU-readback path ---
         // On Optimus the WGC device is Intel; NVENC is on NVIDIA.
@@ -2293,6 +2340,8 @@ namespace fthr {
 
         // --- Step 4-8: WinRT session setup (exception-safe) ---
         wgc_state_ = std::make_unique<WGCState>();
+        wgc_state_->monitor_item = true;
+        monitor_source_invalidated_.store(false, std::memory_order_release);
         try {
             // 4a. Wrap ID3D11Device as WinRT IDirect3DDevice
             winrt::com_ptr<IDXGIDevice> dxgi_dev;
@@ -2304,7 +2353,7 @@ namespace fthr {
             wgc_state_->winrt_device =
                 insp.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
 
-            // 4b. Create capture item for primary monitor
+            // 4b. Create a capture item for the exact resolved monitor.
             auto item_interop = winrt::get_activation_factory<
                 winrt::Windows::Graphics::Capture::GraphicsCaptureItem,
                 IGraphicsCaptureItemInterop>();
@@ -2313,6 +2362,14 @@ namespace fthr {
                 hmonitor,
                 winrt::guid_of<winrt::Windows::Graphics::Capture::GraphicsCaptureItem>(),
                 winrt::put_abi(wgc_state_->item)));
+
+            wgc_state_->item_closed_token = wgc_state_->item.Closed(
+                [this](auto&, auto&) {
+                    monitor_source_invalidated_.store(
+                        true, std::memory_order_release);
+                    wgc_frame_cv_.notify_one();
+                });
+            wgc_state_->item_closed_registered = true;
 
             // 5. Frame pool: 2 slots, free-threaded.
             //
@@ -2356,7 +2413,10 @@ namespace fthr {
             wgc_state_->session.StartCapture();
 
         } catch (winrt::hresult_error const& e) {
-            std::cerr << "[WGC] WinRT error during setup: 0x"
+            std::cerr << "[WGC] "
+                      << monitor::ToString(
+                             monitor::MonitorResolveError::CaptureItemCreationFailed)
+                      << ": WinRT setup error 0x"
                       << std::hex << e.code().value << std::dec
                       << " " << winrt::to_string(e.message()) << std::endl;
             wgc_state_.reset();
@@ -2382,6 +2442,10 @@ namespace fthr {
     void CaptureEngine::ShutdownWGC() {
         if (!wgc_state_) return;
         try {
+            if (wgc_state_->item && wgc_state_->item_closed_registered) {
+                wgc_state_->item.Closed(wgc_state_->item_closed_token);
+                wgc_state_->item_closed_registered = false;
+            }
             if (wgc_state_->session)    wgc_state_->session.Close();
             if (wgc_state_->frame_pool) {
                 wgc_state_->frame_pool.FrameArrived(wgc_state_->frame_arrived_token);
@@ -2443,12 +2507,24 @@ namespace fthr {
                 std::unique_lock<std::mutex> lk(wgc_frame_mutex_);
                 wgc_frame_cv_.wait(lk, [this] {
                     return wgc_frame_ready_ ||
+                           monitor_source_invalidated_.load(
+                               std::memory_order_acquire) ||
                            !running_.load(std::memory_order_relaxed);
                 });
                 wgc_frame_ready_ = false;
             }
 
             if (!running_.load(std::memory_order_relaxed)) break;
+            if (monitor_source_invalidated_.load(std::memory_order_acquire)) {
+                std::cerr << "[CaptureThread/WGC] "
+                          << monitor::ToString(
+                                 monitor::MonitorResolveError::MonitorDisconnected)
+                          << ": selected monitor capture item closed" << std::endl;
+                capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
+                ClearReplayForRecovery();
+                running_.store(false);
+                break;
+            }
 
             try {
                 // Consume the frame FIRST to return the buffer slot to the pool.
@@ -2459,6 +2535,21 @@ namespace fthr {
                 // belongs inside the same bounded error path as surface access.
                 auto frame = wgc_state_->frame_pool.TryGetNextFrame();
                 if (!frame) continue;
+
+                if (wgc_state_->monitor_item) {
+                    const auto content_size = frame.ContentSize();
+                    if (content_size.Width != static_cast<int32_t>(width_)
+                        || content_size.Height != static_cast<int32_t>(height_)) {
+                        std::cerr << "[CaptureThread/WGC] "
+                                  << monitor::ToString(
+                                         monitor::MonitorResolveError::MonitorTopologyChanged)
+                                  << ": selected monitor dimensions changed" << std::endl;
+                        capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
+                        ClearReplayForRecovery();
+                        running_.store(false);
+                        break;
+                    }
+                }
 
                 // QPC frame rate limiter — frame already consumed above, so the
                 // pool slot is freed even when we skip processing this frame.
@@ -2825,143 +2916,36 @@ namespace fthr {
 
 
     // ===========================================================================
-    // InitializeD3D11 - unchanged
+    // InitializeD3D11 - exact selected adapter/output fallback
     // ===========================================================================
 
     bool CaptureEngine::InitializeD3D11() {
         nvidia_device_ = false;
-        D3D_FEATURE_LEVEL feature_level;
-        HRESULT hr;
-
-        // --- Step 1: Find NVIDIA adapter ---
-        // Creating the D3D11 device on the NVIDIA adapter means DXGI Desktop
-        // Duplication outputs frames directly into NVIDIA VRAM. CopyResource into
-        // the NVENC input texture pool is then a GPU-to-GPU copy on the same device
-        // with zero CPU involvement. Without this, DXGI may use the iGPU adapter
-        // and frames would have to cross PCIe before NVENC can read them.
-        IDXGIFactory1* factory = nullptr;
-        hr = CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory);
-        if (FAILED(hr)) {
-            std::cerr << "[D3D11] CreateDXGIFactory1 failed: 0x" << std::hex << hr << std::dec << std::endl;
+        IDXGIOutput* selected_output = nullptr;
+        if (!InitializeMonitorCaptureDevice("DXGI", &selected_output)) {
             return false;
         }
 
-        IDXGIAdapter1* nvidia_adapter = nullptr;
-        {
-            IDXGIAdapter1* a = nullptr;
-            for (UINT i = 0; factory->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; ++i) {
-                DXGI_ADAPTER_DESC1 desc; a->GetDesc1(&desc);
-                char name[256] = {};
-                WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
-                std::cout << "[D3D11] Adapter " << i << ": " << name << std::endl;
-                if (desc.VendorId == 0x10DE && !nvidia_adapter) {
-                    nvidia_adapter = a; a->AddRef();
-                }
-                a->Release();
-            }
-        }
-        factory->Release();
-
-        // --- Step 2: Create D3D11 device ---
-        // Try NVIDIA adapter first. Fall back to default if creation fails.
-        if (nvidia_adapter) {
-            hr = D3D11CreateDevice(nvidia_adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
-                nullptr, 0, D3D11_SDK_VERSION, &device_, &feature_level, &context_);
-            nvidia_adapter->Release();
-            if (SUCCEEDED(hr)) {
-                nvidia_device_ = true;
-                std::cout << "[D3D11] Created device on NVIDIA adapter (GPU zero-copy path)" << std::endl;
-            }
-            else {
-                std::cerr << "[D3D11] NVIDIA D3D11CreateDevice failed (0x" << std::hex << hr << std::dec
-                          << ") - falling back to default adapter" << std::endl;
-            }
-        }
-
-        if (!device_) {
-            hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-                nullptr, 0, D3D11_SDK_VERSION, &device_, &feature_level, &context_);
-            if (FAILED(hr)) {
-                std::cerr << "[D3D11] D3D11CreateDevice failed: 0x" << std::hex << hr << std::dec << std::endl;
-                return false;
-            }
-        }
-
-        // --- Step 3: Set up DXGI Desktop Duplication ---
-        // Helper lambda: tries DuplicateOutput on the current device_.
-        // Returns false and leaves duplication_ = nullptr on failure.
-        auto try_duplication = [&]() -> bool {
-            IDXGIDevice*  dxgi_dev = nullptr;
-            IDXGIAdapter* adapter  = nullptr;
-            IDXGIOutput*  output   = nullptr;
-            IDXGIOutput1* output1  = nullptr;
-
-            if (FAILED(device_->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgi_dev)))
-                return false;
-            if (FAILED(dxgi_dev->GetAdapter(&adapter))) {
-                dxgi_dev->Release(); return false;
-            }
-            if (FAILED(adapter->EnumOutputs(0, &output))) {
-                dxgi_dev->Release(); adapter->Release(); return false;
-            }
-            DXGI_OUTPUT_DESC odesc{};
-            if (FAILED(output->GetDesc(&odesc))) {
-                dxgi_dev->Release(); adapter->Release(); output->Release(); return false;
-            }
-            width_  = static_cast<uint32_t>(odesc.DesktopCoordinates.right  - odesc.DesktopCoordinates.left);
-            height_ = static_cast<uint32_t>(odesc.DesktopCoordinates.bottom - odesc.DesktopCoordinates.top);
-
-            if (FAILED(output->QueryInterface(__uuidof(IDXGIOutput1), (void**)&output1))) {
-                dxgi_dev->Release(); adapter->Release(); output->Release(); return false;
-            }
+        IDXGIOutput1* output1 = nullptr;
+        HRESULT hr = selected_output->QueryInterface(
+            __uuidof(IDXGIOutput1), reinterpret_cast<void**>(&output1));
+        if (SUCCEEDED(hr)) {
             hr = output1->DuplicateOutput(device_, &duplication_);
-            dxgi_dev->Release(); adapter->Release(); output->Release(); output1->Release();
-            return SUCCEEDED(hr);
-        };
-
-        if (!try_duplication()) {
-            if (nvidia_device_) {
-                // DuplicateOutput failed on NVIDIA (Optimus laptop — NVIDIA dGPU has no
-                // direct display output; Intel iGPU drives the display).
-                // GPU zero-copy is not possible, but we keep the NVIDIA device alive so
-                // NVENC can still be used with CPU-side input buffers (Optimus path).
-                std::cerr << "[D3D11] DuplicateOutput failed on NVIDIA adapter - "
-                          << "retrying on default adapter (GPU zero-copy disabled, "
-                          << "NVENC CPU-input path will be used)" << std::endl;
-                nvidia_device_ = false;
-
-                // Stash the NVIDIA device for NVENC use (do NOT release it here).
-                nvenc_device_  = device_;
-                nvenc_context_ = context_;
-                device_  = nullptr;
-                context_ = nullptr;
-
-                hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-                    nullptr, 0, D3D11_SDK_VERSION, &device_, &feature_level, &context_);
-                if (FAILED(hr)) {
-                    std::cerr << "[D3D11] Fallback D3D11CreateDevice failed" << std::endl;
-                    nvenc_context_->Release(); nvenc_context_ = nullptr;
-                    nvenc_device_->Release();  nvenc_device_  = nullptr;
-                    return false;
-                }
-                if (!try_duplication()) {
-                    std::cerr << "[D3D11] DuplicateOutput failed on default adapter" << std::endl;
-                    context_->Release(); context_ = nullptr;
-                    device_->Release();  device_  = nullptr;
-                    nvenc_context_->Release(); nvenc_context_ = nullptr;
-                    nvenc_device_->Release();  nvenc_device_  = nullptr;
-                    return false;
-                }
-            }
-            else {
-                std::cerr << "[D3D11] DuplicateOutput failed" << std::endl;
-                context_->Release(); context_ = nullptr;
-                device_->Release();  device_  = nullptr;
-                return false;
-            }
+            output1->Release();
+        }
+        selected_output->Release();
+        if (FAILED(hr) || !duplication_) {
+            std::cerr << "[D3D11] "
+                      << monitor::ToString(
+                             monitor::MonitorResolveError::OutputResolutionFailed)
+                      << ": DuplicateOutput failed for selected output: 0x"
+                      << std::hex << hr << std::dec << std::endl;
+            if (context_) { context_->Release(); context_ = nullptr; }
+            if (device_) { device_->Release(); device_ = nullptr; }
+            return false;
         }
 
-        // --- Step 4: Staging texture (used by x264 path; NVENC path uses GPU textures instead) ---
+        // Staging texture (software path and the pre-existing hybrid NVENC path).
         {
             D3D11_TEXTURE2D_DESC desc{};
             desc.Width            = width_;
@@ -2979,7 +2963,9 @@ namespace fthr {
         }
 
         std::cout << "[D3D11] Ready - " << width_ << "x" << height_
-                  << (nvidia_device_ ? "  [NVIDIA adapter - GPU zero-copy enabled]" : "  [default adapter]")
+                  << (nvidia_device_
+                      ? "  [selected NVIDIA adapter - GPU zero-copy enabled]"
+                      : "  [selected display-owning adapter]")
                   << std::endl;
         std::cout << "[D3D11] Duplication: " << (duplication_ ? "OK" : "NULL") << std::endl;
         std::cout << "[D3D11] Staging tex: " << (staging_texture_ ? "OK" : "NULL") << std::endl;
