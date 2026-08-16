@@ -1,6 +1,6 @@
 # Canonical audit-ID map
 
-Last reconciled: **2026-08-14**
+Last reconciled: **2026-08-16**
 
 This register is the canonical allocation map for audit IDs appearing in the
 committed repository. It prevents a later finding from silently replacing an
@@ -48,6 +48,8 @@ existing audit. Historical IDs are not renumbered merely to close gaps.
 | AUDIT-045 | X11 worker IPC, lifecycle, performance, and packaging validation | Reserved; separate from AUDIT-044 and not implemented here |
 | AUDIT-046 | Linux pinned FFmpeg header/library ABI mismatch | Resolved |
 | AUDIT-047 | Linux encoded snapshot copies hold the ring mutex | Open, P2 |
+| AUDIT-048 | Windows monitor identity and adapter/output mapping | Open, P0; architecture validated, implementation pending |
+| AUDIT-049 | Windows vendor/codec hardware replay and hybrid-GPU policy | Open, P0; architecture approval required |
 
 When allocating a new ID, search the full history and this map first. A missing
 standalone report does not make a referenced or reserved ID reusable.
