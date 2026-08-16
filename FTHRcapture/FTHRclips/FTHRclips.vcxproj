@@ -24,8 +24,11 @@
     <ClInclude Include="include\audio_ring_buffer.h" />
     <ClInclude Include="include\capture_engine.h" />
     <ClInclude Include="include\encoded_ring_buffer.h" />
+    <ClInclude Include="include\encoded_video_config.h" />
+    <ClInclude Include="include\encoded_video_config_ffmpeg.h" />
     <ClInclude Include="include\hardware_encoder.h" />
     <ClInclude Include="include\packet_buffer_pool.h" />
+    <ClInclude Include="include\replay_encoder.h" />
     <ClInclude Include="include\save_clip_task.h" />
     <ClInclude Include="include\shared_memory.h" />
     <ClInclude Include="include\video_encoder.h" />
@@ -38,6 +41,7 @@
     <ClCompile Include="src\audio_ring_buffer.cpp" />
     <ClCompile Include="src\capture_engine.cpp" />
     <ClCompile Include="src\encoded_ring_buffer.cpp" />
+    <ClCompile Include="src\encoded_video_config.cpp" />
     <ClCompile Include="src\hardware_encoder.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\packet_buffer_pool.cpp" />

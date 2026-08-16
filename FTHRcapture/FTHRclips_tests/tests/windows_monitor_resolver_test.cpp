@@ -1,8 +1,13 @@
 #include "windows_monitor_resolver.h"
+#include "encoded_ring_buffer.h"
+#include "encoded_video_config.h"
+#include "encoded_video_config_ffmpeg.h"
+#include "replay_encoder.h"
 
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -13,6 +18,10 @@ using fthr::monitor::DxgiOutputIdentity;
 using fthr::monitor::MonitorResolveError;
 using fthr::monitor::MonitorResolver;
 using fthr::monitor::MonitorTopologyEntry;
+using fthr::EncodedPacketFormat;
+using fthr::EncodedRingBuffer;
+using fthr::EncodedVideoConfig;
+using fthr::VideoCodec;
 
 int checks = 0;
 
@@ -169,6 +178,96 @@ void NoFallbackToOutputZero() {
           "resolver never returns output zero for missing selected output");
 }
 
+EncodedVideoConfig VideoConfig(VideoCodec codec) {
+    EncodedVideoConfig config;
+    config.codec = codec;
+    config.width = 1920;
+    config.height = 1080;
+    config.frame_rate = {60, 1};
+    config.time_base = {1, 60};
+    config.bitrate_kbps = 16000;
+    config.max_keyframe_interval_frames = 240;
+    config.max_b_frames = 0;
+    config.packet_format = codec == VideoCodec::AV1
+        ? EncodedPacketFormat::LowOverheadObu
+        : EncodedPacketFormat::LengthPrefixedNalUnits;
+    return config;
+}
+
+void H264CodecMapsCorrectly() {
+    Check(fthr::ToAvCodecId(VideoCodec::H264) == AV_CODEC_ID_H264,
+          "H.264 maps to FFmpeg H.264 codec id");
+}
+
+void HevcConfigExistsWithoutProductionEnablement() {
+    const auto config = VideoConfig(VideoCodec::HEVC);
+    Check(config.codec == VideoCodec::HEVC
+              && fthr::ToAvCodecId(config.codec) == AV_CODEC_ID_HEVC,
+          "HEVC config and mux mapping exist");
+    Check(!fthr::IsProductionReplayCodecEnabled(config.codec),
+          "HEVC remains disabled in production");
+}
+
+void Av1ConfigExistsWithoutProductionEnablement() {
+    const auto config = VideoConfig(VideoCodec::AV1);
+    Check(config.codec == VideoCodec::AV1
+              && fthr::ToAvCodecId(config.codec) == AV_CODEC_ID_AV1,
+          "AV1 config and mux mapping exist");
+    Check(!fthr::IsProductionReplayCodecEnabled(config.codec),
+          "AV1 remains disabled in production");
+}
+
+void RingStoresAndSnapshotsGenericConfig() {
+    EncodedRingBuffer ring(8, 60, 1000);
+    auto config = VideoConfig(VideoCodec::HEVC);
+    config.codec_extradata = {1, 2, 3, 4};
+    ring.SetVideoConfig(config);
+    const uint8_t packet[] = {9, 8, 7};
+    ring.Push(packet, sizeof(packet), 41, true, 1000);
+
+    const auto snapshot = ring.TakeSnapshotByTime(1, 1000);
+    Check(snapshot.video_config == config,
+          "ring snapshot preserves codec-neutral video config");
+    Check(snapshot.video_config.codec_extradata == config.codec_extradata,
+          "codec extradata survives ring snapshot");
+}
+
+void PacketTimingAndKeyframeMetadataRemainUnchanged() {
+    EncodedRingBuffer ring(8, 60, 1000);
+    ring.SetVideoConfig(VideoConfig(VideoCodec::H264));
+    const uint8_t packet[] = {4, 5, 6};
+    ring.Push(packet, sizeof(packet), 123, true, 2000);
+
+    const auto snapshot = ring.TakeSnapshotByTime(1, 2000);
+    Check(snapshot.packets.size() == 1 && snapshot.packets[0].pts == 123,
+          "packet PTS unchanged through codec-neutral ring");
+    Check(snapshot.packets[0].is_keyframe,
+          "keyframe metadata unchanged through codec-neutral ring");
+}
+
+void CodecNeutralRingKeepsTimestampIntervalSelection() {
+    EncodedRingBuffer ring(16, 1, 1000);
+    ring.SetVideoConfig(VideoConfig(VideoCodec::H264));
+    const uint8_t packet[] = {1};
+    for (int64_t second = 1; second <= 5; ++second) {
+        ring.Push(packet, sizeof(packet), second - 1,
+                  second == 1 || second == 4, second * 1000);
+    }
+
+    const auto snapshot = ring.TakeSnapshotByTime(2, 5000);
+    Check(snapshot.full_history && snapshot.presentation_start_qpc_s == 3.0,
+          "AUDIT-042 timestamp boundary remains two seconds before save");
+    Check(!snapshot.packets.empty() && snapshot.packets.front().is_keyframe,
+          "timestamp selection retains decoder keyframe pre-roll");
+}
+
+void ReplayEncoderInterfaceIsPolymorphic() {
+    Check(std::has_virtual_destructor_v<fthr::IReplayEncoder>,
+          "replay encoder interface has a virtual destructor");
+    Check(fthr::IsProductionReplayCodecEnabled(VideoCodec::H264),
+          "only existing native H.264 is production enabled");
+}
+
 } // namespace
 
 int main() {
@@ -185,7 +284,14 @@ int main() {
     StaleTransientMappingRejected();
     NoFallbackToPrimary();
     NoFallbackToOutputZero();
-    std::cout << "windows_monitor_resolver_test: 13 scenarios passed ("
+    H264CodecMapsCorrectly();
+    HevcConfigExistsWithoutProductionEnablement();
+    Av1ConfigExistsWithoutProductionEnablement();
+    RingStoresAndSnapshotsGenericConfig();
+    PacketTimingAndKeyframeMetadataRemainUnchanged();
+    CodecNeutralRingKeepsTimestampIntervalSelection();
+    ReplayEncoderInterfaceIsPolymorphic();
+    std::cout << "FTHRclips_tests: 20 scenarios passed ("
               << checks << " checks)" << std::endl;
     return 0;
 }

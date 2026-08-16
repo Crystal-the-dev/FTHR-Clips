@@ -33,8 +33,9 @@
 #include <condition_variable>
 #include <atomic>
 #include <deque>
+#include <memory>
 
-#include "video_encoder.h"
+#include "replay_encoder.h"
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
@@ -65,15 +66,11 @@ namespace fthr {
     // ---------------------------------------------------------------------------
     // HardwareEncoder - NVENC H.264 Encoder (encode-only)
     // ---------------------------------------------------------------------------
-    class HardwareEncoder {
+    class HardwareEncoder final : public IReplayEncoder {
     public:
         // Callback: fired once per encoded frame from within EncodeFrame / EncodeFrameCPU.
         // Runs on CaptureThread. Must be fast — no blocking, no allocation.
-        using PacketCallback = std::function<void(const uint8_t* avcc_data,
-            uint32_t       size,
-            int64_t        pts,
-            bool           is_keyframe,
-            int64_t        wall_qpc)>;
+        using PacketCallback = IReplayEncoder::PacketCallback;
 
         HardwareEncoder();
         ~HardwareEncoder();
@@ -90,43 +87,43 @@ namespace fthr {
                         ID3D11Device*         shared_device,
                         ID3D11DeviceContext*  shared_context,
                         PacketCallback        callback,
-                        bool                  cpu_input_mode = false);
+                        bool                  cpu_input_mode = false) override;
 
         // GPU zero-copy path: encode the frame already CopyResource'd into GetCurrentInputTexture().
         // dxgi_present_qpc: LastPresentTime from DXGI_OUTDUPL_FRAME_INFO (raw QPC counts).
         //   Pass 0 to fall back to internal QPC reading.
-        bool EncodeFrame(int64_t dxgi_present_qpc = 0);
+        bool EncodeFrame(int64_t dxgi_present_qpc = 0) override;
 
         // Optimus / CPU-input path: encode from CPU memory mapped off a staging texture.
         // bgra_data:        pointer to pixel data from D3D11 Map().
         // src_stride:       RowPitch from D3D11_MAPPED_SUBRESOURCE (may exceed width*4).
         // dxgi_present_qpc: same semantics as EncodeFrame().
         bool EncodeFrameCPU(const uint8_t* bgra_data, uint32_t src_stride,
-                            int64_t dxgi_present_qpc = 0);
+                            int64_t dxgi_present_qpc = 0) override;
 
         // Returns the D3D11 texture for the current encode slot (GPU path only).
         // CaptureEngine calls CopyResource(GetCurrentInputTexture(), dxgi_frame)
         // before calling EncodeFrame().
-        ID3D11Texture2D* GetCurrentInputTexture() const noexcept;
+        ID3D11Texture2D* GetCurrentInputTexture() const noexcept override;
 
         // Flush encoder (EOS), drain remaining output, free all NVENC resources.
         void Finalize();
+        void Shutdown() override { Finalize(); }
 
-        // Return the AVCC decoder configuration record (SPS + PPS) extracted during
-        // Initialize(). Call this after Initialize() succeeds to populate
-        // EncodedRingBuffer::SetExtradata().
-        std::vector<uint8_t> GetExtradata() const;
+        EncodedVideoConfig GetVideoConfig() const override;
+        ActiveEncoderInfo GetActiveEncoderInfo() const override;
 
         // Return the QPC epoch used for PTS computation.
         // Returns false if the first frame has not been encoded yet.
-        bool GetEncodeEpoch(int64_t& out_start_qpc, int64_t& out_qpc_freq) const {
+        bool GetEncodeEpoch(
+            int64_t& out_start_qpc, int64_t& out_qpc_freq) const override {
             if (first_frame_) { out_start_qpc = 0; out_qpc_freq = 0; return false; }
             out_start_qpc = encode_start_qpc_;
             out_qpc_freq = qpc_freq_;
             return true;
         }
 
-        bool IsInitialized() const { return initialized_; }
+        bool IsInitialized() const override { return initialized_; }
 
 
     private:
@@ -236,6 +233,10 @@ namespace fthr {
         // per process lifetime (static locals never reset after Finalize).
         int callback_log_count_;
     };
+
+    // Enforces the Stage-2 production support gate: only the current native
+    // NVIDIA H.264 implementation can be constructed.
+    std::unique_ptr<IReplayEncoder> CreateProductionReplayEncoder(VideoCodec codec);
 
 
 } // namespace fthr

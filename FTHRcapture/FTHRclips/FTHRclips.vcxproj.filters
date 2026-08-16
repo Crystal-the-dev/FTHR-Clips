@@ -36,6 +36,15 @@
     <ClInclude Include="include\encoded_ring_buffer.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="include\encoded_video_config.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="include\encoded_video_config_ffmpeg.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="include\replay_encoder.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="include\audio_capture.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -69,6 +78,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\encoded_ring_buffer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\encoded_video_config.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\packet_buffer_pool.cpp">

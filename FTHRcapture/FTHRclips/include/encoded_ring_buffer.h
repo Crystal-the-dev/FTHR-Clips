@@ -1,7 +1,8 @@
 // encoded_ring_buffer.h
 // FTHR Capture Engine - Encoded packet ring buffer
 //
-// Stores AVCC-format encoded H.264 packets produced by HardwareEncoder.
+// Stores container-ready compressed video packets plus their codec-neutral
+// stream configuration.
 // Replaces the raw BGRA FramePool on the NVENC path, dropping RAM usage
 // from ~8GB to ~60MB for a 30-second buffer at 1080p/60fps/16Mbps.
 //
@@ -12,11 +13,9 @@
 // overwritten during its deep copy. Selection is by capture timestamp, not by
 // packet count, and includes the keyframe immediately before the visible start.
 //
-// Data format:
-//   Packets are stored in AVCC format (4-byte big-endian length prefix per
-//   NAL unit, SPS/PPS stripped). SPS/PPS are stored separately in extradata_
-//   and returned with every snapshot for the muxer to use as stream extradata.
-//   Conversion from Annex B happens once at Push() time in HardwareEncoder.
+// Packet bytes are already in the EncodedVideoConfig packet format. The ring
+// never parses or converts them and copies the matching codec configuration
+// into every save snapshot.
 
 #pragma once
 #ifndef FTHR_ENCODED_RING_BUFFER_H
@@ -30,6 +29,8 @@
 #include <condition_variable>
 #include <limits>
 #include <mutex>
+
+#include "encoded_video_config.h"
 
 
 namespace fthr {
@@ -54,14 +55,14 @@ namespace fthr {
     // EncodedRingPacket
     //
     // One compressed video frame stored in the ring buffer.
-    // data is AVCC format - ready to hand directly to av_interleaved_write_frame.
+    // data is a container-ready encoded sample in video_config.packet_format.
     //
     // Named EncodedRingPacket (not EncodedPacket) to avoid collision with
     // the EncodedPacket struct defined in video_encoder.h (pool-backed, different
     // members). Both live in namespace fthr so the names must be distinct.
     // ---------------------------------------------------------------------------
     struct EncodedRingPacket {
-        std::vector<uint8_t> data;         // AVCC-format NAL units (SPS/PPS excluded)
+        std::vector<uint8_t> data;         // Encoded sample in configured packet format
         int64_t              pts = 0;
         int64_t              wall_qpc = 0; // Raw QPC ticks at capture time (same clock as WASAPI)
         bool                 is_keyframe = false;
@@ -79,7 +80,7 @@ namespace fthr {
     // ---------------------------------------------------------------------------
     struct EncodedRingSnapshot {
         std::vector<EncodedRingPacket> packets;   // Ordered oldest -> newest
-        std::vector<uint8_t>           extradata; // AVCC decoder config record (SPS/PPS)
+        EncodedVideoConfig video_config;
 
         // Wall-clock QPC range of packets in this snapshot (seconds).
         // Derived from first/last packet wall_qpc, converted using qpc_freq.
@@ -116,22 +117,18 @@ namespace fthr {
         // Store one encoded packet in the next ring slot.
         // Called from CaptureThread - must be fast.
         //
-        // avcc_data: AVCC-format bytes (SPS/PPS already stripped).
-        //            HardwareEncoder performs the Annex B -> AVCC conversion
-        //            before calling Push, so no conversion happens here.
+        // encoded_data: bytes in video_config.packet_format. The encoder owns
+        //               any conversion before publication.
         // -----------------------------------------------------------------------
-        void Push(const uint8_t* avcc_data, uint32_t size,
+        void Push(const uint8_t* encoded_data, uint32_t size,
             int64_t pts, bool is_keyframe, int64_t wall_qpc = 0);
 
 
         // -----------------------------------------------------------------------
-        // SetExtradata
-        //
-        // Store the AVCC decoder configuration record (SPS + PPS).
-        // Called once by HardwareEncoder after nvEncGetSequenceParams succeeds.
-        // Thread-safe (guarded by extradata_mutex_).
+        // Store codec, geometry, timing, packet format and decoder config as
+        // one atomic stream description for future snapshots.
         // -----------------------------------------------------------------------
-        void SetExtradata(const uint8_t* data, size_t size);
+        void SetVideoConfig(const EncodedVideoConfig& config);
 
 
         // -----------------------------------------------------------------------
@@ -186,9 +183,8 @@ namespace fthr {
         mutable std::mutex publication_mutex_;
         mutable std::condition_variable publication_cv_;
 
-        // SPS/PPS decoder config record for the MP4 muxer.
-        std::vector<uint8_t>   extradata_;
-        mutable std::mutex     extradata_mutex_;
+        EncodedVideoConfig video_config_;
+        mutable std::mutex video_config_mutex_;
     };
 
 

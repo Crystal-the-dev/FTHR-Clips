@@ -14,7 +14,7 @@
 //       instead of calling WritePacketToMuxer.
 //     - WritePacketToMuxer removed entirely.
 //     - Finalize() strips FFmpeg muxer teardown (nothing to tear down).
-//     - GetExtradata() returns the stored AVCC decoder config record.
+//     - GetVideoConfig() returns H.264 timing, packet format and AVCC config.
 
 #ifdef _MSC_VER
 #if __has_include("pch.h")
@@ -852,12 +852,34 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
-    // GetExtradata
-    // ===========================================================================
+    EncodedVideoConfig HardwareEncoder::GetVideoConfig() const {
+        EncodedVideoConfig config;
+        config.codec = VideoCodec::H264;
+        config.width = enc_width_;
+        config.height = enc_height_;
+        config.frame_rate = {static_cast<int32_t>(fps_), 1};
+        config.time_base = {1, static_cast<int32_t>(fps_)};
+        config.bitrate_kbps = bitrate_kbps_;
+        config.max_keyframe_interval_frames = fps_ * 4;
+        config.max_b_frames = 0;
+        config.packet_format = EncodedPacketFormat::LengthPrefixedNalUnits;
+        config.codec_extradata = extradata_;
+        return config;
+    }
 
-    std::vector<uint8_t> HardwareEncoder::GetExtradata() const {
-        return extradata_;
+    ActiveEncoderInfo HardwareEncoder::GetActiveEncoderInfo() const {
+        return {
+            EncoderVendor::Nvidia,
+            ReplayEncoderBackend::NativeNvenc,
+            VideoCodec::H264,
+            true,
+            "NVIDIA NVENC (native)"};
+    }
+
+    std::unique_ptr<IReplayEncoder> CreateProductionReplayEncoder(
+        VideoCodec codec) {
+        if (!IsProductionReplayCodecEnabled(codec)) return nullptr;
+        return std::make_unique<HardwareEncoder>();
     }
 
 

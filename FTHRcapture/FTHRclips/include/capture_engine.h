@@ -59,7 +59,7 @@
 #include <memory>
 
 #include "save_clip_task.h"      // SaveClipTask + SaveClipQueue
-#include "hardware_encoder.h"    // HardwareEncoder + EncoderConfig
+#include "replay_encoder.h"      // codec-neutral Windows replay encoder seam
 #include "encoded_ring_buffer.h" // EncodedRingBuffer
 #include "audio_capture.h"       // AudioCapture (WASAPI loopback -> PCM ring)
 #include "audio_ring_buffer.h"   // AudioRingBuffer (raw float32 PCM)
@@ -274,7 +274,7 @@ namespace fthr {
         // -----------------------------------------------------------------------
         bool                              nvenc_active_;
         bool                              nvidia_device_; // true when D3D11 device is on the NVIDIA adapter (GPU zero-copy enabled)
-        HardwareEncoder                   hw_encoder_;
+        std::unique_ptr<IReplayEncoder>    replay_encoder_;
         std::unique_ptr<EncodedRingBuffer> encoded_ring_;
 
         // -----------------------------------------------------------------------

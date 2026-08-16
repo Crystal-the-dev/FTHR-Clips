@@ -28,7 +28,7 @@ EncodedRingBuffer::EncodedRingBuffer(
 }
 
 void EncodedRingBuffer::Push(
-    const uint8_t* avcc_data,
+    const uint8_t* encoded_data,
     uint32_t size,
     int64_t pts,
     bool is_keyframe,
@@ -42,8 +42,8 @@ void EncodedRingBuffer::Push(
         std::memory_order_relaxed);
     auto& slot = slots_[slot_idx];
     slot.data.resize(size);
-    if (size > 0 && avcc_data)
-        std::memcpy(slot.data.data(), avcc_data, size);
+    if (size > 0 && encoded_data)
+        std::memcpy(slot.data.data(), encoded_data, size);
     slot.pts = pts;
     slot.wall_qpc = wall_qpc;
     slot.is_keyframe = is_keyframe;
@@ -61,11 +61,13 @@ void EncodedRingBuffer::Push(
     publication_cv_.notify_all();
 }
 
-void EncodedRingBuffer::SetExtradata(const uint8_t* data, size_t size) {
-    std::lock_guard<std::mutex> lock(extradata_mutex_);
-    extradata_.assign(data, data + size);
-    std::cout << "[EncodedRingBuffer] Extradata set ("
-              << size << " bytes)" << std::endl;
+void EncodedRingBuffer::SetVideoConfig(const EncodedVideoConfig& config) {
+    std::lock_guard<std::mutex> lock(video_config_mutex_);
+    video_config_ = config;
+    std::cout << "[EncodedRingBuffer] Video config set: "
+              << VideoCodecName(config.codec) << ' '
+              << config.width << 'x' << config.height << ", "
+              << config.codec_extradata.size() << " config bytes" << std::endl;
 }
 
 EncodedRingSnapshot EncodedRingBuffer::TakeSnapshotByTime(
@@ -81,8 +83,8 @@ EncodedRingSnapshot EncodedRingBuffer::TakeSnapshotByTime(
     for (int attempt = 0; attempt < 3; ++attempt) {
         EncodedRingSnapshot snapshot;
         {
-            std::lock_guard<std::mutex> lock(extradata_mutex_);
-            snapshot.extradata = extradata_;
+            std::lock_guard<std::mutex> lock(video_config_mutex_);
+            snapshot.video_config = video_config_;
         }
 
         const uint64_t current_head = head_.load(std::memory_order_acquire);
@@ -136,10 +138,15 @@ EncodedRingSnapshot EncodedRingBuffer::TakeSnapshotByTime(
         if (stale) continue;
 
         snapshot.full_history = selection.full_history;
+        int64_t requested_duration_ticks = DurationInVideoTicks(
+            snapshot.video_config, duration_seconds);
+        if (requested_duration_ticks <= 0) {
+            requested_duration_ticks = static_cast<int64_t>(fps_)
+                * static_cast<int64_t>(duration_seconds);
+        }
         snapshot.presentation_start_pts = replay_interval::PresentationStartPts(
             snapshot.packets.back().pts,
-            static_cast<int64_t>(fps_),
-            static_cast<int64_t>(duration_seconds),
+            requested_duration_ticks,
             snapshot.full_history,
             snapshot.packets.front().pts);
         snapshot.qpc_start_s = static_cast<double>(

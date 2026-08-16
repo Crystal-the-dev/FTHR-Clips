@@ -51,6 +51,8 @@
 #include <Windows.Graphics.Capture.Interop.h>
 
 #include "capture_engine.h"
+#include "hardware_encoder.h"
+#include "encoded_video_config_ffmpeg.h"
 #include "video_encoder.h"
 #include "save_clip_task.h"
 #include "shared_memory.h"
@@ -332,6 +334,11 @@ namespace fthr {
         hw_cfg.fps = fps_;
         hw_cfg.bitrate_kbps = bitrate_kbps_;
 
+        // Stage 2 keeps the production selection intentionally fixed to the
+        // current native NVIDIA H.264 implementation. HEVC/AV1 are modeled for
+        // ring/mux work but the factory refuses to construct them.
+        replay_encoder_ = CreateProductionReplayEncoder(VideoCodec::H264);
+
         // Select NVENC path based on D3D11 adapter situation:
         //   nvidia_device_ = true  → DXGI and NVENC share the same NVIDIA device (GPU zero-copy)
         //   nvenc_device_  != null → Optimus: DXGI on Intel, NVENC on separate NVIDIA device
@@ -343,12 +350,16 @@ namespace fthr {
 
         if (nvidia_device_) {
             // GPU zero-copy path: DXGI and NVENC on the same NVIDIA adapter.
-            nvenc_active_ = hw_encoder_.Initialize(hw_cfg, device_, context_, nvenc_callback, /*cpu_input_mode=*/false);
+            nvenc_active_ = replay_encoder_ && replay_encoder_->Initialize(
+                hw_cfg, device_, context_, nvenc_callback,
+                /*cpu_input_mode=*/false);
         }
         else if (nvenc_device_ != nullptr) {
             // Optimus path: DXGI on Intel, encode on NVIDIA via CPU memcpy.
             std::cout << "[CaptureEngine] Optimus detected - using NVENC with CPU-input path." << std::endl;
-            nvenc_active_ = hw_encoder_.Initialize(hw_cfg, nvenc_device_, nvenc_context_, nvenc_callback, /*cpu_input_mode=*/true);
+            nvenc_active_ = replay_encoder_ && replay_encoder_->Initialize(
+                hw_cfg, nvenc_device_, nvenc_context_, nvenc_callback,
+                /*cpu_input_mode=*/true);
             if (!nvenc_active_) {
                 std::cout << "[CaptureEngine] NVENC init failed on Optimus - falling back to x264." << std::endl;
             }
@@ -369,16 +380,14 @@ namespace fthr {
             QueryPerformanceFrequency(&qpc_freq);
             encoded_ring_ = std::make_unique<EncodedRingBuffer>(capacity, fps_, qpc_freq.QuadPart);
 
-            // Seed extradata (SPS/PPS AVCC record) into the ring buffer.
-            // Every TakeSnapshot() will return this so the muxer can set
-            // stream->codecpar->extradata correctly.
-            auto extradata = hw_encoder_.GetExtradata();
-            if (!extradata.empty()) {
-                encoded_ring_->SetExtradata(extradata.data(), extradata.size());
-            }
-            else {
-                std::cerr << "[CaptureEngine] WARNING: NVENC extradata empty - "
-                    << "MP4 files may not play in all players" << std::endl;
+            // Publish codec, geometry, timing, packet format and decoder
+            // configuration as one immutable stream description.
+            const auto video_config = replay_encoder_->GetVideoConfig();
+            encoded_ring_->SetVideoConfig(video_config);
+            if (video_config.codec_extradata.empty()) {
+                std::cerr << "[CaptureEngine] WARNING: encoded video config "
+                             "has no codec extradata - MP4 files may not play "
+                             "in all players" << std::endl;
             }
 
             // max_frames_ used for stats - set to time-based count.
@@ -539,7 +548,7 @@ namespace fthr {
         // Finalize NVENC encoder after CaptureThread has exited
         // (guarantees no EncodeFrame call is in flight)
         if (nvenc_active_) {
-            hw_encoder_.Finalize();
+            replay_encoder_->Shutdown();
         }
 
         // Stop audio pipeline. Order matters:
@@ -727,7 +736,8 @@ namespace fthr {
 
             // Populate the QPC epoch so MuxEncodedClip can convert video PTS
             // to wall-clock seconds and align audio to it exactly.
-            hw_encoder_.GetEncodeEpoch(task.video_qpc_epoch, task.video_qpc_freq);
+            replay_encoder_->GetEncodeEpoch(
+                task.video_qpc_epoch, task.video_qpc_freq);
 
             // Snapshot the PCM ring buffer.
             // Raw PCM is copied here; AAC encoding happens on SaveClipThread.
@@ -913,12 +923,12 @@ namespace fthr {
     // ===========================================================================
     // MuxEncodedClip (NVENC path)
     //
-    // No encoding. Packets in the snapshot are already AVCC H.264.
-    // Just wrap them in an MP4 container.
+    // No encoding. Packets and their codec-neutral stream configuration are
+    // copied from the replay ring and wrapped directly in MP4.
     //
     // Steps:
     //   1. Open FFmpeg format context + video stream
-    //   2. Set stream extradata (AVCC decoder config from snapshot)
+    //   2. Set codec ID and decoder configuration from EncodedVideoConfig
     //   3. Open file + write header
     //   4. Write each packet (rescale PTS to stream timebase)
     //   5. Write trailer + close
@@ -927,6 +937,22 @@ namespace fthr {
     bool CaptureEngine::MuxEncodedClip(
         const SaveClipTask& task, const std::wstring& output_path) {
         const auto& snap = task.encoded_snapshot;
+        const auto& video_config = snap.video_config;
+
+        if (!IsValidEncodedVideoConfig(video_config)
+            || ToAvCodecId(video_config.codec) == AV_CODEC_ID_NONE) {
+            std::cerr << "[MuxEncodedClip] Invalid encoded video config" << std::endl;
+            SetEngineError(task.shared_memory,
+                L"The replay stream configuration is invalid; the clip was not written.");
+            return false;
+        }
+        const double video_tick_seconds =
+            static_cast<double>(video_config.time_base.numerator)
+            / static_cast<double>(video_config.time_base.denominator);
+        const double video_fps =
+            static_cast<double>(video_config.frame_rate.numerator)
+            / static_cast<double>(video_config.frame_rate.denominator);
+        const double video_frame_seconds = 1.0 / video_fps;
 
         if (snap.packets.empty()) {
             std::cerr << "[MuxEncodedClip] No packets in snapshot" << std::endl;
@@ -980,8 +1006,8 @@ namespace fthr {
         // snapshot without a presentation boundary; normal saves must never
         // advance to the keyframe after the requested start.
         if (!snap.packets.empty() && snap.presentation_start_qpc_s <= 0.0) {
-            const int64_t max_pts_span = static_cast<int64_t>(task.duration_seconds)
-                * static_cast<int64_t>(task.fps);
+            const int64_t max_pts_span = DurationInVideoTicks(
+                video_config, task.duration_seconds);
             const int64_t newest_pts = snap.packets.back().pts;
             const int64_t cutoff_pts = newest_pts - max_pts_span;
 
@@ -1050,7 +1076,7 @@ namespace fthr {
             } else {
                 video_start_wall_s = T_epoch_s
                     + static_cast<double>(snap.packets[keyframe_start].pts)
-                    / static_cast<double>(task.fps);
+                    * video_tick_seconds;
             }
 
             if (video_start_wall_s < task.audio_snapshot.qpc_start_s) {
@@ -1059,7 +1085,7 @@ namespace fthr {
                 const double audio_start_wall_s = task.audio_snapshot.qpc_start_s;
                 const int64_t trim_pts = static_cast<int64_t>(
                     (audio_start_wall_s - T_epoch_s)
-                    * static_cast<double>(task.fps) + 0.5);
+                    / video_tick_seconds + 0.5);
 
                 size_t new_kf = snap.packets.size(); // sentinel = not found
                 for (size_t i = keyframe_start; i < snap.packets.size(); i++) {
@@ -1073,7 +1099,7 @@ namespace fthr {
                     keyframe_start = new_kf;
                     std::cout << "[MuxEncodedClip] Audio-range trim: discarded "
                         << trimmed_frames << " leading video frames ("
-                        << (static_cast<double>(trimmed_frames) / task.fps) << "s) "
+                        << (static_cast<double>(trimmed_frames) / video_fps) << "s) "
                         << "— audio ring only covers from "
                         << (audio_start_wall_s - T_epoch_s) << "s" << std::endl;
                 }
@@ -1110,10 +1136,8 @@ namespace fthr {
         // duration-fallback alignment path and the diagnostic output.
         const int64_t newest_video_pts     = snap.packets.back().pts;
         const int64_t video_clip_pts_span  = newest_video_pts - pts_offset;
-        const double  video_clip_duration_s =
-            (task.fps > 0)
-            ? static_cast<double>(video_clip_pts_span + 1) / static_cast<double>(task.fps)
-            : static_cast<double>(task.duration_seconds);
+        const double video_clip_duration_s =
+            static_cast<double>(video_clip_pts_span + 1) * video_tick_seconds;
 
         // ------------------------------------------------------------------
         // Step D: Align audio to video using per-packet QPC timestamps.
@@ -1190,7 +1214,7 @@ namespace fthr {
                     static_cast<double>(task.video_qpc_epoch)
                         / static_cast<double>(task.video_qpc_freq)
                     + static_cast<double>(pts_offset)
-                        / static_cast<double>(task.fps);
+                        * video_tick_seconds;
                 have_video_wall_time = true;
             }
 
@@ -1295,26 +1319,32 @@ namespace fthr {
         }
 
         video_stream->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
-        video_stream->codecpar->codec_id = AV_CODEC_ID_H264;
-        video_stream->codecpar->width = static_cast<int>(task.enc_width);
-        video_stream->codecpar->height = static_cast<int>(task.enc_height);
+        video_stream->codecpar->codec_id = ToAvCodecId(video_config.codec);
+        video_stream->codecpar->width = static_cast<int>(video_config.width);
+        video_stream->codecpar->height = static_cast<int>(video_config.height);
         video_stream->codecpar->format = AV_PIX_FMT_YUV420P;
 
-        // High-resolution timebase standard for MP4 H.264
+        // High-resolution MP4 stream timebase; packet timestamps are rescaled
+        // from the encoder-provided time base below.
         video_stream->time_base = AVRational{ 1, 90000 };
-        video_stream->avg_frame_rate = AVRational{ static_cast<int>(task.fps), 1 };
-        video_stream->r_frame_rate = AVRational{ static_cast<int>(task.fps), 1 };
+        video_stream->avg_frame_rate = AVRational{
+            video_config.frame_rate.numerator,
+            video_config.frame_rate.denominator};
+        video_stream->r_frame_rate = video_stream->avg_frame_rate;
 
-        // Set AVCC extradata (SPS/PPS decoder config record)
-        if (!snap.extradata.empty()) {
+        // Copy the codec's decoder configuration record (avcC/hvcC/av1C).
+        if (!video_config.codec_extradata.empty()) {
             video_stream->codecpar->extradata = static_cast<uint8_t*>(
-                av_malloc(snap.extradata.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+                av_malloc(video_config.codec_extradata.size()
+                    + AV_INPUT_BUFFER_PADDING_SIZE));
             memcpy(video_stream->codecpar->extradata,
-                snap.extradata.data(), snap.extradata.size());
-            memset(video_stream->codecpar->extradata + snap.extradata.size(),
+                video_config.codec_extradata.data(),
+                video_config.codec_extradata.size());
+            memset(video_stream->codecpar->extradata
+                    + video_config.codec_extradata.size(),
                 0, AV_INPUT_BUFFER_PADDING_SIZE);
             video_stream->codecpar->extradata_size =
-                static_cast<int>(snap.extradata.size());
+                static_cast<int>(video_config.codec_extradata.size());
         }
         else {
             std::cerr << "[MuxEncodedClip] WARNING: no video extradata - "
@@ -1448,7 +1478,9 @@ namespace fthr {
         // ------------------------------------------------------------------
         // Step 4: Write video packets
         // ------------------------------------------------------------------
-        const AVRational encode_tb = { 1, static_cast<int>(task.fps) };
+        const AVRational encode_tb = {
+            video_config.time_base.numerator,
+            video_config.time_base.denominator};
 
         std::cout << "\n========================================" << std::endl;
         std::cout << "[MuxEncodedClip] DIAGNOSTIC INFO" << std::endl;
@@ -1457,12 +1489,17 @@ namespace fthr {
         std::cout << "Keyframe start index      : " << keyframe_start << std::endl;
         std::cout << "Usable packets            : " << usable_count << std::endl;
         std::cout << "Presentation PTS boundary : " << pts_offset
-            << " (" << (static_cast<double>(pts_offset) / task.fps) << "s absolute)" << std::endl;
+            << " (" << (static_cast<double>(pts_offset) * video_tick_seconds)
+            << "s absolute)" << std::endl;
         std::cout << "History classification   : "
             << (snap.full_history ? "full" : "partial") << std::endl;
-        std::cout << "Task FPS                  : " << task.fps << std::endl;
+        std::cout << "Video codec               : "
+            << VideoCodecName(video_config.codec) << std::endl;
+        std::cout << "Task FPS                  : " << video_fps << std::endl;
         std::cout << "Task duration             : " << task.duration_seconds << " seconds" << std::endl;
-        std::cout << "Expected frame count      : " << (task.duration_seconds * task.fps) << std::endl;
+        std::cout << "Expected frame count      : "
+            << (static_cast<double>(task.duration_seconds) * video_fps)
+            << std::endl;
         std::cout << "Audio stream              : "
             << (audio_stream ? "YES" : "NO") << std::endl;
 
@@ -1481,7 +1518,9 @@ namespace fthr {
             }
             if (delta_count > 0) {
                 double avg_delta = static_cast<double>(total_delta) / delta_count;
-                double actual_fps = (avg_delta > 0.0) ? (task.fps / avg_delta) : 0.0;
+                double actual_fps = (avg_delta > 0.0)
+                    ? (1.0 / (avg_delta * video_tick_seconds))
+                    : 0.0;
                 std::cout << "Avg PTS delta             : " << avg_delta
                     << " (actual capture rate ~" << actual_fps << " fps)" << std::endl;
             }
@@ -1642,8 +1681,9 @@ namespace fthr {
         if (ret < 0)
             return fail_media_write(L"flushing interleaved data for", ret);
 
-        const double actual_duration_s = (last_video_pts >= 0 && task.fps > 0)
-            ? (static_cast<double>(last_video_pts) / 90000.0) + (1.0 / task.fps)
+        const double actual_duration_s = (last_video_pts >= 0)
+            ? (static_cast<double>(last_video_pts) / 90000.0)
+                + video_frame_seconds
             : 0.0;
 
         std::cout << "\n[MuxEncodedClip] Summary:" << std::endl;
@@ -1934,7 +1974,7 @@ namespace fthr {
     //
     // Hot path. After acquiring and mapping a DXGI frame:
     //
-    //   NVENC path: pass BGRA to hw_encoder_.EncodeFrame()
+    //   NVENC path: pass BGRA to replay_encoder_->EncodeFrame()
     //               Callback fires -> EncodedRingBuffer::Push()
     //               ring_head_ / ring_count_ NOT updated (encoded ring manages itself)
     //
@@ -2042,12 +2082,13 @@ namespace fthr {
                 // ----------------------------------------------------------
                 SampleContentTexture(
                     tex, frames_captured_.load(std::memory_order_relaxed) + 1);
-                ID3D11Texture2D* input_tex = hw_encoder_.GetCurrentInputTexture();
+                ID3D11Texture2D* input_tex =
+                    replay_encoder_->GetCurrentInputTexture();
                 context_->CopyResource(input_tex, tex);
                 tex->Release();
                 duplication_->ReleaseFrame();
 
-                hw_encoder_.EncodeFrame(info.LastPresentTime.QuadPart);
+                replay_encoder_->EncodeFrame(info.LastPresentTime.QuadPart);
                 // Callback inside EncodeFrame fires -> EncodedRingBuffer::Push()
             }
             else if (nvenc_active_) {
@@ -2079,7 +2120,7 @@ namespace fthr {
                     static_cast<const uint8_t*>(mapped.pData), mapped.RowPitch,
                     width_, height_, frames_captured_.load(std::memory_order_relaxed) + 1);
 
-                hw_encoder_.EncodeFrameCPU(
+                replay_encoder_->EncodeFrameCPU(
                     static_cast<const uint8_t*>(mapped.pData),
                     mapped.RowPitch,
                     info.LastPresentTime.QuadPart);
@@ -2603,9 +2644,10 @@ namespace fthr {
                     // ----------------------------------------------------------
                     SampleContentTexture(
                         tex.get(), frames_captured_.load(std::memory_order_relaxed) + 1);
-                    ID3D11Texture2D* input_tex = hw_encoder_.GetCurrentInputTexture();
+                    ID3D11Texture2D* input_tex =
+                        replay_encoder_->GetCurrentInputTexture();
                     context_->CopyResource(input_tex, tex.get());
-                    hw_encoder_.EncodeFrame(now.QuadPart); // use rate-limiter QPC as frame timestamp
+                    replay_encoder_->EncodeFrame(now.QuadPart); // use rate-limiter QPC as frame timestamp
                 }
                 else if (nvenc_active_ && staging_texture_) {
                     // ----------------------------------------------------------
@@ -2628,7 +2670,7 @@ namespace fthr {
                         static_cast<const uint8_t*>(mapped.pData), mapped.RowPitch,
                         width_, height_, frames_captured_.load(std::memory_order_relaxed) + 1);
 
-                    hw_encoder_.EncodeFrameCPU(
+                    replay_encoder_->EncodeFrameCPU(
                         static_cast<const uint8_t*>(mapped.pData),
                         mapped.RowPitch, now.QuadPart);
                     // Callback inside EncodeFrameCPU fires -> EncodedRingBuffer::Push()
