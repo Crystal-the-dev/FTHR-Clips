@@ -35,6 +35,11 @@ from typing import Optional
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from core.clip_files import is_completed_video_path
+from core.clip_readiness import (
+    ClipReadinessRegistry,
+    ClipReadinessState,
+    get_clip_readiness_registry,
+)
 
 
 _HISTORY_FILE = Path.home() / '.fthr' / 'upload_history.json'
@@ -49,9 +54,10 @@ class UploadManager(QObject):
     upload_finished = Signal(str, bool, str)   # path, success, message
     upload_error    = Signal(str, str, str, str)  # title, detail, level, clip_path
 
-    def __init__(self, settings_manager):
+    def __init__(self, settings_manager, readiness: ClipReadinessRegistry | None = None):
         super().__init__()
         self._sm = settings_manager
+        self._readiness = readiness or get_clip_readiness_registry()
         self._history: dict = self._load_history()
         self._queue: queue.Queue = queue.Queue()
         self._interval_timer = QTimer(self)
@@ -102,16 +108,16 @@ class UploadManager(QObject):
         file is fully written (os.replace complete).  If has_mic_mux=False the
         event is pre-set so the upload worker starts without waiting.
         """
-        event = threading.Event()
         if not is_completed_video_path(path):
             print(f'[Upload] Refused incomplete clip path: {os.path.basename(path)}')
+            event = threading.Event()
             event.set()
             return event
-        if not has_mic_mux:
-            event.set()
+        handle = self._readiness.engine_committed(
+            path, needs_finalization=has_mic_mux)
+        event = handle.event
 
         if not self._sm.get('upload_enabled', False):
-            event.set()
             return event
 
         mode = self._sm.get('upload_mode', 'manual')
@@ -124,7 +130,7 @@ class UploadManager(QObject):
         return event
 
     def enqueue_upload(self, path: str):
-        """Manual or interval-triggered upload. Assumes file is already complete."""
+        """Queue upload, using the same readiness truth as immediate mode."""
         if not is_completed_video_path(path):
             print(f'[Upload] Refused incomplete clip path: {os.path.basename(path)}')
             return
@@ -134,8 +140,7 @@ class UploadManager(QObject):
             if self.is_uploaded(path) or path in self._in_flight:
                 return
             self._in_flight.add(path)
-        event = threading.Event()
-        event.set()
+        event = self._readiness.event_for(path)
         self._queue.put(('upload', path, event))
 
     def is_uploaded(self, path: str) -> bool:
@@ -152,8 +157,27 @@ class UploadManager(QObject):
             if task is None:
                 break
             _, path, event = task
-            # Wait up to 60 s for the mic-mux thread to finish writing the file
-            event.wait(timeout=60.0)
+            # A timeout is never evidence that final bytes are ready. Wait in
+            # short interruptible intervals until the registry reaches a real
+            # terminal state or shutdown is requested.
+            while not self._stop_event.is_set():
+                event.wait(timeout=0.25)
+                state = self._readiness.state(path)
+                if state in {
+                        ClipReadinessState.READY,
+                        ClipReadinessState.READY_WITH_WARNING,
+                        ClipReadinessState.FINALIZATION_FAILED}:
+                    break
+            if self._stop_event.is_set():
+                with self._in_flight_lock:
+                    self._in_flight.discard(path)
+                continue
+            if not self._readiness.can_access(path):
+                with self._in_flight_lock:
+                    self._in_flight.discard(path)
+                self.upload_finished.emit(
+                    path, False, 'Clip finalization failed; upload was not started')
+                continue
             self.upload_started.emit(path)
             success, msg = self._do_single_upload(path)
             with self._in_flight_lock:

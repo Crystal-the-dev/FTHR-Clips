@@ -177,3 +177,26 @@ def test_generated_socket_command_uses_resolved_nc_and_private_path(
     assert ' nc -U' not in cmd, 'bare `nc` must not survive in generated binds'
     assert '/tmp/fthr_hotkey.sock' not in cmd
     assert str(linux_runtime.hotkey_socket_path(create_dir=False)) in cmd
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='Linux hotkey socket')
+@pytest.mark.parametrize('compositor', ['kwin', 'gnome', 'generic'])
+def test_displayed_hotkey_instructions_use_private_socket(
+        tmp_path, monkeypatch, compositor):
+    from core import linux_runtime
+    from core.hotkey_manager import HotkeyManager
+
+    _make_fake_tool(tmp_path, 'nc')
+    monkeypatch.setenv('PATH', str(tmp_path))
+    run = tmp_path / 'run-user'
+    run.mkdir(mode=0o700)
+    monkeypatch.setenv('XDG_RUNTIME_DIR', str(run))
+    linux_tools.reset_cache()
+
+    instructions = HotkeyManager.setup_instructions(
+        SimpleNamespace(), compositor)
+
+    assert '/tmp/fthr_hotkey.sock' not in instructions
+    assert str(linux_runtime.hotkey_socket_path(create_dir=False)) in instructions
+    for action in ('save_clip', 'save_extended_clip', 'save_screenshot'):
+        assert action in instructions

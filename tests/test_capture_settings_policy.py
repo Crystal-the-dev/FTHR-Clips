@@ -9,6 +9,7 @@ from core.capture_settings import (
     ApplyStatus,
     CaptureConfig,
     CaptureConfigTracker,
+    compute_buffer_seconds,
     validate_extended_clip_length,
     validate_fps,
     validate_normal_clip_length,
@@ -42,6 +43,19 @@ def test_product_limits_have_one_authoritative_policy():
     assert validate_normal_clip_length(300) == 300
     assert validate_extended_clip_length(300) == 300
     assert validate_fps(240) == 240
+
+
+def test_every_exposed_duration_fits_the_native_ring():
+    for normal in NORMAL_CLIP_VALUES:
+        for extended in EXTENDED_CLIP_VALUES:
+            ring = compute_buffer_seconds(normal, extended)
+            assert max(normal, extended) <= ring <= 300
+
+
+def test_python_microphone_history_matches_maximum_replay():
+    from core.mic_recorder import KEEP_SECONDS
+
+    assert KEEP_SECONDS >= max(EXTENDED_CLIP_VALUES)
 
 
 @pytest.mark.parametrize(
@@ -89,3 +103,15 @@ def test_failed_restart_preserves_previous_active_config():
     assert tracker.active == old
     assert tracker.requested == requested
     assert tracker.error == 'encoder unavailable'
+
+
+def test_engine_exit_clears_the_active_process_snapshot():
+    old = _config(codec='h264')
+    tracker = CaptureConfigTracker(active=old)
+
+    tracker.deactivate('engine exited')
+
+    assert tracker.status is ApplyStatus.FAILED
+    assert tracker.active is None
+    assert tracker.requested == old
+    assert tracker.error == 'engine exited'

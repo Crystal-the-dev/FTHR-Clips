@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from core.transactional_output import (
     commit_staged_output,
     create_staged_output_path,
     discard_staged_output,
 )
+from ui.clip_viewer import ClipViewer, VolumePopup
 
 
 def test_staged_export_is_same_directory_and_not_final_looking(tmp_path):
@@ -38,3 +41,35 @@ def test_success_atomically_promotes_staged_output(tmp_path):
 
     assert final.read_bytes() == b'complete output'
     assert not staged.exists()
+
+
+def test_editor_failure_removes_staged_output_and_never_publishes_final(
+        tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import subprocess
+
+    final = tmp_path / 'export.mp4'
+    emitted = []
+    fake = SimpleNamespace(
+        _build_export_cmd=lambda **kwargs: ['ffmpeg', kwargs['out_path']],
+        _export_done=SimpleNamespace(emit=lambda *args: emitted.append(args)),
+        export_error=SimpleNamespace(emit=lambda *_args: None),
+    )
+    monkeypatch.setattr('ui.clip_viewer.get_ffmpeg_exe', lambda: 'ffmpeg')
+    monkeypatch.setattr('ui.clip_viewer.software_video_args', lambda: [])
+
+    def _failed_run(cmd, **_kwargs):
+        Path(cmd[-1]).write_bytes(b'partial')
+        raise subprocess.CalledProcessError(1, cmd, stderr=b'failed')
+
+    monkeypatch.setattr('ui.clip_viewer.subprocess.run', _failed_run)
+
+    ClipViewer._export_worker(fake, 0.0, 1.0, str(final), None)
+
+    assert not final.exists()
+    assert list(tmp_path.glob('*.partial.*')) == []
+    assert emitted and emitted[-1][0] is False
+
+
+def test_alpha_volume_popup_exposes_master_only():
+    assert VolumePopup._SOURCES == [('master', 'MASTER')]

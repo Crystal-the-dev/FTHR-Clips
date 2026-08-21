@@ -18,6 +18,7 @@ non-Wayland / Windows use.
 import keyboard
 import socket
 import os
+import shlex
 import sys
 import subprocess
 import threading
@@ -282,6 +283,24 @@ class HotkeyManager(QObject):
                 print(f'[Hotkey] Cannot determine socket path: {exc}')
                 sock = '<socket unavailable>'
         return f'echo -n "{action}" | {nc} -U {sock}'
+
+    def setup_instructions(self, compositor: str) -> str:
+        """Return compositor instructions built from the real private socket."""
+        commands = {
+            action: self.socket_command(action)
+            for action in ('save_clip', 'save_extended_clip', 'save_screenshot')
+        }
+        if compositor == 'kwin':
+            heading = 'KDE: System Settings → Shortcuts → Custom Shortcuts'
+            rendered = commands.values()
+        elif compositor == 'gnome':
+            heading = 'GNOME: Settings → Keyboard → Custom Shortcuts'
+            rendered = (f'bash -c {shlex.quote(command)}'
+                        for command in commands.values())
+        else:
+            heading = 'Bind your preferred keys to these commands:'
+            rendered = commands.values()
+        return heading + '\n\n' + '\n'.join(rendered)
 
     def _build_bind_line(self, action: str) -> str:
         key       = self.hotkeys.get(action, '')

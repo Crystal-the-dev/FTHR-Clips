@@ -2,6 +2,12 @@
 import os, sys, threading, subprocess
 from core.ffmpeg_tools import (
     get_ffmpeg_exe, software_video_args, FFmpegUnavailable)
+from core.library_ownership import MediaOwnership, classify_media_path
+from core.transactional_output import (
+    commit_staged_output,
+    create_staged_output_path,
+    discard_staged_output,
+)
 from pathlib import Path
 from datetime import datetime
 
@@ -1057,6 +1063,7 @@ class ShareWindow(QDialog):
             out_p = share_dir / f'{stem}{suffix[:-4]}_{n}.mp4'
             n += 1
         out       = str(out_p)
+        staged    = str(create_staged_output_path(out_p))
         cr        = self._crop_rect
         duration_s = max(self._end_s - self._start_s, 0.1)
 
@@ -1093,7 +1100,7 @@ class ShareWindow(QDialog):
                    *software_video_args(bitrate_kbps=video_kbps),
                    '-maxrate', f'{maxrate_kbps}k',
                    '-bufsize', f'{bufsize_kbps}k',
-                   '-c:a', 'aac', '-b:a', f'{audio_kbps}k', out]
+                   '-c:a', 'aac', '-b:a', f'{audio_kbps}k', staged]
         elif cr or audio_out:
             # Crop or mix needed — re-encode the affected stream(s).
             filters = []
@@ -1117,14 +1124,14 @@ class ShareWindow(QDialog):
                 cmd += ['-c:a', 'aac', '-b:a', '192k']
             else:
                 cmd += ['-c:a', 'copy']
-            cmd.append(out)
+            cmd.append(staged)
         else:
             cmd = [ffmpeg, '-y',
                    '-ss', str(self._start_s), '-i', self._clip_path,
                    '-t', str(duration_s),
-                   '-c', 'copy', out]
+                   '-c', 'copy', staged]
 
-        self._pending_export_out = out  # track so closeEvent can remove partial file
+        self._pending_export_out = staged
         try:
             self._proc = subprocess.Popen(
                 cmd,
@@ -1133,16 +1140,20 @@ class ShareWindow(QDialog):
             )
             _, stderr = self._proc.communicate()
             if self._cancelled:
+                discard_staged_output(staged)
                 return
             if self._proc.returncode == 0:
-                self._pending_export_out = None  # export succeeded, keep the file
+                commit_staged_output(staged, out)
+                self._pending_export_out = None
                 self._export_sig.emit(True, out)
             else:
                 err  = stderr.decode(errors='replace').strip()
                 last = next((l for l in reversed(err.splitlines()) if l.strip()), err[:120])
+                discard_staged_output(staged)
                 self._pending_export_out = None
                 self._export_sig.emit(False, last)
         except Exception as e:
+            discard_staged_output(staged)
             self._pending_export_out = None
             if not self._cancelled:
                 self._export_sig.emit(False, str(e))
@@ -1241,36 +1252,14 @@ class ShareWindow(QDialog):
 
 class VolumePopup(QDialog):
     """
-    Floating popup anchored under the VOL button in the clip editor's
-    control bar. Holds a master volume slider plus per-source sliders
-    for the four fixed categories: game, browser, music app, Discord.
-
-    Master drives QMediaPlayer playback in real time. Per-source values are
-    applied at export time via ffmpeg amix using the per-track audio. They
-    are inert for clips recorded before the engine's multi-track audio
-    capture is available, but the values still persist and apply once such
-    clips exist.
+    Floating master-volume popup. Semantic per-source labels stay hidden
+    until a future container contract can prove what each stream represents.
     """
 
     master_changed = Signal(int)            # 0–100
     source_changed = Signal(str, int)       # (source_key, 0–100)
 
-    # Windows shows per-app WASAPI sources; Linux shows Desktop + Mic.
-    _SOURCES = (
-        [
-            ('master',  'MASTER'),
-            ('game',    'GAME'),
-            ('browser', 'BROWSER'),
-            ('music',   'MUSIC APP'),
-            ('discord', 'DISCORD'),
-        ]
-        if sys.platform == 'win32' else
-        [
-            ('master',  'MASTER'),
-            ('desktop', 'DESKTOP'),
-            ('mic',     'MIC'),
-        ]
-    )
+    _SOURCES = [('master', 'MASTER')]
 
     def __init__(self, master_vol: int,
                  source_volumes: dict | None = None,
@@ -1349,10 +1338,7 @@ class VolumePopup(QDialog):
 
             root.addLayout(row)
 
-        if self._multitrack:
-            note_text = 'Per-source applied at export'
-        else:
-            note_text = 'Single-track clip — sliders saved, full multi-track soon'
+        note_text = 'Per-track controls unavailable without verified track metadata'
         note = QLabel(note_text)
         note.setStyleSheet(
             'color: #666666; font-size: 8px; font-style: italic; '
@@ -1399,13 +1385,15 @@ class ClipViewer(QDialog):
 
     def __init__(self, clip_path: str, bridge, parent=None,
                  thumb_pixmap: QPixmap = None, settings_manager=None,
-                 upload_enabled: bool = False, metadata_manager=None):
+                 upload_enabled: bool = False, metadata_manager=None,
+                 linked_import: bool = False):
         super().__init__(parent)
         self.clip_path       = clip_path
         self.bridge          = bridge
         self.sm              = settings_manager
         self._mm             = metadata_manager
         self._upload_enabled = upload_enabled
+        self._linked_import = linked_import
         self._crop_rect    = None
         self._thumb_pixmap = thumb_pixmap
         self._thumb_overlay: QLabel | None = None
@@ -1659,37 +1647,15 @@ class ClipViewer(QDialog):
         ctrl_lay.addWidget(self.time_label)
         ctrl_lay.addStretch()
 
-        # Volume dropdown — opens a popup with master + per-source sliders.
-        # Master controls QMediaPlayer playback today. Per-source values are
-        # passed to ffmpeg at export time. They have audible per-track effect
-        # only on clips recorded with multi-track audio capture (engine work
-        # tracked separately); otherwise they apply to the single audio track
-        # as a whole.
+        # Volume dropdown — master playback level only for the alpha.
         if self.sm:
             self._master_volume = int(self.sm.get('master_volume', 80))
-            stored_sources = self.sm.get('source_volumes') or {}
         else:
             self._master_volume = 80
-            stored_sources = {}
-        if sys.platform == 'win32':
-            self._source_volumes: dict[str, int] = {
-                'game':    int(stored_sources.get('game',    100)),
-                'browser': int(stored_sources.get('browser', 100)),
-                'music':   int(stored_sources.get('music',   100)),
-                'discord': int(stored_sources.get('discord', 100)),
-            }
-        else:
-            self._source_volumes: dict[str, int] = {
-                'desktop': int(stored_sources.get('desktop', 100)),
-                'mic':     int(stored_sources.get('mic',     100)),
-            }
-        # Multi-track detection runs `ffmpeg -i` as a subprocess (up to 4 s).
-        # Doing it synchronously froze the editor on first open. Default to
-        # single-track and let _detect_multitrack_audio_async upgrade the flag
-        # once the worker thread reports back. Per-source sliders are only
-        # functionally different on multi-track clips; the default is safe.
+        self._source_volumes: dict[str, int] = {}
+        # Stream count alone cannot prove semantic identities. Keep the alpha
+        # editor master-only until the future track contract carries metadata.
         self._multitrack_audio = False
-        QTimer.singleShot(0, self._detect_multitrack_audio_async)
         self.vol_btn = QPushButton(f'VOL  {self._master_volume}%  ▾')
         self.vol_btn.setObjectName('volBtn')
         self.vol_btn.setFixedHeight(28)
@@ -1882,6 +1848,11 @@ class ClipViewer(QDialog):
         self.delete_btn.setObjectName('deleteBtn')
         self.delete_btn.setFixedHeight(36)
         self.delete_btn.clicked.connect(self._delete_clip)
+        if self._linked_import:
+            self.delete_btn.setText('Linked original — protected')
+            self.delete_btn.setEnabled(False)
+            self.delete_btn.setToolTip(
+                'Remove its import folder from FTHR; the original stays on disk.')
         sb_outer.addWidget(self.delete_btn)
 
         main.addWidget(sidebar)
@@ -2599,11 +2570,12 @@ class ClipViewer(QDialog):
             )
             return
 
+        staged = create_staged_output_path(out)
         cmd = self._build_export_cmd(
             ffmpeg=ffmpeg,
             start_s=start_s,
             duration_s=end_s - start_s,
-            out_path=out,
+            out_path=str(staged),
             crop_rect=crop_rect,
             video_args=software_video_args(),
         )
@@ -2611,14 +2583,18 @@ class ClipViewer(QDialog):
         try:
             subprocess.run(cmd, check=True, capture_output=True,
                            timeout=600, **_NO_WINDOW)
+            commit_staged_output(staged, out)
             self._export_done.emit(True, out)
         except subprocess.TimeoutExpired:
+            discard_staged_output(staged)
             self._export_done.emit(False, 'Export timed out after 10 minutes')
         except subprocess.CalledProcessError as e:
+            discard_staged_output(staged)
             err  = e.stderr.decode(errors='replace').strip()
             last = next((l for l in reversed(err.splitlines()) if l.strip()), err[:120])
             self._export_done.emit(False, last)
         except Exception as e:
+            discard_staged_output(staged)
             self._export_done.emit(False, str(e))
 
     def _on_export_done(self, success: bool, msg: str):
@@ -2684,6 +2660,18 @@ class ClipViewer(QDialog):
 
     def _delete_clip(self):
         from PySide6.QtWidgets import QMessageBox
+        imported_roots = (
+            self.sm.get('imported_clip_folders', []) if self.sm else [])
+        ownership = classify_media_path(
+            self.clip_path, Path.home() / 'FTHR_Clips', imported_roots)
+        if self._linked_import or ownership is not MediaOwnership.FTHR_OWNED:
+            QMessageBox.information(
+                self,
+                'Linked Original Protected',
+                'This clip is linked from another folder. FTHR will not '
+                'delete the original with the generic Delete action.',
+            )
+            return
         reply = QMessageBox.question(
             self, 'Delete Clip',
             f'Delete {os.path.basename(self.clip_path)}?\nThis cannot be undone.',

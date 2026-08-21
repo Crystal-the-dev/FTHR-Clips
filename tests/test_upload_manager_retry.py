@@ -2,6 +2,8 @@
 sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parent.parent / 'FTHR_UI'))
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
+import time
+
 from unittest.mock import patch, MagicMock
 
 
@@ -88,3 +90,60 @@ def test_interval_scan_does_not_enqueue_partial_files(qapp, tmp_path, monkeypatc
     um._interval_scan()
 
     assert um._queue.empty()
+
+
+def test_upload_waits_for_real_final_ready_state(qapp, tmp_path):
+    from core.clip_readiness import ClipReadinessRegistry
+    from core.upload_manager import UploadManager
+
+    sm = MagicMock()
+    sm.get.side_effect = lambda key, default=None: {
+        'upload_enabled': True,
+        'upload_mode': 'manual',
+    }.get(key, default)
+    registry = ClipReadinessRegistry()
+    um = UploadManager(sm, registry)
+    clip = tmp_path / 'clip.mp4'
+    clip.write_bytes(b'base')
+    registry.engine_committed(str(clip), needs_finalization=True)
+    uploaded = []
+    um._do_single_upload = lambda path: (uploaded.append(path) or (True, 'ok'))
+    um.start()
+    try:
+        um.enqueue_upload(str(clip))
+        time.sleep(0.15)
+        assert uploaded == []
+
+        registry.complete(str(clip))
+        deadline = time.monotonic() + 2
+        while not uploaded and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert uploaded == [str(clip)]
+    finally:
+        um.stop()
+
+
+def test_failed_finalization_never_uploads(qapp, tmp_path):
+    from core.clip_readiness import ClipReadinessRegistry
+    from core.upload_manager import UploadManager
+
+    sm = MagicMock()
+    sm.get.side_effect = lambda key, default=None: {
+        'upload_enabled': True,
+        'upload_mode': 'manual',
+    }.get(key, default)
+    registry = ClipReadinessRegistry()
+    um = UploadManager(sm, registry)
+    clip = tmp_path / 'clip.mp4'
+    registry.engine_committed(str(clip), needs_finalization=True)
+    uploaded = []
+    um._do_single_upload = lambda path: (uploaded.append(path) or (True, 'ok'))
+    um.start()
+    try:
+        um.enqueue_upload(str(clip))
+        registry.finalization_failed(
+            str(clip), 'missing final bytes', base_clip_usable=False)
+        time.sleep(0.2)
+        assert uploaded == []
+    finally:
+        um.stop()

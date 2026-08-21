@@ -35,6 +35,7 @@ def _within(path: Path, root: Path) -> bool:
         path.relative_to(root)
         return True
     except ValueError:
+        # pathlib uses ValueError to report that path is outside root.
         return False
 
 

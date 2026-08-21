@@ -110,14 +110,35 @@ from version import (
 )
 from core import linux_tools
 from core.capture_bridge import CaptureBridge
+from core.alpha_capabilities import (
+    effective_multiband_audio_enabled,
+    encoder_preset_supported,
+    filter_alpha_preset,
+    focus_pause_supported,
+)
+from core.capture_settings import (
+    EXTENDED_CLIP_VALUES,
+    FPS_VALUES,
+    NORMAL_CLIP_VALUES,
+    CaptureConfig,
+    CaptureConfigTracker,
+    compute_buffer_seconds,
+    validate_extended_clip_length,
+    validate_fps,
+    validate_normal_clip_length,
+)
 from core.capture_health import (
     CaptureHealthMonitor,
     CaptureHealthState,
     evaluate_save_admission,
 )
 from core.diagnostics import get_logger
-from core.engine_startup_diagnostics import extract_startup_failure
+from core.engine_startup_diagnostics import (
+    extract_startup_failure,
+    extract_startup_warnings,
+)
 from core.clip_files import cleanup_stale_partial_clips, is_completed_video_path
+from core.clip_readiness import get_clip_readiness_registry
 from core.save_state import (SaveStateMachine, EngineEvent, OutcomeKind)
 from core.hotkey_manager import HotkeyManager
 from core.game_detector import GameDetector
@@ -129,6 +150,8 @@ from core.windows_monitor import (
     enumerate_windows_monitors,
     normalize_monitor_device_path,
 )
+from core.screenshot_target import build_grim_command, select_qt_screen
+from core.library_ownership import add_import_root, remove_import_root
 from core.mic_recorder import MicRecorder, write_wav
 from core.ffmpeg_tools import (
     get_ffmpeg_exe, software_video_args, FFmpegUnavailable)
@@ -448,7 +471,8 @@ def select_post_route(*, audio_on: bool, multiband_enabled: bool,
     'finalize' only rewrites the file when there is something to apply, so a
     plain clip with no watermark/crop/camera is ready immediately.
     """
-    multiband_on = audio_on and multiband_enabled
+    multiband_on = audio_on and effective_multiband_audio_enabled(
+        multiband_enabled)
     mic_active = audio_on and not multiband_on and mic_running
 
     if mic_active:
@@ -776,11 +800,11 @@ class CaptureSettingsPopup(_PopupPanel):
     restart_needed      = Signal()
     summary_changed     = Signal(str)   # emitted whenever any value changes
 
-    _CLIP_VALUES  = [5, 10, 15, 30, 45, 60, 120, 180, 300, 600, 900]
-    _CLIP_LABELS  = ['5s','10s','15s','30s','45s','1m','2m','3m','5m','10m','15m']
-    _EXT_VALUES   = [30, 45, 60, 120, 180, 300, 600, 900]
-    _EXT_LABELS   = ['30s','45s','1m','2m','3m','5m','10m','15m']
-    _FPS_VALUES   = [30, 60, 120, 144, 165, 240, 360]
+    _CLIP_VALUES  = list(NORMAL_CLIP_VALUES)
+    _CLIP_LABELS  = ['5s','10s','15s','30s','45s','1m','1m 30s','2m','3m','4m','5m']
+    _EXT_VALUES   = list(EXTENDED_CLIP_VALUES)
+    _EXT_LABELS   = ['30s','45s','1m','1m 30s','2m','3m','4m','5m']
+    _FPS_VALUES   = list(FPS_VALUES)
     _RES_LABELS   = ['480p','720p','1080p','1440p','Source']
     _RES_KEYS     = ['480p','720p','1080p','1440p','source']
     _QUAL_LABELS  = ['Low','Medium','High']
@@ -868,6 +892,7 @@ class CaptureSettingsPopup(_PopupPanel):
         self.cur_clip = self._CLIP_VALUES[idx]
         self.sm.set('clip_length', self.cur_clip)
         self.sm.save_settings()
+        self._mark_restart()
         self.clip_length_changed.emit(self.cur_clip)
         self._update_summary()
 
@@ -875,6 +900,7 @@ class CaptureSettingsPopup(_PopupPanel):
         self.cur_ext = self._EXT_VALUES[idx]
         self.sm.set('extended_clip_length', self.cur_ext)
         self.sm.save_settings()
+        self._mark_restart()
         self.extended_clip_changed.emit(self.cur_ext)
         self._update_summary()
 
@@ -932,6 +958,7 @@ class CaptureSettingsPopup(_PopupPanel):
         self.cur_qual = self._QUAL_KEYS[idx]
         self.sm.set('bitrate_level', self.cur_qual)
         self.sm.save_settings()
+        self._mark_restart()
         kbps = BITRATE_PRESETS[self.cur_res][self.cur_qual]
         self.bitrate_changed.emit(kbps)
         self._update_summary()
@@ -1366,27 +1393,8 @@ class HotkeyPopup(_PopupPanel):
 
         if _comp == 'hyprland':
             _instr = '✓ Hotkeys are applied to your Hyprland config automatically.'
-        elif _comp == 'kwin':
-            _instr = (
-                'In System Settings → Shortcuts → Custom Shortcuts:\n\n'
-                'echo -n "save_clip" | nc -U /tmp/fthr_hotkey.sock\n'
-                'echo -n "save_extended_clip" | nc -U /tmp/fthr_hotkey.sock\n'
-                'echo -n "save_screenshot" | nc -U /tmp/fthr_hotkey.sock'
-            )
-        elif _comp == 'gnome':
-            _instr = (
-                'In Settings → Keyboard → Custom Shortcuts:\n\n'
-                "bash -c 'echo -n \"save_clip\" | nc -U /tmp/fthr_hotkey.sock'\n"
-                "bash -c 'echo -n \"save_extended_clip\" | nc -U /tmp/fthr_hotkey.sock'\n"
-                "bash -c 'echo -n \"save_screenshot\" | nc -U /tmp/fthr_hotkey.sock'"
-            )
         else:
-            _instr = (
-                'Configure your compositor to run for each hotkey:\n\n'
-                'echo -n "save_clip" | nc -U /tmp/fthr_hotkey.sock\n'
-                'echo -n "save_extended_clip" | nc -U /tmp/fthr_hotkey.sock\n'
-                'echo -n "save_screenshot" | nc -U /tmp/fthr_hotkey.sock'
-            )
+            _instr = self.hotkey_manager.setup_instructions(_comp)
 
         instr_lbl = QLabel(_instr)
         instr_lbl.setWordWrap(True)
@@ -1592,7 +1600,9 @@ class MainWindow(QMainWindow):
         self.clip_metadata_manager = ClipMetadataManager()
 
         from core.upload_manager import UploadManager
-        self.upload_manager = UploadManager(self.settings_manager)
+        self._clip_readiness = get_clip_readiness_registry()
+        self.upload_manager = UploadManager(
+            self.settings_manager, self._clip_readiness)
         # Give the settings widget a back-reference so its Save button can call
         # refresh_settings() without needing a direct signal connection.
         self.settings_manager._upload_manager_ref = self.upload_manager
@@ -1604,20 +1614,39 @@ class MainWindow(QMainWindow):
             if hasattr(Colors, _tk):
                 setattr(Colors, _tk, _val)
 
-        # settings.json is user-editable — coerce numerics defensively so a
-        # hand-edited "framerate": "60" (string) can't crash buffer math.
-        def _int_setting(key, default, lo, hi):
+        # settings.json is user-editable. Invalid values are rejected and
+        # replaced with the documented default, with a diagnostic, rather than
+        # silently clamped to a value the user did not select.
+        def _validated_setting(key, default, validator):
             try:
-                return max(lo, min(hi, int(self.settings_manager.get(key, default))))
+                value = int(self.settings_manager.get(key, default))
+                return validator(value)
             except (TypeError, ValueError):
+                bad = self.settings_manager.get(key, default)
+                print(f'[Settings] Rejected invalid {key}={bad!r}; using {default}')
+                self.settings_manager.set(key, default)
                 return default
 
-        self.clip_duration          = _int_setting('clip_length',          30, 5, 300)
-        self.extended_clip_duration = _int_setting('extended_clip_length', 60, 5, 600)
-        self.capture_fps            = _int_setting('framerate',            60, 15, 240)
+        self.clip_duration = _validated_setting(
+            'clip_length', 30, validate_normal_clip_length)
+        self.extended_clip_duration = _validated_setting(
+            'extended_clip_length', 60, validate_extended_clip_length)
+        self.capture_fps = _validated_setting(
+            'framerate', 60, validate_fps)
+
+        # These implementations remain in source for later work, but cannot
+        # be revived by an old settings file during the alpha.
+        if self.settings_manager.get('multiband_audio_enabled', False):
+            print('[Settings] Multiband audio is disabled for the alpha')
+            self.settings_manager.set('multiband_audio_enabled', False)
+        if (not focus_pause_supported(sys.platform)
+                and self.settings_manager.get('anticheat_detection_enabled', False)):
+            print('[Settings] Focus pause is unavailable on Windows alpha')
+            self.settings_manager.set('anticheat_detection_enabled', False)
+        self.settings_manager.save_settings()
 
         saved_res  = self.settings_manager.get('resolution',   'source')
-        saved_qual = self.settings_manager.get('bitrate_level', 'high')
+        saved_qual = self.settings_manager.get('bitrate_level', 'medium')
         # Derive the correct kbps from the saved resolution+quality preset so
         # the engine starts with the right bitrate even before any UI interaction
         # fires the bitrate_changed signal.
@@ -1625,7 +1654,9 @@ class MainWindow(QMainWindow):
             saved_res, BITRATE_PRESETS['source']).get(saved_qual, 25000)
 
         self.capture_width, self.capture_height = _resolution_to_dims(saved_res)
-        self.buffer_seconds = max(self.clip_duration, self.extended_clip_duration) + 2
+        self.buffer_seconds = compute_buffer_seconds(
+            self.clip_duration, self.extended_clip_duration)
+        self._capture_config = CaptureConfigTracker()
 
         self.engine_process = None
         self._engine_startup_output = None
@@ -1697,7 +1728,8 @@ class MainWindow(QMainWindow):
         self._focus_monitor.focus_lost.connect(self._on_focus_lost)
         self._focus_monitor.focus_regained.connect(self._on_focus_regained)
 
-        if (self.settings_manager.get('anticheat_detection_enabled', False)
+        if (focus_pause_supported(sys.platform)
+                and self.settings_manager.get('anticheat_detection_enabled', False)
                 and self.settings_manager.get('capture_mode', 'desktop') == 'window'):
             target = self.settings_manager.get('target_window_name', '')
             self._focus_monitor.set_target(target)
@@ -1740,7 +1772,8 @@ class MainWindow(QMainWindow):
         # Start the always-on microphone recorder so saved clips can include
         # the user's voice. The C++ engine doesn't capture mic — we record
         # in Python and ffmpeg-mux it into each clip after save.
-        self._start_mic_recorder()
+        if self.settings_manager.get('audio_capture_enabled', True):
+            self._start_mic_recorder()
 
         # Launch the capture engine once the event loop is running. Deferring
         # past __init__ keeps the window responsive while the engine boots and
@@ -1763,6 +1796,7 @@ class MainWindow(QMainWindow):
         self._save_poll_timer = QTimer(self)
         self._save_poll_timer.setInterval(50)
         self._save_poll_timer.timeout.connect(self._on_save_poll_tick)
+        self._published_final_clips: set[str] = set()
 
     # =======================================================================
     # UI layout
@@ -1945,6 +1979,7 @@ class MainWindow(QMainWindow):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.clip_grid = ClipGrid(settings_manager=self.settings_manager)
+        self.clip_grid.set_readiness_checker(self._clip_readiness.can_access)
         self.clip_grid.clip_opened.connect(self._on_clip_opened)
         scroll.setWidget(self.clip_grid)
         body_layout.addWidget(scroll, stretch=1)
@@ -1961,6 +1996,8 @@ class MainWindow(QMainWindow):
             self.capture_card.restart)
         self._settings_page_widget.encoder_config_changed.connect(
             self._on_encoder_config_changed)
+        self._settings_page_widget.audio_capture_changed.connect(
+            self._on_audio_capture_changed)
         self.main_stack.addWidget(self._settings_page_widget)
 
         # Wire upload manager → clip grid + start
@@ -2192,7 +2229,8 @@ class MainWindow(QMainWindow):
             self.settings_mode_cluster.setVisible(False)
         else:
             self.main_stack.setCurrentIndex(1)
-            if self.settings_manager.get('multiband_audio_enabled', False):
+            if effective_multiband_audio_enabled(
+                    self.settings_manager.get('multiband_audio_enabled', False)):
                 try:
                     self._settings_page_widget._mappings_timer.start()
                 except AttributeError:
@@ -2299,8 +2337,16 @@ class MainWindow(QMainWindow):
             from PySide6.QtCore import QTimer as _QT
             _QT.singleShot(2000, self._show_compositor_warning)
 
-    def _on_hotkey_save_clip(self):          self._save_clip(self.clip_duration)
-    def _on_hotkey_save_extended_clip(self): self._save_clip(self.extended_clip_duration)
+    def _on_hotkey_save_clip(self):
+        config = self._capture_config.active
+        self._save_clip(config.normal_clip_seconds if config else self.clip_duration)
+
+    def _on_hotkey_save_extended_clip(self):
+        config = self._capture_config.active
+        self._save_clip(
+            config.extended_clip_seconds
+            if config else self.extended_clip_duration)
+
     def _on_hotkey_save_screenshot(self):
         from ui.screenshot_editor import ScreenshotEditor
         from PySide6.QtCore import QDialog
@@ -2310,6 +2356,10 @@ class MainWindow(QMainWindow):
         screenshots_dir.mkdir(parents=True, exist_ok=True)
         raw_path = screenshots_dir / f'screenshot_from_{timestamp}.png'
 
+        config = self._capture_config.active
+        selected_monitor = (
+            config.monitor if config is not None
+            else self.settings_manager.get('capture_monitor', ''))
         captured = False
         if sys.platform != 'win32':
             # grim is Wayland-only and often absent. Resolve it explicitly so a
@@ -2318,7 +2368,7 @@ class MainWindow(QMainWindow):
             grim = linux_tools.path('grim')
             if grim:
                 result = subprocess.run(
-                    [grim, str(raw_path)],
+                    build_grim_command(grim, str(raw_path), selected_monitor),
                     capture_output=True,
                     **_NO_WINDOW,
                 )
@@ -2331,14 +2381,23 @@ class MainWindow(QMainWindow):
                       f'Falling back to the Qt screen grab.')
 
         if not captured:
-            screen = QApplication.primaryScreen()
+            screens = QApplication.screens()
+            monitors = enumerate_windows_monitors() if sys.platform == 'win32' else ()
+            screen = select_qt_screen(
+                selected_monitor,
+                screens,
+                platform=sys.platform,
+                windows_monitors=monitors,
+                primary=QApplication.primaryScreen(),
+            )
             if screen:
                 pixmap = screen.grabWindow(0)
                 captured = pixmap.save(str(raw_path))
 
         if not captured:
             QMessageBox.warning(self, 'Screenshot Failed',
-                                'Could not capture the screen.')
+                                'The selected capture monitor is unavailable '
+                                'or could not be captured.')
             return
 
         editor = ScreenshotEditor(str(raw_path), self)
@@ -2391,7 +2450,7 @@ class MainWindow(QMainWindow):
         self.settings_manager.save_settings()
         # Stop the focus monitor — no game to track anymore
         self._focus_monitor.stop()
-        if self.bridge.is_connected():
+        if focus_pause_supported(sys.platform) and self.bridge.is_connected():
             self.bridge.resume_recording()
         self._restart_capture_engine()
         self.capture_card.show_prompt('Game closed — switched back to Desktop')
@@ -2408,7 +2467,8 @@ class MainWindow(QMainWindow):
         self.settings_manager.set('target_window_name', window_name)
         self.settings_manager.save_settings()
         # Update the focus monitor's target immediately if anticheat is enabled.
-        if (self.settings_manager.get('anticheat_detection_enabled', False)
+        if (focus_pause_supported(sys.platform)
+                and self.settings_manager.get('anticheat_detection_enabled', False)
                 and window_name):
             self._focus_monitor.set_target(window_name)
             self._focus_monitor.start()
@@ -2424,12 +2484,12 @@ class MainWindow(QMainWindow):
         self._pending_game_window = None
 
     def _on_focus_lost(self):
-        if self.bridge.is_connected():
+        if focus_pause_supported(sys.platform) and self.bridge.is_connected():
             self.bridge.pause_recording()
             self._set_status('PAUSED — GAME UNFOCUSED', status_warning_qss())
 
     def _on_focus_regained(self):
-        if self.bridge.is_connected():
+        if focus_pause_supported(sys.platform) and self.bridge.is_connected():
             self.bridge.resume_recording()
             # Resume is a request, not proof that fresh frames have returned.
             self._set_status('CAPTURE STARTING', status_idle_qss())
@@ -2440,15 +2500,77 @@ class MainWindow(QMainWindow):
 
     def _on_clip_length_changed(self, duration: int):
         self.clip_duration  = duration
-        self.buffer_seconds = max(duration, self.extended_clip_duration) + 2
+        self.buffer_seconds = compute_buffer_seconds(
+            duration, self.extended_clip_duration)
 
     def _on_extended_clip_length_changed(self, duration: int):
         self.extended_clip_duration = duration
-        self.buffer_seconds = max(self.clip_duration, duration) + 2
+        self.buffer_seconds = compute_buffer_seconds(
+            self.clip_duration, duration)
 
     def _on_framerate_changed(self, fps: int):        self.capture_fps = fps
     def _on_resolution_changed(self, w: int, h: int): self.capture_width, self.capture_height = w, h
     def _on_bitrate_changed(self, kbps: int):         self.capture_bitrate = kbps
+
+    def _on_audio_capture_changed(self, _enabled: bool):
+        self._restart_capture_engine()
+
+    def _sync_requested_capture_settings(self) -> bool:
+        try:
+            clip = validate_normal_clip_length(
+                int(self.settings_manager.get('clip_length', 30)))
+            extended = validate_extended_clip_length(
+                int(self.settings_manager.get('extended_clip_length', 60)))
+            fps = validate_fps(int(self.settings_manager.get('framerate', 60)))
+        except (TypeError, ValueError) as exc:
+            self.push_error(
+                'INVALID CAPTURE PRESET',
+                f'The preset was not applied: {exc}',
+                level='warning',
+            )
+            return False
+        resolution = self.settings_manager.get('resolution', 'source')
+        quality = self.settings_manager.get('bitrate_level', 'medium')
+        if resolution not in BITRATE_PRESETS or quality not in {'low', 'medium', 'high'}:
+            self.push_error(
+                'INVALID CAPTURE PRESET',
+                'The preset contains an unsupported resolution or quality.',
+                level='warning',
+            )
+            return False
+        self.clip_duration = clip
+        self.extended_clip_duration = extended
+        self.capture_fps = fps
+        self.capture_width, self.capture_height = _resolution_to_dims(resolution)
+        self.capture_bitrate = BITRATE_PRESETS[resolution][quality]
+        self.buffer_seconds = compute_buffer_seconds(clip, extended)
+        return True
+
+    def _requested_capture_config(self) -> CaptureConfig:
+        return CaptureConfig(
+            fps=self.capture_fps,
+            buffer_seconds=compute_buffer_seconds(
+                self.clip_duration, self.extended_clip_duration),
+            width=self.capture_width,
+            height=self.capture_height,
+            bitrate_kbps=self.capture_bitrate,
+            codec=self.settings_manager.get('codec_pref', 'auto'),
+            preset=int(self.settings_manager.get('encoder_preset', 4)),
+            monitor=self.settings_manager.get('capture_monitor', ''),
+            scaling=self.settings_manager.get('scaling_mode', 'stretch'),
+            audio_enabled=bool(
+                self.settings_manager.get('audio_capture_enabled', True)),
+            normal_clip_seconds=self.clip_duration,
+            extended_clip_seconds=self.extended_clip_duration,
+        )
+
+    def _apply_active_audio_state(self, config: CaptureConfig) -> None:
+        recorder = MicRecorder()
+        if config.audio_enabled:
+            if not recorder.is_running():
+                self._start_mic_recorder()
+        else:
+            recorder.stop()
 
     # =======================================================================
     # Engine lifecycle
@@ -2475,25 +2597,30 @@ class MainWindow(QMainWindow):
         return False
 
     def start_engine(self) -> bool:
+        launch_config = self._requested_capture_config()
+        self._capture_config.request(launch_config)
+        self._capture_config.begin_apply()
         if not self.engine_path or not self.engine_path.exists():
             print("Engine executable not found.")
             self._set_status('NO ENGINE', status_warning_qss())
             QTimer.singleShot(500, self._warn_no_engine)
+            self._capture_config.fail('engine executable not found')
+            self._restart_pending = False
             return False
 
         # Preserve the legacy raw-capacity budget as a diagnostic input. Public
         # alpha startup refuses hardware failure, but the engine reports how
         # short the old raw history would have been instead of claiming 30/60s.
-        actual_w = self.capture_width  if self.capture_width  else 1920
-        actual_h = self.capture_height if self.capture_height else 1080
+        actual_w = launch_config.width if launch_config.width else 1920
+        actual_h = launch_config.height if launch_config.height else 1080
         bytes_per_frame = actual_w * actual_h * 4
-        frames_needed   = self.buffer_seconds * self.capture_fps
+        frames_needed   = launch_config.buffer_seconds * launch_config.fps
         mb_needed       = max(64, (frames_needed * bytes_per_frame + (1024*1024-1)) // (1024*1024))
         max_buffer_mb   = min(int(mb_needed) + 64, 2048)   # hard 2 GB ceiling
 
         capture_mode    = self.settings_manager.get('capture_mode',    'desktop')
         target_hwnd     = self.settings_manager.get('target_hwnd',     0)
-        capture_monitor = self.settings_manager.get('capture_monitor', '')
+        capture_monitor = launch_config.monitor
         # target_hwnd comes from user-editable settings.json — never trust it.
         try:
             target_hwnd = int(target_hwnd)
@@ -2503,42 +2630,37 @@ class MainWindow(QMainWindow):
         hwnd_arg        = str(target_hwnd)
 
         # 0 = stretch (default), 1 = fit (letterbox/pillarbox)
-        scaling_mode = self.settings_manager.get('scaling_mode', 'stretch')
+        scaling_mode = launch_config.scaling
         scale_arg    = '1' if scaling_mode == 'fit' else '0'
 
-        print(f"Starting engine  |  FPS={self.capture_fps}  "
-              f"Buffer={self.buffer_seconds}s  "
-              f"Bitrate={self.capture_bitrate}kbps  Pool={max_buffer_mb}MB  "
+        print(f"Starting engine  |  FPS={launch_config.fps}  "
+              f"Buffer={launch_config.buffer_seconds}s  "
+              f"Bitrate={launch_config.bitrate_kbps}kbps  Pool={max_buffer_mb}MB  "
               f"Scale={scaling_mode}"
               + (f"  Monitor={capture_monitor}" if capture_monitor else ""))
         codec_pref_int = {
             'auto': 0, 'h264': 1, 'hevc': 2, 'av1': 3
-        }.get(self.settings_manager.get('codec_pref', 'auto'), 0)
-        encoder_preset = self.settings_manager.get('encoder_preset', 4)
-        multiband_enabled = self.settings_manager.get('multiband_audio_enabled', False)
-        if multiband_enabled:
-            self._write_audio_categories_json()
-        multiband_arg = '1' if multiband_enabled else '0'
-        audio_enabled = self.settings_manager.get('audio_capture_enabled', True)
-        audio_arg = '1' if audio_enabled else '0'
+        }.get(launch_config.codec, 0)
+        encoder_preset = launch_config.preset
+        multiband_arg = '0'
+        audio_arg = '1' if launch_config.audio_enabled else '0'
         try:
             # A process/backend restart starts a new replay generation. Keep the
             # one-per-incident recovery budget, but never carry stale buffer age.
             self._capture_health.reset(preserve_recovery_budget=True)
             popen_options = dict(_NO_WINDOW)
-            if sys.platform == 'win32':
-                self._close_engine_startup_output()
-                self._engine_startup_output = tempfile.TemporaryFile(
-                    mode='w+', encoding='utf-8', errors='replace')
-                popen_options.update(
-                    stdout=self._engine_startup_output,
-                    stderr=subprocess.STDOUT,
-                )
+            self._close_engine_startup_output()
+            self._engine_startup_output = tempfile.TemporaryFile(
+                mode='w+', encoding='utf-8', errors='replace')
+            popen_options.update(
+                stdout=self._engine_startup_output,
+                stderr=subprocess.STDOUT,
+            )
             self.engine_process = subprocess.Popen(
                 [str(self.engine_path),
-                 str(self.capture_fps), str(self.buffer_seconds),
-                 str(self.capture_width), str(self.capture_height),
-                 str(self.capture_bitrate), str(max_buffer_mb),
+                 str(launch_config.fps), str(launch_config.buffer_seconds),
+                 str(launch_config.width), str(launch_config.height),
+                 str(launch_config.bitrate_kbps), str(max_buffer_mb),
                  mode_arg, hwnd_arg, scale_arg, capture_monitor,
                  str(codec_pref_int), str(encoder_preset),
                  multiband_arg, audio_arg],
@@ -2560,8 +2682,17 @@ class MainWindow(QMainWindow):
                     if self._engine_gen != _my_gen:
                         return   # superseded by a newer start/restart
                     if self.bridge.initialize():
+                        startup_output = self._read_engine_startup_output()
+                        startup_warnings = extract_startup_warnings(startup_output)
+                        if startup_output.strip():
+                            print(startup_output.rstrip())
                         self._close_engine_startup_output()
-                        def _on_connected():
+                        def _on_connected(
+                                startup_warnings=startup_warnings):
+                            # Connection proves IPC only. Promote requested to
+                            # active after capture-health observes fresh frames.
+                            self._pending_launch_config = launch_config
+                            self._pending_launch_generation = _my_gen
                             self._set_status('CAPTURE STARTING', status_idle_qss())
                             self._set_rec_dot_state('disconnected')
                             QTimer.singleShot(2000, self._check_hardware_encoding_status)
@@ -2570,6 +2701,14 @@ class MainWindow(QMainWindow):
                                 from ui.capture_card import _play_sound, _SND_STARTUP
                                 vol = self.settings_manager.get('sound_volume_startup', 100)
                                 _play_sound(_SND_STARTUP, vol)
+                            for warning in startup_warnings:
+                                self.push_error(
+                                    warning.title,
+                                    warning.detail,
+                                    level='warning',
+                                    actions=[('OPEN AUDIO SETTINGS',
+                                              self._toggle_settings_page)],
+                                )
                         self._ui_call.emit(_on_connected)
                         print("Connected to capture engine.")
                         return
@@ -2585,6 +2724,8 @@ class MainWindow(QMainWindow):
                       f"{failure.detail}")
                 def _on_failed():
                     self.stop_engine()
+                    self._capture_config.fail(failure.detail)
+                    self._restart_pending = False
                     self._set_status('DISCONNECTED', status_warning_qss())
                     self.push_error(
                         failure.title,
@@ -2607,6 +2748,8 @@ class MainWindow(QMainWindow):
                 level='error',
                 actions=[('RESTART ENGINE', self._restart_capture_engine)],
             )
+            self._capture_config.fail(str(e))
+            self._restart_pending = False
             return False
 
     def _read_engine_startup_output(self) -> str:
@@ -2648,6 +2791,15 @@ class MainWindow(QMainWindow):
         self._close_engine_startup_output()
 
     def _restart_capture_engine(self):
+        if hasattr(self, '_save_state') and self._save_state.is_busy():
+            self._set_status('APPLYING AFTER CURRENT SAVE', status_idle_qss())
+            if not getattr(self, '_restart_deferred_for_save', False):
+                self._restart_deferred_for_save = True
+                def _retry_after_save():
+                    self._restart_deferred_for_save = False
+                    self._restart_capture_engine()
+                QTimer.singleShot(500, _retry_after_save)
+            return
         # Guard against button spam: each unguarded click would spawn another
         # engine process fighting over the same shared memory.
         if getattr(self, '_restart_pending', False):
@@ -2659,13 +2811,8 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(1000, self._finish_restart)
 
     def _on_encoder_config_changed(self):
-        codec  = self.settings_manager.get('codec_pref',     'auto')
-        preset = self.settings_manager.get('encoder_preset', 4)
-        if self.bridge.is_connected():
-            self.bridge.set_encoder_config(codec, preset)
-            self._set_status('APPLYING…', status_idle_qss())
-        else:
-            self._set_status('SAVED', status_idle_qss())
+        self._set_status('APPLYING / RESTARTING CAPTURE', status_idle_qss())
+        self._restart_capture_engine()
 
     def _write_audio_categories_json(self):
         """Write ~/.fthr/audio_categories.json for the C++ engine to read at startup."""
@@ -2697,9 +2844,7 @@ class MainWindow(QMainWindow):
 
     def _finish_restart(self):
         self.bridge = CaptureBridge()
-        try:
-            self.start_engine()
-        finally:
+        if not self.start_engine():
             self._restart_pending = False
 
     # =======================================================================
@@ -3049,20 +3194,17 @@ class MainWindow(QMainWindow):
             print(f'[Save] Late success accepted for {output_path.name} — the '
                   f'timeout warning was premature')
 
-        print(f'Clip saved: {output_path.name}')
-        self.clip_saved.emit(str(output_path))
+        print(f'Base clip committed: {output_path.name}')
         self.clip_grid._known_files = None
         self.clip_grid._load_clips()
-        self._set_status('SAVED', status_active_qss())
-        QTimer.singleShot(2000, self._update_status)
-        res_label = _dims_to_label(self.capture_width, self.capture_height)
-        self.capture_card.show_clip(duration_seconds, self.capture_fps, res_label)
 
         # Pick the post-processing route. Exactly one runs — see
         # select_post_route() for why that exclusivity is load-bearing.
+        active_config = self._capture_config.active
         route, has_async_mux = select_post_route(
-            audio_on=self.settings_manager.get('audio_capture_enabled', True),
-            multiband_enabled=self.settings_manager.get('multiband_audio_enabled', False),
+            audio_on=(active_config.audio_enabled if active_config else
+                      self.settings_manager.get('audio_capture_enabled', True)),
+            multiband_enabled=False,
             mic_running=(MicRecorder.is_available() and MicRecorder().is_running()),
             watermark=self.settings_manager.get('watermark_enabled', False),
             auto_crop=self.settings_manager.get('auto_crop_enabled', False),
@@ -3076,6 +3218,9 @@ class MainWindow(QMainWindow):
         clip_ready = self.upload_manager.notify_clip_saved(
             str(output_path), has_mic_mux=has_async_mux)
 
+        if has_async_mux:
+            self._set_status('FINALIZING…', status_idle_qss())
+
         args = (str(output_path), duration_seconds, mic_end_time, clip_ready)
         if route == 'mic':
             self._mux_mic_into_clip(*args)
@@ -3083,6 +3228,65 @@ class MainWindow(QMainWindow):
             self._mux_multiband_into_clip(*args)
         else:
             self._finalize_clip(*args)
+        if not has_async_mux:
+            self._publish_final_clip(str(output_path), duration_seconds)
+
+    def _record_finalization_warning(self, clip_path: str, message: str) -> None:
+        self._clip_readiness.record_warning(clip_path, message)
+
+    def _complete_clip_finalization(
+            self, clip_path: str, duration_seconds: int) -> None:
+        try:
+            usable = os.path.isfile(clip_path) and os.path.getsize(clip_path) > 0
+        except OSError:
+            usable = False
+        if usable:
+            self._clip_readiness.complete(clip_path)
+        else:
+            self._clip_readiness.finalization_failed(
+                clip_path,
+                'The final clip file is missing or empty.',
+                base_clip_usable=False,
+            )
+        self._ui_call.emit(
+            lambda: self._publish_final_clip(clip_path, duration_seconds))
+
+    def _publish_final_clip(self, clip_path: str, duration_seconds: int) -> None:
+        key = os.path.normcase(os.path.abspath(clip_path))
+        if key in self._published_final_clips:
+            return
+        self._published_final_clips.add(key)
+        if not self._clip_readiness.can_access(clip_path):
+            self._set_status('FINALIZATION FAILED', status_warning_qss())
+            self.push_error(
+                'CLIP FINALIZATION FAILED',
+                'The final clip file is unavailable. The base save was not '
+                'reported as a completed clip.',
+                level='error',
+            )
+            return
+
+        warnings = self._clip_readiness.warnings(clip_path)
+        print(f'Clip ready: {os.path.basename(clip_path)}')
+        self.clip_saved.emit(clip_path)
+        self.clip_grid._known_files = None
+        self.clip_grid._load_clips()
+        if warnings:
+            self._set_status('SAVED WITH WARNING', status_warning_qss())
+            self.push_error(
+                'CLIP SAVED WITH WARNING',
+                warnings[-1],
+                level='warning',
+            )
+        else:
+            self._set_status('SAVED', status_active_qss())
+        QTimer.singleShot(2000, self._update_status)
+        config = self._capture_config.active
+        fps = config.fps if config else self.capture_fps
+        width = config.width if config else self.capture_width
+        height = config.height if config else self.capture_height
+        self.capture_card.show_clip(
+            duration_seconds, fps, _dims_to_label(width, height))
 
     def _open_clips_folder(self):
         """Open ~/FTHR_Clips in the platform file manager."""
@@ -3142,12 +3346,15 @@ class MainWindow(QMainWindow):
             return
         # When multiband is active, _multiband_mux_worker owns clip_ready.
         # Don't touch the event here — it will be set in that worker's finally block.
-        if self.settings_manager.get('multiband_audio_enabled', False):
+        if effective_multiband_audio_enabled(
+                self.settings_manager.get('multiband_audio_enabled', False)):
             return
 
         if not MicRecorder.is_available() or not MicRecorder().is_running():
-            if clip_ready is not None:
-                clip_ready.set()
+            self._record_finalization_warning(
+                clip_path, 'Microphone capture stopped before finalization; '
+                'the base clip was retained.')
+            self._complete_clip_finalization(clip_path, duration_seconds)
             return
 
         self._spawn_mux_thread(
@@ -3162,7 +3369,18 @@ class MainWindow(QMainWindow):
         if not hasattr(self, '_mux_threads'):
             self._mux_threads = []
         self._mux_threads = [t for t in self._mux_threads if t.is_alive()]
-        t = threading.Thread(target=target, args=args, daemon=True)
+        def _run_and_publish():
+            try:
+                target(*args)
+            except Exception as exc:
+                clip_path = str(args[0])
+                print(f'[Finalize] Unhandled worker error: {exc}')
+                self._record_finalization_warning(
+                    clip_path, f'Optional clip processing failed: {exc}')
+            finally:
+                self._complete_clip_finalization(str(args[0]), int(args[1]))
+
+        t = threading.Thread(target=_run_and_publish, daemon=True)
         self._mux_threads.append(t)
         t.start()
         return t
@@ -3175,6 +3393,8 @@ class MainWindow(QMainWindow):
             ffmpeg = get_ffmpeg_exe()
         except FFmpegUnavailable as e:
             print(f'[Mic] {e} — skipping mic mux')
+            self._record_finalization_warning(
+                clip_path, 'Microphone mix was skipped because FFmpeg is unavailable.')
             if clip_ready is not None:
                 clip_ready.set()
             return
@@ -3197,6 +3417,8 @@ class MainWindow(QMainWindow):
                 time.sleep(0.25)
             else:
                 print(f'[Mic] Clip {clip_path} did not stabilize — skipping mux')
+                self._record_finalization_warning(
+                    clip_path, 'Microphone mix was skipped because the clip did not stabilize.')
                 return
 
             # Try to mix mic audio into the clip. Any failure is non-fatal:
@@ -3232,9 +3454,14 @@ class MainWindow(QMainWindow):
                                     print(f'[Mic] Mixed mic into {os.path.basename(clip_path)}')
                                 except OSError as e:
                                     print(f'[Mic] Could not replace clip: {e}')
+                                    self._record_finalization_warning(
+                                        clip_path, 'Microphone mix could not replace the base clip.')
                             else:
                                 err = result.stderr.decode(errors='replace').strip().splitlines()
                                 print(f'[Mic] ffmpeg failed: {err[-1] if err else "(no stderr)"}')
+                                self._record_finalization_warning(
+                                    clip_path, 'Microphone track could not be merged; '
+                                    'the base clip was retained.')
                                 self._ui_call.emit(lambda: self.push_error(
                                     'MIC AUDIO FAILED',
                                     'Microphone track could not be merged.'
@@ -3245,6 +3472,8 @@ class MainWindow(QMainWindow):
                                 ))
                         except subprocess.TimeoutExpired:
                             print('[Mic] ffmpeg timed out after 120s — skipping mux')
+                            self._record_finalization_warning(
+                                clip_path, 'Microphone mix timed out; the base clip was retained.')
                             self._ui_call.emit(lambda: self.push_error(
                                 'MIC AUDIO FAILED',
                                 'ffmpeg timed out. Clip saved without mic audio.',
@@ -3252,8 +3481,12 @@ class MainWindow(QMainWindow):
                             ))
                         except Exception as e:
                             print(f'[Mic] ffmpeg mux error: {e}')
+                            self._record_finalization_warning(
+                                clip_path, 'Microphone mix failed; the base clip was retained.')
             else:
                 print('[Mic] No mic samples for this clip window')
+                self._record_finalization_warning(
+                    clip_path, 'No microphone samples were available for this clip.')
 
             # Always apply post-processing to whatever clip exists now
             # (either the muxed version or the original if mux failed).
@@ -3375,6 +3608,8 @@ class MainWindow(QMainWindow):
             return
         from core.camera_recorder import CameraRecorder
         if not CameraRecorder.is_available() or not CameraRecorder().is_running():
+            self._record_finalization_warning(
+                clip_path, 'Camera overlay was requested but the camera was unavailable.')
             return
         import re as _re
         import tempfile as _tf
@@ -3385,6 +3620,8 @@ class MainWindow(QMainWindow):
         cam_tmp.close()
 
         if not CameraRecorder().write_segment(cam_path, clip_end_time, duration_sec, 30.0):
+            self._record_finalization_warning(
+                clip_path, 'Camera overlay could not be rendered; the base clip was retained.')
             try:
                 os.remove(cam_path)
             except FileNotFoundError:
@@ -3432,6 +3669,8 @@ class MainWindow(QMainWindow):
             else:
                 err = result.stderr.decode(errors='replace').strip().splitlines()
                 print(f'[Camera] ffmpeg failed: {err[-1] if err else "(no stderr)"}')
+                self._record_finalization_warning(
+                    clip_path, 'Camera overlay failed; the base clip was retained.')
                 self._ui_call.emit(lambda: self.push_error(
                     'CAMERA OVERLAY FAILED',
                     'FFmpeg error. Clip saved without camera overlay.',
@@ -3439,6 +3678,8 @@ class MainWindow(QMainWindow):
                 ))
         except Exception as e:
             print(f'[Camera] Error: {e}')
+            self._record_finalization_warning(
+                clip_path, 'Camera overlay failed; the base clip was retained.')
         finally:
             for p in (cam_path, out_path):
                 try:
@@ -3491,6 +3732,8 @@ class MainWindow(QMainWindow):
             else:
                 err = result.stderr.decode(errors='replace').strip().splitlines()
                 print(f'[Watermark] ffmpeg failed: {err[-1] if err else "(no stderr)"}')
+                self._record_finalization_warning(
+                    clip_path, 'Watermark failed; the base clip was retained.')
                 self._ui_call.emit(lambda: self.push_error(
                     'WATERMARK FAILED',
                     'Watermark could not be applied. Clip saved without it.',
@@ -3498,6 +3741,8 @@ class MainWindow(QMainWindow):
                 ))
         except Exception as e:
             print(f'[Watermark] Error: {e}')
+            self._record_finalization_warning(
+                clip_path, 'Watermark failed; the base clip was retained.')
             self._ui_call.emit(lambda: self.push_error(
                 'WATERMARK FAILED',
                 'Watermark could not be applied. Clip saved without it.',
@@ -3522,6 +3767,8 @@ class MainWindow(QMainWindow):
             )
         except Exception as e:
             print(f'[AutoCrop] cropdetect probe failed: {e} — skipping')
+            self._record_finalization_warning(
+                clip_path, 'Auto-crop analysis failed; the base clip was retained.')
             return
         matches = _re.findall(r'crop=(\d+:\d+:\d+:\d+)',
                               probe.stderr.decode(errors='replace'))
@@ -3561,6 +3808,8 @@ class MainWindow(QMainWindow):
             else:
                 err = result.stderr.decode(errors='replace').strip().splitlines()
                 print(f'[AutoCrop] ffmpeg failed: {err[-1] if err else "(no stderr)"}')
+                self._record_finalization_warning(
+                    clip_path, 'Auto-crop failed; the base clip was retained.')
                 self._ui_call.emit(lambda: self.push_error(
                     'AUTO-CROP FAILED',
                     'Auto-crop could not be applied. Clip saved uncropped.',
@@ -3568,6 +3817,8 @@ class MainWindow(QMainWindow):
                 ))
         except Exception as e:
             print(f'[AutoCrop] Error: {e}')
+            self._record_finalization_warning(
+                clip_path, 'Auto-crop failed; the base clip was retained.')
             self._ui_call.emit(lambda: self.push_error(
                 'AUTO-CROP FAILED',
                 'Auto-crop could not be applied. Clip saved uncropped.',
@@ -3601,6 +3852,8 @@ class MainWindow(QMainWindow):
                 ffmpeg = get_ffmpeg_exe()
             except FFmpegUnavailable as e:
                 print(f'[Finalize] {e} — skipping post-processing')
+                self._record_finalization_warning(
+                    clip_path, 'Optional processing was skipped because FFmpeg is unavailable.')
                 return
             deadline = time.monotonic() + max(duration_seconds * 2, 15)
             last_size = -1
@@ -3616,6 +3869,8 @@ class MainWindow(QMainWindow):
                 time.sleep(0.25)
             else:
                 print('[Finalize] Clip did not stabilize — skipping watermark')
+                self._record_finalization_warning(
+                    clip_path, 'Optional processing was skipped because the clip did not stabilize.')
                 return
             self._apply_crop(clip_path, ffmpeg)
             self._apply_watermark(clip_path, ffmpeg)
@@ -3637,6 +3892,11 @@ class MainWindow(QMainWindow):
         if proc is not None and proc.poll() is not None:
             code = proc.returncode
             self.engine_process = None
+            self._capture_config.deactivate(
+                f'capture engine exited unexpectedly (code {code})')
+            self._pending_launch_config = None
+            self._pending_launch_generation = None
+            self._restart_pending = False
             if self.bridge:
                 self.bridge.shutdown()
             self.bridge = CaptureBridge()
@@ -3688,8 +3948,11 @@ class MainWindow(QMainWindow):
         self._pump_save_responses()
         codec = self.bridge.get_active_codec()
         if codec:
-            preset = self.bridge.get_active_preset()
-            new_enc_text = f'{codec} — P{preset}'
+            if encoder_preset_supported(sys.platform):
+                preset = self.bridge.get_active_preset()
+                new_enc_text = f'{codec} — P{preset}'
+            else:
+                new_enc_text = codec
             lbl = self._settings_page_widget.active_encoder_lbl
             if lbl.text() != new_enc_text:
                 lbl.setText(new_enc_text)
@@ -3702,6 +3965,26 @@ class MainWindow(QMainWindow):
                 generation=status.get('capture_generation', 0),
             )
             self._capture_health_snapshot = snapshot
+            pending_config = getattr(self, '_pending_launch_config', None)
+            pending_generation = getattr(
+                self, '_pending_launch_generation', None)
+            if (pending_config is not None
+                    and pending_generation == self._engine_gen):
+                if snapshot.state in {
+                        CaptureHealthState.HEALTHY,
+                        CaptureHealthState.CONTENT_SUSPECT}:
+                    self._capture_config.succeed()
+                    self._restart_pending = False
+                    self._apply_active_audio_state(pending_config)
+                    self._pending_launch_config = None
+                    self._pending_launch_generation = None
+                elif snapshot.state in {
+                        CaptureHealthState.STALLED,
+                        CaptureHealthState.FAILED}:
+                    self._capture_config.fail(snapshot.reason)
+                    self._restart_pending = False
+                    self._pending_launch_config = None
+                    self._pending_launch_generation = None
             if snapshot.changed:
                 self._capture_health_log.info(
                     'Capture health: %s -> %s reason=%s frame_count=%d generation=%d '
@@ -3781,6 +4064,14 @@ class MainWindow(QMainWindow):
             self._last_status_style = style
 
     def _on_clip_opened(self, clip_path: str, thumb_pixmap: QPixmap, card_global_rect: QRect):
+        if not self._clip_readiness.can_access(clip_path):
+            self.push_error(
+                'CLIP STILL FINALIZING',
+                'Playback, editing and upload become available after optional '
+                'processing has finished.',
+                level='warning',
+            )
+            return
         # The file may have been deleted/renamed in the file manager while its
         # card was still visible — opening the viewer on a dead path gives a
         # black player window with a cryptic media error.
@@ -3798,7 +4089,8 @@ class MainWindow(QMainWindow):
         viewer = ClipViewer(clip_path, self.bridge, self, thumb_pixmap=thumb_pixmap,
                             settings_manager=self.settings_manager,
                             upload_enabled=upload_on,
-                            metadata_manager=self.clip_metadata_manager)
+                            metadata_manager=self.clip_metadata_manager,
+                            linked_import=self.clip_grid.is_linked_import(clip_path))
         viewer.upload_requested.connect(self.upload_manager.enqueue_upload)
         viewer.export_error.connect(self.push_error)
         viewer.showMaximized()
@@ -4185,6 +4477,7 @@ class _SettingsPage(QWidget):
     imported_folders_changed  = Signal()
     notification_monitor_changed = Signal()
     encoder_config_changed    = Signal()
+    audio_capture_changed     = Signal(bool)
 
     _AUTOSTART_KEY  = r'Software\Microsoft\Windows\CurrentVersion\Run'
     _AUTOSTART_NAME = 'FTHRClips'
@@ -4420,26 +4713,29 @@ class _SettingsPage(QWidget):
         self._upload_settings_widget = UploadSettingsWidget(self.sm, no_scroll=True)
         layout.addWidget(self._upload_settings_widget)
 
-        # -- Anticheat Detection --
-        layout.addSpacing(28)
-        layout.addWidget(_flat_section_header('Anticheat Detection'))
-        layout.addSpacing(12)
+        # Focus pause has no Windows replay implementation. Do not expose a
+        # control that would route through the unrelated legacy record toggle.
+        if focus_pause_supported(sys.platform):
+            layout.addSpacing(28)
+            layout.addWidget(_flat_section_header('Anticheat Detection'))
+            layout.addSpacing(12)
 
-        self.anticheat_check = QCheckBox('Pause recording when game is unfocused')
-        self.anticheat_check.setStyleSheet(checkbox_qss())
-        self.anticheat_check.setChecked(
-            self.sm.get('anticheat_detection_enabled', False))
-        self.anticheat_check.toggled.connect(self._on_anticheat_toggled)
-        layout.addWidget(self.anticheat_check)
-        layout.addSpacing(4)
+            self.anticheat_check = QCheckBox(
+                'Pause recording when game is unfocused')
+            self.anticheat_check.setStyleSheet(checkbox_qss())
+            self.anticheat_check.setChecked(
+                self.sm.get('anticheat_detection_enabled', False))
+            self.anticheat_check.toggled.connect(self._on_anticheat_toggled)
+            layout.addWidget(self.anticheat_check)
+            layout.addSpacing(4)
 
-        _at_hint = QLabel(
-            'Window capture only. Pauses the ring buffer when the game '
-            'is not in the foreground. Off by default.'
-        )
-        _at_hint.setWordWrap(True)
-        _at_hint.setStyleSheet(label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
-        layout.addWidget(_at_hint)
+            _at_hint = QLabel(
+                'Window capture only. Pauses the ring buffer when the game '
+                'is not in the foreground. Off by default.'
+            )
+            _at_hint.setWordWrap(True)
+            _at_hint.setStyleSheet(label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
+            layout.addWidget(_at_hint)
 
         # -- Settings Presets --
         layout.addSpacing(28)
@@ -4524,7 +4820,10 @@ class _SettingsPage(QWidget):
         rl.setContentsMargins(10, 6, 6, 6)
         rl.setSpacing(8)
 
-        path_lbl = QLabel(path)
+        display_path = path
+        if not os.path.isdir(path):
+            display_path += '  —  MISSING (remove link or reconnect drive)'
+        path_lbl = QLabel(display_path)
         path_lbl.setStyleSheet(label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
         path_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         rl.addWidget(path_lbl, 1)
@@ -4546,11 +4845,10 @@ class _SettingsPage(QWidget):
     def _remove_import_folder(self, path: str):
         if self.sm is None:
             return
-        folders = list(self.sm.get('imported_clip_folders', []))
-        if path in folders:
-            folders.remove(path)
-            self.sm.set('imported_clip_folders', folders)
-            self.sm.save_settings()
+        folders = remove_import_root(
+            self.sm.get('imported_clip_folders', []), path)
+        self.sm.set('imported_clip_folders', folders)
+        self.sm.save_settings()
         self._refresh_import_folders_list()
         self.imported_folders_changed.emit()
 
@@ -4562,11 +4860,10 @@ class _SettingsPage(QWidget):
         )
         if not folder or self.sm is None:
             return
-        folders = list(self.sm.get('imported_clip_folders', []))
-        if folder not in folders:
-            folders.append(folder)
-            self.sm.set('imported_clip_folders', folders)
-            self.sm.save_settings()
+        folders = add_import_root(
+            self.sm.get('imported_clip_folders', []), folder)
+        self.sm.set('imported_clip_folders', folders)
+        self.sm.save_settings()
         self._refresh_import_folders_list()
         # Remove from scan results if it was pending there
         self._scan_pending = [(n, p) for n, p in self._scan_pending if p != folder]
@@ -4584,11 +4881,16 @@ class _SettingsPage(QWidget):
             ('GeForce Experience',   Path.home() / 'Videos' / 'NVIDIA'),
             ('Nvidia Highlights',    Path.home() / 'Videos' / 'Nvidia Highlights'),
         ]
-        existing = set(self.sm.get('imported_clip_folders', []) if self.sm else [])
+        existing = {
+            os.path.normcase(os.path.realpath(path))
+            for path in (
+                self.sm.get('imported_clip_folders', []) if self.sm else [])
+        }
         found = [
             (name, str(path))
             for name, path in _known
-            if path.exists() and str(path) not in existing
+            if (path.exists()
+                and os.path.normcase(os.path.realpath(path)) not in existing)
         ]
 
         # Clear scan results area for fresh output
@@ -4672,11 +4974,10 @@ class _SettingsPage(QWidget):
 
     def _scan_add(self, software_name: str, path: str):
         if self.sm is not None:
-            folders = list(self.sm.get('imported_clip_folders', []))
-            if path not in folders:
-                folders.append(path)
-                self.sm.set('imported_clip_folders', folders)
-                self.sm.save_settings()
+            folders = add_import_root(
+                self.sm.get('imported_clip_folders', []), path)
+            self.sm.set('imported_clip_folders', folders)
+            self.sm.save_settings()
             self._refresh_import_folders_list()
         self._scan_pending = [(n, p) for n, p in self._scan_pending if p != path]
         self._rebuild_scan_results()
@@ -4931,7 +5232,8 @@ class _SettingsPage(QWidget):
         outer.addSpacing(24)
         outer.addWidget(_settings_hsep())
         outer.addSpacing(20)
-        outer.addWidget(_flat_section_header('Multiband Audio'))
+        mb_header = _flat_section_header('Multiband Audio')
+        outer.addWidget(mb_header)
         outer.addSpacing(8)
 
         mb_desc = QLabel(
@@ -4944,7 +5246,7 @@ class _SettingsPage(QWidget):
 
         self.multiband_check = QCheckBox('Enable Multiband Audio')
         self.multiband_check.setStyleSheet(checkbox_qss())
-        self.multiband_check.setChecked(self.sm.get('multiband_audio_enabled', False))
+        self.multiband_check.setChecked(False)
         self.multiband_check.toggled.connect(self._on_multiband_toggled)
         outer.addWidget(self.multiband_check)
         outer.addSpacing(12)
@@ -4957,7 +5259,7 @@ class _SettingsPage(QWidget):
         self._cat_rows = []
         self._rebuild_category_rows(mb_inner)
         outer.addWidget(self.multiband_container)
-        self.multiband_container.setVisible(self.sm.get('multiband_audio_enabled', False))
+        self.multiband_container.setVisible(False)
 
         # Recognised app→category label (updated by timer when page is visible)
         self.mappings_lbl = QLabel('Detected apps: —')
@@ -4981,6 +5283,14 @@ class _SettingsPage(QWidget):
         add_row.addWidget(self.new_cat_patterns, 2)
         add_row.addWidget(add_btn)
         outer.addLayout(add_row)
+
+        # Retain the implementation for the planned audio rework, but remove
+        # every activation surface from the public alpha.
+        for widget in (
+                mb_header, mb_desc, self.multiband_check,
+                self.multiband_container, self.mappings_lbl,
+                self.new_cat_name, self.new_cat_patterns, add_btn):
+            widget.setVisible(False)
 
         # Timer to refresh mappings label every 2s while page is visible
         self._mappings_timer = QTimer(self)
@@ -5052,6 +5362,7 @@ class _SettingsPage(QWidget):
             self._cat_rows.append((name_lbl, slider, val_lbl, del_btn))
 
     def _on_multiband_toggled(self, checked: bool):
+        checked = effective_multiband_audio_enabled(checked)
         self.sm.set('multiband_audio_enabled', checked)
         self.sm.save_settings()
         self.multiband_container.setVisible(checked)
@@ -5073,6 +5384,7 @@ class _SettingsPage(QWidget):
     def _on_audio_capture_toggled(self, checked: bool):
         self.sm.set('audio_capture_enabled', checked)
         self.sm.save_settings()
+        self.audio_capture_changed.emit(checked)
 
     def _on_watermark_toggled(self, checked: bool):
         self.sm.set('watermark_enabled', checked)
@@ -5195,10 +5507,19 @@ class _SettingsPage(QWidget):
         data = self._presets_mgr.load(name)
         if data is None:
             return
-        for k, v in data.items():
+        filtered = filter_alpha_preset(data)
+        previous = {key: self.sm.get(key) for key in filtered}
+        for k, v in filtered.items():
             self.sm.set(k, v)
-        self.sm.save_settings()
         main_win = self.window()
+        if (hasattr(main_win, '_sync_requested_capture_settings')
+                and not main_win._sync_requested_capture_settings()):
+            for key, value in previous.items():
+                self.sm.set(key, value)
+            if hasattr(main_win, 'cap_settings_popup'):
+                main_win.cap_settings_popup.reload_from_settings()
+            return
+        self.sm.save_settings()
         if hasattr(main_win, 'cap_settings_popup'):
             main_win.cap_settings_popup.reload_from_settings()
         if hasattr(main_win, '_restart_capture_engine'):
@@ -5461,15 +5782,7 @@ class _SettingsPage(QWidget):
         layout.setContentsMargins(0, 0, 16, 32)
         layout.setSpacing(0)
 
-        layout.addWidget(_flat_section_header('Startup'))
-        layout.addSpacing(12)
-
-        self.splash_check = QCheckBox('Enable startup splash screen')
-        self.splash_check.setChecked(True)
-        layout.addWidget(self.splash_check)
-
         # -- Camera Overlay --
-        layout.addSpacing(28)
         layout.addWidget(_flat_section_header('Camera Overlay'))
         layout.addSpacing(12)
 
@@ -5615,6 +5928,10 @@ class _SettingsPage(QWidget):
         self.encoder_preset_combo.setStyleSheet(_COMBO_STYLE)
         saved_preset = self.sm.get('encoder_preset', 4)
         self.encoder_preset_combo.setCurrentIndex(max(0, min(6, saved_preset - 1)))
+        if not encoder_preset_supported(sys.platform):
+            self.encoder_preset_combo.setEnabled(False)
+            self.encoder_preset_combo.setToolTip(
+                'Windows encoder presets are not configurable in this alpha.')
         layout.addLayout(_row('PRESET', self.encoder_preset_combo))
         layout.addSpacing(8)
 
@@ -5635,10 +5952,23 @@ class _SettingsPage(QWidget):
         self.codec_combo.currentIndexChanged.connect(self._on_encoder_setting_changed)
         self.encoder_preset_combo.currentIndexChanged.connect(self._on_encoder_setting_changed)
 
-        enc_note = QLabel('Applying will briefly interrupt recording and clear the current buffer.')
+        note_text = 'Applying restarts capture and clears the current replay history.'
+        if not encoder_preset_supported(sys.platform):
+            note_text += ' Windows encoder preset selection is unavailable.'
+        enc_note = QLabel(note_text)
         enc_note.setStyleSheet(label_body(Colors.TEXT_DIM,
             Fonts.SIZE_SMALL if hasattr(Fonts, 'SIZE_SMALL') else Fonts.SIZE_BODY))
         layout.addWidget(enc_note)
+
+        if sys.platform == 'win32':
+            qualification = QLabel(
+                'Alpha hardware qualification: NVIDIA same-adapter verified. '
+                'AMD and Intel are code-ready but hardware-unverified. '
+                'Hybrid/cross-adapter capture is not supported.')
+            qualification.setWordWrap(True)
+            qualification.setStyleSheet(
+                label_body(Colors.TEXT_MUTED, Fonts.SIZE_BODY))
+            layout.addWidget(qualification)
 
         layout.addSpacing(28)
         layout.addWidget(_settings_hsep())
@@ -5663,7 +5993,9 @@ class _SettingsPage(QWidget):
     def _on_encoder_apply(self):
         codec_map = {0: 'auto', 1: 'h264', 2: 'hevc', 3: 'av1'}
         codec  = codec_map.get(self.codec_combo.currentIndex(), 'auto')
-        preset = self.encoder_preset_combo.currentIndex() + 1   # 0-indexed combo → 1-7
+        preset = self.encoder_preset_combo.currentIndex() + 1
+        if not encoder_preset_supported(sys.platform):
+            preset = int(self.sm.get('encoder_preset', 4))
         self.sm.set('codec_pref',     codec)
         self.sm.set('encoder_preset', preset)
         self.sm.save_settings()
@@ -5710,9 +6042,10 @@ class _SettingsPage(QWidget):
         layout.addWidget(_flat_section_header('Available Versions'))
         layout.addSpacing(12)
 
-        latest_lbl = QLabel('You are on the latest version.')
-        latest_lbl.setStyleSheet(label_body(Colors.ACCENT, Fonts.SIZE_BODY_L))
-        layout.addWidget(latest_lbl)
+        update_lbl = QLabel(
+            'Updates: Manual\nAutomatic update checks are not available yet.')
+        update_lbl.setStyleSheet(label_body(Colors.TEXT_MUTED, Fonts.SIZE_BODY_L))
+        layout.addWidget(update_lbl)
 
         layout.addStretch()
         return page

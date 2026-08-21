@@ -1,4 +1,7 @@
-from core.engine_startup_diagnostics import extract_startup_failure
+from core.engine_startup_diagnostics import (
+    extract_startup_failure,
+    extract_startup_warnings,
+)
 
 
 def test_extracts_last_structured_engine_failure():
@@ -24,3 +27,15 @@ def test_detail_is_bounded_for_ui_display():
     failure = extract_startup_failure(output)
 
     assert len(failure.detail) == 1000
+
+
+def test_extracts_linux_video_only_audio_warning():
+    output = (
+        'FTHR_STARTUP_WARNING: DESKTOP_AUDIO_UNAVAILABLE: '
+        'Default output monitor could not be opened; capture continues video-only.\n')
+
+    warnings = extract_startup_warnings(output)
+
+    assert len(warnings) == 1
+    assert warnings[0].code == 'DESKTOP_AUDIO_UNAVAILABLE'
+    assert 'video-only' in warnings[0].detail

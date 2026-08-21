@@ -53,6 +53,27 @@ class ClipReadinessRegistry:
             handle.state = ClipReadinessState.READY
             handle.event.set()
 
+    def record_warning(
+        self, path: str | os.PathLike[str], message: str
+    ) -> None:
+        handle = self._get_or_create(path)
+        with self._lock:
+            handle.warning_messages.append(str(message))
+
+    def complete(self, path: str | os.PathLike[str]) -> None:
+        handle = self._get_or_create(path)
+        with self._lock:
+            handle.state = (
+                ClipReadinessState.READY_WITH_WARNING
+                if handle.warning_messages
+                else ClipReadinessState.READY
+            )
+            handle.event.set()
+
+    def is_tracked(self, path: str | os.PathLike[str]) -> bool:
+        with self._lock:
+            return _key(path) in self._handles
+
     def finalization_failed(
         self,
         path: str | os.PathLike[str],

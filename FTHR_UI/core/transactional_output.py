@@ -29,4 +29,5 @@ def discard_staged_output(staged_path: str | os.PathLike[str]) -> None:
     try:
         Path(staged_path).unlink()
     except FileNotFoundError:
+        # Cleanup is idempotent; another cancellation path may have removed it.
         pass

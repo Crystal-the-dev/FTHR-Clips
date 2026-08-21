@@ -50,9 +50,9 @@ except Exception:
 # at internally, so we dodge a resample. Mono because it's a mic, not an orchestra.
 SAMPLE_RATE = 48000
 BLOCK_SIZE  = 1024
-# Keep 90s of mic in RAM. That's comfortably longer than any clip length the UI
-# offers, with slack. Costs ~17MB of float32. cope, you have 16 gigs.
-KEEP_SECONDS = 90
+# Match the truthful maximum replay duration. Mono float32 at 48 kHz costs
+# about 58 MB at five minutes and is allocated gradually as samples arrive.
+KEEP_SECONDS = 300
 
 
 class MicRecorder:

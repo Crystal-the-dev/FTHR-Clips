@@ -38,13 +38,11 @@ def test_exactly_one_route_for_every_settings_combination(combo):
     assert isinstance(has_async, bool)
 
 
-def test_mic_and_multiband_are_mutually_exclusive():
-    """Both enabled: multiband wins, the mic mux must not also run. Running
-    both would have two ffmpeg workers rewriting the same file."""
+def test_legacy_multiband_request_cannot_activate_during_alpha():
     route, _ = select_post_route(
         audio_on=True, multiband_enabled=True, mic_running=True,
         watermark=False, auto_crop=False, camera=False)
-    assert route == 'multiband'
+    assert route == 'mic'
 
 
 def test_mic_route_only_when_mic_is_actually_running():
@@ -90,15 +88,19 @@ def test_finalize_defers_upload_when_it_will_rewrite_the_file(flag):
 
 
 def test_mux_routes_always_defer_the_upload():
-    for kwargs, expected in (
-        (dict(audio_on=True, multiband_enabled=False, mic_running=True,
-              watermark=False, auto_crop=False, camera=False), 'mic'),
-        (dict(audio_on=True, multiband_enabled=True, mic_running=False,
-              watermark=False, auto_crop=False, camera=False), 'multiband'),
-    ):
-        route, has_async = select_post_route(**kwargs)
-        assert route == expected
-        assert has_async is True
+    route, has_async = select_post_route(
+        audio_on=True, multiband_enabled=False, mic_running=True,
+        watermark=False, auto_crop=False, camera=False)
+    assert route == 'mic'
+    assert has_async is True
+
+
+def test_gated_multiband_does_not_create_fake_async_work():
+    route, has_async = select_post_route(
+        audio_on=True, multiband_enabled=True, mic_running=False,
+        watermark=False, auto_crop=False, camera=False)
+    assert route == 'finalize'
+    assert has_async is False
 
 
 def test_completion_handler_dispatches_one_route_only():

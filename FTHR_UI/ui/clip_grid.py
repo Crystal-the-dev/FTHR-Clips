@@ -38,6 +38,7 @@ from core.clip_files import (
     is_completed_video_path,
     is_library_media_path,
 )
+from core.library_ownership import MediaOwnership, classify_media_path
 
 
 class _DropdownCombo(QComboBox):
@@ -386,19 +387,25 @@ class ClipThumbnail(QFrame):
     upload_requested = Signal(str)
 
     def __init__(self, file_path: str, is_video: bool = True, imported: bool = False,
-                 upload_enabled: bool = False, uploaded: bool = False, parent=None):
+                 upload_enabled: bool = False, uploaded: bool = False,
+                 ready: bool = True, parent=None):
         super().__init__(parent)
         self.file_path      = file_path
         self.is_video       = is_video
         self.imported       = imported
         self.upload_enabled = upload_enabled
         self.uploaded       = uploaded
+        self.ready          = ready
         self.setObjectName('clipCard')
         self.setFixedSize(_CARD_W, _CARD_H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self._fade_anim: QPropertyAnimation | None = None
         self._setup_ui()
+        if not self.ready:
+            self.share_btn.setEnabled(False)
+            self.menu_btn.setEnabled(False)
+            self.setCursor(Qt.CursorShape.ArrowCursor)
         if not is_video:
             self._load_image_thumbnail()
 
@@ -465,6 +472,14 @@ class ClipThumbnail(QFrame):
             imp.move(8, _THUMB_H - imp.height() - 8)
             imp.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             self._imported_badge_h = imp.height() + 4   # used to stack UPLOADED above it
+
+        if not self.ready:
+            finalizing = QLabel('FINALIZING', thumb)
+            finalizing.setStyleSheet(
+                'color: white; background: rgba(180,110,0,220); '
+                'padding: 3px 7px; font-weight: bold;')
+            finalizing.adjustSize()
+            finalizing.move(8, 8)
 
         # "UPLOADED" badge — pre-created, shown/hidden dynamically
         self._upload_badge = QLabel('UPLOADED', thumb)
@@ -605,7 +620,7 @@ class ClipThumbnail(QFrame):
 
     def _on_share_click(self):
         # Share is wired through ClipViewer for now — open the viewer
-        if self.is_video:
+        if self.is_video and self.ready:
             px = self.thumb_label.pixmap() or QPixmap()
             global_rect = QRect(self.mapToGlobal(QPoint(0, 0)), self.size())
             self.opened.emit(self.file_path, px, global_rect)
@@ -622,7 +637,10 @@ class ClipThumbnail(QFrame):
         else:
             upload_act = None
         menu.addSeparator()
-        del_act = menu.addAction('Delete')
+        del_act = menu.addAction(
+            'Linked original — managed outside FTHR'
+            if self.imported else 'Delete')
+        del_act.setEnabled(not self.imported)
         action = menu.exec(self.menu_btn.mapToGlobal(QPoint(0, self.menu_btn.height())))
         if action == open_act:
             self._on_share_click()
@@ -643,6 +661,18 @@ class ClipThumbnail(QFrame):
             self._confirm_delete()
 
     def _confirm_delete(self):
+        if not self.ready:
+            return
+        ownership = classify_media_path(
+            self.file_path, os.path.expanduser('~/FTHR_Clips'), [])
+        if self.imported or ownership is not MediaOwnership.FTHR_OWNED:
+            QMessageBox.information(
+                self,
+                'Linked Original Protected',
+                'Imported files stay in their original folder. FTHR will not '
+                'delete this file with the generic Delete action.',
+            )
+            return
         reply = QMessageBox.question(
             self, 'Delete',
             f'Delete {os.path.basename(self.file_path)}?',
@@ -716,7 +746,10 @@ class ClipThumbnail(QFrame):
         else:
             upload_act = None
         menu.addSeparator()
-        del_act = menu.addAction('Delete')
+        del_act = menu.addAction(
+            'Linked original — managed outside FTHR'
+            if self.imported else 'Delete')
+        del_act.setEnabled(not self.imported)
         action = menu.exec(event.globalPos())
         if action == open_act:
             self._on_share_click()
@@ -777,6 +810,8 @@ class ClipThumbnail(QFrame):
             self.duration_label.move(_CARD_W - self.duration_label.width() - 10, 10)
 
     def mousePressEvent(self, event):
+        if not self.ready:
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             # Don't trigger card-open if the click was on a child button —
             # those handle their own actions. We can detect by checking the
@@ -811,6 +846,7 @@ class ClipGrid(QWidget):
         self._sm              = settings_manager
         self._upload_checker  = None   # callable(path) -> bool
         self._upload_enabled  = None   # callable() -> bool
+        self._readiness_checker = None  # callable(path) -> bool
         self.clips_dir      = os.path.expanduser('~/FTHR_Clips')
         self.thumbnails     = []
         self._thumb_widgets = {}
@@ -854,6 +890,13 @@ class ClipGrid(QWidget):
         self.refresh_timer.timeout.connect(self._load_clips)
         self.refresh_timer.start(30000)
 
+    def is_linked_import(self, path: str) -> bool:
+        target = os.path.normcase(os.path.realpath(path))
+        return any(
+            os.path.normcase(os.path.realpath(candidate)) == target
+            for candidate in self._imported_files
+        )
+
     def set_upload_checker(self, checker):
         """checker(path: str) -> bool  — True if the clip has been uploaded."""
         self._upload_checker = checker
@@ -861,6 +904,9 @@ class ClipGrid(QWidget):
     def set_upload_enabled_checker(self, checker):
         """checker() -> bool  — True if uploads are enabled (shows Upload menu item)."""
         self._upload_enabled = checker
+
+    def set_readiness_checker(self, checker):
+        self._readiness_checker = checker
 
     def refresh_theme(self):
         for card in self._thumb_widgets.values():
@@ -1365,11 +1411,15 @@ class ClipGrid(QWidget):
         for i, fp in enumerate(files):
             is_video = is_completed_video_path(fp)
             uploaded = bool(self._upload_checker and self._upload_checker(fp))
+            ready = bool(
+                self._readiness_checker(fp)
+                if self._readiness_checker else True)
             thumb = ClipThumbnail(
                 fp, is_video=is_video,
                 imported=fp in self._imported_files,
                 upload_enabled=upload_enabled,
                 uploaded=uploaded,
+                ready=ready,
             )
             thumb.opened.connect(self.clip_opened.emit)
             thumb.clicked.connect(
@@ -1382,7 +1432,7 @@ class ClipGrid(QWidget):
             if not self._in_transition:
                 thumb.fade_in(delay_ms=min((starting_idx + i) * 35, 600))
 
-            if is_video:
+            if is_video and ready:
                 worker = _ThumbnailWorker(fp)
                 worker.signals.finished.connect(self._on_thumb_ready)
                 self._thread_pool.start(worker)

@@ -43,6 +43,15 @@ class CaptureConfig:
     monitor: str
     scaling: str
     audio_enabled: bool
+    normal_clip_seconds: int = 30
+    extended_clip_seconds: int = 60
+
+
+def compute_buffer_seconds(normal_seconds: int, extended_seconds: int) -> int:
+    """Return a native-safe ring size while retaining the usual safety margin."""
+    normal = validate_normal_clip_length(normal_seconds)
+    extended = validate_extended_clip_length(extended_seconds)
+    return min(300, max(normal, extended) + 2)
 
 
 class ApplyStatus(Enum):
@@ -82,5 +91,11 @@ class CaptureConfigTracker:
         self.error = ''
 
     def fail(self, error: str) -> None:
+        self.status = ApplyStatus.FAILED
+        self.error = str(error)
+
+    def deactivate(self, error: str) -> None:
+        """Record that no running engine owns the previous active snapshot."""
+        self.active = None
         self.status = ApplyStatus.FAILED
         self.error = str(error)

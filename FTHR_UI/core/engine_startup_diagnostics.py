@@ -8,6 +8,10 @@ _STARTUP_FAILURE = re.compile(
     r'^FTHR_STARTUP_ERROR:\s*([A-Z0-9_]+):\s*(.+)$',
     re.MULTILINE,
 )
+_STARTUP_WARNING = re.compile(
+    r'^FTHR_STARTUP_WARNING:\s*([A-Z0-9_]+):\s*(.+)$',
+    re.MULTILINE,
+)
 _MAX_DETAIL_LENGTH = 1000
 
 
@@ -16,6 +20,24 @@ class EngineStartupFailure:
     code: str
     title: str
     detail: str
+
+
+@dataclass(frozen=True)
+class EngineStartupWarning:
+    code: str
+    title: str
+    detail: str
+
+
+def extract_startup_warnings(output: str) -> tuple[EngineStartupWarning, ...]:
+    return tuple(
+        EngineStartupWarning(
+            code=match.group(1),
+            title=match.group(1).replace('_', ' '),
+            detail=match.group(2).strip()[:_MAX_DETAIL_LENGTH],
+        )
+        for match in _STARTUP_WARNING.finditer(output or '')
+    )
 
 
 def extract_startup_failure(output: str) -> EngineStartupFailure:

@@ -62,3 +62,16 @@ def test_existing_untracked_clip_is_ready_by_default(tmp_path):
 
     assert registry.can_access(str(clip))
     assert registry.state(str(clip)) is ClipReadinessState.READY
+
+
+def test_recorded_optional_warning_is_published_at_completion(tmp_path):
+    clip = tmp_path / 'clip.mp4'
+    clip.write_bytes(b'valid base')
+    registry = ClipReadinessRegistry()
+    registry.engine_committed(str(clip), needs_finalization=True)
+
+    registry.record_warning(str(clip), 'watermark failed')
+    registry.complete(str(clip))
+
+    assert registry.state(str(clip)) is ClipReadinessState.READY_WITH_WARNING
+    assert registry.warnings(str(clip)) == ('watermark failed',)
