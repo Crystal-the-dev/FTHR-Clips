@@ -147,7 +147,11 @@ shortcut · uninstaller (removes `%APPDATA%\fthr`).
 
 - DXGI desktop capture requires Windows 10 or later.
 - Global hotkeys work unprivileged on Windows.
-- NVENC is auto-detected at runtime, falling back to software encoding.
+- The selected monitor and encoder must belong to the same adapter. NVIDIA is
+  physically qualified; AMD/Intel are code-ready but require their own hardware
+  qualification. Hybrid/cross-adapter fallback is deliberately refused.
+- Windows encoder backends currently own their preset choice; the alpha UI does
+  not expose a P1–P7 selector that the engine would ignore.
 
 ---
 
@@ -245,18 +249,20 @@ FTHRclips <fps> <buffer_s> <w> <h> <bitrate_kbps> <_> <_> <_> <scaling>
 FTHRcapture_linux/build/FTHRclips 30 10 1280 720 6000 0 0 0 0 "" 0 4 0 1
 ```
 
-Capture backends are tried in order: `wlr-screencopy` → `ext-image-copy-capture`
-→ `x11grab`. The engine logs which one it selected. No root is required.
+The alpha build tries `wlr-screencopy` and then
+`ext-image-copy-capture`. FFmpeg `x11grab` is compiled out by default because
+AUDIT-044 has no proven bounded-cancellation path. Unsupported sessions fail
+clearly after bounded recovery instead of falling back to X11. Developers can
+compile the known-unbounded backend only with
+`-DFTHR_EXPERIMENTAL_X11GRAB=ON`; such a build is not an alpha release build.
 
 ### 4. Audio
 
-The engine captures the default PulseAudio monitor source (PipeWire's PulseAudio
-compatibility layer works). To select a specific source:
-
-```bash
-PULSE_SOURCE=alsa_output.pci-0000_00_1f.3.analog-stereo.monitor \
-  FTHRcapture_linux/build/FTHRclips ...
-```
+The engine resolves the PulseAudio default **sink**, then opens that sink's
+`monitor_source_name` (PipeWire's PulseAudio compatibility layer works). It
+never treats the default microphone/source as desktop audio. Resolution/open is
+performed synchronously; failure emits a structured startup warning and capture
+continues video-only.
 
 On some distributions your user must be in the `audio` group:
 

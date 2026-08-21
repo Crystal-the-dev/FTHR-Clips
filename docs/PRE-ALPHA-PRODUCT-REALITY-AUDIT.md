@@ -1038,3 +1038,90 @@ The 22 decisions in section 34 cover cohort/vendor support, audio model and devi
 ### 18. Is the current product internally coherent enough for the planned alpha?
 
 **NO.** The qualified Windows/NVIDIA capture-and-save core is coherent, but the product surface around it is not yet: several controls promise inactive behavior, audio has incompatible platform models, final readiness is ambiguous, external import ownership is unsafe, and broad hardware/Linux claims outrun runtime evidence. A short, explicitly scoped product-truth pass can make a NVIDIA-first alpha viable; a broad Windows-and-Linux alpha cannot responsibly ship from this exact state.
+
+## Fix-pass status update — 2026-08-21
+
+This addendum records the later Product Truth / Broken Feature Fix Pass. It does
+not rewrite the baseline findings above. Current source at `2b46cb4` supersedes
+the old-behavior descriptions where the table below says resolved or hidden.
+
+| Finding | Current status | Current behavior |
+|---|---|---|
+| Linked/imported original deletion | **RESOLVED** | Imported roots remain links. Normalized real-path ownership disables and hard-guards generic Delete; removing a root only unregisters it. |
+| Duration/FPS truth | **RESOLVED** | Both replay durations stop at 300 seconds, FPS at 240, and the native launch ring never exceeds 300 seconds. Invalid persisted values are rejected to documented defaults rather than silently clamped. |
+| Codec/quality/duration/FPS/resolution/monitor/audio Apply | **RESOLVED** | These are requested values until a full engine restart produces a matching fresh healthy generation. Failure preserves the requested value but does not label it active. |
+| Windows P1–P7 preset | **HIDDEN FOR ALPHA** | Windows backends do not consume the preset argv consistently, so the selector and invented active-P4 label are disabled. |
+| Clip final readiness | **RESOLVED** | Native `CLIP_SAVED` remains the atomic base-commit boundary. Application readiness gates thumbnails, playback, edit, upload and delete until optional work reaches READY, READY_WITH_WARNING or FINALIZATION_FAILED. |
+| Upload 60-second race | **RESOLVED** | Every upload entry point waits on the readiness registry; an elapsed timeout/event alone cannot promote intermediate bytes. |
+| Optional processing result | **RESOLVED** | A usable base survives optional failure and is published once as READY_WITH_WARNING; a missing/empty final file is FINALIZATION_FAILED. |
+| Windows focus pause | **HIDDEN FOR ALPHA** | No legacy start/stop command is presented as replay focus pause. |
+| Linux hotkey instructions | **RESOLVED** | Hyprland/KDE/GNOME/generic instructions use the resolved owner-only runtime socket and never `/tmp/fthr_hotkey.sock`. |
+| Fake latest-version / splash setting | **RESOLVED** | Updates are described as manual; the dead startup-splash control is removed. |
+| Screenshot monitor | **RESOLVED IN SOURCE** | Screenshot uses the active capture monitor. A selected-but-missing target fails explicitly rather than silently using the primary display. Representative Linux runtime remains unverified. |
+| Normal Linux desktop audio | **RESOLVED IN SOURCE** | The engine resolves the default sink and opens its monitor source synchronously. It never substitutes the default microphone; open failure produces a video-only startup warning. Real desktop/audio-content qualification remains open. |
+| Multiband and semantic per-source controls | **DEFERRED TO AUDIO REWORK / HIDDEN FOR ALPHA** | UI, presets, post-route and Linux native startup all force the feature off. Legacy implementation files remain isolated. The editor exposes master volume only and does not fabricate Game/Discord/Browser/Music identities. |
+| Local export publication | **RESOLVED** | FFmpeg writes a unique same-directory staging file and atomically replaces the final name only after success; cancellation/failure removes the stage. |
+| AUDIT-044 X11 cancellation | **STILL OPEN; MITIGATED FOR ALPHA** | `x11grab` is excluded by default. Unsupported X11/Wayland sessions fail clearly and exit after bounded recovery. The experimental opt-in is not release-eligible. No worker/subprocess or Shared Memory change was introduced. |
+| AMD / Intel / hybrid qualification | **STILL OPEN** | AMD and Intel remain code-ready/automated-tested. Physical AMD, Intel and hybrid results do not exist. |
+| Linux public support | **STILL OPEN** | Build/tests and bounded failure are proven; real wlroots/GNOME/KDE visible capture, audio content, hotkeys and current AppImage lifecycle are not. |
+| Installer lifecycle and signing | **STILL OPEN** | The current-source installer install/launch/capture/relaunch/uninstall flow was not run. The binaries are not code-signed; signing/reputation is an owner decision. |
+
+### Fix-pass verification actually performed
+
+- Python: **450 passed, 34 skipped** on Windows; Ruff and `compileall` passed.
+- Windows Release x64: MSBuild passed. Native suite: **82 scenarios / 149
+  checks** passed, including replay policy and AMD/Intel failure/policy matrices.
+- Current NVIDIA runtime: RTX 4060 Ti, same adapter, native NVENC H.264/HEVC/AV1.
+  Each codec produced warm-up, measured 30.016-second, measured 60.010-second
+  and two rapid saves; all 15 files fully decoded, carried one audio stream and
+  left no partial file. This does not qualify AMD, Intel, hybrid, GUI settings,
+  screenshot or installer lifecycle.
+- Linux development build: succeeded under WSL with system FFmpeg; native CTest
+  **10/10 passed**. A pure-X11 smoke opened `RDPSink.monitor`, refused x11grab,
+  exhausted three recoveries and exited cleanly. This is not a representative
+  compositor/audio-content test and not the pinned Release/AppImage build.
+- Source licence/asset gate: **76 checks, 0 failed, 1 warning** (Linux pinned
+  FFmpeg not vendored in this Windows checkout). Existing Windows artifact
+  licence/Qt/asset gate: **84 checks, 0 failed**; that artifact predates this
+  source fix and is not a current functional package build.
+- Version, Shared Memory v4, response publication, exception baseline,
+  repository hygiene and generated-asset gates passed. No ABI change occurred.
+
+### Updated release conclusion
+
+The product-truth correction itself is **PASS**. The code is coherent enough for
+the planned UI redesign, but no public tag is justified yet: the current GUI and
+installer lifecycle were not exercised, signing remains undecided, and broad
+Windows/Linux qualification is incomplete. NVIDIA is the only hardware cohort
+with current physical codec/save evidence.
+
+## MULTI-AUDIO REWORK HANDOFF
+
+- **Current platform implementations:** Windows captures the selected render
+  device through event-driven WASAPI loopback into one system mix. Linux normal
+  capture uses PulseAudio/pipewire-pulse `pa_simple` against the default sink's
+  monitor source. Python `sounddevice` captures one optional microphone. The
+  legacy Linux multiband code creates category sinks/PCM buffers but is disabled
+  at every alpha boundary; Windows has no equivalent implementation.
+- **Clock domains:** Windows system PCM carries WASAPI QPC positions in
+  100-nanosecond units, shared with video selection. Linux video and normal
+  audio segments use `CLOCK_MONOTONIC` nanoseconds. Python microphone chunks use
+  `time.monotonic()` plus frame-count-derived 48 kHz positions. These domains
+  are not one cross-platform clock contract.
+- **Reusable current APIs:** Windows `AudioCapture`, `AudioRingBuffer` snapshot
+  selection and `AudioEncoder`; Linux `AudioCapture::Start/Stop/ExtractSegment`;
+  Python `MicRecorder.extract_segment`/WAV writer; the application clip-readiness
+  registry and same-directory atomic replacement helpers.
+- **Libraries and formats:** Windows uses WASAPI plus FFmpeg AAC. Linux uses
+  libpulse/`pa_simple` for float32 stereo 48 kHz PCM and FFmpeg AAC/muxing.
+  Python uses `sounddevice`/NumPy for mono float32 48 kHz microphone PCM and the
+  bundled FFmpeg tools for `amix`/MP4 replacement.
+- **Current mux capability:** Normal output is one MP4 audio stream. Windows and
+  Linux system audio is already a mix; the optional microphone is later mixed
+  into that stream. Legacy Linux category buffers can be extracted before save,
+  but the old route collapses them and does not preserve semantic tracks.
+- **Legacy behavior not to preserve accidentally:** application rerouting to
+  null sinks, fabricated Game/Discord/Browser/Music identities, platform-only
+  category semantics, destructive deletion of category evidence, double-applied
+  gain, settings/native activation split, and treating one mixed AAC stream as
+  independent editable tracks.

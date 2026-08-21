@@ -9,6 +9,7 @@ AUDIO_H = (ROOT / 'FTHRcapture_linux/src/audio_capture.h').read_text()
 BACKEND_CPP = (ROOT / 'FTHRcapture_linux/src/capture_backend.cpp').read_text()
 CMAKE = (ROOT / 'FTHRcapture_linux/CMakeLists.txt').read_text()
 MAIN_CPP = (ROOT / 'FTHRcapture_linux/src/main.cpp').read_text()
+SYSTEM_REPORT = (ROOT / 'tools/linux_system_report.sh').read_text()
 
 
 def test_auto_desktop_audio_resolves_default_sink_monitor():
@@ -40,3 +41,9 @@ def test_x11grab_is_default_off_and_compilation_is_conditional():
     assert ' OFF)' in option[:160]
     assert '#if FTHR_EXPERIMENTAL_X11GRAB' in BACKEND_CPP
     assert 'x11grab disabled for alpha' in BACKEND_CPP
+
+
+def test_linux_report_does_not_advertise_x11_fallback():
+    assert 'then x11grab' not in SYSTEM_REPORT
+    assert "'x11grab'          'disabled for alpha" in SYSTEM_REPORT
+    assert 'no alpha-safe backend (X11/x11grab disabled)' in SYSTEM_REPORT

@@ -20,6 +20,11 @@ Without it most reports are not actionable.
 | ~~**Bare-name external tool calls**~~ | Resolved 2026-08-06. `hyprctl`, `xdotool`, `xprop`, `grim`, `nc` and `xdg-open` were invoked by bare name, so `PATH` decided which binary ran and a missing tool surfaced as a swallowed `FileNotFoundError`. Now resolved once to an absolute path through `core/linux_tools.py`, cached, logged at startup, with required/optional classification. 13 new tests including `PATH` shadowing. |
 | ~~**Short replay saves**~~ (AUDIT-042) | Resolved 2026-08-14. Timestamp-driven selection retains the preceding keyframe and uses MP4 edit-list presentation instead of discarding footage through the next keyframe. Real WGC/NVENC saves at 30 s and 60 s were exact and fully decoded; see `docs/AUDIT-042-SHORT-SAVE-DURATION.md`. |
 | ~~**Linux FFmpeg header/library ABI mismatch**~~ (AUDIT-046) | Resolved 2026-08-14. Release linked pinned FFmpeg 8.1 libraries but could compile against system headers. CMake now gives the engine and FFmpeg-backed tests the pinned include directory; the actual-MP4 test exposed and verifies the fix. |
+| ~~**Product settings claimed inactive values**~~ | Resolved for the alpha surface 2026-08-21. Replay/FPS limits now match both engines, restart-required settings keep requested and active values separate, and a setting becomes active only after a fresh healthy capture generation. Windows's ignored P1–P7 selector is hidden. |
+| ~~**Linked imports could delete originals**~~ | Resolved 2026-08-21. Imported folders remain links, but ownership is classified with normalized real paths and generic Delete is disabled/guarded for external originals. Removing a folder from FTHR only removes the registration. |
+| ~~**Base save was exposed as final bytes**~~ | Resolved 2026-08-21. Engine `CLIP_SAVED` still means atomic base commit; the application now gates playback/edit/upload/delete/thumbnail work until optional processing reaches a terminal readiness state. |
+| ~~**Linux default source could be a microphone**~~ | Resolved in source 2026-08-21. Normal capture resolves the default sink's monitor source and otherwise reports video-only; real GNOME/KDE/wlroots runtime content remains unverified. |
+| ~~**No-backend Linux process remained alive**~~ | Resolved 2026-08-21. Recovery exhaustion now ends the engine. Native CTest and a pure-X11 WSL smoke both terminate within the bound. |
 
 ## Unverified — treat as unknown, not as working
 
@@ -29,15 +34,11 @@ Without it most reports are not actionable.
   measured **all black** (luma min 0, max 0, one distinct value). XWayland under
   WSLg has no root-window content to grab. The plumbing works; the picture is
   unproven. See `docs/SUPPORTED_PLATFORMS.md`.
-- **The Linux engine does not exit promptly when no display backend exists.**
-  With both `DISPLAY` and `WAYLAND_DISPLAY` removed it reports the missing
-  backend and exhausts three recovery attempts, but the host process remains
-  alive beyond the test's eight-second bound. The full Linux Python suite
-  therefore has one failure; AUDIT-013 did not modify that C++ lifecycle path.
 - **No real Linux desktop was tested**: Hyprland, KDE Plasma, GNOME and bare
-  metal X11 are all `NOT RUN`. Neither Wayland capture backend
-  (`wlr-screencopy`, `ext-image-copy-capture`) has ever succeeded — WSLg's
-  Weston implements neither, so only the x11grab fallback was exercised.
+  metal are all `NOT RUN`. Neither Wayland capture backend
+  (`wlr-screencopy`, `ext-image-copy-capture`) has succeeded in a representative
+  desktop session. Historical WSLg/x11grab evidence does not qualify the current
+  alpha build because x11grab is now disabled.
 - **No Linux hotkey has ever fired.** The Hyprland auto-config path
   (`~/.config/hypr/fthr-hotkeys.conf` + `hyprctl reload`) is untested.
 - **No visible desktop GUI walkthrough was performed** this cycle. The real
@@ -74,10 +75,11 @@ Without it most reports are not actionable.
   `$XDG_RUNTIME_DIR/fthr/` (dir `0700`, socket `0600`), falling back to
   `~/.fthr/run/`. A stale `/tmp/fthr_hotkey.sock` from an older build is removed
   on startup **only** if it is a dead socket you own.
-- Wayland capture needs `wlr-screencopy` (wlroots compositors: Hyprland, Sway,
-  river) or `ext-image-copy-capture`. **KWin and Mutter implement neither**, so
-  KDE and GNOME fall back to x11grab via XWayland. The engine reports which
-  backend it chose.
+- Wayland capture needs `wlr-screencopy` (wlroots compositors such as Hyprland,
+  Sway and river) or `ext-image-copy-capture`. If the running compositor exposes
+  neither protocol, the alpha engine reports that no safe backend is available
+  and exits after bounded recovery. X11/x11grab is deliberately disabled while
+  AUDIT-044 remains open.
 - Optional tools (`hyprctl`, `xdotool`, `xprop`, `grim`, `nc`, `xdg-open`) are
   resolved once through `PATH` to an absolute path and logged at startup. A
   missing tool now produces a message naming the tool, what breaks, and what to
@@ -98,8 +100,9 @@ Without it most reports are not actionable.
   engine. If no window is visible, end the running `FTHRClips` process.
 - **The UI can freeze for up to 1 second** when saving if the engine is
   unresponsive. Known (AUDIT-011), not yet fixed.
-- **Failures are often silent.** 34 code paths swallow their errors, so a
-  feature can stop working with nothing in the log. Being fixed.
+- Some optional/cleanup failures remain log-only. The exception gate tracks the
+  reviewed baseline; final clip-processing failures now surface a READY WITH
+  WARNING or FINALIZATION FAILED result instead of unconditional success.
 - **AUDIT-047 (P2): Linux encoded snapshot copies hold the ring mutex.** A
   synthetic 60-second/16-Mbps snapshot held it for about 54 ms; a future change
   should move the deep copy outside the global producer lock.
@@ -120,4 +123,6 @@ relying on any of these:
 
 - Community / Get Invite / Account buttons are visual only.
 - Auto-clipping is not enabled.
-- Per-source volume sliders persist but only affect multi-track clips.
+- Multiband/per-source controls are hidden and forcibly disabled for alpha.
+  Legacy Linux implementation code remains for the clean-sheet audio rework,
+  but cannot be activated by old settings or presets.

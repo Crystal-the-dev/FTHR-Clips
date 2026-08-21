@@ -4,19 +4,22 @@
 executed by anyone on this project. It is not a prediction that it will fail —
 it is a statement that nobody knows.
 
-Last updated: 2026-08-06.
+Last updated: 2026-08-21.
 
 ## Summary
 
 | Platform | State |
 |---|---|
-| Windows 10/11 x64 | Built and bundled; **not exercised at runtime this cycle** |
-| Linux — engine, IPC, clip pipeline | **Verified** on Ubuntu 24.04 / WSL2 / XWayland |
-| Linux — real desktop capture (visible pixels) | **NOT VERIFIED** — see the caveat below |
-| Linux — Hyprland / KDE / GNOME / bare-metal Wayland | `NOT RUN` |
+| Windows 10 x64 + same-adapter NVIDIA | **Physically verified** on RTX 4060 Ti: native H.264/HEVC/AV1, audio, 30/60-second saves |
+| Windows + AMD / Intel | Code-integrated and automated-tested; physical hardware `NOT RUN` |
+| Windows hybrid/cross-adapter | Unsupported for alpha; no CPU full-frame fallback |
+| Linux — engine, IPC and bounded failure | **Verified** on Ubuntu 24.04 / WSL2 |
+| Linux — real Wayland desktop capture (visible pixels) | **NOT VERIFIED** |
+| Linux — X11 | Disabled for alpha while AUDIT-044 remains open |
 
-FTHR Clips is **not** "Linux supported". Exactly one Linux environment has been
-exercised, and it is an unusual one.
+FTHR Clips must not be advertised as broadly Linux-supported. The current Linux
+build is experimental and requires a compositor that exposes one of the two
+implemented Wayland capture protocols.
 
 ## The environment that was actually tested
 
@@ -29,8 +32,8 @@ exercised, and it is an unusual one.
 | Display server | WSLg Weston (Wayland) + XWayland (`WAYLAND_DISPLAY=wayland-0`, `DISPLAY=:0`) |
 | Desktop environment | none (`XDG_CURRENT_DESKTOP` unset) |
 | Compositor | Weston (RDP backend) |
-| Capture backend used | **x11grab**, via the X11 fallback |
-| Audio | PulseAudio 17.0 via `/mnt/wslg/PulseServer` (RDPSink / RDPSource) |
+| Capture backend used | No current safe video backend: WSLg exposes neither supported Wayland protocol; x11grab is disabled |
+| Audio | PulseAudio 17.0 via `/mnt/wslg/PulseServer`; current smoke resolved `RDPSink.monitor` |
 | GPU | NVIDIA GeForce RTX 4060 Ti, driver 610.62 (WSL passthrough) |
 | Encoder used | `av1_nvenc` (hardware) |
 | Python | CPython 3.12.3 |
@@ -49,44 +52,47 @@ bash tools/linux_system_report.sh
 
 ### The caveat that matters most
 
-The capture pipeline works end to end: the engine grabs frames, the ring buffer
-fills, NVENC encodes, and a valid, fully decodable MP4 is written. **But the
-pixels in those frames are black.** Measured directly:
+An older build exercised the XWayland/x11grab pipeline end to end and wrote a
+decodable MP4, but **its pixels were black**. Measured directly:
 
 ```
 first frame luma: min 0, max 0, mean 0.0, distinct values 1
 ```
 
-XWayland under WSLg has no real root-window content for `x11grab` to read.
-So this proves the *plumbing*, not the *picture*. Nobody has yet confirmed that
-FTHR Clips records what is actually on a Linux screen.
+XWayland under WSLg had no real root-window content for `x11grab` to read. That
+historical result proved plumbing, not a picture, and does not apply to the
+current alpha build because x11grab is disabled. Nobody has yet confirmed that
+the current Wayland build records visible content on a representative desktop.
 
 ## Support matrix
 
 | Distro | Desktop | Display server | Compositor | Capture backend | Audio | Hotkey method | Tested | Notes |
 |---|---|---|---|---|---|---|---|---|
-| Ubuntu 24.04 | none | Wayland + XWayland | Weston (WSLg) | **x11grab** | PulseAudio | socket only (no compositor binds) | **YES** — engine, IPC, clip save, audio | Frames are black; WSLg has no wlr-screencopy |
+| Ubuntu 24.04 | none | Wayland + XWayland | Weston (WSLg) | none in alpha | Pulse monitor opens | socket only (no compositor binds) | **YES** — build, IPC, audio-open and bounded failure only | No supported Wayland protocol; x11grab disabled |
 | Arch / any | Hyprland | Wayland | Hyprland | wlr-screencopy | PipeWire | auto-written binds + socket | `NOT RUN` | The primary intended target; auto-config code is untested |
-| Any | KDE Plasma | Wayland | KWin | wlr-screencopy ✗ / ext-image-copy-capture | PipeWire | **manual** — see below | `NOT RUN` | KWin does not implement wlr-screencopy |
-| Any | GNOME | Wayland | Mutter | ext-image-copy-capture | PipeWire | **manual** | `NOT RUN` | Mutter does not implement wlr-screencopy |
-| Any | any | X11 | any | x11grab | PulseAudio/PipeWire | **manual** | Partially — backend exercised under XWayland only | Never tested on a real X11 session |
+| Any | KDE Plasma | Wayland | KWin | ext-image-copy-capture if compositor exposes it | PipeWire | **manual** — see below | `NOT RUN` | Unsupported when the protocol is absent |
+| Any | GNOME | Wayland | Mutter | ext-image-copy-capture if compositor exposes it | PipeWire | **manual** | `NOT RUN` | Unsupported when the protocol is absent |
+| Any | any | X11 | any | disabled | PulseAudio/PipeWire | **manual** | bounded-rejection smoke only | AUDIT-044 open; experimental compile opt-in is not an alpha build |
 | Any | any | Wayland | anything else | none available | — | — | `NOT RUN` | Engine reports this clearly and exits the Wayland path |
 
 ### Wayland backend availability
 
-The engine tries, in order: `wlr-screencopy` → `ext-image-copy-capture` → `x11grab`.
-Observed on WSLg Weston:
+The alpha engine tries, in order: `wlr-screencopy` →
+`ext-image-copy-capture`. Observed on WSLg Weston:
 
 ```
 [WlrBackend] zwlr_screencopy_manager_v1 not available — compositor must support wlr-screencopy
 [ExtBackend] ext-image-copy-capture not available
-[Backend] No Wayland capture backend available
-[Backend] Using x11grab
+[Backend] x11grab disabled for alpha: AUDIT-044 bounded cancellation unresolved
+[Backend] No capture backend available on this system
+[Capture] Recovery exhausted after 3 attempts
+[FTHR] Capture backend stopped; exiting engine
 ```
 
-That is the intended, legible failure path for an unsupported compositor, and it
-works. The X11 fallback is load-bearing on any non-wlroots desktop and must not
-be removed.
+That is the intended, bounded failure path for an unsupported compositor. A
+developer may compile the known-unbounded historical backend with
+`FTHR_EXPERIMENTAL_X11GRAB=ON`, but that binary is not eligible for alpha
+packaging or support claims.
 
 ## Hotkeys
 

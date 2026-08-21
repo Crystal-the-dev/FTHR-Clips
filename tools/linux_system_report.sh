@@ -56,9 +56,10 @@ if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
 fi
 # Which capture backend the engine will pick, by the same rule it uses.
 if [ -n "${WAYLAND_DISPLAY:-}" ]; then
-    _kv 'engine will try'  'wlr-screencopy, then ext-image-copy-capture, then x11grab'
+    _kv 'engine will try'  'wlr-screencopy, then ext-image-copy-capture'
+    _kv 'x11grab'          'disabled for alpha (AUDIT-044 bounded cancellation unresolved)'
 else
-    _kv 'engine will try'  'x11grab'
+    _kv 'engine will try'  'no alpha-safe backend (X11/x11grab disabled)'
 fi
 
 # ---------------------------------------------------------------------------
