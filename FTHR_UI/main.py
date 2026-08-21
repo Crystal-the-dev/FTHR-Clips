@@ -116,6 +116,7 @@ from core.capture_health import (
     evaluate_save_admission,
 )
 from core.diagnostics import get_logger
+from core.engine_startup_diagnostics import extract_startup_failure
 from core.clip_files import cleanup_stale_partial_clips, is_completed_video_path
 from core.save_state import (SaveStateMachine, EngineEvent, OutcomeKind)
 from core.hotkey_manager import HotkeyManager
@@ -1627,6 +1628,7 @@ class MainWindow(QMainWindow):
         self.buffer_seconds = max(self.clip_duration, self.extended_clip_duration) + 2
 
         self.engine_process = None
+        self._engine_startup_output = None
         self.bridge         = CaptureBridge()
         self._capture_health = CaptureHealthMonitor()
         self._capture_health_snapshot = None
@@ -2479,9 +2481,9 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(500, self._warn_no_engine)
             return False
 
-        # Calculate x264 fallback FramePool budget from ACTUAL capture resolution,
-        # not worst-case 4K. Cap at 2 GB — above that the user is better served
-        # by buying an NVIDIA card than by allocating half their RAM to a ring buffer.
+        # Preserve the legacy raw-capacity budget as a diagnostic input. Public
+        # alpha startup refuses hardware failure, but the engine reports how
+        # short the old raw history would have been instead of claiming 30/60s.
         actual_w = self.capture_width  if self.capture_width  else 1920
         actual_h = self.capture_height if self.capture_height else 1080
         bytes_per_frame = actual_w * actual_h * 4
@@ -2523,6 +2525,15 @@ class MainWindow(QMainWindow):
             # A process/backend restart starts a new replay generation. Keep the
             # one-per-incident recovery budget, but never carry stale buffer age.
             self._capture_health.reset(preserve_recovery_budget=True)
+            popen_options = dict(_NO_WINDOW)
+            if sys.platform == 'win32':
+                self._close_engine_startup_output()
+                self._engine_startup_output = tempfile.TemporaryFile(
+                    mode='w+', encoding='utf-8', errors='replace')
+                popen_options.update(
+                    stdout=self._engine_startup_output,
+                    stderr=subprocess.STDOUT,
+                )
             self.engine_process = subprocess.Popen(
                 [str(self.engine_path),
                  str(self.capture_fps), str(self.buffer_seconds),
@@ -2531,7 +2542,7 @@ class MainWindow(QMainWindow):
                  mode_arg, hwnd_arg, scale_arg, capture_monitor,
                  str(codec_pref_int), str(encoder_preset),
                  multiband_arg, audio_arg],
-                **_NO_WINDOW
+                **popen_options
             )
             # Poll for connection in a background thread so the UI stays responsive.
             # Up to 3s total (20 × 150ms). On success, fire UI updates back on
@@ -2549,6 +2560,7 @@ class MainWindow(QMainWindow):
                     if self._engine_gen != _my_gen:
                         return   # superseded by a newer start/restart
                     if self.bridge.initialize():
+                        self._close_engine_startup_output()
                         def _on_connected():
                             self._set_status('CAPTURE STARTING', status_idle_qss())
                             self._set_rec_dot_state('disconnected')
@@ -2561,16 +2573,22 @@ class MainWindow(QMainWindow):
                         self._ui_call.emit(_on_connected)
                         print("Connected to capture engine.")
                         return
+                    if (self.engine_process is not None
+                            and self.engine_process.poll() is not None):
+                        break
                 # initialize() never succeeded — kill the orphaned process
                 if self._engine_gen != _my_gen:
                     return   # a newer start owns the engine now — don't kill it
-                print("Engine did not respond — terminating.")
+                failure = extract_startup_failure(
+                    self._read_engine_startup_output())
+                print(f"Engine did not respond — {failure.code}: "
+                      f"{failure.detail}")
                 def _on_failed():
                     self.stop_engine()
                     self._set_status('DISCONNECTED', status_warning_qss())
                     self.push_error(
-                        'ENGINE NOT RESPONDING',
-                        'Connection failed. The engine may not be running.',
+                        failure.title,
+                        failure.detail,
                         level='error',
                         actions=[('RESTART ENGINE', self._restart_capture_engine)],
                     )
@@ -2591,6 +2609,26 @@ class MainWindow(QMainWindow):
             )
             return False
 
+    def _read_engine_startup_output(self) -> str:
+        stream = self._engine_startup_output
+        if stream is None:
+            return ''
+        try:
+            stream.flush()
+            stream.seek(0)
+            return stream.read()
+        except (OSError, ValueError):
+            return ''
+
+    def _close_engine_startup_output(self):
+        stream = self._engine_startup_output
+        self._engine_startup_output = None
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
     def stop_engine(self):
         if self.bridge:
             self.bridge.shutdown()
@@ -2607,6 +2645,7 @@ class MainWindow(QMainWindow):
             self.engine_process = None
         else:
             pass  # no known PID — do not kill by name to avoid affecting other instances
+        self._close_engine_startup_output()
 
     def _restart_capture_engine(self):
         # Guard against button spam: each unguarded click would spawn another
@@ -3796,9 +3835,10 @@ class MainWindow(QMainWindow):
         if not is_hw:
             self.push_error(
                 'HARDWARE ENCODING UNAVAILABLE',
-                'No NVENC/AMF/QSV encoder found. Using software x264 (higher CPU).',
-                level='warning',
-                actions=[('OPEN SETTINGS', self._toggle_settings_page)],
+                'No hardware replay encoder is active. Capture must be restarted; '
+                'FTHR does not silently switch to a shorter raw replay buffer.',
+                level='error',
+                actions=[('RESTART ENGINE', self._restart_capture_engine)],
             )
             print(f"[UI] Hardware encoding not available (codec: {codec or 'unknown'})")
         else:
