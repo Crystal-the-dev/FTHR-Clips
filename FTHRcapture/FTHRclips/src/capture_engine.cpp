@@ -244,6 +244,8 @@ namespace fthr {
         else
             std::cout << target_width_ << "x" << target_height_ << std::endl;
         std::cout << "  Bitrate    : " << bitrate_kbps_ << " kbps" << std::endl;
+        std::cout << "  Codec      : " << VideoCodecName(config.video_codec)
+                  << std::endl;
 
         // ------------------------------------------------------------------
         // Select capture backend based on config.capture_mode.
@@ -334,10 +336,7 @@ namespace fthr {
         hw_cfg.fps = fps_;
         hw_cfg.bitrate_kbps = bitrate_kbps_;
 
-        // Stage 2 keeps the production selection intentionally fixed to the
-        // current native NVIDIA H.264 implementation. HEVC/AV1 are modeled for
-        // ring/mux work but the factory refuses to construct them.
-        replay_encoder_ = CreateProductionReplayEncoder(VideoCodec::H264);
+        replay_encoder_ = CreateProductionReplayEncoder(config.video_codec);
 
         // Select NVENC path based on D3D11 adapter situation:
         //   nvidia_device_ = true  → DXGI and NVENC share the same NVIDIA device (GPU zero-copy)
@@ -369,6 +368,14 @@ namespace fthr {
             nvenc_active_ = false;
         }
 
+        if (!nvenc_active_ && config.video_codec != VideoCodec::H264) {
+            std::cerr << "[CaptureEngine] Requested "
+                      << VideoCodecName(config.video_codec)
+                      << " could not initialize on the selected NVIDIA device. "
+                         "Refusing a silent H.264 fallback." << std::endl;
+            return false;
+        }
+
         if (nvenc_active_) {
             // Capacity: 2x time-based frame count gives comfortable headroom.
             // At 1080p/60fps/30s: 3600 slots × ~33KB avg = ~120MB.
@@ -383,7 +390,11 @@ namespace fthr {
             // Publish codec, geometry, timing, packet format and decoder
             // configuration as one immutable stream description.
             const auto video_config = replay_encoder_->GetVideoConfig();
-            encoded_ring_->SetVideoConfig(video_config);
+            if (!encoded_ring_->SetVideoConfig(video_config)) {
+                std::cerr << "[CaptureEngine] Could not publish immutable encoded "
+                             "stream configuration" << std::endl;
+                return false;
+            }
             if (video_config.codec_extradata.empty()) {
                 std::cerr << "[CaptureEngine] WARNING: encoded video config "
                              "has no codec extradata - MP4 files may not play "

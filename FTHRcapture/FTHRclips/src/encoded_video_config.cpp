@@ -15,9 +15,10 @@ const char* VideoCodecName(VideoCodec codec) noexcept {
 bool IsMp4PacketFormatCompatible(const EncodedVideoConfig& config) noexcept {
     switch (config.codec) {
     case VideoCodec::H264:
-    case VideoCodec::HEVC:
         return config.packet_format
             == EncodedPacketFormat::LengthPrefixedNalUnits;
+    case VideoCodec::HEVC:
+        return config.packet_format == EncodedPacketFormat::AnnexBNalUnits;
     case VideoCodec::AV1:
         return config.packet_format == EncodedPacketFormat::LowOverheadObu;
     }

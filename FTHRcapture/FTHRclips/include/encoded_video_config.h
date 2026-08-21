@@ -17,9 +17,12 @@ enum class VideoCodec : uint32_t {
 };
 
 enum class EncodedPacketFormat : uint32_t {
-    // Four-byte big-endian NAL length prefixes; used by AVC/H.264 and HEVC
-    // samples in MP4. Decoder configuration lives in codec_extradata.
+    // Four-byte big-endian NAL length prefixes; used by AVC/H.264 samples in
+    // MP4. Decoder configuration lives in codec_extradata.
     LengthPrefixedNalUnits,
+    // HEVC Annex B access units. The pinned FFmpeg MP4 muxer converts them to
+    // length-prefixed samples and builds hvcC from Annex B VPS/SPS/PPS.
+    AnnexBNalUnits,
     // AV1 low-overhead OBU samples with av1C decoder configuration.
     LowOverheadObu,
 };
@@ -70,11 +73,10 @@ bool IsMp4PacketFormatCompatible(const EncodedVideoConfig& config) noexcept;
 int64_t DurationInVideoTicks(
     const EncodedVideoConfig& config, uint32_t seconds) noexcept;
 
-// Stage 2 deliberately keeps the production matrix unchanged. The factory
-// also enforces this gate; HEVC and AV1 are representable for ring/mux tests
-// but cannot be selected by CaptureEngine yet.
 constexpr bool IsProductionReplayCodecEnabled(VideoCodec codec) noexcept {
-    return codec == VideoCodec::H264;
+    return codec == VideoCodec::H264
+        || codec == VideoCodec::HEVC
+        || codec == VideoCodec::AV1;
 }
 
 } // namespace fthr

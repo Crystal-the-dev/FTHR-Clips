@@ -84,6 +84,9 @@ namespace fthr {
         uint32_t target_height = 0;
         uint32_t bitrate_kbps = 16000;
         uint32_t max_buffer_mb = 512;
+        // argv[11]: Auto and explicit H.264 both resolve to H.264 for this
+        // NVIDIA stage; explicit HEVC/AV1 must never silently become H.264.
+        VideoCodec video_codec = VideoCodec::H264;
 
         // Capture mode — set at startup, requires engine restart to change.
         enum class CaptureModeEnum : uint32_t { DESKTOP = 0, WINDOW = 1 };
@@ -149,6 +152,11 @@ namespace fthr {
         bool     IsRecording()   const;
         uint64_t GetFrameCount() const;
         bool     IsNvencActive() const { return nvenc_active_; }
+        VideoCodec GetActiveVideoCodec() const {
+            return nvenc_active_ && replay_encoder_
+                ? replay_encoder_->GetActiveEncoderInfo().codec
+                : VideoCodec::H264;
+        }
         uint32_t GetCaptureHealthFlags() const { return capture_health_flags_.load(); }
         uint32_t GetCaptureGeneration() const { return capture_generation_.load(); }
         uint32_t GetContentSampleSequence() const { return content_sample_sequence_.load(); }

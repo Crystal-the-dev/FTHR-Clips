@@ -61,13 +61,20 @@ void EncodedRingBuffer::Push(
     publication_cv_.notify_all();
 }
 
-void EncodedRingBuffer::SetVideoConfig(const EncodedVideoConfig& config) {
+bool EncodedRingBuffer::SetVideoConfig(const EncodedVideoConfig& config) {
     std::lock_guard<std::mutex> lock(video_config_mutex_);
+    if (video_config_set_ && !(video_config_ == config)) {
+        std::cerr << "[EncodedRingBuffer] Rejected stream config change within "
+                     "one capture generation" << std::endl;
+        return false;
+    }
     video_config_ = config;
+    video_config_set_ = true;
     std::cout << "[EncodedRingBuffer] Video config set: "
               << VideoCodecName(config.codec) << ' '
               << config.width << 'x' << config.height << ", "
               << config.codec_extradata.size() << " config bytes" << std::endl;
+    return true;
 }
 
 EncodedRingSnapshot EncodedRingBuffer::TakeSnapshotByTime(

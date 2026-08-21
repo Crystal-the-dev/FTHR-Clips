@@ -128,7 +128,9 @@ namespace fthr {
         // Store codec, geometry, timing, packet format and decoder config as
         // one atomic stream description for future snapshots.
         // -----------------------------------------------------------------------
-        void SetVideoConfig(const EncodedVideoConfig& config);
+        // The stream description is immutable after its first publication in
+        // this generation, preventing codec/config and packet mismatches.
+        bool SetVideoConfig(const EncodedVideoConfig& config);
 
 
         // -----------------------------------------------------------------------
@@ -185,6 +187,7 @@ namespace fthr {
 
         EncodedVideoConfig video_config_;
         mutable std::mutex video_config_mutex_;
+        bool video_config_set_ = false;
     };
 
 

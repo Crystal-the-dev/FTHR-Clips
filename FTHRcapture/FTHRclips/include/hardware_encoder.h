@@ -52,6 +52,7 @@ namespace fthr {
         bool        available;
         bool        h264_supported;
         bool        hevc_supported;
+        bool        av1_supported;
         uint32_t    max_encode_width;
         uint32_t    max_encode_height;
         uint32_t    max_encode_sessions;
@@ -64,7 +65,7 @@ namespace fthr {
 
 
     // ---------------------------------------------------------------------------
-    // HardwareEncoder - NVENC H.264 Encoder (encode-only)
+    // HardwareEncoder - native NVENC H.264/HEVC/AV1 encoder (encode-only)
     // ---------------------------------------------------------------------------
     class HardwareEncoder final : public IReplayEncoder {
     public:
@@ -72,7 +73,7 @@ namespace fthr {
         // Runs on CaptureThread. Must be fast — no blocking, no allocation.
         using PacketCallback = IReplayEncoder::PacketCallback;
 
-        HardwareEncoder();
+        explicit HardwareEncoder(VideoCodec codec);
         ~HardwareEncoder();
 
         // Initialize NVENC session and allocate input buffer pool.
@@ -127,7 +128,7 @@ namespace fthr {
 
 
     private:
-        // Lock output bitstream buffer, convert Annex B -> AVCC, fire callback, unlock.
+        // Lock output, normalize H.264 to AVCC, fire the codec packet, then unlock.
         // Runs on DrainThread — never called from CaptureThread in the async path.
         bool RetrieveOutput(uint32_t buf_idx);
 
@@ -200,6 +201,7 @@ namespace fthr {
         uint32_t enc_height_;
         uint32_t fps_;
         uint32_t bitrate_kbps_;
+        VideoCodec codec_;
         bool     initialized_;
         int64_t  pts_;
         int64_t  last_forced_idr_pts_;
@@ -224,7 +226,7 @@ namespace fthr {
         std::vector<std::pair<const uint8_t*, int>> nals_scratch_;
 
         // -----------------------------------------------------------------------
-        // SPS/PPS extradata (AVCC decoder config record)
+        // H.264 avcC, HEVC Annex B VPS/SPS/PPS, or AV1 sequence header OBUs.
         // -----------------------------------------------------------------------
         std::vector<uint8_t> extradata_;
 
@@ -234,8 +236,7 @@ namespace fthr {
         int callback_log_count_;
     };
 
-    // Enforces the Stage-2 production support gate: only the current native
-    // NVIDIA H.264 implementation can be constructed.
+    // Constructs only codecs enabled for the native NVIDIA backend.
     std::unique_ptr<IReplayEncoder> CreateProductionReplayEncoder(VideoCodec codec);
 
 

@@ -8,13 +8,14 @@
 //   Changes from the per-clip version:
 //     - Initialize() takes EncoderConfig + PacketCallback, not an output path.
 //       The encoder lives for the full engine lifetime, not per clip.
-//     - Step 8 now extracts SPS/PPS and stores AVCC extradata in extradata_.
+//     - Sequence headers are stored in the representation expected by the
+//       pinned MP4 muxer for the selected codec.
 //       No FFmpeg format context, no file open, no avformat_write_header.
-//     - RetrieveOutput() converts Annex B -> AVCC then fires packet_callback_
-//       instead of calling WritePacketToMuxer.
+//     - RetrieveOutput() preserves HEVC Annex B and AV1 low-overhead OBUs;
+//       only H.264 retains its established Annex B -> AVCC conversion.
 //     - WritePacketToMuxer removed entirely.
 //     - Finalize() strips FFmpeg muxer teardown (nothing to tear down).
-//     - GetVideoConfig() returns H.264 timing, packet format and AVCC config.
+//     - GetVideoConfig() returns codec-specific timing, packet format and config.
 
 #ifdef _MSC_VER
 #if __has_include("pch.h")
@@ -25,6 +26,7 @@
 #endif
 
 #include "hardware_encoder.h"
+#include "nvenc_codec_config.h"
 #include "video_encoder.h"
 
 #ifdef _MSC_VER
@@ -330,6 +332,8 @@ namespace fthr {
                     result.h264_supported = true;
                 if (memcmp(&encode_guids[i], &NV_ENC_CODEC_HEVC_GUID, sizeof(GUID)) == 0)
                     result.hevc_supported = true;
+                if (memcmp(&encode_guids[i], &NV_ENC_CODEC_AV1_GUID, sizeof(GUID)) == 0)
+                    result.av1_supported = true;
             }
             delete[] encode_guids;
         }
@@ -381,7 +385,7 @@ namespace fthr {
     // HardwareEncoder - Constructor
     // ===========================================================================
 
-    HardwareEncoder::HardwareEncoder()
+    HardwareEncoder::HardwareEncoder(VideoCodec codec)
         : nvenc_encoder_(nullptr)
         , nvenc_session_(nullptr)
         , nvenc_dll_(nullptr)
@@ -402,6 +406,7 @@ namespace fthr {
         , enc_height_(0)
         , fps_(60)
         , bitrate_kbps_(16000)
+        , codec_(codec)
         , initialized_(false)
         , pts_(0)
         , last_forced_idr_pts_(-1)
@@ -439,6 +444,12 @@ namespace fthr {
             return false;
         }
 
+        const auto* codec_selection = GetNvencCodecSelection(codec_);
+        if (!codec_selection) {
+            std::cerr << "[HardwareEncoder] Unsupported codec selection" << std::endl;
+            return false;
+        }
+
         packet_callback_ = std::move(callback);
 
         src_width_ = config.src_width;
@@ -462,7 +473,8 @@ namespace fthr {
         std::cout << "[HardwareEncoder] Init: "
             << src_width_ << "x" << src_height_
             << " -> " << enc_width_ << "x" << enc_height_
-            << "  " << fps_ << " fps  " << bitrate_kbps_ << " kbps" << std::endl;
+            << "  " << fps_ << " fps  " << bitrate_kbps_ << " kbps  "
+            << VideoCodecName(codec_) << std::endl;
 
         if (enc_width_ == 0 || enc_height_ == 0 || fps_ == 0 || fps_ > 360) {
             std::cerr << "[HardwareEncoder] Invalid config" << std::endl;
@@ -538,6 +550,55 @@ namespace fthr {
             return false;
         }
 
+        auto close_uninitialized_session = [&]() {
+            if (nvenc_session_) {
+                nvenc_api->nvEncDestroyEncoder(nvenc_session_);
+                nvenc_session_ = nullptr;
+            }
+            delete nvenc_api;
+            nvenc_encoder_ = nullptr;
+            FreeLibrary(nvenc_dll);
+            nvenc_dll_ = nullptr;
+        };
+
+        // Validate support on the exact D3D11 device/session used for capture.
+        // Vendor ID, GPU model and FFmpeg encoder lists are not capability proof.
+        uint32_t guid_count = 0;
+        status = nvenc_api->nvEncGetEncodeGUIDCount(nvenc_session_, &guid_count);
+        std::vector<GUID> encode_guids(guid_count);
+        uint32_t guids_retrieved = 0;
+        if (status != NV_ENC_SUCCESS || guid_count == 0
+            || nvenc_api->nvEncGetEncodeGUIDs(
+                   nvenc_session_, encode_guids.data(), guid_count,
+                   &guids_retrieved) != NV_ENC_SUCCESS
+            || !IsNvencCodecSupported(
+                   codec_, encode_guids.data(), guids_retrieved)) {
+            std::cerr << "[HardwareEncoder] Requested " << VideoCodecName(codec_)
+                      << " is not supported by this NVENC session" << std::endl;
+            close_uninitialized_session();
+            return false;
+        }
+
+        uint32_t input_format_count = 0;
+        status = nvenc_api->nvEncGetInputFormatCount(
+            nvenc_session_, codec_selection->encode_guid, &input_format_count);
+        std::vector<NV_ENC_BUFFER_FORMAT> input_formats(input_format_count);
+        uint32_t formats_retrieved = 0;
+        if (status != NV_ENC_SUCCESS || input_format_count == 0
+            || nvenc_api->nvEncGetInputFormats(
+                   nvenc_session_, codec_selection->encode_guid,
+                   input_formats.data(), input_format_count,
+                   &formats_retrieved) != NV_ENC_SUCCESS
+            || !IsNvencInputFormatSupported(
+                   NV_ENC_BUFFER_FORMAT_ARGB,
+                   input_formats.data(), formats_retrieved)) {
+            std::cerr << "[HardwareEncoder] Requested " << VideoCodecName(codec_)
+                      << " does not support the existing ARGB D3D11 input path"
+                      << std::endl;
+            close_uninitialized_session();
+            return false;
+        }
+
         // ------------------------------------------------------------------
         // Step 5: Load preset config + override rate control
         // ------------------------------------------------------------------
@@ -546,7 +607,7 @@ namespace fthr {
 
         status = nvenc_api->nvEncGetEncodePresetConfigEx(
             nvenc_session_,
-            NV_ENC_CODEC_H264_GUID,
+            codec_selection->encode_guid,
             NV_ENC_PRESET_P2_GUID,
             NV_ENC_TUNING_INFO_LOW_LATENCY,
             &preset_config
@@ -562,7 +623,6 @@ namespace fthr {
                 << ") - using manual config" << std::endl;
             memset(&encode_config, 0, sizeof(encode_config));
             encode_config.version = NV_ENC_CONFIG_VER;
-            encode_config.profileGUID = NV_ENC_H264_PROFILE_MAIN_GUID;
         }
 
         encode_config.rcParams.version = NV_ENC_RC_PARAMS_VER;
@@ -577,23 +637,14 @@ namespace fthr {
         // slots and also blocks in WaitForFreeSlot — deadlock, 0 frames captured.
         encode_config.rcParams.enableLookahead = 0;
 
-        encode_config.frameIntervalP = 1;
-        // IDR every 4 seconds instead of every 1 second. Keyframes are 4-10x
-        // larger than P-frames and cause brief GPU spikes at each boundary.
-        // 4s intervals keep the ring buffer seekable while reducing spike frequency.
-        encode_config.gopLength = static_cast<uint32_t>(fps_) * 4;
-
-        encode_config.encodeCodecConfig.h264Config.idrPeriod = static_cast<uint32_t>(fps_) * 4;
-        encode_config.encodeCodecConfig.h264Config.chromaFormatIDC = 1;
-        encode_config.encodeCodecConfig.h264Config.level = NV_ENC_LEVEL_AUTOSELECT;
-        encode_config.encodeCodecConfig.h264Config.enableVFR = 0;
-        encode_config.encodeCodecConfig.h264Config.outputPictureTimingSEI = 0;
-        encode_config.encodeCodecConfig.h264Config.outputBufferingPeriodSEI = 0;
-
-        // Suppress timing_info in SPS via VUI parameters
-        NV_ENC_CONFIG_H264_VUI_PARAMETERS vui_params = {};
-        vui_params.timingInfoPresentFlag = 0;
-        encode_config.encodeCodecConfig.h264Config.h264VUIParameters = vui_params;
+        // Preserve the existing four-media-second keyframe bound and no-B-frame
+        // policy while selecting only the small codec-specific config union.
+        if (!ConfigureNvencCodec(codec_, fps_, encode_config)) {
+            std::cerr << "[HardwareEncoder] Could not configure requested codec"
+                      << std::endl;
+            close_uninitialized_session();
+            return false;
+        }
 
         // ------------------------------------------------------------------
         // Step 6: Initialize encoder
@@ -602,7 +653,7 @@ namespace fthr {
         memset(&init_params, 0, sizeof(init_params));
         init_params.version = NV_ENC_INITIALIZE_PARAMS_VER;
         init_params.encodeConfig = &encode_config;
-        init_params.encodeGUID = NV_ENC_CODEC_H264_GUID;
+        init_params.encodeGUID = codec_selection->encode_guid;
         init_params.presetGUID = NV_ENC_PRESET_P2_GUID;
         init_params.encodeWidth = enc_width_;
         init_params.encodeHeight = enc_height_;
@@ -622,7 +673,8 @@ namespace fthr {
             FreeLibrary(nvenc_dll); nvenc_dll_ = nullptr;
             return false;
         }
-        std::cout << "[HardwareEncoder] Encoder initialized" << std::endl;
+        std::cout << "[HardwareEncoder] " << VideoCodecName(codec_)
+                  << " encoder initialized" << std::endl;
 
         // ------------------------------------------------------------------
         // Step 7: Allocate input buffer pool
@@ -791,7 +843,7 @@ namespace fthr {
         }
 
         // ------------------------------------------------------------------
-        // Step 8: Extract SPS/PPS -> build AVCC extradata
+        // Step 8: Extract codec sequence/config data for the pinned MP4 muxer.
         // ------------------------------------------------------------------
         std::vector<uint8_t> spspps_vec(NV_MAX_SEQ_HDR_LEN, 0);
         uint8_t* spspps_buf = spspps_vec.data();
@@ -807,37 +859,58 @@ namespace fthr {
                 << NvencStatusToString(status) << ") - extradata unavailable" << std::endl;
         }
         else {
-            std::cout << "[HardwareEncoder] SPS/PPS retrieved (" << spspps_size << " bytes)" << std::endl;
+            std::cout << "[HardwareEncoder] Sequence header retrieved ("
+                      << spspps_size << " bytes)" << std::endl;
 
-            const uint8_t* sps_data = nullptr; int sps_size = 0;
-            const uint8_t* pps_data = nullptr; int pps_size = 0;
+            if (codec_ == VideoCodec::H264) {
+                const uint8_t* sps_data = nullptr; int sps_size = 0;
+                const uint8_t* pps_data = nullptr; int pps_size = 0;
 
-            std::vector<NalSpan> nals;
-            ParseAnnexBNals(spspps_buf, static_cast<int>(spspps_size), nals);
-            for (size_t n = 0; n < nals.size(); n++) {
-                const uint8_t* ptr = nals[n].first;
-                int            sz = nals[n].second;
-                if (sz < 1) continue;
-                uint8_t nal_type = ptr[0] & 0x1F;
-                if (nal_type == 7) { sps_data = ptr; sps_size = sz; }
-                if (nal_type == 8) { pps_data = ptr; pps_size = sz; }
-            }
+                std::vector<NalSpan> nals;
+                ParseAnnexBNals(spspps_buf, static_cast<int>(spspps_size), nals);
+                for (const auto& nal : nals) {
+                    const uint8_t* ptr = nal.first;
+                    const int sz = nal.second;
+                    if (sz < 1) continue;
+                    const uint8_t nal_type = ptr[0] & 0x1F;
+                    if (nal_type == 7) { sps_data = ptr; sps_size = sz; }
+                    if (nal_type == 8) { pps_data = ptr; pps_size = sz; }
+                }
 
-            if (sps_data && sps_size >= 4 && pps_data && pps_size >= 1) {
-                extradata_ = BuildAvccExtradata(sps_data, sps_size, pps_data, pps_size);
-                std::cout << "[HardwareEncoder] AVCC extradata built ("
-                    << extradata_.size() << " bytes)" << std::endl;
+                if (sps_data && sps_size >= 4 && pps_data && pps_size >= 1) {
+                    extradata_ = BuildAvccExtradata(
+                        sps_data, sps_size, pps_data, pps_size);
+                }
+            } else if (spspps_size > 0) {
+                // HEVC remains Annex B; AV1 is configured for low-overhead OBU.
+                // The pinned FFmpeg MP4 muxer builds hvcC/av1C from these bytes.
+                extradata_.assign(spspps_buf, spspps_buf + spspps_size);
             }
-            else {
-                std::cerr << "[HardwareEncoder] WARNING: SPS/PPS NAL units not found in sequence header" << std::endl;
+        }
+
+        if (extradata_.empty()) {
+            std::cerr << "[HardwareEncoder] "
+                      << (codec_ == VideoCodec::H264 ? "WARNING: " : "")
+                      << "No usable " << VideoCodecName(codec_)
+                      << " decoder configuration was produced" << std::endl;
+            if (codec_ != VideoCodec::H264) {
+                initialized_ = true;
+                Finalize();
+                return false;
             }
+        } else {
+            std::cout << "[HardwareEncoder] " << VideoCodecName(codec_)
+                      << " decoder configuration ready (" << extradata_.size()
+                      << " bytes)" << std::endl;
         }
 
         // Note: resolution downscaling (src -> enc) is now handled by NVENC natively.
         // The input textures are src_width_ x src_height_; NVENC outputs enc_width_ x enc_height_.
         // No CPU swscale needed.
 
-        avcc_buf_.reserve(static_cast<size_t>(enc_width_) * enc_height_ * 2);
+        if (codec_ == VideoCodec::H264) {
+            avcc_buf_.reserve(static_cast<size_t>(enc_width_) * enc_height_ * 2);
+        }
 
         initialized_ = true;
 
@@ -853,33 +926,26 @@ namespace fthr {
 
 
     EncodedVideoConfig HardwareEncoder::GetVideoConfig() const {
-        EncodedVideoConfig config;
-        config.codec = VideoCodec::H264;
-        config.width = enc_width_;
-        config.height = enc_height_;
-        config.frame_rate = {static_cast<int32_t>(fps_), 1};
-        config.time_base = {1, static_cast<int32_t>(fps_)};
-        config.bitrate_kbps = bitrate_kbps_;
-        config.max_keyframe_interval_frames = fps_ * 4;
-        config.max_b_frames = 0;
-        config.packet_format = EncodedPacketFormat::LengthPrefixedNalUnits;
-        config.codec_extradata = extradata_;
-        return config;
+        return BuildNvencVideoConfig(
+            codec_, enc_width_, enc_height_, fps_, bitrate_kbps_, extradata_);
     }
 
     ActiveEncoderInfo HardwareEncoder::GetActiveEncoderInfo() const {
+        const auto* selection = GetNvencCodecSelection(codec_);
         return {
             EncoderVendor::Nvidia,
             ReplayEncoderBackend::NativeNvenc,
-            VideoCodec::H264,
+            codec_,
             true,
-            "NVIDIA NVENC (native)"};
+            selection ? selection->active_codec_name : "nvenc_unknown"};
     }
 
     std::unique_ptr<IReplayEncoder> CreateProductionReplayEncoder(
         VideoCodec codec) {
-        if (!IsProductionReplayCodecEnabled(codec)) return nullptr;
-        return std::make_unique<HardwareEncoder>();
+        if (!IsProductionReplayBackendEnabled(EncoderVendor::Nvidia, codec)) {
+            return nullptr;
+        }
+        return std::make_unique<HardwareEncoder>(codec);
     }
 
 
@@ -1087,28 +1153,36 @@ namespace fthr {
         }
 
         if (lock_bs.bitstreamSizeInBytes > 0 && lock_bs.bitstreamBufferPtr) {
-            const uint8_t* annexb_data = static_cast<const uint8_t*>(lock_bs.bitstreamBufferPtr);
-            const uint32_t annexb_size = lock_bs.bitstreamSizeInBytes;
+            const uint8_t* packet_data =
+                static_cast<const uint8_t*>(lock_bs.bitstreamBufferPtr);
+            uint32_t packet_size = lock_bs.bitstreamSizeInBytes;
             const bool     is_keyframe = (lock_bs.pictureType == NV_ENC_PIC_TYPE_IDR ||
                 lock_bs.pictureType == NV_ENC_PIC_TYPE_I);
 
             const int64_t output_pts = static_cast<int64_t>(lock_bs.outputTimeStamp);
 
-            int avcc_size = AnnexBToAvcc(annexb_data, static_cast<int>(annexb_size),
-                avcc_buf_, nals_scratch_, /*skip_spspps=*/true);
+            if (codec_ == VideoCodec::H264) {
+                const int avcc_size = AnnexBToAvcc(
+                    packet_data, static_cast<int>(packet_size),
+                    avcc_buf_, nals_scratch_, /*skip_spspps=*/true);
+                packet_data = avcc_buf_.data();
+                packet_size = avcc_size > 0
+                    ? static_cast<uint32_t>(avcc_size)
+                    : 0;
+            }
 
-            if (avcc_size > 0 && packet_callback_) {
+            if (packet_size > 0 && packet_callback_) {
                 if (callback_log_count_ < 3) {
                     std::cout << "[HardwareEncoder] Callback #" << callback_log_count_
                         << ": output_PTS=" << output_pts
-                        << " size=" << avcc_size
+                        << " size=" << packet_size
                         << (is_keyframe ? " [KEYFRAME]" : "")
                         << std::endl;
                 }
                 callback_log_count_++;
 
-                packet_callback_(avcc_buf_.data(),
-                    static_cast<uint32_t>(avcc_size),
+                packet_callback_(packet_data,
+                    packet_size,
                     output_pts,
                     is_keyframe,
                     slot_qpc_[buf_idx]);

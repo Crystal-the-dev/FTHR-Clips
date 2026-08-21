@@ -1,5 +1,5 @@
 // replay_encoder.h
-// Small Windows replay-encoder seam; Stage 2 keeps native NVENC H.264 only.
+// Small Windows replay-encoder seam for native NVIDIA replay encoding.
 
 #pragma once
 #ifndef FTHR_REPLAY_ENCODER_H
@@ -39,6 +39,13 @@ struct ActiveEncoderInfo {
     bool hardware = false;
     std::string name;
 };
+
+constexpr bool IsProductionReplayBackendEnabled(
+    EncoderVendor vendor,
+    VideoCodec codec) noexcept {
+    return vendor == EncoderVendor::Nvidia
+        && IsProductionReplayCodecEnabled(codec);
+}
 
 class IReplayEncoder {
 public:

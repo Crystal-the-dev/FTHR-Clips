@@ -26,6 +26,7 @@
 //            Only meaningful when target_width/height are non-zero AND differ in
 //            aspect ratio from the captured source.
 //   argv[10] monitor_path   Stable normalized Windows monitor device path.
+//   argv[11] codec_pref     0 = auto/H.264, 1 = H.264, 2 = HEVC, 3 = AV1.
 //
 // Threading:
 //   This file runs entirely on the main thread.
@@ -79,6 +80,8 @@ static void PrintConfig(const fthr::CaptureConfig& cfg) {
     else
         std::cout << cfg.target_width << "x" << cfg.target_height << std::endl;
     std::cout << "  Bitrate      : " << cfg.bitrate_kbps << " kbps" << std::endl;
+    std::cout << "  Video codec  : " << fthr::VideoCodecName(cfg.video_codec)
+              << std::endl;
     std::cout << "  Max pool     : " << cfg.max_buffer_mb << " MB (x264 fallback only)" << std::endl;
 
     using Mode = fthr::CaptureConfig::CaptureModeEnum;
@@ -140,11 +143,28 @@ int main(int argc, char* argv[]) {
     }
 
     // argv[10] = capture_monitor  (stable Windows monitor device path)
-    // argv[11] = codec_pref       (communicated via shared memory RECONFIGURE_ENCODER)
+    // argv[11] = codec_pref       (0=auto/H.264, 1=H.264, 2=HEVC, 3=AV1)
     // argv[12] = encoder_preset   (same)
     // argv[13] = multiband_arg    (Windows uses per-app WASAPI; multiband handled in engine)
     // argv[14] = audio_enabled    (0 = disable WASAPI loopback capture)
     config.monitor_device_path = ParseArgUtf8(argc, argv, 10);
+    switch (ParseArgU32(argc, argv, 11, 0)) {
+    case 0:
+    case 1:
+        config.video_codec = fthr::VideoCodec::H264;
+        break;
+    case 2:
+        config.video_codec = fthr::VideoCodec::HEVC;
+        break;
+    case 3:
+        config.video_codec = fthr::VideoCodec::AV1;
+        break;
+    default:
+        std::cerr << "[Config] Unknown codec preference - using Auto/H.264"
+                  << std::endl;
+        config.video_codec = fthr::VideoCodec::H264;
+        break;
+    }
     config.audio_enabled = (ParseArgU32(argc, argv, 14, 1) != 0);
 
     // ------------------------------------------------------------------
@@ -213,6 +233,7 @@ int main(int argc, char* argv[]) {
         std::cout << "  GPU           : " << nvenc_info.gpu_name << std::endl;
         std::cout << "  H.264         : " << (nvenc_info.h264_supported ? "Yes" : "No") << std::endl;
         std::cout << "  HEVC          : " << (nvenc_info.hevc_supported ? "Yes" : "No") << std::endl;
+        std::cout << "  AV1           : " << (nvenc_info.av1_supported ? "Yes" : "No") << std::endl;
         std::cout << "  Max res       : " << nvenc_info.max_encode_width
             << "x" << nvenc_info.max_encode_height << std::endl;
     }
@@ -291,7 +312,14 @@ int main(int argc, char* argv[]) {
         // build (libx264 is GPL and is no longer shipped). This string is read
         // back by the UI and shown to the user, so reporting "libx264" here
         // would be an outright false claim about what encoded their clip.
-        const char* codec_name = engine.IsNvencActive() ? "h264_nvenc" : "libopenh264";
+        const char* codec_name = "libopenh264";
+        if (engine.IsNvencActive()) {
+            switch (engine.GetActiveVideoCodec()) {
+            case fthr::VideoCodec::H264: codec_name = "h264_nvenc"; break;
+            case fthr::VideoCodec::HEVC: codec_name = "hevc_nvenc"; break;
+            case fthr::VideoCodec::AV1: codec_name = "av1_nvenc"; break;
+            }
+        }
         strncpy_s(layout->active_codec, sizeof(layout->active_codec),
                   codec_name, _TRUNCATE);
     }
