@@ -97,7 +97,7 @@ Everything else below is either already green or is honest, tracked work.
 | 5.1 | `python -m pytest tests/` green | **PARTIAL** — Windows **450 passed / 34 skipped** at the product-truth HEAD. Linux-specific runtime cases skip on Windows; a full Linux Python run remains `NOT RUN`. |
 | 5.2 | `python -m ruff check .` clean | **PASS** |
 | 5.3 | `python -m compileall FTHR_UI tests tools` clean | **PASS** |
-| 5.4 | `tools/verify_shared_memory_contract.py` | **PASS** — 23 fields, 2712 B (win32) / 4248 B (linux), enums and reserved slots 4–9 intact |
+| 5.4 | `tools/verify_shared_memory_contract.py` | **PASS** — current layout: 29 fields, 2736 B (Windows) / 4272 B (Linux), enums and reserved slots 4–9 intact; still Shared Memory v4. |
 | 5.5 | C++ engines have automated tests | **PASS** — current Windows native suite **82 scenarios / 149 checks**; Linux native CTest **10/10 passed**, including recovery, duration, transactional save, Wayland bounded dispatch, timestamps, and actual short-MP4 integration. |
 
 ## 6. Builds
