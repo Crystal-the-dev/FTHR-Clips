@@ -1,5 +1,5 @@
 // replay_encoder.h
-// Small Windows replay-encoder seam for native NVIDIA replay encoding.
+// Small Windows replay-encoder seam for codec-neutral hardware replay encoding.
 
 #pragma once
 #ifndef FTHR_REPLAY_ENCODER_H
@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 
 struct ID3D11Device;
@@ -40,11 +41,43 @@ struct ActiveEncoderInfo {
     std::string name;
 };
 
+constexpr ReplayEncoderBackend SelectProductionReplayBackend(
+    EncoderVendor vendor,
+    VideoCodec codec) noexcept {
+    if (!IsProductionReplayCodecEnabled(codec)) {
+        return ReplayEncoderBackend::Software;
+    }
+    switch (vendor) {
+    case EncoderVendor::Nvidia: return ReplayEncoderBackend::NativeNvenc;
+    case EncoderVendor::Amd: return ReplayEncoderBackend::FfmpegAmf;
+    case EncoderVendor::Intel:
+    case EncoderVendor::Software:
+        return ReplayEncoderBackend::Software;
+    }
+    return ReplayEncoderBackend::Software;
+}
+
 constexpr bool IsProductionReplayBackendEnabled(
     EncoderVendor vendor,
     VideoCodec codec) noexcept {
-    return vendor == EncoderVendor::Nvidia
-        && IsProductionReplayCodecEnabled(codec);
+    return SelectProductionReplayBackend(vendor, codec)
+        != ReplayEncoderBackend::Software;
+}
+
+constexpr EncoderVendor EncoderVendorFromPciVendorId(
+    uint32_t vendor_id) noexcept {
+    switch (vendor_id) {
+    case 0x10DE: return EncoderVendor::Nvidia;
+    case 0x1002: return EncoderVendor::Amd;
+    case 0x8086: return EncoderVendor::Intel;
+    default: return EncoderVendor::Software;
+    }
+}
+
+constexpr bool ShouldAllocateRawReplayPool(
+    ReplayEncoderBackend backend,
+    bool initialized) noexcept {
+    return !initialized || backend == ReplayEncoderBackend::Software;
 }
 
 class IReplayEncoder {
@@ -70,16 +103,27 @@ public:
         uint32_t source_stride,
         int64_t present_qpc = 0) = 0;
     virtual ID3D11Texture2D* GetCurrentInputTexture() const noexcept = 0;
+    virtual uint32_t GetCurrentInputSubresource() const noexcept { return 0; }
 
     // Flushes pending packets and releases encoder resources. The current
     // native encoder's Finalize operation already has exactly these semantics.
     virtual void Shutdown() = 0;
     virtual EncodedVideoConfig GetVideoConfig() const = 0;
     virtual ActiveEncoderInfo GetActiveEncoderInfo() const = 0;
+    virtual std::string GetLastError() const { return {}; }
     virtual bool GetEncodeEpoch(
         int64_t& start_qpc, int64_t& qpc_frequency) const = 0;
     virtual bool IsInitialized() const = 0;
 };
+
+const char* EncoderVendorName(EncoderVendor vendor) noexcept;
+EncoderVendor QueryD3D11DeviceVendor(ID3D11Device* device) noexcept;
+
+// The selected monitor's capture adapter is authoritative. NVIDIA stays on
+// native NVENC; AMD uses FFmpeg AMF; Intel remains on the current fallback.
+std::unique_ptr<IReplayEncoder> CreateProductionReplayEncoder(
+    EncoderVendor vendor,
+    VideoCodec codec);
 
 } // namespace fthr
 

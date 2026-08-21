@@ -204,6 +204,8 @@ namespace fthr {
         , monitor_resolver_(monitor_topology_source_)
         , nvenc_active_(false)
         , nvidia_device_(false)
+        , replay_encoder_cpu_input_(false)
+        , capture_adapter_vendor_(EncoderVendor::Software)
         , max_frames_(0)
         , frames_captured_(0)
         , frames_dropped_(0)
@@ -324,9 +326,13 @@ namespace fthr {
         }
 
         // ------------------------------------------------------------------
-        // Attempt NVENC initialization
+        // Select one compressed replay backend from the adapter that owns the
+        // capture source. The only cross-adapter exception is the pre-existing
+        // Intel-display/NVIDIA Optimus CPU-input path.
         // ------------------------------------------------------------------
-        std::cout << "[CaptureEngine] Attempting NVENC initialization..." << std::endl;
+        std::cout << "[CaptureEngine] Attempting hardware replay initialization "
+                  << "for selected " << EncoderVendorName(capture_adapter_vendor_)
+                  << " adapter..." << std::endl;
 
         EncoderConfig hw_cfg;
         hw_cfg.src_width = width_;
@@ -336,42 +342,53 @@ namespace fthr {
         hw_cfg.fps = fps_;
         hw_cfg.bitrate_kbps = bitrate_kbps_;
 
-        replay_encoder_ = CreateProductionReplayEncoder(config.video_codec);
+        EncoderVendor encoder_vendor = capture_adapter_vendor_;
+        ID3D11Device* encoder_device = device_;
+        ID3D11DeviceContext* encoder_context = context_;
+        bool cpu_input_mode = false;
+        if (capture_adapter_vendor_ != EncoderVendor::Nvidia
+            && capture_adapter_vendor_ != EncoderVendor::Amd
+            && nvenc_device_) {
+            encoder_vendor = EncoderVendor::Nvidia;
+            encoder_device = nvenc_device_;
+            encoder_context = nvenc_context_;
+            cpu_input_mode = true;
+        }
 
-        // Select NVENC path based on D3D11 adapter situation:
-        //   nvidia_device_ = true  → DXGI and NVENC share the same NVIDIA device (GPU zero-copy)
-        //   nvenc_device_  != null → Optimus: DXGI on Intel, NVENC on separate NVIDIA device
-        //                            Uses CPU-side NVENC input buffers (still hardware H.264)
-        //   neither              → No NVIDIA GPU or NVENC unavailable; fall back to x264
-        auto nvenc_callback = [this](const uint8_t* data, uint32_t size, int64_t pts, bool is_keyframe, int64_t wall_qpc) {
+        replay_encoder_ = CreateProductionReplayEncoder(
+            encoder_vendor, config.video_codec);
+
+        auto packet_callback = [this](const uint8_t* data, uint32_t size,
+                                      int64_t pts, bool is_keyframe,
+                                      int64_t wall_qpc) {
             encoded_ring_->Push(data, size, pts, is_keyframe, wall_qpc);
         };
 
-        if (nvidia_device_) {
-            // GPU zero-copy path: DXGI and NVENC on the same NVIDIA adapter.
-            nvenc_active_ = replay_encoder_ && replay_encoder_->Initialize(
-                hw_cfg, device_, context_, nvenc_callback,
-                /*cpu_input_mode=*/false);
+        replay_encoder_cpu_input_ = cpu_input_mode;
+        nvenc_active_ = replay_encoder_ && replay_encoder_->Initialize(
+            hw_cfg, encoder_device, encoder_context, packet_callback,
+            cpu_input_mode);
+        if (!nvenc_active_ && replay_encoder_) {
+            std::cerr << "[CaptureEngine] "
+                      << EncoderVendorName(encoder_vendor) << ' '
+                      << VideoCodecName(config.video_codec)
+                      << " hardware initialization failed";
+            const std::string detail = replay_encoder_->GetLastError();
+            if (!detail.empty()) std::cerr << ": " << detail;
+            std::cerr << std::endl;
         }
-        else if (nvenc_device_ != nullptr) {
-            // Optimus path: DXGI on Intel, encode on NVIDIA via CPU memcpy.
-            std::cout << "[CaptureEngine] Optimus detected - using NVENC with CPU-input path." << std::endl;
-            nvenc_active_ = replay_encoder_ && replay_encoder_->Initialize(
-                hw_cfg, nvenc_device_, nvenc_context_, nvenc_callback,
-                /*cpu_input_mode=*/true);
-            if (!nvenc_active_) {
-                std::cout << "[CaptureEngine] NVENC init failed on Optimus - falling back to x264." << std::endl;
-            }
-        }
-        else {
-            std::cout << "[CaptureEngine] No NVIDIA device available - using x264 fallback." << std::endl;
-            nvenc_active_ = false;
+        if (nvenc_active_ && replay_encoder_cpu_input_
+            && !EnsureStagingTexture()) {
+            std::cerr << "[CaptureEngine] Hybrid hardware replay requires a "
+                         "readback texture, but creation failed" << std::endl;
+            return false;
         }
 
         if (!nvenc_active_ && config.video_codec != VideoCodec::H264) {
             std::cerr << "[CaptureEngine] Requested "
                       << VideoCodecName(config.video_codec)
-                      << " could not initialize on the selected NVIDIA device. "
+                      << " could not initialize on the selected "
+                      << EncoderVendorName(encoder_vendor) << " device. "
                          "Refusing a silent H.264 fallback." << std::endl;
             return false;
         }
@@ -405,14 +422,22 @@ namespace fthr {
             // ring_head_ / ring_count_ not used on NVENC path.
             max_frames_ = static_cast<size_t>(buffer_seconds_) * fps_;
 
-            std::cout << "[CaptureEngine] NVENC active. Encoded ring: "
-                << capacity << " slots. FramePool: skipped." << std::endl;
+            const auto active = replay_encoder_->GetActiveEncoderInfo();
+            std::cout << "[CaptureEngine] " << active.name
+                << " active. Encoded ring: " << capacity
+                << " slots. Raw FramePool: skipped." << std::endl;
         }
         else {
             // ------------------------------------------------------------------
             // x264 fallback: allocate raw BGRA FramePool
             // ------------------------------------------------------------------
-            std::cout << "[CaptureEngine] NVENC unavailable - using x264 fallback." << std::endl;
+            replay_encoder_cpu_input_ = false;
+            if (!EnsureStagingTexture()) {
+                std::cerr << "[CaptureEngine] Software fallback requires a "
+                             "readback texture, but creation failed" << std::endl;
+                return false;
+            }
+            std::cout << "[CaptureEngine] Hardware replay unavailable - using x264 fallback." << std::endl;
 
             const size_t bytes_per_frame = static_cast<size_t>(width_)
                 * static_cast<size_t>(height_) * 4;
@@ -524,7 +549,11 @@ namespace fthr {
     // ===========================================================================
 
     void CaptureEngine::Shutdown() {
-        if (!running_.load()) return;
+        const bool has_resources = capture_thread_ || encode_thread_
+            || save_clip_thread_ || device_ || context_ || wgc_state_
+            || replay_encoder_ || audio_active_ || nvenc_device_
+            || nvenc_context_;
+        if (!has_resources) return;
 
         std::cout << "[CaptureEngine] Shutting down..." << std::endl;
 
@@ -561,6 +590,8 @@ namespace fthr {
         if (nvenc_active_) {
             replay_encoder_->Shutdown();
         }
+        nvenc_active_ = false;
+        replay_encoder_cpu_input_ = false;
 
         // Stop audio pipeline. Order matters:
         //   1. Stop WASAPI thread (no more EncodeSamples calls after this)
@@ -587,6 +618,8 @@ namespace fthr {
         // Release the Optimus NVENC device after D3D11 and NVENC are both shut down.
         if (nvenc_context_) { nvenc_context_->Release(); nvenc_context_ = nullptr; }
         if (nvenc_device_)  { nvenc_device_->Release();  nvenc_device_ = nullptr; }
+        replay_encoder_.reset();
+        encoded_ring_.reset();
 
         std::cout << "[CaptureEngine] Shutdown complete. Frames captured: "
             << frames_captured_.load() << std::endl;
@@ -1985,7 +2018,8 @@ namespace fthr {
     //
     // Hot path. After acquiring and mapping a DXGI frame:
     //
-    //   NVENC path: pass BGRA to replay_encoder_->EncodeFrame()
+    //   Compressed hardware path: copy BGRA on-GPU into the replay encoder
+    //               (native NVENC or FFmpeg AMF), then EncodeFrame()
     //               Callback fires -> EncodedRingBuffer::Push()
     //               ring_head_ / ring_count_ NOT updated (encoded ring manages itself)
     //
@@ -2012,7 +2046,8 @@ namespace fthr {
 
         std::cout << "[CaptureThread] " << fps_ << " fps ("
             << target_ms << " ms/frame)  "
-            << (nvenc_active_ ? "NVENC" : "software") << " path" << std::endl;
+            << (nvenc_active_ ? GetActiveEncoderName() : "software")
+            << " path" << std::endl;
 
         uint32_t consecutive_acquire_errors = 0;
 
@@ -2085,24 +2120,21 @@ namespace fthr {
                 continue;
             }
 
-            if (nvenc_active_ && nvidia_device_) {
+            if (nvenc_active_ && !replay_encoder_cpu_input_) {
                 // ----------------------------------------------------------
-                // NVENC GPU zero-copy path.
-                // DXGI and NVENC share the same NVIDIA device.
-                // CopyResource is a pure GPU op — no CPU read, no stall.
+                // Same-adapter compressed replay path (native NVENC or AMF).
+                // CopyResource is a pure GPU op; there is no full-frame CPU
+                // readback or upload on the normal AMD path.
                 // ----------------------------------------------------------
-                SampleContentTexture(
-                    tex, frames_captured_.load(std::memory_order_relaxed) + 1);
-                ID3D11Texture2D* input_tex =
-                    replay_encoder_->GetCurrentInputTexture();
-                context_->CopyResource(input_tex, tex);
+                const bool encoded = EncodeGpuReplayTexture(
+                    tex,
+                    info.LastPresentTime.QuadPart,
+                    frames_captured_.load(std::memory_order_relaxed) + 1);
                 tex->Release();
                 duplication_->ReleaseFrame();
-
-                replay_encoder_->EncodeFrame(info.LastPresentTime.QuadPart);
-                // Callback inside EncodeFrame fires -> EncodedRingBuffer::Push()
+                if (!encoded) break;
             }
-            else if (nvenc_active_) {
+            else if (nvenc_active_ && replay_encoder_cpu_input_) {
                 // ----------------------------------------------------------
                 // NVENC CPU-input path (Optimus).
                 // DXGI on Intel adapter; NVENC on separate NVIDIA device.
@@ -2131,13 +2163,15 @@ namespace fthr {
                     static_cast<const uint8_t*>(mapped.pData), mapped.RowPitch,
                     width_, height_, frames_captured_.load(std::memory_order_relaxed) + 1);
 
-                replay_encoder_->EncodeFrameCPU(
+                const bool encoded = replay_encoder_->EncodeFrameCPU(
                     static_cast<const uint8_t*>(mapped.pData),
                     mapped.RowPitch,
                     info.LastPresentTime.QuadPart);
-                // Callback inside EncodeFrameCPU fires -> EncodedRingBuffer::Push()
-
                 context_->Unmap(staging_texture_, 0);
+                if (!encoded) {
+                    FailReplayEncoder("hybrid NVENC CPU-input submission");
+                    break;
+                }
             }
             else {
                 // ----------------------------------------------------------
@@ -2194,6 +2228,81 @@ namespace fthr {
                   << frames_captured_.load() << std::endl;
         if (capture_health_flags_.load() != CAPTURE_HEALTH_BACKEND_FAILED)
             capture_health_flags_.store(CAPTURE_HEALTH_NONE);
+    }
+
+    bool CaptureEngine::EnsureStagingTexture() {
+        if (staging_texture_) return true;
+        if (!device_ || width_ == 0 || height_ == 0) return false;
+
+        D3D11_TEXTURE2D_DESC description{};
+        description.Width = width_;
+        description.Height = height_;
+        description.MipLevels = 1;
+        description.ArraySize = 1;
+        description.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        description.SampleDesc.Count = 1;
+        description.Usage = D3D11_USAGE_STAGING;
+        description.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        const HRESULT result = device_->CreateTexture2D(
+            &description, nullptr, &staging_texture_);
+        if (FAILED(result)) {
+            std::cerr << "[CaptureEngine] D3D11 readback texture creation failed: 0x"
+                      << std::hex << result << std::dec << std::endl;
+            return false;
+        }
+        return true;
+    }
+
+    bool CaptureEngine::EncodeGpuReplayTexture(
+        ID3D11Texture2D* source,
+        int64_t present_qpc,
+        uint64_t produced_frame) {
+        if (!source || !replay_encoder_ || !context_) {
+            FailReplayEncoder("D3D11 replay input setup");
+            return false;
+        }
+        ID3D11Texture2D* input = replay_encoder_->GetCurrentInputTexture();
+        if (!input) {
+            FailReplayEncoder("D3D11 replay input acquisition");
+            return false;
+        }
+
+        D3D11_TEXTURE2D_DESC source_description{};
+        D3D11_TEXTURE2D_DESC input_description{};
+        source->GetDesc(&source_description);
+        input->GetDesc(&input_description);
+        if (source_description.Width != input_description.Width
+            || source_description.Height != input_description.Height
+            || source_description.Format != input_description.Format) {
+            FailReplayEncoder("D3D11 replay texture compatibility check");
+            return false;
+        }
+
+        SampleContentTexture(source, produced_frame);
+        context_->CopySubresourceRegion(
+            input,
+            replay_encoder_->GetCurrentInputSubresource(),
+            0, 0, 0,
+            source,
+            0,
+            nullptr);
+        if (!replay_encoder_->EncodeFrame(present_qpc)) {
+            FailReplayEncoder("hardware frame submission");
+            return false;
+        }
+        return true;
+    }
+
+    void CaptureEngine::FailReplayEncoder(const char* operation) {
+        ClearReplayForRecovery();
+        capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
+        running_.store(false);
+        std::cerr << "[CaptureEngine] " << operation << " failed";
+        if (replay_encoder_) {
+            const std::string detail = replay_encoder_->GetLastError();
+            if (!detail.empty()) std::cerr << ": " << detail;
+        }
+        std::cerr << "; a fresh capture generation is required" << std::endl;
     }
 
 
@@ -2276,11 +2385,14 @@ namespace fthr {
             return false;
         }
 
-        nvidia_device_ = capture_desc.VendorId == 0x10DE;
-        if (!nvidia_device_ && !nvenc_device_) {
+        capture_adapter_vendor_ = EncoderVendorFromPciVendorId(
+            capture_desc.VendorId);
+        nvidia_device_ = capture_adapter_vendor_ == EncoderVendor::Nvidia;
+        if (capture_adapter_vendor_ == EncoderVendor::Intel && !nvenc_device_) {
             // Preserve the existing hybrid-GPU behavior: capture on the selected
-            // display-owning adapter, with a separate NVIDIA NVENC device and the
-            // already-existing CPU-input path. No new readback path is introduced.
+            // Intel display adapter, with a separate NVIDIA NVENC device and the
+            // existing CPU-input path. An AMD-owned monitor stays on AMD AMF;
+            // machine-wide GPU enumeration must not override monitor ownership.
             IDXGIAdapter1* encoder_adapter = nullptr;
             for (UINT index = 0;
                  factory->EnumAdapters1(index, &encoder_adapter) != DXGI_ERROR_NOT_FOUND;
@@ -2319,9 +2431,8 @@ namespace fthr {
         factory->Release();
         std::cout << '[' << backend_name << "] Selected output ready: "
                   << width_ << 'x' << height_
-                  << (nvidia_device_
-                      ? " [NVIDIA same-adapter GPU path]"
-                      : " [display-owning adapter]")
+                  << " [" << EncoderVendorName(capture_adapter_vendor_)
+                  << " display-owning adapter]"
                   << std::endl;
         return true;
     }
@@ -2475,13 +2586,14 @@ namespace fthr {
             if (context_) { context_->Release(); context_ = nullptr; }
             if (device_)  { device_->Release();  device_  = nullptr; }
             nvidia_device_ = false;
+            capture_adapter_vendor_ = EncoderVendor::Software;
             return false;
         }
 
         std::cout << "[WGC] Ready. Capture started ("
                   << width_ << "x" << height_ << ", "
-                  << (nvidia_device_ ? "NVIDIA adapter — GPU zero-copy"
-                      : (nvenc_device_ ? "default adapter — NVENC CPU-input" : "default adapter"))
+                  << EncoderVendorName(capture_adapter_vendor_)
+                  << " capture adapter"
                   << ")" << std::endl;
         return true;
     }
@@ -2535,9 +2647,10 @@ namespace fthr {
 
         std::cout << "[CaptureThread/WGC] Started ("
                   << fps_ << " fps, "
-                  << (nvenc_active_ ? "NVENC" : "software") << " path, "
-                  << (nvidia_device_ ? "GPU zero-copy"
-                      : (nvenc_active_ ? "Optimus CPU-input" : "default adapter"))
+                  << (nvenc_active_ ? GetActiveEncoderName() : "software")
+                  << " path, "
+                  << (replay_encoder_cpu_input_ ? "hybrid CPU-input"
+                      : (nvenc_active_ ? "same-adapter GPU input" : "readback"))
                   << ")" << std::endl;
 
         LARGE_INTEGER qpc_freq;
@@ -2647,20 +2760,19 @@ namespace fthr {
                 winrt::com_ptr<ID3D11Texture2D> tex;
                 winrt::check_hresult(interop->GetInterface(IID_PPV_ARGS(tex.put())));
 
-                if (nvenc_active_ && nvidia_device_) {
+                if (nvenc_active_ && !replay_encoder_cpu_input_) {
                     // ----------------------------------------------------------
-                    // NVENC GPU zero-copy path (desktop NVIDIA).
-                    // Frame is in NVIDIA VRAM, NVENC reads from same device.
-                    // CopyResource is a pure GPU operation — no CPU stall.
+                    // Same-adapter compressed replay (native NVENC or AMF).
+                    // A GPU CopyResource feeds the encoder-owned texture.
                     // ----------------------------------------------------------
-                    SampleContentTexture(
-                        tex.get(), frames_captured_.load(std::memory_order_relaxed) + 1);
-                    ID3D11Texture2D* input_tex =
-                        replay_encoder_->GetCurrentInputTexture();
-                    context_->CopyResource(input_tex, tex.get());
-                    replay_encoder_->EncodeFrame(now.QuadPart); // use rate-limiter QPC as frame timestamp
+                    if (!EncodeGpuReplayTexture(
+                            tex.get(), now.QuadPart,
+                            frames_captured_.load(std::memory_order_relaxed) + 1)) {
+                        break;
+                    }
                 }
-                else if (nvenc_active_ && staging_texture_) {
+                else if (nvenc_active_ && replay_encoder_cpu_input_
+                    && staging_texture_) {
                     // ----------------------------------------------------------
                     // NVENC CPU-input path (Optimus).
                     // WGC on Intel adapter; NVENC on separate NVIDIA device.
@@ -2681,12 +2793,14 @@ namespace fthr {
                         static_cast<const uint8_t*>(mapped.pData), mapped.RowPitch,
                         width_, height_, frames_captured_.load(std::memory_order_relaxed) + 1);
 
-                    replay_encoder_->EncodeFrameCPU(
+                    const bool encoded = replay_encoder_->EncodeFrameCPU(
                         static_cast<const uint8_t*>(mapped.pData),
                         mapped.RowPitch, now.QuadPart);
-                    // Callback inside EncodeFrameCPU fires -> EncodedRingBuffer::Push()
-
                     context_->Unmap(staging_texture_, 0);
+                    if (!encoded) {
+                        FailReplayEncoder("hybrid NVENC CPU-input submission");
+                        break;
+                    }
                 }
                 else {
                     // ----------------------------------------------------------
@@ -2868,6 +2982,8 @@ namespace fthr {
                 return false;
             }
         }
+        capture_adapter_vendor_ = QueryD3D11DeviceVendor(device_);
+        nvidia_device_ = capture_adapter_vendor_ == EncoderVendor::Nvidia;
 
         // --- Steps 3-8: WinRT capture session (exception-safe) ---
         wgc_state_ = std::make_unique<WGCState>();
@@ -2897,8 +3013,9 @@ namespace fthr {
 
             // 6. Staging texture for CPU-readback paths (Optimus or x264 fallback).
             //    Created on the WGC device; used in CaptureThreadWGC() Map/Unmap.
-            //    Not needed on desktop NVIDIA (GPU zero-copy — no CPU read).
-            if (!nvidia_device_) {
+            //    Not needed on a same-adapter NVIDIA or AMD hardware path.
+            if (capture_adapter_vendor_ != EncoderVendor::Nvidia
+                && capture_adapter_vendor_ != EncoderVendor::Amd) {
                 D3D11_TEXTURE2D_DESC tdesc{};
                 tdesc.Width            = width_;
                 tdesc.Height           = height_;
@@ -2955,14 +3072,14 @@ namespace fthr {
             if (context_) { context_->Release(); context_ = nullptr; }
             if (device_)  { device_->Release();  device_  = nullptr; }
             nvidia_device_ = false;
+            capture_adapter_vendor_ = EncoderVendor::Software;
             return false;
         }
 
         std::cout << "[WinCapture] Ready  "
                   << width_ << "x" << height_ << "  "
-                  << (nvidia_device_ ? "NVIDIA adapter — GPU zero-copy"
-                      : (nvenc_device_ ? "default adapter — NVENC CPU-input"
-                                       : "default adapter — x264"))
+                  << EncoderVendorName(capture_adapter_vendor_)
+                  << " capture adapter"
                   << std::endl;
         return true;
     }
@@ -2974,6 +3091,7 @@ namespace fthr {
 
     bool CaptureEngine::InitializeD3D11() {
         nvidia_device_ = false;
+        capture_adapter_vendor_ = EncoderVendor::Software;
         IDXGIOutput* selected_output = nullptr;
         if (!InitializeMonitorCaptureDevice("DXGI", &selected_output)) {
             return false;
@@ -2998,30 +3116,14 @@ namespace fthr {
             return false;
         }
 
-        // Staging texture (software path and the pre-existing hybrid NVENC path).
-        {
-            D3D11_TEXTURE2D_DESC desc{};
-            desc.Width            = width_;
-            desc.Height           = height_;
-            desc.MipLevels        = 1;
-            desc.ArraySize        = 1;
-            desc.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
-            desc.SampleDesc.Count = 1;
-            desc.Usage            = D3D11_USAGE_STAGING;
-            desc.CPUAccessFlags   = D3D11_CPU_ACCESS_READ;
-            if (FAILED(device_->CreateTexture2D(&desc, nullptr, &staging_texture_))) {
-                std::cerr << "[D3D11] Staging texture creation failed" << std::endl;
-                return false;
-            }
-        }
-
         std::cout << "[D3D11] Ready - " << width_ << "x" << height_
                   << (nvidia_device_
                       ? "  [selected NVIDIA adapter - GPU zero-copy enabled]"
                       : "  [selected display-owning adapter]")
                   << std::endl;
         std::cout << "[D3D11] Duplication: " << (duplication_ ? "OK" : "NULL") << std::endl;
-        std::cout << "[D3D11] Staging tex: " << (staging_texture_ ? "OK" : "NULL") << std::endl;
+        std::cout << "[D3D11] Readback texture: deferred until fallback policy"
+                  << std::endl;
         return true;
     }
 
@@ -3039,6 +3141,8 @@ namespace fthr {
         if (duplication_)     { duplication_->Release();     duplication_ = nullptr; }
         if (context_)         { context_->Release();         context_ = nullptr; }
         if (device_)          { device_->Release();          device_ = nullptr; }
+        nvidia_device_ = false;
+        capture_adapter_vendor_ = EncoderVendor::Software;
         // nvenc_device_ / nvenc_context_ are intentionally NOT released here.
         // They must outlive the NVENC encoder session (which is finalized in Shutdown()
         // before this is called). On ACCESS_LOST reinit they stay valid.

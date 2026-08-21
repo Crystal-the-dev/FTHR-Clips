@@ -940,15 +940,6 @@ namespace fthr {
             selection ? selection->active_codec_name : "nvenc_unknown"};
     }
 
-    std::unique_ptr<IReplayEncoder> CreateProductionReplayEncoder(
-        VideoCodec codec) {
-        if (!IsProductionReplayBackendEnabled(EncoderVendor::Nvidia, codec)) {
-            return nullptr;
-        }
-        return std::make_unique<HardwareEncoder>(codec);
-    }
-
-
     // ===========================================================================
     // ComputePts (private helper)
     // ===========================================================================

@@ -48,6 +48,9 @@
     <ClInclude Include="include\replay_encoder.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="include\ffmpeg_amf_replay_encoder.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="include\audio_capture.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -102,6 +105,15 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\capture_engine.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ffmpeg_amf_replay_encoder.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\replay_encoder_factory.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\replay_encoder_policy.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\windows_monitor_resolver.cpp">

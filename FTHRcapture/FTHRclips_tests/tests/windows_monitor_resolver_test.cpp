@@ -14,6 +14,8 @@
 #include <utility>
 #include <vector>
 
+int RunAmfReplayEncoderTests();
+
 namespace {
 
 using fthr::monitor::AdapterLuid;
@@ -392,9 +394,13 @@ void ReplayEncoderInterfaceIsPolymorphic() {
               && fthr::IsProductionReplayBackendEnabled(
                   fthr::EncoderVendor::Nvidia, VideoCodec::AV1),
           "NVIDIA native production backend enables all three codecs");
-    Check(!fthr::IsProductionReplayBackendEnabled(
-              fthr::EncoderVendor::Amd, VideoCodec::H264),
-          "AMD production encoding remains disabled");
+    Check(fthr::IsProductionReplayBackendEnabled(
+              fthr::EncoderVendor::Amd, VideoCodec::H264)
+              && fthr::IsProductionReplayBackendEnabled(
+                  fthr::EncoderVendor::Amd, VideoCodec::HEVC)
+              && fthr::IsProductionReplayBackendEnabled(
+                  fthr::EncoderVendor::Amd, VideoCodec::AV1),
+          "AMD FFmpeg AMF production backend enables all three codecs");
     Check(!fthr::IsProductionReplayBackendEnabled(
               fthr::EncoderVendor::Intel, VideoCodec::H264),
           "Intel production encoding remains disabled");
@@ -428,7 +434,8 @@ int main() {
     CodecNeutralRingKeepsTimestampIntervalSelection();
     RingKeepsOneImmutableConfigPerGeneration();
     ReplayEncoderInterfaceIsPolymorphic();
-    std::cout << "FTHRclips_tests: 25 scenarios passed ("
-              << checks << " checks)" << std::endl;
+    const int amf_checks = RunAmfReplayEncoderTests();
+    std::cout << "FTHRclips_tests: 49 scenarios passed ("
+              << (checks + amf_checks) << " checks total)" << std::endl;
     return 0;
 }

@@ -282,8 +282,9 @@ int main(int argc, char* argv[]) {
     // ------------------------------------------------------------------
     // 4. Initialise the capture engine
     //
-    // CaptureEngine::Initialize() will attempt NVENC first.
-    // On success: encoded ring buffer active, FramePool skipped.
+    // CaptureEngine::Initialize() selects the hardware replay backend from the
+    // capture adapter (native NVENC on NVIDIA, FFmpeg AMF on AMD).
+    // On hardware success: encoded ring buffer active, FramePool skipped.
     // On failure: x264 fallback with raw BGRA FramePool.
     //
     // is_initialized is set to true ONLY after this succeeds. Python's
@@ -312,16 +313,9 @@ int main(int argc, char* argv[]) {
         // build (libx264 is GPL and is no longer shipped). This string is read
         // back by the UI and shown to the user, so reporting "libx264" here
         // would be an outright false claim about what encoded their clip.
-        const char* codec_name = "libopenh264";
-        if (engine.IsNvencActive()) {
-            switch (engine.GetActiveVideoCodec()) {
-            case fthr::VideoCodec::H264: codec_name = "h264_nvenc"; break;
-            case fthr::VideoCodec::HEVC: codec_name = "hevc_nvenc"; break;
-            case fthr::VideoCodec::AV1: codec_name = "av1_nvenc"; break;
-            }
-        }
+        const std::string codec_name = engine.GetActiveEncoderName();
         strncpy_s(layout->active_codec, sizeof(layout->active_codec),
-                  codec_name, _TRUNCATE);
+                  codec_name.c_str(), _TRUNCATE);
     }
 
     // v3 fields are zeroed by SharedMemory::Initialize() and written by the

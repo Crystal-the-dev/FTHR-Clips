@@ -24,13 +24,13 @@
 //
 // Encode backend (selected after capture backend):
 //
-//   NVENC path (nvenc_active_ = true):
-//     - HardwareEncoder encodes every frame from CaptureThread
+//   Compressed hardware path (legacy nvenc_active_ flag = true):
+//     - Native NVENC or FFmpeg AMF encodes every frame from CaptureThread
 //     - Encoded AVCC packets pushed into EncodedRingBuffer via callback
 //     - Raw FramePool NOT allocated (~8GB saved at 1080p/60fps/30s)
 //     - SaveClip: TakeSnapshot() -> MuxEncodedClip() (no re-encoding)
 //
-//   x264 fallback (nvenc_active_ = false):
+//   x264 fallback (legacy nvenc_active_ flag = false):
 //     - Existing raw BGRA FramePool path, unchanged
 //     - SaveClip: existing VideoEncoder encode loop
 //
@@ -152,6 +152,11 @@ namespace fthr {
         bool     IsRecording()   const;
         uint64_t GetFrameCount() const;
         bool     IsNvencActive() const { return nvenc_active_; }
+        std::string GetActiveEncoderName() const {
+            return nvenc_active_ && replay_encoder_
+                ? replay_encoder_->GetActiveEncoderInfo().name
+                : "libopenh264";
+        }
         VideoCodec GetActiveVideoCodec() const {
             return nvenc_active_ && replay_encoder_
                 ? replay_encoder_->GetActiveEncoderInfo().codec
@@ -214,6 +219,12 @@ namespace fthr {
         bool ResolveSelectedMonitor(const char* backend_name);
         bool InitializeMonitorCaptureDevice(
             const char* backend_name, IDXGIOutput** selected_output);
+        bool EnsureStagingTexture();
+        bool EncodeGpuReplayTexture(
+            ID3D11Texture2D* source,
+            int64_t present_qpc,
+            uint64_t produced_frame);
+        void FailReplayEncoder(const char* operation);
 
         // -----------------------------------------------------------------------
         // D3D11 state (shared by WGC and DXGI paths)
@@ -278,10 +289,14 @@ namespace fthr {
         monitor::MonitorTopologyEntry resolved_monitor_;
 
         // -----------------------------------------------------------------------
-        // NVENC path
+        // Compressed replay path. nvenc_active_ retains its legacy name because
+        // it is mirrored into the frozen shared-memory v4 contract; it now means
+        // "a hardware replay encoder is active" for native NVENC or FFmpeg AMF.
         // -----------------------------------------------------------------------
         bool                              nvenc_active_;
         bool                              nvidia_device_; // true when D3D11 device is on the NVIDIA adapter (GPU zero-copy enabled)
+        bool                              replay_encoder_cpu_input_;
+        EncoderVendor                     capture_adapter_vendor_;
         std::unique_ptr<IReplayEncoder>    replay_encoder_;
         std::unique_ptr<EncodedRingBuffer> encoded_ring_;
 

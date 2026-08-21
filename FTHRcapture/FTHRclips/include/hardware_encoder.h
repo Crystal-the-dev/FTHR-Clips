@@ -236,10 +236,6 @@ namespace fthr {
         int callback_log_count_;
     };
 
-    // Constructs only codecs enabled for the native NVIDIA backend.
-    std::unique_ptr<IReplayEncoder> CreateProductionReplayEncoder(VideoCodec codec);
-
-
 } // namespace fthr
 
 
