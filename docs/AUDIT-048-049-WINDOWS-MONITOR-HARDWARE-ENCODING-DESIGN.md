@@ -931,3 +931,147 @@ alpha ready: AMD H.264/HEVC/AV1, Intel H.264/HEVC/AV1, hybrid capture/encode ada
 policy and their physical qualification remain AUDIT-049 P0 work. No new audit finding
 is required because these are the already-defined remaining parts of AUDIT-049. The
 next bounded task is exactly AMD H.264, HEVC and AV1 through FFmpeg AMF plus D3D11.
+
+## Implementation addendum — 2026-08-21 — AMD codec stage
+
+This addendum records the AMD H.264, HEVC and AV1 source implementation. No AMD GPU is
+present on the development host, so it deliberately distinguishes code/build evidence
+from real AMF runtime, media and performance evidence. AUDIT-049 remains **OPEN, P0**.
+
+### Pinned FFmpeg and runtime evidence
+
+The shipped Windows build is `n8.1.2-21-gce3c09c101-20260630`. Its live encoder list
+contains `h264_amf`, `hevc_amf` and `av1_amf`; all three advertise D3D11 hardware input
+and accept BGRA through the common AMF wrapper. The pinned `amfenc.c` wraps
+`AV_PIX_FMT_D3D11` frames through `CreateSurfaceFromDX11Native`, retains the submitted
+`AVFrame` until AMF releases the surface and copies only the resulting compressed
+buffer into an `AVPacket`. The host-copy branch is not used.
+
+The D3D11 frames context uses `DXGI_FORMAT_B8G8R8A8_UNORM`/`AV_PIX_FMT_BGRA` and a
+fixed eight-slice GPU texture-array pool. A non-zero pool is required by this pinned
+`hwcontext_d3d11va.c`; the capture loop therefore copies subresource zero of the WGC or
+DXGI texture into the current encoder-owned array slice with
+`CopySubresourceRegion`. FFmpeg passes the slice index to AMF. No texture is mapped.
+
+FFmpeg derives its AMF device from the supplied D3D11 device and loads the AMD AMF
+runtime dynamically (`amfrt64.dll` on 64-bit Windows). FTHR does not package an AMF
+SDK/runtime DLL. Missing driver runtime, unsupported hardware or a codec-specific open
+failure is returned as an initialization error. The test host has no AMD display
+adapter and no system `amfrt64.dll`, which is expected and means real AMF behavior is
+not verified here.
+
+### Architecture and ownership
+
+`FfmpegAmfReplayEncoder` implements `IReplayEncoder`. A narrow codec-session object
+owns the `AVCodecContext`, D3D11 `AVHWDeviceContext`, `AVHWFramesContext`, reusable
+`AVFrame`, reusable `AVPacket` and the COM reference held by FFmpeg. Destruction and
+every failed initialization unwind through one reset path. The outer wrapper owns QPC
+timestamping, forced-keyframe policy, packet callbacks, flush and generation-local
+timing lookup. It adds no encoder thread or queue; FFmpeg/AMF owns any internal async
+work.
+
+The centralized factory selects exactly:
+
+- selected NVIDIA adapter → native NVENC;
+- selected AMD adapter → FFmpeg AMF;
+- Intel/unknown adapter → current fallback;
+- the pre-existing Intel-display/NVIDIA Optimus case → native NVENC CPU-input.
+
+An AMD-owned monitor is never redirected to an unrelated NVIDIA or AMD adapter. The
+AMF session independently queries the supplied D3D11 device, requires AMD vendor
+`0x1002`, and verifies that the immediate context belongs to the same COM device.
+Requested and active codec/config must match. H.264 may use the existing truthful
+OpenH264/raw fallback after AMF failure; explicit HEVC or AV1 fails closed rather than
+silently becoming H.264.
+
+The primary supported AMD path is native-resolution, same-adapter capture. A configured
+source/output resolution mismatch is rejected because adding an unmeasured D3D11
+scaler was outside this bounded stage. This restriction is explicit; it cannot silently
+produce the wrong resolution or fall into a continuous CPU conversion path.
+
+### Frame, encode and packet contracts
+
+The normal path for all three codecs is:
+
+`WGC/DXGI BGRA texture → GPU CopySubresourceRegion → FFmpeg D3D11 BGRA frame → AMF → compressed packet → EncodedRingBuffer → MP4 transaction`.
+
+Full-frame CPU copies, GPU-to-CPU readbacks and CPU-to-GPU uploads are all zero on that
+path. There is one full-frame GPU copy and AMF performs any internal hardware color
+conversion required by the codec. The raw replay `FramePool` and readback staging
+texture are deferred and remain unallocated after successful AMF initialization.
+
+All codecs use Main profile, CBR, ultra-low-latency usage, speed quality, four-frame
+AMF async depth, zero B-frames, low-delay codec flags and a nominal four-second GOP.
+HEVC and AV1 explicitly use eight-bit input and GOP header insertion; HEVC uses one GOP
+per IDR, and AV1 requests lowest latency. Independently of frame arrival rate, the
+wrapper forces an I/IDR/key frame whenever QPC-derived media PTS advances by four
+seconds. No `frame_index / configured_fps` wall-time assumption was introduced.
+
+Encoder and replay time base remain `1/fps`. Each `AVFrame::pts` comes from the existing
+QPC epoch and monotonic media-time calculation. AMF packet PTS and keyframe flags are
+required and passed unchanged into the ring; no-B-frame MP4 output continues to use
+`DTS = PTS`, rescaled from encoder time base to stream time base `1/90000`. This
+preserves the AUDIT-042 interval model.
+
+H.264 AMF Annex-B output is normalized to length-prefixed samples and its SPS/PPS are
+converted to `avcC`. HEVC retains Annex-B access units/extradata for the pinned MP4
+muxer to form `hvcC`. AV1 retains low-overhead OBUs and sequence-header data for
+`av1C`. No packet is admitted until a valid immutable `EncodedVideoConfig` is available.
+Recovery destroys the codec/hardware contexts, clears the replay generation and creates
+a fresh config; old callbacks cannot arrive because the wrapper has no background
+thread.
+
+### Memory/performance model
+
+The removed normal AMD CPU traffic was approximately 498 MB/s at 1080p60, 885 MB/s at
+1440p60 and 1.99 GB/s at 4K60, before later save-time encoding. At 16 Mbit/s the
+compressed video payload is approximately 2 MB/s, 60 MB for 30 seconds or 120 MB for
+60 seconds (about 57.2/114.4 MiB), plus packet overhead. The eight-slice BGRA AMF input
+pool is approximately 63.3 MiB at 1080p, 112.5 MiB at 1440p or 253.1 MiB at 4K. GPU
+copy bandwidth still exists, but no equivalent full-resolution bandwidth crosses the
+CPU memory boundary. Gaming-FPS or quality improvements are not claimed without AMD
+hardware measurements.
+
+### Deterministic verification and limitations
+
+The native executable now reports 49 scenarios / 83 checks. Its 24 AMD scenarios cover
+adapter policy, exact H.264/HEVC/AV1 encoder names, all missing-encoder cases, encoder
+open and hardware-context failures, real non-AMD D3D11 rejection, no silent codec
+fallback, three `EncodedVideoConfig` forms, ring/mux config, timestamp/keyframe and
+subresource propagation, generation immutability, flush/error behavior, raw-pool
+avoidance and transactional cleanup after a simulated mux-writer failure.
+
+The Windows Release x64 solution builds with zero compiler/linker warnings and errors.
+The full Python result is 391 passed / 30 platform skips. Ruff, compileall, version,
+response, shared-memory v4 (Windows 2736 bytes / Linux 4272 bytes), exception and
+hygiene gates pass. The source licence gate passes 76 checks with only the known absent
+vendored-Linux-FFmpeg warning; the existing Windows bundle passes 84/84 licence, Qt and
+asset checks. No package file or proprietary runtime was added. Linux source was not
+modified and Linux runtime regression was not executed on this Windows host.
+
+The available RTX 4060 Ti still opened `h264_nvenc`, `hevc_nvenc` and `av1_nvenc` in
+the pinned FFmpeg build; short smoke files for all three fully decoded. Prior product
+30/60-second NVIDIA evidence remains authoritative and the deterministic factory tests
+prove NVIDIA never routes to AMF.
+
+Real AMD fields remain **NOT VERIFIED — NO AMD HARDWARE**: GPU/driver capability,
+H.264/HEVC/AV1 open and encode, 30/60-second saves, warm-up/recovery saves, rapid save,
+ffprobe, full decode, observed keyframe gaps, save latency, process CPU, GPU video
+encode utilization and memory. Local qualification must run that complete matrix on an
+AMD-owned monitor, including an older GPU that truthfully rejects AV1 if unsupported.
+
+### Status after the AMD stage
+
+| Vendor | H.264 | HEVC | AV1 |
+|---|---|---|---|
+| NVIDIA | Integrated + verified | Integrated + verified | Integrated + verified |
+| AMD | Code integrated; hardware unverified | Code integrated; hardware unverified | Code integrated; hardware unverified |
+| Intel | Not integrated | Not integrated | Not integrated |
+
+AMD codec stage verdict: **CODE READY / HARDWARE UNVERIFIED** for the bounded
+same-adapter native-resolution architecture. AUDIT-049 remains **OPEN, P0** because
+Intel H.264/HEVC/AV1 and hybrid-GPU qualification remain. No new audit finding is
+created: the architecture is the already-approved AUDIT-049 AMD stage and introduces
+no new binary, IPC contract or security boundary. General Windows alpha remains
+**NO**. The next task is exactly Intel H.264, HEVC and AV1 through QSV/oneVPL plus
+D3D11; Intel work has not begun here.
