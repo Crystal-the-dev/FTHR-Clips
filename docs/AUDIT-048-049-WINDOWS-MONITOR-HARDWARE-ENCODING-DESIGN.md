@@ -849,3 +849,85 @@ LUIDs, actual replay capacity, normalized selected-monitor identity/status, and 
 encoder drop counters. Capability data should distinguish available, selected and
 active state so the UI cannot claim an encoder that initialization rejected. This work
 made no shared-memory layout, enum or version change.
+
+## Implementation addendum — 2026-08-21 — NVIDIA codec stage
+
+This addendum records the bounded NVIDIA-only implementation after the Stage 2
+foundation. It does not widen support to AMD, Intel or hybrid-adapter configurations,
+and AUDIT-049 remains **OPEN, P0**.
+
+### Integrated NVIDIA matrix
+
+| Vendor | H.264 | HEVC | AV1 |
+|---|---|---|---|
+| NVIDIA | Integrated and physically verified | Integrated and physically verified | Integrated and physically verified |
+| AMD | Not integrated | Not integrated | Not integrated |
+| Intel | Not integrated | Not integrated | Not integrated |
+
+The native NVENC backend now selects and verifies the requested codec GUID and ARGB
+input format against the live encode session before initialization. The pinned NVENC
+headers expose API version 13.0 and the H.264, HEVC and AV1 codec/profile GUIDs used by
+this implementation. All three codecs use preset P2 with low-latency tuning, the
+existing VBR target/ceiling policy, no B-frames and a four-media-second maximum GOP.
+Explicit HEVC or AV1 selection fails closed when that codec cannot initialize; it
+cannot silently report or run H.264. Auto/H.264 retains the existing software fallback
+policy.
+
+The encoded ring's video configuration is immutable within one capture generation.
+Recovery therefore creates a fresh generation/config rather than mixing codecs or
+extradata. The existing AUDIT-022/023/035 health signals, AUDIT-028 transactional save,
+AUDIT-042 timestamp-driven interval selection and recovery policy are preserved.
+
+H.264 remains length-prefixed AVC with `avcC`. HEVC uses Annex-B packets and sequence
+headers that FFmpeg converts to MP4 samples/`hvcC`. AV1 uses low-overhead OBU packets
+and sequence header data for `av1C`. An initial AV1 configuration that suppressed
+sequence headers produced a recognizable but undecodable MP4 and was rejected. The
+final configuration matches the pinned FFmpeg NVENC integration: non-Annex-B AV1,
+sequence headers enabled and repeated on keyframes. Full decode then passed.
+
+No raw-frame IPC, CPU readback, CPU pixel-format conversion, CPU-to-GPU upload or new
+full-frame copy was introduced. WGC and NVENC retain persistent D3D11 textures and one
+`CopyResource`; only H.264 performs the pre-existing compressed-packet Annex-B-to-AVCC
+conversion. HEVC and AV1 packets are published directly into the existing compressed
+ring path. No new SDK binary or third-party runtime is packaged.
+
+### Physical runtime evidence
+
+Hardware: NVIDIA GeForce RTX 4060 Ti, driver 610.88, 1920x1080 AOC display, WGC,
+same-adapter D3D11/NVENC, 60 FPS target and 16 Mbit/s. The runtime used the repository's
+pinned FFmpeg `n8.1.2-21-gce3c09c101` build. Audio was disabled to isolate video codec
+correctness.
+
+| Codec | Active backend | 30-second save | 60-second save | Rapid save | Full decode | Max keyframe gap |
+|---|---|---:|---:|---:|---|---:|
+| H.264 | `h264_nvenc` | 30.000 s | 60.000 s | 30.000 s | Pass | 4.017 s |
+| HEVC | `hevc_nvenc` | 30.000 s | 60.000 s | 30.000 s | Pass | 4.017 s |
+| AV1 | `av1_nvenc` | 30.000 s | 60.000 s | 30.000 s | Pass | 4.017 s |
+
+Each MP4 reports start time zero and stream time base `1/90000`. Warm-up saves requested
+at 30 seconds after roughly five seconds of connected capture produced valid partial-
+history clips of 6.283 s (H.264), 6.450 s (HEVC) and 6.217 s (AV1), rather than padded
+30-second files. All three warm-up files also passed full decode. The runtime does not
+expose an exact encode-drop counter, so no zero-drop claim is made.
+
+Observed process samples were 3.52–4.05% of one CPU core, 267–271 MiB working set and
+roughly 4–7% NVIDIA encoder utilization during these desktop workloads. Save completion
+was observed in under one second, but was not instrumented as an internal latency
+benchmark. These samples confirm no obvious stage-specific regression; they are not a
+broad performance qualification.
+
+### Verification and remaining scope
+
+Native deterministic coverage now comprises 25 scenarios / 57 checks for codec
+configuration, production backend gating, per-generation ring immutability, packet
+format/extradata contracts and the existing monitor/replay behavior. Python coverage
+also verifies that all three explicit codec preferences survive a settings restart.
+Product build, focused tests, full regression and release/contract gates are recorded
+in the implementation handoff.
+
+This stage makes the three NVIDIA codec rows implementation-ready on the physically
+tested same-adapter Windows configuration. It does **not** make the general Windows
+alpha ready: AMD H.264/HEVC/AV1, Intel H.264/HEVC/AV1, hybrid capture/encode adapter
+policy and their physical qualification remain AUDIT-049 P0 work. No new audit finding
+is required because these are the already-defined remaining parts of AUDIT-049. The
+next bounded task is exactly AMD H.264, HEVC and AV1 through FFmpeg AMF plus D3D11.
