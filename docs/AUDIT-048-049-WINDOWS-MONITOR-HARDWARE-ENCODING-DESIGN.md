@@ -1075,3 +1075,143 @@ created: the architecture is the already-approved AUDIT-049 AMD stage and introd
 no new binary, IPC contract or security boundary. General Windows alpha remains
 **NO**. The next task is exactly Intel H.264, HEVC and AV1 through QSV/oneVPL plus
 D3D11; Intel work has not begun here.
+
+## Implementation addendum — 2026-08-21 — Intel codec stage
+
+This addendum records the same-adapter Intel H.264, HEVC and AV1 source integration.
+The development host has only an NVIDIA GeForce RTX 4060 Ti and no Intel display
+adapter, so code/build evidence is kept separate from QSV runtime, media and
+performance evidence. AUDIT-049 remains **OPEN, P0**.
+
+### Exact pinned FFmpeg/QSV evidence
+
+The shipped Windows build is `n8.1.2-21-gce3c09c101-20260630`, revision
+`ce3c09c101c83add623774d414a9f9498caf5c25`. Its live encoder list contains
+`h264_qsv`, `hevc_qsv` and `av1_qsv`; the build configuration enables `libvpl`, and
+the hardware-device list contains both `qsv` and `d3d11va`. The three encoders accept
+`AV_PIX_FMT_QSV`; their eight-bit common software format is NV12.
+
+The implementation was checked against the exact revision's
+`libavutil/hwcontext_qsv.c:qsv_device_derive_from_child`,
+`qsv_frames_derive_from`, `qsv_map_to` and `qsv_map_from`, plus
+`libavutil/hwcontext_d3d11va.c`. Device derivation passes the selected
+`ID3D11Device` into oneVPL and constrains selection with the Intel device identity and
+adapter LUID. Fixed D3D11 pools preserve the array-slice handle in the QSV
+`mfxHDLPair`; a pool carrying `D3D11_BIND_RENDER_TARGET` instead uses
+`MFX_INFINITE` for the second handle. FTHR therefore deliberately separates the
+single VideoProcessor render target from the eight-slice encoder pool.
+
+The exact `libavcodec/qsvenc.c` uses the caller's `AV_PIX_FMT_QSV` hardware frames,
+an async FIFO and forced-IDR behavior. `qsvenc_h264.c` and `qsvenc_hevc.c` expose
+decoder configuration after open. With global headers, `qsvenc_av1.c` applies the
+`extract_extradata` bitstream filter, so AV1 decoder configuration arrives as
+`AV_PKT_DATA_NEW_EXTRADATA` with the first encoded packet. AV1 also requires a
+sufficient oneVPL implementation version; unsupported Intel generations fail the
+codec open rather than changing codec.
+
+`avcodec-62.dll` has no direct dependency on a separate `vpl` or `mfx` DLL. The
+pinned FFmpeg build was linked with the oneVPL dispatcher; the installed Intel
+graphics driver must provide the actual QSV/oneVPL implementation. FTHR adds and
+packages no DLL, SDK binary or proprietary runtime. Missing runtime, driver support
+or codec support is a truthful initialization error. The existing FFmpeg LGPL
+provenance and release-license gate remain unchanged.
+
+### Architecture, conversion and ownership
+
+`FfmpegQsvReplayEncoder` implements `IReplayEncoder`. Its production codec session
+owns the FFmpeg D3D11 device context, QSV device derived from that exact context,
+D3D11 NV12 frames context, derived QSV frames context, reusable frames/packet and
+all D3D11 VideoProcessor objects. The selected monitor's AUDIT-048 adapter remains
+authoritative: vendor `0x8086` is required, and the supplied immediate context must
+belong to the same COM device. No default or unrelated Intel adapter is opened.
+
+The persistent pipeline is:
+
+`WGC/DXGI BGRA texture → D3D11 VideoProcessor scale/color conversion → persistent NV12 render target → CopySubresourceRegion into current D3D11/QSV pool slice → h264_qsv/hevc_qsv/av1_qsv → compressed ring → existing MP4 transaction`.
+
+Microsoft's D3D11 contract permits eligible default textures (including bind flags
+zero or supported video/render combinations) as VideoProcessor inputs and requires
+`D3D11_BIND_RENDER_TARGET` for the output. The source/output rectangles make scaling
+and BGRA-to-NV12 conversion one VideoProcessor operation. The converter texture,
+output view, enumerator, processor and eight encoder surfaces are persistent. Only
+the input view follows the acquired capture resource per frame; no full-resolution
+heap buffer or application encoder thread was added.
+
+All three codecs use eight-bit NV12. The encoder pool is a fixed eight-slice D3D11
+texture array with `D3D11_BIND_DECODER | D3D11_BIND_VIDEO_ENCODER`, enough for QSV
+`async_depth=4`, the prepared frame and transient retained references. It intentionally
+does not carry the render-target flag, so the exact FFmpeg mapping retains each array
+slice. There are zero CPU full-frame copies, zero GPU-to-CPU readbacks and zero
+CPU-to-GPU uploads. Each frame performs one GPU VideoProcessor conversion/scale and
+one NV12 GPU copy.
+
+At 60 FPS, avoiding the old BGRA CPU path removes approximately 498 MB/s at 1080p,
+885 MB/s at 1440p and 1.99 GB/s at 4K. The remaining NV12 GPU copy is approximately
+187, 332 and 746 MB/s respectively. The eight-slice NV12 pool plus one converter
+surface uses about 26.7 MiB at 1080p, 47.5 MiB at 1440p or 106.8 MiB at 4K. At
+16 Mbit/s, compressed replay payload remains about 60 MB for 30 seconds or 120 MB for
+60 seconds, before small container/packet overhead. No gaming-FPS improvement is
+claimed without Intel hardware measurement.
+
+### Codec, timing, config and failure contracts
+
+H.264 maps only to `h264_qsv`, HEVC only to `hevc_qsv`, and AV1 only to `av1_qsv`.
+All use Main profile, target/minimum/maximum rate at the configured bitrate, very-fast
+preset, low-delay/global-header/closed-GOP flags, no B-frames, look-ahead depth zero,
+QSV async depth four and forced IDR. The wrapper independently forces a keyframe at
+most every four media seconds. Requested and active codec/packet format must match;
+there is no QSV codec fallback and no software encoder reported as Intel hardware.
+
+Time base remains `1/fps`. QPC-derived monotonic media PTS is submitted to FFmpeg;
+packet PTS and keyframe status pass to the replay ring, while absent packet DTS uses
+PTS under the zero-B-frame policy. This keeps AUDIT-042's timestamp-selected 30/60
+second interval model unchanged. Send/receive handles EAGAIN, drains every available
+packet and flushes to EOF on shutdown.
+
+H.264 Annex-B packets are normalized to length-prefixed samples and SPS/PPS become
+`avcC`. HEVC remains Annex B with encoder extradata for the pinned MP4 muxer to form
+`hvcC`. AV1 remains low-overhead OBU. Because pinned QSV may produce AV1 sequence
+configuration with the first packet, the ring publishes its immutable
+`EncodedVideoConfig` immediately before admitting that packet. Missing or changing
+configuration fails the generation. Device removal, conversion, QSV session,
+send/receive or config-publication failure enters the existing recovery/failure path;
+no stale packet is accepted.
+
+Successful Intel initialization skips both the raw replay pool and readback staging
+texture. Save remains compressed snapshot to codec-neutral MP4 mux to AUDIT-028
+temporary file/atomic rename, with no video re-encode. The shared-memory v4 layout,
+UI/engine IPC, Linux implementation, NVIDIA native path and AMD AMF path are unchanged.
+
+### Verification and remaining scope
+
+The native executable reports 76 scenarios and 115 checks after adding the real WARP
+wrong-device rejection. Its 27 Intel requirements cover vendor routing, all three
+exact QSV names, missing runtime/codec failures, device/context/derivation/conversion
+failures, no silent codec fallback, three config forms, ring/mux/transaction behavior,
+PTS/keyframe propagation, deferred AV1 config, generation isolation, flush/errors,
+raw-pool avoidance and NVIDIA/AMD policy regressions.
+
+Release x64 builds successfully. Python regression is 391 passed with 30 Windows
+platform skips. Ruff, compileall, version, engine-response, shared-memory v4, exception
+and hygiene gates pass. The combined source/existing-Windows-artifact release gate
+passes 160 checks with only the known warning that a vendored Linux FFmpeg is absent
+on this Windows checkout. PySide6/Qt and all 25 source assets plus 20 packaged Windows
+assets remain approved. Linux source was not modified.
+
+Real Intel fields remain **NOT VERIFIED — NO INTEL HARDWARE**: GPU/driver, H.264/HEVC/
+AV1 codec opens, 30/60-second and rapid saves, ffprobe, full decode, observed keyframe
+gaps, save latency, process CPU, GPU conversion/encode utilization and memory. Local
+qualification must run that matrix on an Intel-owned monitor; an older Intel device
+that lacks AV1 must report AV1 unsupported without invalidating working H.264/HEVC.
+
+| Vendor | H.264 | HEVC | AV1 |
+|---|---|---|---|
+| NVIDIA | Integrated + verified | Integrated + verified | Integrated + verified |
+| AMD | Code integrated; hardware unverified | Code integrated; hardware unverified | Code integrated; hardware unverified |
+| Intel | Code integrated; hardware unverified | Code integrated; hardware unverified | Code integrated; hardware unverified |
+
+Intel codec stage verdict: **CODE READY / HARDWARE UNVERIFIED**. AUDIT-049 remains
+**OPEN, P0** because AMD/Intel physical qualification, hybrid-GPU policy and final
+capability truth remain. No new audit ID is needed: this is the planned Intel portion
+of AUDIT-049 and adds no binary, IPC version or separate security boundary. General
+Windows alpha remains **NO**.
