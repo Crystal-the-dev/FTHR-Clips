@@ -179,11 +179,11 @@ void NvidiaStillSelectsNativeNvenc() {
         "NVIDIA adapter remains on native NVENC");
 }
 
-void IntelRemainsUnsupported() {
+void IntelStageDoesNotAffectAmdPolicy() {
     CheckAmf(fthr::SelectProductionReplayBackend(
                   EncoderVendor::Intel, VideoCodec::H264)
-              == ReplayEncoderBackend::Software,
-        "Intel remains on current software fallback");
+              == ReplayEncoderBackend::FfmpegQsv,
+        "Intel now selects QSV without changing AMD AMF policy");
 }
 
 void RequestedCodecsMapToExactAmfNames() {
@@ -385,7 +385,7 @@ void SuccessfulAmfUsesCompressedReplay() {
 int RunAmfReplayEncoderTests() {
     AmdAdapterSelectsAmf();
     NvidiaStillSelectsNativeNvenc();
-    IntelRemainsUnsupported();
+    IntelStageDoesNotAffectAmdPolicy();
     RequestedCodecsMapToExactAmfNames();
     MissingEncodersFailHonestly();
     InitializationFailuresPropagate();

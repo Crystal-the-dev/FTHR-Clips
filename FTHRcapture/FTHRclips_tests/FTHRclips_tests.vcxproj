@@ -12,10 +12,12 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="tests\amf_replay_encoder_test.cpp" />
+    <ClCompile Include="tests\qsv_replay_encoder_test.cpp" />
     <ClCompile Include="tests\windows_monitor_resolver_test.cpp" />
     <ClCompile Include="..\FTHRclips\src\encoded_ring_buffer.cpp" />
     <ClCompile Include="..\FTHRclips\src\encoded_video_config.cpp" />
     <ClCompile Include="..\FTHRclips\src\ffmpeg_amf_replay_encoder.cpp" />
+    <ClCompile Include="..\FTHRclips\src\ffmpeg_qsv_replay_encoder.cpp" />
     <ClCompile Include="..\FTHRclips\src\nvenc_codec_config.cpp" />
     <ClCompile Include="..\FTHRclips\src\replay_encoder_policy.cpp" />
     <ClCompile Include="..\FTHRclips\src\windows_monitor_resolver.cpp" />

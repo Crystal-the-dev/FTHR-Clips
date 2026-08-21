@@ -15,6 +15,7 @@
 #include <vector>
 
 int RunAmfReplayEncoderTests();
+int RunQsvReplayEncoderTests();
 
 namespace {
 
@@ -401,9 +402,13 @@ void ReplayEncoderInterfaceIsPolymorphic() {
               && fthr::IsProductionReplayBackendEnabled(
                   fthr::EncoderVendor::Amd, VideoCodec::AV1),
           "AMD FFmpeg AMF production backend enables all three codecs");
-    Check(!fthr::IsProductionReplayBackendEnabled(
-              fthr::EncoderVendor::Intel, VideoCodec::H264),
-          "Intel production encoding remains disabled");
+    Check(fthr::IsProductionReplayBackendEnabled(
+              fthr::EncoderVendor::Intel, VideoCodec::H264)
+              && fthr::IsProductionReplayBackendEnabled(
+                  fthr::EncoderVendor::Intel, VideoCodec::HEVC)
+              && fthr::IsProductionReplayBackendEnabled(
+                  fthr::EncoderVendor::Intel, VideoCodec::AV1),
+          "Intel FFmpeg QSV production backend enables all three codecs");
 }
 
 } // namespace
@@ -435,7 +440,8 @@ int main() {
     RingKeepsOneImmutableConfigPerGeneration();
     ReplayEncoderInterfaceIsPolymorphic();
     const int amf_checks = RunAmfReplayEncoderTests();
-    std::cout << "FTHRclips_tests: 49 scenarios passed ("
-              << (checks + amf_checks) << " checks total)" << std::endl;
+    const int qsv_checks = RunQsvReplayEncoderTests();
+    std::cout << "FTHRclips_tests: 76 scenarios passed ("
+              << (checks + amf_checks + qsv_checks) << " checks total)" << std::endl;
     return 0;
 }
