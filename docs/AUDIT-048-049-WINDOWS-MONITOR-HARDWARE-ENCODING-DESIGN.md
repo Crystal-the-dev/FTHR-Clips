@@ -1215,3 +1215,178 @@ Intel codec stage verdict: **CODE READY / HARDWARE UNVERIFIED**. AUDIT-049 remai
 capability truth remain. No new audit ID is needed: this is the planned Intel portion
 of AUDIT-049 and adds no binary, IPC version or separate security boundary. General
 Windows alpha remains **NO**.
+
+## AUDIT-049 — Final qualification — 2026-08-21
+
+### Decision and status
+
+AUDIT-049 remains **OPEN, P0**. The code/policy portion is complete, and the physically
+tested NVIDIA same-adapter cohort is ready for a controlled alpha. AMD and Intel remain
+**CODE READY / HW UNVERIFIED** because this machine has no AMD or Intel adapter. Hybrid
+GPU capture/encoding remains **NOT READY**. These missing physical results are existing
+AUDIT-049 scope, not a new independent finding.
+
+The final public-alpha policy is:
+
+1. The selected monitor/capture D3D11 adapter is authoritative.
+2. NVIDIA uses native NVENC, AMD uses FFmpeg AMF, and Intel uses FFmpeg QSV on that
+   exact adapter/device.
+3. The requested codec must initialize and must equal the active codec.
+4. An unrelated vendor elsewhere in the machine cannot steal encoder selection.
+5. Automatic cross-adapter encoding and the legacy raw replay fallback are disabled.
+6. Failure stops capture startup with a structured, visible error; it never claims a
+   30/60-second replay that is not physically available.
+
+`SelectWindowsReplayPolicy` is the sole production selection policy. Hardware probing
+is generation-local: the backend is opened once during engine startup on the current
+capture device. A monitor/topology/device/codec change requires a fresh engine
+generation, so there is no persistent adapter/driver capability cache to become stale.
+
+### Hybrid policy evaluation
+
+| Policy | Transfer/CPU behavior | Reliability and maintenance | Alpha decision |
+|---|---|---|---|
+| A — capture-adapter encoder | Existing same-device GPU conversion/copy only; no cross-adapter full frame | Smallest surface, already represented by all three backends | **Selected** |
+| B — NVIDIA whenever present | May require Intel/AMD GPU → CPU → NVIDIA upload or unqualified shared-resource behavior | Reintroduces the removed vendor-presence heuristic | Rejected |
+| C — strongest codec encoder | Same transfer uncertainty as B and selection changes by codec | Requires per-pair capability/performance qualification | Rejected |
+| D — automatic cost-aware | Needs trustworthy runtime cost measurements, topology cache and recovery for every adapter pair | Highest complexity and alpha-blocker risk | Deferred |
+| E — same-adapter + user override | Same safe default; override still needs an approved transfer path and explicit cost | Reasonable future product direction | Default half selected; override deferred |
+
+The former Intel-display/NVIDIA CPU-input path was removed from production selection.
+It performed a full BGRA readback and upload and was created by enumerating NVIDIA
+presence rather than by a qualified adapter-pair policy. No replacement cross-adapter
+path is advertised.
+
+Direct3D 11.1 can share eligible 2D textures using NT handles and keyed-mutex
+synchronization, but this alone does not prove a zero-copy cross-*adapter* encode path.
+Windows hybrid cross-adapter resources require driver support, one shared linear
+allocation in the aperture segment, pitch/height alignment and explicit synchronization.
+D3D11.3 row-major cross-adapter layouts may avoid application CPU staging, but still
+need per adapter-pair compatibility, encoder acceptance, synchronization and performance
+qualification. Therefore shared-handle, cross-adapter texture and D3D12 bridge designs
+remain future measured work, not an alpha fallback. Primary references:
+
+- Microsoft [`D3D11_RESOURCE_MISC_FLAG`](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ne-d3d11-d3d11_resource_misc_flag)
+  and [`OpenSharedResource1`](https://learn.microsoft.com/en-us/windows/win32/api/d3d11_1/nf-d3d11_1-id3d11device1-opensharedresource1)
+  documentation;
+- Microsoft [*Using Cross-Adapter Resources in a Hybrid System*](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/using-cross-adapter-resources-in-a-hybrid-system);
+- Microsoft [*Default Texture Mapping*](https://learn.microsoft.com/en-us/windows/win32/direct3d11/default-texture-mapping)
+  (row-major cross-adapter layout).
+
+The actual capture format is BGRA, four bytes/pixel. One full-frame transfer at 60 FPS
+is approximately:
+
+| Resolution | One direction | CPU readback + upload |
+|---|---:|---:|
+| 1920×1080 | 497.7 MB/s (474.6 MiB/s) | 995.3 MB/s (949.2 MiB/s) |
+| 2560×1440 | 884.7 MB/s (843.8 MiB/s) | 1.77 GB/s (1.65 GiB/s) |
+| 3840×2160 | 1.99 GB/s (1.85 GiB/s) | 3.98 GB/s (3.71 GiB/s) |
+
+Those figures exclude row-pitch padding, additional copies, synchronization and PCIe/
+shared-memory contention. The CPU-staged route is therefore forbidden as an automatic
+gaming-capture default.
+
+### Capability truth and failure behavior
+
+The internal generation capability records requested/active codec, active backend,
+hardware state, capture/encoder vendor, same-adapter state, initialization result and
+generation. Startup logs emit the corresponding `ReplayCapability` record. On success,
+the frozen v4 fields `nvenc_active` (legacy name meaning any Windows hardware encoder)
+and `active_codec` publish actual backend truth such as `h264_nvenc`, `hevc_amf` or
+`av1_qsv`; the selected monitor path and configured history already remain available
+to the two processes. Because all successful alpha paths are hardware, same-adapter and
+compressed, replay capacity equals configured compressed history. No extra ABI fields
+are required to make an alpha go/no-go decision.
+
+On failure the engine emits a bounded `FTHR_STARTUP_ERROR` record. The Windows UI
+captures native startup output and displays the code/detail instead of the former
+generic “engine not responding” message. Supported error classes include
+`REQUESTED_CODEC_UNSUPPORTED`, `HARDWARE_ENCODER_UNAVAILABLE`,
+`CAPTURE_ADAPTER_UNSUPPORTED`, `CROSS_ADAPTER_PATH_UNAVAILABLE`,
+`REPLAY_CAPACITY_LIMITED` and `ENCODER_INIT_FAILED`. FFmpeg AMF/QSV and native NVENC
+preserve their backend detail. There is no silent codec substitution.
+
+Shared memory therefore remains **v4**, exactly 2736 bytes on Windows and 4272 bytes on
+Linux. A v5 would be useful for richer live diagnostics or future user-selectable
+cross-adapter routing, but is not required for this fail-closed controlled cohort and
+was not implemented.
+
+The raw-capacity calculator remains deterministic for diagnostics. For example,
+512 MiB holds only 64 whole 1920×1080 BGRA frames, or 1.066 seconds at 60 FPS. The
+production policy refuses capture rather than representing that as a 60-second replay.
+
+### Repeatable physical qualification
+
+`tools/qualify_windows_hardware.py` provides the local qualification sequence. It
+starts one fresh engine generation per requested codec, reads actual `active_codec`
+from shared memory, captures a partial warm-up, full 30-second and 60-second histories,
+performs two rapid sequential saves, probes every file, fully decodes video, extracts
+keyframe timestamps, checks audio presence and confirms no final `.partial` remains.
+It writes a JSON report and one engine log per codec. Example:
+
+```powershell
+python tools\qualify_windows_hardware.py --codec all --output build\audit-049-machine
+```
+
+The operator must close the normal FTHR application first. Optional `--monitor`,
+`--width`, `--height`, `--fps`, `--bitrate` and executable-path arguments support
+another machine or packaged build. GPU 3D/copy/video-encode counters and game FPS lows
+remain external measurements; the report labels them rather than inventing values.
+
+### NVIDIA physical regression — pass
+
+Machine: Windows 10 Pro 22H2, build 19045; NVIDIA GeForce RTX 4060 Ti; driver WMI
+`32.0.16.1088` (NVIDIA 610.88); AOC 1920×1080 monitor; exact monitor device path and
+adapter LUID `0:124769`; native resolution, 60 FPS, 16 Mbit/s, audio enabled. Every
+generation logged capture vendor NVIDIA, encoder vendor NVIDIA, native-NVENC backend,
+same-adapter policy, compressed ring and skipped raw pool.
+
+| Codec | Active codec | Warm-up | 30-second | 60-second | Rapid pair | Full decode | Audio | Max keyframe gap |
+|---|---|---:|---:|---:|---|---|---|---:|
+| H.264 | `h264_nvenc` | 5.802 s | 30.016 s | 60.010 s | 5.013/5.013 s | Pass (all) | Present | 4.017 s |
+| HEVC | `hevc_nvenc` | 5.933 s | 30.016 s | 60.010 s | 5.013/5.013 s | Pass (all) | Present | 4.017 s |
+| AV1 | `av1_nvenc` | 5.917 s | 30.016 s | 60.010 s | 5.013/5.013 s | Pass (all) | Present | 4.017 s |
+
+Every output had the requested codec/resolution, every final `.partial` was absent and
+capture health remained active. Save latency ranges were 0.252–2.171 s (H.264),
+0.252–2.170 s (HEVC) and 0.302–2.168 s (AV1). End-of-run working set/private bytes were
+approximately 259/618 MB, 380/732 MB and 341/706 MB respectively. Average engine-process
+CPU was 11.25%, 11.34% and 11.20% of one logical-core equivalent over the three runs.
+These are desktop integration observations, not gaming-overhead qualification or a
+Medal comparison; GPU counters still require an external measurement pass.
+
+### AMD, Intel, scaling, OS and packaging truth
+
+No AMD/Intel physical result is claimed. For each codec, runtime open, 30/60-second
+duration, rapid save, probe/decode, keyframes, latency, CPU, GPU encode, memory and
+device-loss recovery remain **NOT VERIFIED — HARDWARE ABSENT**. AMD downscale behavior
+is not advertised; its current same-adapter cohort remains native-resolution only.
+Intel GPU VideoProcessor scaling is code-integrated but remains hardware-unverified.
+
+Windows 10 22H2 is physically verified only for the NVIDIA cohort above. Windows 11,
+AMD and Intel OS/driver combinations remain unverified. The package keeps the pinned
+FFmpeg encoders `h264_amf`/`hevc_amf`/`av1_amf` and
+`h264_qsv`/`hevc_qsv`/`av1_qsv`; no AMF DLL, oneVPL/QSV implementation DLL or new
+vendor binary was added. AMF uses the driver runtime; the Intel driver supplies the
+hardware implementation. Missing runtimes fail at initialization and reach the UI.
+
+### Final matrix and alpha cohort
+
+| Vendor | H.264 | HEVC | AV1 |
+|---|---|---|---|
+| NVIDIA | **VERIFIED** | **VERIFIED** | **VERIFIED** |
+| AMD | **CODE READY / HW UNVERIFIED** | **CODE READY / HW UNVERIFIED** | **CODE READY / HW UNVERIFIED** |
+| Intel | **CODE READY / HW UNVERIFIED** | **CODE READY / HW UNVERIFIED** | **CODE READY / HW UNVERIFIED** |
+
+- NVIDIA same-adapter: **READY** on the tested RTX 4060 Ti/driver/Windows 10 cohort.
+- AMD same-adapter: **CODE READY / HW UNVERIFIED**.
+- Intel same-adapter: **CODE READY / HW UNVERIFIED**.
+- Intel-display + NVIDIA and AMD-display + NVIDIA: **NOT READY**.
+- Multi-monitor: **READY** under the resolved AUDIT-048 exact-monitor contract.
+- Windows alpha: **CONTROLLED COHORT ONLY**; not general Windows support.
+
+AUDIT-028 transactional saves, AUDIT-042 timestamp duration, AUDIT-048 monitor mapping,
+capture health/recovery and the NVIDIA 3×3 path remain intact. The only next AUDIT-049
+task is representative AMD and Intel physical qualification with the reusable harness;
+the audit cannot close until that evidence exists or those cohorts are explicitly
+removed from public support.
