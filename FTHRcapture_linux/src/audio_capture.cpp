@@ -1,8 +1,12 @@
 #include "audio_capture.h"
 #include <pulse/simple.h>
 #include <pulse/error.h>
+#include <pulse/pulseaudio.h>
+#include <chrono>
+#include <functional>
 #include <iostream>
 #include <cstring>
+#include <thread>
 #include <time.h>
 
 namespace fthr {
@@ -26,15 +30,124 @@ static constexpr size_t kMaxRingSamples =
 // Chunk size: 10ms worth of frames
 static constexpr int kFramesPerChunk = AudioCapture::kSampleRate / 100;
 
+struct MonitorResolver {
+    std::string default_sink;
+    std::string monitor_source;
+    bool server_done{false};
+    bool sink_done{false};
+};
+
+static void server_info_cb(pa_context*, const pa_server_info* info, void* userdata) {
+    auto* state = static_cast<MonitorResolver*>(userdata);
+    if (info && info->default_sink_name)
+        state->default_sink = info->default_sink_name;
+    state->server_done = true;
+}
+
+static void sink_info_cb(pa_context*, const pa_sink_info* info, int eol,
+                         void* userdata) {
+    auto* state = static_cast<MonitorResolver*>(userdata);
+    if (info && info->monitor_source_name)
+        state->monitor_source = info->monitor_source_name;
+    if (eol != 0) state->sink_done = true;
+}
+
+static bool iterate_until(pa_mainloop* loop, pa_context* context,
+                          const std::function<bool()>& done,
+                          std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!done() && std::chrono::steady_clock::now() < deadline) {
+        int retval = 0;
+        if (pa_mainloop_iterate(loop, 0, &retval) < 0) return false;
+        const auto state = pa_context_get_state(context);
+        if (state == PA_CONTEXT_FAILED || state == PA_CONTEXT_TERMINATED)
+            return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return done();
+}
+
+static std::string resolve_default_sink_monitor() {
+    pa_mainloop* loop = pa_mainloop_new();
+    if (!loop) return {};
+    pa_context* context = pa_context_new(pa_mainloop_get_api(loop), "FTHRclips");
+    if (!context) {
+        pa_mainloop_free(loop);
+        return {};
+    }
+
+    std::string result;
+    MonitorResolver resolver;
+    if (pa_context_connect(context, nullptr, PA_CONTEXT_NOAUTOSPAWN, nullptr) >= 0
+        && iterate_until(loop, context, [context] {
+            return pa_context_get_state(context) == PA_CONTEXT_READY;
+        }, std::chrono::seconds(2))) {
+        pa_operation* server_op = pa_context_get_server_info(
+            context, server_info_cb, &resolver);
+        if (server_op && iterate_until(loop, context, [&resolver] {
+                return resolver.server_done;
+            }, std::chrono::seconds(2))) {
+            pa_operation_unref(server_op);
+            server_op = nullptr;
+            if (!resolver.default_sink.empty()) {
+                pa_operation* sink_op = pa_context_get_sink_info_by_name(
+                    context, resolver.default_sink.c_str(), sink_info_cb, &resolver);
+                if (sink_op && iterate_until(loop, context, [&resolver] {
+                        return resolver.sink_done;
+                    }, std::chrono::seconds(2))) {
+                    result = resolver.monitor_source;
+                }
+                if (sink_op) pa_operation_unref(sink_op);
+            }
+        }
+        if (server_op) pa_operation_unref(server_op);
+    }
+
+    pa_context_disconnect(context);
+    pa_context_unref(context);
+    pa_mainloop_free(loop);
+    return result;
+}
+
 // ---------------------------------------------------------------------------
 // Start / Stop
 // ---------------------------------------------------------------------------
 
 bool AudioCapture::Start(const std::string& device_name) {
-    if (running_.load())
-        return true;
+    Stop();
+
+    std::string source_name = device_name;
+    if (source_name.empty() || source_name == "auto")
+        source_name = resolve_default_sink_monitor();
+    if (source_name.empty()) {
+        std::cerr << "[Audio] Default output monitor could not be resolved"
+                  << std::endl;
+        return false;
+    }
+
+    pa_sample_spec ss;
+    ss.format   = PA_SAMPLE_FLOAT32LE;
+    ss.rate     = static_cast<uint32_t>(kSampleRate);
+    ss.channels = static_cast<uint8_t>(kChannels);
+    int pa_err = 0;
+    stream_ = pa_simple_new(
+        nullptr, "FTHRclips", PA_STREAM_RECORD, source_name.c_str(),
+        "desktop-output-loopback", &ss, nullptr, nullptr, &pa_err);
+    if (!stream_) {
+        std::cerr << "[Audio] Could not open output monitor '" << source_name
+                  << "': " << pa_strerror(pa_err) << std::endl;
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        chunks_.clear();
+        ring_total_ = 0;
+    }
+    std::cout << "[Audio] Capturing default output monitor: "
+              << source_name << std::endl;
     running_.store(true);
-    thread_ = std::thread(&AudioCapture::CaptureLoop, this, device_name);
+    thread_ = std::thread(&AudioCapture::CaptureLoop, this);
     return true;
 }
 
@@ -42,49 +155,18 @@ void AudioCapture::Stop() {
     running_.store(false);
     if (thread_.joinable())
         thread_.join();
+    if (stream_) {
+        pa_simple_free(stream_);
+        stream_ = nullptr;
+    }
 }
 
 // ---------------------------------------------------------------------------
 // CaptureLoop — runs on background thread
 // ---------------------------------------------------------------------------
 
-void AudioCapture::CaptureLoop(std::string device_name) {
-    // PulseAudio sample spec: float32, 48kHz, stereo
-    pa_sample_spec ss;
-    ss.format   = PA_SAMPLE_FLOAT32LE;
-    ss.rate     = static_cast<uint32_t>(kSampleRate);
-    ss.channels = static_cast<uint8_t>(kChannels);
-
-    // Determine source: use default sink monitor for loopback unless overridden
-    const char* source = nullptr;
-    std::string monitor;
-    if (!device_name.empty() && device_name != "auto") {
-        source = device_name.c_str();
-    }
-    // If source is nullptr, PulseAudio will use the default source.
-    // For true loopback, the user should configure their default source
-    // to be a monitor (e.g. alsa_output.*.monitor in PipeWire-pulse).
-
+void AudioCapture::CaptureLoop() {
     int pa_err = 0;
-    pa_simple* pa = pa_simple_new(
-        nullptr,          // default server
-        "FTHRclips",      // application name
-        PA_STREAM_RECORD,
-        source,           // source device (nullptr = default)
-        "loopback",       // stream description
-        &ss,
-        nullptr,          // default channel map
-        nullptr,          // default buffering attributes
-        &pa_err
-    );
-
-    if (!pa) {
-        std::cerr << "[Audio] pa_simple_new failed: "
-                  << pa_strerror(pa_err) << std::endl;
-        running_.store(false);
-        return;
-    }
-
     std::cout << "[Audio] PulseAudio capture started ("
               << kSampleRate << "Hz stereo float32)" << std::endl;
 
@@ -94,7 +176,7 @@ void AudioCapture::CaptureLoop(std::string device_name) {
     while (running_.load()) {
         int64_t chunk_start_ns = mono_ns();
 
-        if (pa_simple_read(pa, buf.data(),
+        if (pa_simple_read(stream_, buf.data(),
                            buf.size() * sizeof(float), &pa_err) < 0) {
             std::cerr << "[Audio] pa_simple_read error: "
                       << pa_strerror(pa_err) << std::endl;
@@ -121,7 +203,6 @@ void AudioCapture::CaptureLoop(std::string device_name) {
         }
     }
 
-    pa_simple_free(pa);
     std::cout << "[Audio] PulseAudio capture stopped" << std::endl;
 }
 

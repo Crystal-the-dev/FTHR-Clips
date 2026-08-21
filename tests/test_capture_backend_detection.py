@@ -16,7 +16,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 BINARY = Path(__file__).parent.parent / 'FTHRcapture_linux/build/FTHRclips'
-KNOWN_BACKENDS = ['wlr-screencopy', 'ext-image-copy-capture-v1', 'x11grab']
+KNOWN_BACKENDS = ['wlr-screencopy', 'ext-image-copy-capture-v1']
 
 
 def test_binary_exists():
@@ -27,6 +27,8 @@ def test_backend_auto_detects():
     """Engine must start and log a known backend within 3 seconds."""
     if not BINARY.exists():
         pytest.skip("Binary not built")
+    if not os.environ.get('WAYLAND_DISPLAY'):
+        pytest.skip('Public alpha backends require a real Wayland session')
 
     proc = subprocess.Popen(
         [str(BINARY), '30', '5', '1280', '720', '4000', '0',
@@ -47,6 +49,29 @@ def test_backend_auto_detects():
     finally:
         proc.kill()
         proc.wait()
+
+
+def test_pure_x11_is_disabled_and_exits_bounded():
+    if not BINARY.exists():
+        pytest.skip('Binary not built')
+    env = dict(os.environ)
+    env.pop('WAYLAND_DISPLAY', None)
+    env['DISPLAY'] = ':9876'
+    proc = subprocess.Popen(
+        [str(BINARY), '30', '5', '0', '0', '4000', '0',
+         '', '0', '', '0', '4', '0', '0'],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=env,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=8)
+        combined = stdout + stderr
+        assert 'x11grab disabled for alpha' in combined
+        assert 'Using x11grab' not in combined
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        pytest.fail('Alpha engine hung in a pure X11 environment')
 
 
 def test_no_backend_exits_cleanly():

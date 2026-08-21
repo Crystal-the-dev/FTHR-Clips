@@ -60,7 +60,13 @@ int main(int argc, char* argv[]) {
     cfg.preset     = (argc > 12) ? static_cast<int>(arg_u32(argv, 12, 4)) : 4;
     if (cfg.preset < 1) cfg.preset = 1;
     if (cfg.preset > 7) cfg.preset = 7;
-    cfg.multiband_enabled = (argc > 13) && (arg_u32(argv, 13, 0) == 1);
+    const bool multiband_requested =
+        (argc > 13) && (arg_u32(argv, 13, 0) == 1);
+    if (multiband_requested) {
+        std::cerr << "[FTHR] Multiband audio is disabled for the public alpha; "
+                  << "using normal desktop audio." << std::endl;
+    }
+    cfg.multiband_enabled = false;
     cfg.audio_enabled = !((argc > 14) && (arg_u32(argv, 14, 1) == 0));
 
     // Clamp
@@ -291,6 +297,11 @@ int main(int argc, char* argv[]) {
         layout->content_suspicious_streak = engine.GetContentSuspiciousStreak();
         layout->content_luma_mean = engine.GetContentLumaMean();
         layout->content_luma_variance = engine.GetContentLumaVariance();
+        if (!engine.IsCapturing()) {
+            std::cerr << "[FTHR] Capture backend stopped; exiting engine"
+                      << std::endl;
+            break;
+        }
         // Keep active_codec in shared memory up to date
         const std::string& ac = engine.GetActiveCodec();
         if (!ac.empty()) {

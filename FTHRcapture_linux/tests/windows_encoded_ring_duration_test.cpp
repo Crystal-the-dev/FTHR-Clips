@@ -23,6 +23,12 @@ void TestExactAudit042Regression() {
     constexpr uint32_t fps = 30;
     constexpr int64_t qpc_frequency = 180;
     fthr::EncodedRingBuffer ring(1000, fps, qpc_frequency);
+    fthr::EncodedVideoConfig config;
+    config.width = 1920;
+    config.height = 1080;
+    config.frame_rate = {30, 1};
+    config.time_base = {1, 30};
+    assert(ring.SetVideoConfig(config));
     PushRegressionSequence(ring);
 
     // Frame 330 begins at QPC 2310. The save boundary is its nominal end.

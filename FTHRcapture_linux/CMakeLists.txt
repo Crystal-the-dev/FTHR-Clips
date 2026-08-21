@@ -3,6 +3,12 @@ project(FTHRclips_linux CXX C)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# FFmpeg x11grab can block in XCB replies that do not consult the public
+# interrupt callback. Keep the source available for AUDIT-044 design work,
+# but do not ship an unbounded shutdown path in the public alpha.
+option(FTHR_EXPERIMENTAL_X11GRAB
+    "Enable unbounded experimental FFmpeg x11grab backend" OFF)
+
 include(CTest)
 if(BUILD_TESTING)
     add_executable(fthr_replay_interval_test
@@ -24,7 +30,8 @@ if(BUILD_TESTING)
 
     add_executable(fthr_windows_encoded_ring_duration_test
         tests/windows_encoded_ring_duration_test.cpp
-        ../FTHRcapture/FTHRclips/src/encoded_ring_buffer.cpp)
+        ../FTHRcapture/FTHRclips/src/encoded_ring_buffer.cpp
+        ../FTHRcapture/FTHRclips/src/encoded_video_config.cpp)
     target_include_directories(fthr_windows_encoded_ring_duration_test PRIVATE
         ../FTHRcapture/FTHRclips/include
         ../FTHRcapture_common)
@@ -259,14 +266,13 @@ add_custom_command(
     DEPENDS ${PROTO_XML_DIR}/ext-foreign-toplevel-list-v1.xml
 )
 
-add_executable(FTHRclips
+set(FTHR_ENGINE_SOURCES
     src/main.cpp
     src/shared_memory.cpp
     src/capture_engine.cpp
     src/backend_wlr.cpp
     src/backend_ext.cpp
     src/wayland_dispatch.cpp
-    src/backend_x11.cpp
     src/capture_backend.cpp
     src/audio_capture.cpp
     src/audio_multi_capture.cpp
@@ -279,6 +285,12 @@ add_executable(FTHRclips
     ${PROTO_GEN_DIR}/ext-image-capture-source-protocol.c
     ${PROTO_GEN_DIR}/ext-foreign-toplevel-list-protocol.c
 )
+
+if(FTHR_EXPERIMENTAL_X11GRAB)
+    list(APPEND FTHR_ENGINE_SOURCES src/backend_x11.cpp)
+endif()
+
+add_executable(FTHRclips ${FTHR_ENGINE_SOURCES})
 
 target_include_directories(FTHRclips PRIVATE
     src/
@@ -296,6 +308,8 @@ target_link_libraries(FTHRclips PRIVATE
 )
 
 target_compile_options(FTHRclips PRIVATE -Wall -Wextra)
+target_compile_definitions(FTHRclips PRIVATE
+    FTHR_EXPERIMENTAL_X11GRAB=$<BOOL:${FTHR_EXPERIMENTAL_X11GRAB}>)
 
 # ---------------------------------------------------------------------------
 # Runtime library search path — AUDIT-014

@@ -1,7 +1,9 @@
 #include "capture_backend.h"
 #include "backend_wlr.h"
 #include "backend_ext.h"
+#if FTHR_EXPERIMENTAL_X11GRAB
 #include "backend_x11.h"
+#endif
 #include <cstdlib>
 #include <iostream>
 
@@ -37,13 +39,19 @@ std::unique_ptr<ICaptureBackend> CreateBestBackend(
         std::cerr << "[Backend] No Wayland capture backend available" << std::endl;
     }
 
-    // 3. x11grab (pure X11 session, or fallback)
+    // x11grab remains opt-in until AUDIT-044 has a proven bounded-cancellation
+    // architecture. Never silently fall back to it in an alpha build.
     if (cancelled()) return nullptr;
+#if FTHR_EXPERIMENTAL_X11GRAB
     auto x11 = std::make_unique<X11Backend>();
     if (x11->Initialize(cfg)) {
         std::cerr << "[Backend] Using x11grab" << std::endl;
         return x11;
     }
+#else
+    std::cerr << "[Backend] x11grab disabled for alpha: AUDIT-044 bounded "
+                 "cancellation unresolved" << std::endl;
+#endif
 
     std::cerr << "[Backend] No capture backend available on this system" << std::endl;
     return nullptr;

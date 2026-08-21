@@ -6,6 +6,7 @@
 #include <thread>
 #include <atomic>
 #include <cstdint>
+#include <pulse/simple.h>
 
 namespace fthr {
 
@@ -16,7 +17,7 @@ class AudioCapture {
 public:
     static constexpr int kSampleRate  = 48000;
     static constexpr int kChannels    = 2;
-    static constexpr int kMaxSeconds  = 120;
+    static constexpr int kMaxSeconds  = 300;
 
     AudioCapture() = default;
     ~AudioCapture() { Stop(); }
@@ -35,7 +36,7 @@ public:
                                       uint32_t duration_ms) const;
 
 private:
-    void CaptureLoop(std::string device_name);
+    void CaptureLoop();
 
     struct TimedChunk {
         std::vector<float> samples;  // interleaved stereo float32
@@ -47,6 +48,7 @@ private:
     size_t                    ring_total_{0};  // guarded by mutex_
     std::thread               thread_;
     std::atomic<bool>         running_{false};
+    pa_simple*                stream_{nullptr};
 };
 
 } // namespace fthr
