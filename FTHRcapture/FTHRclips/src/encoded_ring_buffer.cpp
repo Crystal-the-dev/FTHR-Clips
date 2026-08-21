@@ -77,6 +77,11 @@ bool EncodedRingBuffer::SetVideoConfig(const EncodedVideoConfig& config) {
     return true;
 }
 
+bool EncodedRingBuffer::HasVideoConfig() const {
+    std::lock_guard<std::mutex> lock(video_config_mutex_);
+    return video_config_set_;
+}
+
 EncodedRingSnapshot EncodedRingBuffer::TakeSnapshotByTime(
     uint32_t duration_seconds, int64_t target_end_qpc) const {
     using replay_interval::Sample;

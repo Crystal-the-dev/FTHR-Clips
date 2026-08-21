@@ -1,6 +1,7 @@
 #include "replay_encoder.h"
 
 #include "ffmpeg_amf_replay_encoder.h"
+#include "ffmpeg_qsv_replay_encoder.h"
 #include "hardware_encoder.h"
 
 namespace fthr {
@@ -14,6 +15,7 @@ std::unique_ptr<IReplayEncoder> CreateProductionReplayEncoder(
     case ReplayEncoderBackend::FfmpegAmf:
         return std::make_unique<FfmpegAmfReplayEncoder>(codec);
     case ReplayEncoderBackend::FfmpegQsv:
+        return std::make_unique<FfmpegQsvReplayEncoder>(codec);
     case ReplayEncoderBackend::Software:
         return nullptr;
     }

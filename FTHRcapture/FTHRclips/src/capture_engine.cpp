@@ -327,8 +327,8 @@ namespace fthr {
 
         // ------------------------------------------------------------------
         // Select one compressed replay backend from the adapter that owns the
-        // capture source. The only cross-adapter exception is the pre-existing
-        // Intel-display/NVIDIA Optimus CPU-input path.
+        // capture source. Intel now stays on its selected D3D11 adapter for
+        // QSV. Hybrid-GPU policy remains a separate qualification task.
         // ------------------------------------------------------------------
         std::cout << "[CaptureEngine] Attempting hardware replay initialization "
                   << "for selected " << EncoderVendorName(capture_adapter_vendor_)
@@ -346,8 +346,7 @@ namespace fthr {
         ID3D11Device* encoder_device = device_;
         ID3D11DeviceContext* encoder_context = context_;
         bool cpu_input_mode = false;
-        if (capture_adapter_vendor_ != EncoderVendor::Nvidia
-            && capture_adapter_vendor_ != EncoderVendor::Amd
+        if (capture_adapter_vendor_ == EncoderVendor::Software
             && nvenc_device_) {
             encoder_vendor = EncoderVendor::Nvidia;
             encoder_device = nvenc_device_;
@@ -358,9 +357,22 @@ namespace fthr {
         replay_encoder_ = CreateProductionReplayEncoder(
             encoder_vendor, config.video_codec);
 
+        replay_config_publish_failed_.store(false);
         auto packet_callback = [this](const uint8_t* data, uint32_t size,
                                       int64_t pts, bool is_keyframe,
                                       int64_t wall_qpc) {
+            if (!encoded_ring_ || !replay_encoder_) {
+                replay_config_publish_failed_.store(true);
+                return;
+            }
+            if (!encoded_ring_->HasVideoConfig()) {
+                const auto config = replay_encoder_->GetVideoConfig();
+                if (!replay_encoder_->IsVideoConfigReady()
+                    || !encoded_ring_->SetVideoConfig(config)) {
+                    replay_config_publish_failed_.store(true);
+                    return;
+                }
+            }
             encoded_ring_->Push(data, size, pts, is_keyframe, wall_qpc);
         };
 
@@ -407,15 +419,15 @@ namespace fthr {
             // Publish codec, geometry, timing, packet format and decoder
             // configuration as one immutable stream description.
             const auto video_config = replay_encoder_->GetVideoConfig();
-            if (!encoded_ring_->SetVideoConfig(video_config)) {
-                std::cerr << "[CaptureEngine] Could not publish immutable encoded "
-                             "stream configuration" << std::endl;
-                return false;
-            }
-            if (video_config.codec_extradata.empty()) {
-                std::cerr << "[CaptureEngine] WARNING: encoded video config "
-                             "has no codec extradata - MP4 files may not play "
-                             "in all players" << std::endl;
+            if (replay_encoder_->IsVideoConfigReady()) {
+                if (!encoded_ring_->SetVideoConfig(video_config)) {
+                    std::cerr << "[CaptureEngine] Could not publish immutable encoded "
+                                 "stream configuration" << std::endl;
+                    return false;
+                }
+            } else {
+                std::cout << "[CaptureEngine] Decoder configuration will be "
+                             "published with the first encoded packet" << std::endl;
             }
 
             // max_frames_ used for stats - set to time-based count.
@@ -2006,6 +2018,7 @@ namespace fthr {
 
     void CaptureEngine::ClearReplayForRecovery() {
         if (encoded_ring_) encoded_ring_->Clear();
+        replay_config_publish_failed_.store(false);
         ring_head_.store(0, std::memory_order_release);
         ring_count_.store(0, std::memory_order_release);
         content_suspicious_streak_.store(0);
@@ -2019,7 +2032,7 @@ namespace fthr {
     // Hot path. After acquiring and mapping a DXGI frame:
     //
     //   Compressed hardware path: copy BGRA on-GPU into the replay encoder
-    //               (native NVENC or FFmpeg AMF), then EncodeFrame()
+    //               (native NVENC, FFmpeg AMF, or FFmpeg QSV), then EncodeFrame()
     //               Callback fires -> EncodedRingBuffer::Push()
     //               ring_head_ / ring_count_ NOT updated (encoded ring manages itself)
     //
@@ -2261,33 +2274,43 @@ namespace fthr {
             FailReplayEncoder("D3D11 replay input setup");
             return false;
         }
-        ID3D11Texture2D* input = replay_encoder_->GetCurrentInputTexture();
-        if (!input) {
-            FailReplayEncoder("D3D11 replay input acquisition");
-            return false;
-        }
-
-        D3D11_TEXTURE2D_DESC source_description{};
-        D3D11_TEXTURE2D_DESC input_description{};
-        source->GetDesc(&source_description);
-        input->GetDesc(&input_description);
-        if (source_description.Width != input_description.Width
-            || source_description.Height != input_description.Height
-            || source_description.Format != input_description.Format) {
-            FailReplayEncoder("D3D11 replay texture compatibility check");
-            return false;
-        }
-
         SampleContentTexture(source, produced_frame);
-        context_->CopySubresourceRegion(
-            input,
-            replay_encoder_->GetCurrentInputSubresource(),
-            0, 0, 0,
-            source,
-            0,
-            nullptr);
+        if (replay_encoder_->RequiresBackendGpuPreparation()) {
+            if (!replay_encoder_->PrepareGpuFrame(source, 0)) {
+                FailReplayEncoder("backend GPU conversion");
+                return false;
+            }
+        } else {
+            ID3D11Texture2D* input = replay_encoder_->GetCurrentInputTexture();
+            if (!input) {
+                FailReplayEncoder("D3D11 replay input acquisition");
+                return false;
+            }
+
+            D3D11_TEXTURE2D_DESC source_description{};
+            D3D11_TEXTURE2D_DESC input_description{};
+            source->GetDesc(&source_description);
+            input->GetDesc(&input_description);
+            if (source_description.Width != input_description.Width
+                || source_description.Height != input_description.Height
+                || source_description.Format != input_description.Format) {
+                FailReplayEncoder("D3D11 replay texture compatibility check");
+                return false;
+            }
+            context_->CopySubresourceRegion(
+                input,
+                replay_encoder_->GetCurrentInputSubresource(),
+                0, 0, 0,
+                source,
+                0,
+                nullptr);
+        }
         if (!replay_encoder_->EncodeFrame(present_qpc)) {
             FailReplayEncoder("hardware frame submission");
+            return false;
+        }
+        if (replay_config_publish_failed_.load()) {
+            FailReplayEncoder("encoded stream configuration publication");
             return false;
         }
         return true;

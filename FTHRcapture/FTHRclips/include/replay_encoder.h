@@ -50,7 +50,7 @@ constexpr ReplayEncoderBackend SelectProductionReplayBackend(
     switch (vendor) {
     case EncoderVendor::Nvidia: return ReplayEncoderBackend::NativeNvenc;
     case EncoderVendor::Amd: return ReplayEncoderBackend::FfmpegAmf;
-    case EncoderVendor::Intel:
+    case EncoderVendor::Intel: return ReplayEncoderBackend::FfmpegQsv;
     case EncoderVendor::Software:
         return ReplayEncoderBackend::Software;
     }
@@ -102,6 +102,12 @@ public:
         const uint8_t* bgra_data,
         uint32_t source_stride,
         int64_t present_qpc = 0) = 0;
+    // Backends that require format conversion/scaling before submission can
+    // prepare the current hardware-pool frame themselves. Direct-copy
+    // backends keep the default path unchanged.
+    virtual bool RequiresBackendGpuPreparation() const noexcept { return false; }
+    virtual bool PrepareGpuFrame(
+        ID3D11Texture2D*, uint32_t = 0) { return false; }
     virtual ID3D11Texture2D* GetCurrentInputTexture() const noexcept = 0;
     virtual uint32_t GetCurrentInputSubresource() const noexcept { return 0; }
 
@@ -109,6 +115,7 @@ public:
     // native encoder's Finalize operation already has exactly these semantics.
     virtual void Shutdown() = 0;
     virtual EncodedVideoConfig GetVideoConfig() const = 0;
+    virtual bool IsVideoConfigReady() const { return true; }
     virtual ActiveEncoderInfo GetActiveEncoderInfo() const = 0;
     virtual std::string GetLastError() const { return {}; }
     virtual bool GetEncodeEpoch(
@@ -120,7 +127,7 @@ const char* EncoderVendorName(EncoderVendor vendor) noexcept;
 EncoderVendor QueryD3D11DeviceVendor(ID3D11Device* device) noexcept;
 
 // The selected monitor's capture adapter is authoritative. NVIDIA stays on
-// native NVENC; AMD uses FFmpeg AMF; Intel remains on the current fallback.
+// native NVENC; AMD uses FFmpeg AMF; Intel uses FFmpeg QSV on the same device.
 std::unique_ptr<IReplayEncoder> CreateProductionReplayEncoder(
     EncoderVendor vendor,
     VideoCodec codec);

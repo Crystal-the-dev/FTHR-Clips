@@ -131,6 +131,7 @@ namespace fthr {
         // The stream description is immutable after its first publication in
         // this generation, preventing codec/config and packet mismatches.
         bool SetVideoConfig(const EncodedVideoConfig& config);
+        bool HasVideoConfig() const;
 
 
         // -----------------------------------------------------------------------

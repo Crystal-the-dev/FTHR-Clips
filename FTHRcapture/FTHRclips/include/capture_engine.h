@@ -25,7 +25,7 @@
 // Encode backend (selected after capture backend):
 //
 //   Compressed hardware path (legacy nvenc_active_ flag = true):
-//     - Native NVENC or FFmpeg AMF encodes every frame from CaptureThread
+//     - Native NVENC, FFmpeg AMF, or FFmpeg QSV encodes every frame
 //     - Encoded AVCC packets pushed into EncodedRingBuffer via callback
 //     - Raw FramePool NOT allocated (~8GB saved at 1080p/60fps/30s)
 //     - SaveClip: TakeSnapshot() -> MuxEncodedClip() (no re-encoding)
@@ -291,7 +291,7 @@ namespace fthr {
         // -----------------------------------------------------------------------
         // Compressed replay path. nvenc_active_ retains its legacy name because
         // it is mirrored into the frozen shared-memory v4 contract; it now means
-        // "a hardware replay encoder is active" for native NVENC or FFmpeg AMF.
+        // "a hardware replay encoder is active" for NVENC, AMF, or QSV.
         // -----------------------------------------------------------------------
         bool                              nvenc_active_;
         bool                              nvidia_device_; // true when D3D11 device is on the NVIDIA adapter (GPU zero-copy enabled)
@@ -299,6 +299,7 @@ namespace fthr {
         EncoderVendor                     capture_adapter_vendor_;
         std::unique_ptr<IReplayEncoder>    replay_encoder_;
         std::unique_ptr<EncodedRingBuffer> encoded_ring_;
+        std::atomic<bool>                  replay_config_publish_failed_{false};
 
         // -----------------------------------------------------------------------
         // x264 fallback path

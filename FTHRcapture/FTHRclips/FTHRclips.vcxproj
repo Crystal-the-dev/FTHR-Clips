@@ -27,6 +27,7 @@
     <ClInclude Include="include\encoded_video_config.h" />
     <ClInclude Include="include\encoded_video_config_ffmpeg.h" />
     <ClInclude Include="include\ffmpeg_amf_replay_encoder.h" />
+    <ClInclude Include="include\ffmpeg_qsv_replay_encoder.h" />
     <ClInclude Include="include\hardware_encoder.h" />
     <ClInclude Include="include\nvenc_codec_config.h" />
     <ClInclude Include="include\packet_buffer_pool.h" />
@@ -45,6 +46,7 @@
     <ClCompile Include="src\encoded_ring_buffer.cpp" />
     <ClCompile Include="src\encoded_video_config.cpp" />
     <ClCompile Include="src\ffmpeg_amf_replay_encoder.cpp" />
+    <ClCompile Include="src\ffmpeg_qsv_replay_encoder.cpp" />
     <ClCompile Include="src\hardware_encoder.cpp" />
     <ClCompile Include="src\nvenc_codec_config.cpp" />
     <ClCompile Include="src\main.cpp" />
