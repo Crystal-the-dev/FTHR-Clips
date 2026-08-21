@@ -434,18 +434,21 @@ namespace fthr {
                                      ID3D11DeviceContext*  shared_context,
                                      PacketCallback        callback,
                                      bool                  cpu_input_mode) {
+        last_error_ = "NVENC encoder initialization failed";
         if (initialized_) {
             std::cerr << "[HardwareEncoder] Already initialized" << std::endl;
             Finalize();
         }
 
         if (!callback) {
+            last_error_ = "NVENC packet callback is missing";
             std::cerr << "[HardwareEncoder] PacketCallback must not be null" << std::endl;
             return false;
         }
 
         const auto* codec_selection = GetNvencCodecSelection(codec_);
         if (!codec_selection) {
+            last_error_ = "requested codec is unsupported by the NVENC backend";
             std::cerr << "[HardwareEncoder] Unsupported codec selection" << std::endl;
             return false;
         }
@@ -477,6 +480,7 @@ namespace fthr {
             << VideoCodecName(codec_) << std::endl;
 
         if (enc_width_ == 0 || enc_height_ == 0 || fps_ == 0 || fps_ > 360) {
+            last_error_ = "invalid NVENC dimensions or frame rate";
             std::cerr << "[HardwareEncoder] Invalid config" << std::endl;
             return false;
         }
@@ -486,6 +490,7 @@ namespace fthr {
         // ------------------------------------------------------------------
         HMODULE nvenc_dll = LoadLibraryA("nvEncodeAPI64.dll");
         if (!nvenc_dll) {
+            last_error_ = "NVENC runtime unavailable: nvEncodeAPI64.dll not found";
             std::cerr << "[HardwareEncoder] nvEncodeAPI64.dll not found" << std::endl;
             return false;
         }
@@ -494,6 +499,7 @@ namespace fthr {
         NVENCAPICREATEINSTANCE NvEncodeAPICreateInstance =
             (NVENCAPICREATEINSTANCE)GetProcAddress(nvenc_dll, "NvEncodeAPICreateInstance");
         if (!NvEncodeAPICreateInstance) {
+            last_error_ = "NVENC runtime unavailable: NvEncodeAPICreateInstance not found";
             std::cerr << "[HardwareEncoder] NvEncodeAPICreateInstance not found" << std::endl;
             FreeLibrary(nvenc_dll); nvenc_dll_ = nullptr;
             return false;
@@ -505,6 +511,8 @@ namespace fthr {
 
         NVENCSTATUS status = NvEncodeAPICreateInstance(nvenc_api);
         if (status != NV_ENC_SUCCESS) {
+            last_error_ = std::string("NVENC API initialization failed: ")
+                + NvencStatusToString(status);
             std::cerr << "[HardwareEncoder] NvEncodeAPICreateInstance: " << NvencStatusToString(status) << std::endl;
             delete nvenc_api;
             FreeLibrary(nvenc_dll); nvenc_dll_ = nullptr;
@@ -521,6 +529,7 @@ namespace fthr {
         // cross-device (potentially cross-PCIe) texture copy that existed before.
         // ------------------------------------------------------------------
         if (!shared_device || !shared_context) {
+            last_error_ = "NVENC same-adapter D3D11 device/context is unavailable";
             std::cerr << "[HardwareEncoder] shared_device/context must not be null" << std::endl;
             delete nvenc_api; nvenc_encoder_ = nullptr;
             FreeLibrary(nvenc_dll); nvenc_dll_ = nullptr;
@@ -543,6 +552,8 @@ namespace fthr {
 
         status = nvenc_api->nvEncOpenEncodeSessionEx(&session_params, &nvenc_session_);
         if (status != NV_ENC_SUCCESS) {
+            last_error_ = std::string("NVENC session initialization failed: ")
+                + NvencStatusToString(status);
             std::cerr << "[HardwareEncoder] nvEncOpenEncodeSessionEx: " << NvencStatusToString(status) << std::endl;
             // d3d11 device/context not owned - do not Release
             delete nvenc_api; nvenc_encoder_ = nullptr;
@@ -573,6 +584,8 @@ namespace fthr {
                    &guids_retrieved) != NV_ENC_SUCCESS
             || !IsNvencCodecSupported(
                    codec_, encode_guids.data(), guids_retrieved)) {
+            last_error_ = std::string("requested ") + VideoCodecName(codec_)
+                + " codec is unsupported by this NVENC session";
             std::cerr << "[HardwareEncoder] Requested " << VideoCodecName(codec_)
                       << " is not supported by this NVENC session" << std::endl;
             close_uninitialized_session();
@@ -592,6 +605,8 @@ namespace fthr {
             || !IsNvencInputFormatSupported(
                    NV_ENC_BUFFER_FORMAT_ARGB,
                    input_formats.data(), formats_retrieved)) {
+            last_error_ = std::string("requested ") + VideoCodecName(codec_)
+                + " codec does not support the required ARGB D3D11 input";
             std::cerr << "[HardwareEncoder] Requested " << VideoCodecName(codec_)
                       << " does not support the existing ARGB D3D11 input path"
                       << std::endl;
@@ -640,6 +655,7 @@ namespace fthr {
         // Preserve the existing four-media-second keyframe bound and no-B-frame
         // policy while selecting only the small codec-specific config union.
         if (!ConfigureNvencCodec(codec_, fps_, encode_config)) {
+            last_error_ = "requested NVENC codec configuration is unsupported";
             std::cerr << "[HardwareEncoder] Could not configure requested codec"
                       << std::endl;
             close_uninitialized_session();
@@ -666,6 +682,8 @@ namespace fthr {
 
         status = nvenc_api->nvEncInitializeEncoder(nvenc_session_, &init_params);
         if (status != NV_ENC_SUCCESS) {
+            last_error_ = std::string("NVENC encoder initialization failed: ")
+                + NvencStatusToString(status);
             std::cerr << "[HardwareEncoder] nvEncInitializeEncoder: " << NvencStatusToString(status) << std::endl;
             nvenc_api->nvEncDestroyEncoder(nvenc_session_); nvenc_session_ = nullptr;
             // d3d11 device/context not owned - do not Release
@@ -894,6 +912,8 @@ namespace fthr {
                       << "No usable " << VideoCodecName(codec_)
                       << " decoder configuration was produced" << std::endl;
             if (codec_ != VideoCodec::H264) {
+                last_error_ = std::string("NVENC ") + VideoCodecName(codec_)
+                    + " decoder configuration is unavailable";
                 initialized_ = true;
                 Finalize();
                 return false;
@@ -920,6 +940,7 @@ namespace fthr {
         drain_stop_.store(false);
         drain_thread_ = new std::thread(&HardwareEncoder::DrainThread, this);
 
+        last_error_.clear();
         std::cout << "[HardwareEncoder] Ready (async drain enabled)." << std::endl;
         return true;
     }

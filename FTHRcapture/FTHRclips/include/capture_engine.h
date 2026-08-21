@@ -9,11 +9,10 @@
 //     - Hooks at the DWM/compositor level. Survives independent flip mode,
 //       so it captures kernel-anti-cheat games (Valorant/Vanguard, EAC/BE
 //       titles) that DXGI cannot see. Same path Xbox Game Bar uses.
-//     - On Optimus laptops, WGC can deliver frames directly into NVIDIA VRAM
-//       (unlike DXGI which forces Intel GPU involvement). No CPU copy.
+//     - Desktop monitor capture creates D3D11 on the adapter that owns the
+//       selected monitor and keeps encoding on that same device.
 //     - FrameArrived callback signals CaptureThread; no polling loop.
-//     - Sets nvidia_device_ = true on desktop NVIDIA (single GPU). On Optimus,
-//       nvidia_device_ is false and nvenc_device_ holds the separate NVIDIA device.
+//     - Automatic Optimus/cross-adapter encoder redirection is disabled.
 //     - Variants: CreateForMonitor (desktop + AC games), CreateForWindow
 //       (regular window mode).
 //
@@ -30,9 +29,9 @@
 //     - Raw FramePool NOT allocated (~8GB saved at 1080p/60fps/30s)
 //     - SaveClip: TakeSnapshot() -> MuxEncodedClip() (no re-encoding)
 //
-//   x264 fallback (legacy nvenc_active_ flag = false):
-//     - Existing raw BGRA FramePool path, unchanged
-//     - SaveClip: existing VideoEncoder encode loop
+//   Unsupported hardware path (legacy nvenc_active_ flag = false):
+//     - Capture startup is refused for the public alpha
+//     - Raw replay code remains non-production and is never selected silently
 //
 // Threading model:
 //   CaptureThread  - grabs frames (WGC or DXGI), routes to NVENC or FramePool
@@ -155,12 +154,21 @@ namespace fthr {
         std::string GetActiveEncoderName() const {
             return nvenc_active_ && replay_encoder_
                 ? replay_encoder_->GetActiveEncoderInfo().name
-                : "libopenh264";
+                : "unavailable";
         }
         VideoCodec GetActiveVideoCodec() const {
             return nvenc_active_ && replay_encoder_
                 ? replay_encoder_->GetActiveEncoderInfo().codec
                 : VideoCodec::H264;
+        }
+        const std::string& GetLastStartupError() const {
+            return last_startup_error_;
+        }
+        ReplayStartupError GetLastStartupErrorCode() const {
+            return last_startup_error_code_;
+        }
+        const ActiveReplayCapability& GetActiveReplayCapability() const {
+            return active_replay_capability_;
         }
         uint32_t GetCaptureHealthFlags() const { return capture_health_flags_.load(); }
         uint32_t GetCaptureGeneration() const { return capture_generation_.load(); }
@@ -225,6 +233,7 @@ namespace fthr {
             int64_t present_qpc,
             uint64_t produced_frame);
         void FailReplayEncoder(const char* operation);
+        bool FailStartup(ReplayStartupError code, std::string detail);
 
         // -----------------------------------------------------------------------
         // D3D11 state (shared by WGC and DXGI paths)
@@ -235,8 +244,8 @@ namespace fthr {
         ID3D11Texture2D*        staging_texture_;  // null on WGC+NVENC path
         ID3D11Texture2D*        health_staging_texture_; // 16x9 grid, sampled ~1 Hz
 
-        // Optimus state: capture on Intel adapter, NVENC on separate NVIDIA device.
-        // Used by both DXGI and WGC paths on Optimus laptops.
+        // Legacy cross-adapter resources. They remain null under the final alpha
+        // policy; automatic cross-adapter replay is deliberately unsupported.
         ID3D11Device*        nvenc_device_;
         ID3D11DeviceContext* nvenc_context_;
 
@@ -300,6 +309,10 @@ namespace fthr {
         std::unique_ptr<IReplayEncoder>    replay_encoder_;
         std::unique_ptr<EncodedRingBuffer> encoded_ring_;
         std::atomic<bool>                  replay_config_publish_failed_{false};
+        ActiveReplayCapability             active_replay_capability_{};
+        ReplayStartupError                 last_startup_error_code_ =
+            ReplayStartupError::None;
+        std::string                        last_startup_error_;
 
         // -----------------------------------------------------------------------
         // x264 fallback path

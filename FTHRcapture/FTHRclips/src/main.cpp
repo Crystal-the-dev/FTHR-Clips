@@ -18,7 +18,7 @@
 //   argv[3]  target_width   Output width in pixels. 0 = native resolution. Default: 0
 //   argv[4]  target_height  Output height in pixels. 0 = native resolution. Default: 0
 //   argv[5]  bitrate_kbps   Encoder bitrate in kbps (500-60000). Default: 16000
-//   argv[6]  max_buffer_mb  Memory ceiling for raw frame pool (x264 fallback only).
+//   argv[6]  max_buffer_mb  Legacy raw-capacity diagnostic budget; no automatic fallback.
 //            Not used when NVENC is active - encoded ring buffer has no raw frame budget.
 //   argv[7]  capture_mode   0 = desktop (default), 1 = window
 //   argv[8]  target_hwnd    64-bit decimal HWND when capture_mode == 1, else 0
@@ -82,7 +82,8 @@ static void PrintConfig(const fthr::CaptureConfig& cfg) {
     std::cout << "  Bitrate      : " << cfg.bitrate_kbps << " kbps" << std::endl;
     std::cout << "  Video codec  : " << fthr::VideoCodecName(cfg.video_codec)
               << std::endl;
-    std::cout << "  Max pool     : " << cfg.max_buffer_mb << " MB (x264 fallback only)" << std::endl;
+    std::cout << "  Raw budget   : " << cfg.max_buffer_mb
+              << " MB (diagnostic only; automatic fallback disabled)" << std::endl;
 
     using Mode = fthr::CaptureConfig::CaptureModeEnum;
     if (cfg.capture_mode == Mode::WINDOW && cfg.target_hwnd != 0) {
@@ -283,9 +284,10 @@ int main(int argc, char* argv[]) {
     // 4. Initialise the capture engine
     //
     // CaptureEngine::Initialize() selects the hardware replay backend from the
-    // capture adapter (native NVENC on NVIDIA, FFmpeg AMF on AMD).
+    // capture adapter (native NVENC on NVIDIA, FFmpeg AMF on AMD, FFmpeg QSV
+    // on Intel). Automatic cross-adapter and raw replay fallbacks are disabled.
     // On hardware success: encoded ring buffer active, FramePool skipped.
-    // On failure: x264 fallback with raw BGRA FramePool.
+    // On failure: startup stops with a structured, user-visible reason.
     //
     // is_initialized is set to true ONLY after this succeeds. Python's
     // CaptureBridge.initialize() checks this flag before connecting.
@@ -294,10 +296,11 @@ int main(int argc, char* argv[]) {
 
     fthr::CaptureEngine engine;
     if (!engine.Initialize(config)) {
-        std::cerr << "[Fatal] Capture engine init failed (DXGI unavailable?)" << std::endl;
+        std::cerr << "[Fatal] Capture engine init failed: "
+                  << fthr::ReplayStartupErrorName(
+                         engine.GetLastStartupErrorCode())
+                  << std::endl;
         layout->is_initialized = false;
-        std::cout << "Press Enter to exit...";
-        std::cin.get();
         return 1;
     }
 
@@ -309,10 +312,8 @@ int main(int argc, char* argv[]) {
 
     // Populate v2 fields so Python get_active_codec() returns a meaningful string.
     {
-        // The software fallback is OpenH264 since the move to an LGPL FFmpeg
-        // build (libx264 is GPL and is no longer shipped). This string is read
-        // back by the UI and shown to the user, so reporting "libx264" here
-        // would be an outright false claim about what encoded their clip.
+        // Successful public-alpha startup always reports the exact active
+        // hardware encoder. Failed startup never publishes is_initialized.
         const std::string codec_name = engine.GetActiveEncoderName();
         strncpy_s(layout->active_codec, sizeof(layout->active_codec),
                   codec_name.c_str(), _TRUNCATE);
@@ -325,6 +326,17 @@ int main(int argc, char* argv[]) {
     std::cout << "  is_initialized = true" << std::endl;
     std::cout << "  nvenc_active   = " << (layout->nvenc_active ? "true" : "false") << std::endl;
     std::cout << "  active_codec   = " << layout->active_codec << std::endl;
+    const auto& capability = engine.GetActiveReplayCapability();
+    std::cout << "  replay_policy  = same-adapter" << std::endl;
+    std::cout << "  capture_vendor = "
+              << fthr::EncoderVendorName(capability.capture_vendor) << std::endl;
+    std::cout << "  encoder_vendor = "
+              << fthr::EncoderVendorName(capability.encoder_vendor) << std::endl;
+    std::cout << "  encoder_backend= "
+              << fthr::ReplayEncoderBackendName(capability.active_backend)
+              << std::endl;
+    std::cout << "  replay_capacity= " << config.buffer_seconds
+              << "s configured compressed history" << std::endl;
 
     // ------------------------------------------------------------------
     // 5. Command loop - polls shared memory for UI commands

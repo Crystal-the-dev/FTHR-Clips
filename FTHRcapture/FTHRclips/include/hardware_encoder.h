@@ -113,6 +113,7 @@ namespace fthr {
 
         EncodedVideoConfig GetVideoConfig() const override;
         ActiveEncoderInfo GetActiveEncoderInfo() const override;
+        std::string GetLastError() const override { return last_error_; }
 
         // Return the QPC epoch used for PTS computation.
         // Returns false if the first frame has not been encoded yet.
@@ -203,6 +204,7 @@ namespace fthr {
         uint32_t bitrate_kbps_;
         VideoCodec codec_;
         bool     initialized_;
+        std::string last_error_;
         int64_t  pts_;
         int64_t  last_forced_idr_pts_;
 

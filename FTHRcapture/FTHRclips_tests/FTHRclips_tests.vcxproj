@@ -13,6 +13,7 @@
   <ItemGroup>
     <ClCompile Include="tests\amf_replay_encoder_test.cpp" />
     <ClCompile Include="tests\qsv_replay_encoder_test.cpp" />
+    <ClCompile Include="tests\windows_replay_policy_test.cpp" />
     <ClCompile Include="tests\windows_monitor_resolver_test.cpp" />
     <ClCompile Include="..\FTHRclips\src\encoded_ring_buffer.cpp" />
     <ClCompile Include="..\FTHRclips\src\encoded_video_config.cpp" />

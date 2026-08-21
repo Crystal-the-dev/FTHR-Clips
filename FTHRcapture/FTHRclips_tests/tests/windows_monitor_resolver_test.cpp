@@ -16,6 +16,7 @@
 
 int RunAmfReplayEncoderTests();
 int RunQsvReplayEncoderTests();
+int RunWindowsReplayPolicyTests();
 
 namespace {
 
@@ -441,7 +442,9 @@ int main() {
     ReplayEncoderInterfaceIsPolymorphic();
     const int amf_checks = RunAmfReplayEncoderTests();
     const int qsv_checks = RunQsvReplayEncoderTests();
-    std::cout << "FTHRclips_tests: 76 scenarios passed ("
-              << (checks + amf_checks + qsv_checks) << " checks total)" << std::endl;
+    const int policy_checks = RunWindowsReplayPolicyTests();
+    std::cout << "FTHRclips_tests: 82 scenarios passed ("
+              << (checks + amf_checks + qsv_checks + policy_checks)
+              << " checks total)" << std::endl;
     return 0;
 }

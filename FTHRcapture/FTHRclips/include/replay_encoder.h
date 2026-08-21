@@ -12,6 +12,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
@@ -31,6 +32,46 @@ enum class ReplayEncoderBackend : uint32_t {
     FfmpegAmf,
     FfmpegQsv,
     Software,
+};
+
+enum class ReplayStartupError : uint32_t {
+    None,
+    RequestedCodecUnsupported,
+    HardwareEncoderUnavailable,
+    CaptureAdapterUnsupported,
+    CrossAdapterPathUnavailable,
+    ReplayCapacityLimited,
+    EncoderInitFailed,
+};
+
+struct WindowsReplaySelection {
+    EncoderVendor capture_vendor = EncoderVendor::Software;
+    EncoderVendor encoder_vendor = EncoderVendor::Software;
+    ReplayEncoderBackend backend = ReplayEncoderBackend::Software;
+    VideoCodec requested_codec = VideoCodec::H264;
+    bool same_adapter = false;
+    bool allowed = false;
+    ReplayStartupError error = ReplayStartupError::None;
+};
+
+struct ActiveReplayCapability {
+    VideoCodec requested_codec = VideoCodec::H264;
+    VideoCodec active_codec = VideoCodec::H264;
+    ReplayEncoderBackend active_backend = ReplayEncoderBackend::Software;
+    EncoderVendor capture_vendor = EncoderVendor::Software;
+    EncoderVendor encoder_vendor = EncoderVendor::Software;
+    bool hardware = false;
+    bool same_adapter = false;
+    bool initialized = false;
+    uint64_t generation = 0;
+    ReplayStartupError error = ReplayStartupError::None;
+    std::string active_name;
+};
+
+struct RawReplayCapacity {
+    uint64_t frame_capacity = 0;
+    uint64_t capacity_milliseconds = 0;
+    bool meets_requested_duration = false;
 };
 
 struct ActiveEncoderInfo {
@@ -80,6 +121,63 @@ constexpr bool ShouldAllocateRawReplayPool(
     return !initialized || backend == ReplayEncoderBackend::Software;
 }
 
+constexpr bool IsAutomaticCrossAdapterReplayAllowed() noexcept {
+    return false;
+}
+
+constexpr bool IsAutomaticRawReplayFallbackAllowed() noexcept {
+    return false;
+}
+
+constexpr WindowsReplaySelection SelectWindowsReplayPolicy(
+    EncoderVendor capture_vendor,
+    VideoCodec requested_codec) noexcept {
+    WindowsReplaySelection result;
+    result.capture_vendor = capture_vendor;
+    result.encoder_vendor = capture_vendor;
+    result.requested_codec = requested_codec;
+    result.backend = SelectProductionReplayBackend(
+        capture_vendor, requested_codec);
+    result.same_adapter = capture_vendor != EncoderVendor::Software;
+
+    if (!IsProductionReplayCodecEnabled(requested_codec)) {
+        result.error = ReplayStartupError::RequestedCodecUnsupported;
+        return result;
+    }
+    if (capture_vendor == EncoderVendor::Software
+        || result.backend == ReplayEncoderBackend::Software) {
+        result.error = ReplayStartupError::CaptureAdapterUnsupported;
+        return result;
+    }
+    result.allowed = true;
+    return result;
+}
+
+constexpr RawReplayCapacity CalculateRawReplayCapacity(
+    uint32_t width,
+    uint32_t height,
+    uint32_t bytes_per_pixel,
+    uint32_t effective_fps,
+    uint32_t requested_seconds,
+    uint32_t budget_mebibytes) noexcept {
+    RawReplayCapacity result;
+    if (width == 0 || height == 0 || bytes_per_pixel == 0
+        || effective_fps == 0 || requested_seconds == 0) {
+        return result;
+    }
+    const uint64_t bytes_per_frame = static_cast<uint64_t>(width)
+        * static_cast<uint64_t>(height)
+        * static_cast<uint64_t>(bytes_per_pixel);
+    const uint64_t budget_bytes = static_cast<uint64_t>(budget_mebibytes)
+        * 1024ULL * 1024ULL;
+    result.frame_capacity = budget_bytes / bytes_per_frame;
+    result.capacity_milliseconds = result.frame_capacity * 1000ULL
+        / static_cast<uint64_t>(effective_fps);
+    result.meets_requested_duration = result.capacity_milliseconds
+        >= static_cast<uint64_t>(requested_seconds) * 1000ULL;
+    return result;
+}
+
 class IReplayEncoder {
 public:
     using PacketCallback = std::function<void(
@@ -124,7 +222,16 @@ public:
 };
 
 const char* EncoderVendorName(EncoderVendor vendor) noexcept;
+const char* ReplayEncoderBackendName(ReplayEncoderBackend backend) noexcept;
+const char* ReplayStartupErrorName(ReplayStartupError error) noexcept;
 EncoderVendor QueryD3D11DeviceVendor(ID3D11Device* device) noexcept;
+ReplayStartupError ClassifyReplayInitializationFailure(
+    std::string_view detail) noexcept;
+ActiveReplayCapability EvaluateActiveReplayCapability(
+    const WindowsReplaySelection& selection,
+    const ActiveEncoderInfo& active,
+    bool initialized,
+    uint64_t generation);
 
 // The selected monitor's capture adapter is authoritative. NVIDIA stays on
 // native NVENC; AMD uses FFmpeg AMF; Intel uses FFmpeg QSV on the same device.

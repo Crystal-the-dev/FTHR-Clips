@@ -28,8 +28,8 @@
 //   NVENC path: CaptureThread -> HardwareEncoder -> EncodedRingBuffer
 //               SaveClip -> TakeSnapshot -> MuxEncodedClip (no re-encoding)
 //               FramePool NOT allocated
-//   x264 path:  CaptureThread -> FramePool (raw BGRA ring buffer)
-//               SaveClip -> EncodeRawClip (VideoEncoder encode loop)
+//   Raw replay code remains for non-production/legacy use, but public-alpha
+//   startup never selects it as an automatic fallback.
 //
 // Audio:
 //   AudioCapture (WASAPI loopback) -> raw float32 PCM -> AudioRingBuffer
@@ -66,6 +66,7 @@
 #include <cstring>
 #include <cwctype>
 #include <algorithm>
+#include <sstream>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -217,17 +218,30 @@ namespace fthr {
         Shutdown();
     }
 
+    bool CaptureEngine::FailStartup(
+        ReplayStartupError code, std::string detail) {
+        last_startup_error_code_ = code;
+        last_startup_error_ = std::move(detail);
+        std::cerr << "FTHR_STARTUP_ERROR: "
+                  << ReplayStartupErrorName(code) << ": "
+                  << last_startup_error_ << std::endl;
+        return false;
+    }
+
 
     // ===========================================================================
     // Initialize
     //
     // 1. Init D3D11 / DXGI (always)
-    // 2. Try NVENC - if succeeds: EncodedRingBuffer, skip FramePool
-    // 3. If NVENC fails: fall through to x264 FramePool path
-    // 4. Start threads
+    // 2. Select the hardware encoder on the capture adapter
+    // 3. Refuse startup if that exact codec/backend cannot initialize
+    // 4. Start threads with a compressed replay ring
     // ===========================================================================
 
     bool CaptureEngine::Initialize(const CaptureConfig& config) {
+        last_startup_error_code_ = ReplayStartupError::None;
+        last_startup_error_.clear();
+        active_replay_capability_ = {};
         fps_ = config.framerate;
         buffer_seconds_ = config.buffer_seconds;
         target_width_ = config.target_width;
@@ -288,7 +302,10 @@ namespace fthr {
                 focus_gated_ = false;
                 if (!InitializeD3D11()) {
                     std::cerr << "[CaptureEngine] D3D11 initialization failed" << std::endl;
-                    return false;
+                    return FailStartup(
+                        ReplayStartupError::CaptureAdapterUnsupported,
+                        "The selected monitor could not be opened on its exact "
+                        "display adapter.");
                 }
             }
         }
@@ -307,7 +324,10 @@ namespace fthr {
                     wgc_active_ = false;
                     if (!InitializeD3D11()) {
                         std::cerr << "[CaptureEngine] D3D11 initialization failed" << std::endl;
-                        return false;
+                        return FailStartup(
+                            ReplayStartupError::CaptureAdapterUnsupported,
+                            "The selected capture source could not be opened on "
+                            "a supported display adapter.");
                     }
                 }
             }
@@ -320,7 +340,10 @@ namespace fthr {
                 wgc_active_ = false;
                 if (!InitializeD3D11()) {
                     std::cerr << "[CaptureEngine] D3D11 initialization failed" << std::endl;
-                    return false;
+                    return FailStartup(
+                        ReplayStartupError::CaptureAdapterUnsupported,
+                        "The selected monitor could not be opened on its exact "
+                        "display adapter.");
                 }
             }
         }
@@ -342,20 +365,34 @@ namespace fthr {
         hw_cfg.fps = fps_;
         hw_cfg.bitrate_kbps = bitrate_kbps_;
 
-        EncoderVendor encoder_vendor = capture_adapter_vendor_;
-        ID3D11Device* encoder_device = device_;
-        ID3D11DeviceContext* encoder_context = context_;
-        bool cpu_input_mode = false;
-        if (capture_adapter_vendor_ == EncoderVendor::Software
-            && nvenc_device_) {
-            encoder_vendor = EncoderVendor::Nvidia;
-            encoder_device = nvenc_device_;
-            encoder_context = nvenc_context_;
-            cpu_input_mode = true;
+        const auto selection = SelectWindowsReplayPolicy(
+            capture_adapter_vendor_, config.video_codec);
+        if (!selection.allowed) {
+            return FailStartup(selection.error,
+                "The selected capture adapter has no approved same-adapter "
+                "hardware replay path for the requested codec. Automatic "
+                "cross-adapter and raw replay fallbacks are disabled.");
         }
 
+        std::cout << "[ReplayCapability] requested="
+                  << VideoCodecName(config.video_codec)
+                  << " capture_adapter="
+                  << EncoderVendorName(selection.capture_vendor)
+                  << " encoder_adapter="
+                  << EncoderVendorName(selection.encoder_vendor)
+                  << " backend="
+                  << ReplayEncoderBackendName(selection.backend)
+                  << " adapter_policy=same-adapter"
+                  << std::endl;
+
         replay_encoder_ = CreateProductionReplayEncoder(
-            encoder_vendor, config.video_codec);
+            selection.encoder_vendor, config.video_codec);
+        if (!replay_encoder_) {
+            return FailStartup(
+                ReplayStartupError::HardwareEncoderUnavailable,
+                "The approved same-adapter hardware encoder backend is not "
+                "available in this build.");
+        }
 
         replay_config_publish_failed_.store(false);
         auto packet_callback = [this](const uint8_t* data, uint32_t size,
@@ -376,36 +413,48 @@ namespace fthr {
             encoded_ring_->Push(data, size, pts, is_keyframe, wall_qpc);
         };
 
-        replay_encoder_cpu_input_ = cpu_input_mode;
-        nvenc_active_ = replay_encoder_ && replay_encoder_->Initialize(
-            hw_cfg, encoder_device, encoder_context, packet_callback,
-            cpu_input_mode);
-        if (!nvenc_active_ && replay_encoder_) {
+        replay_encoder_cpu_input_ = false;
+        nvenc_active_ = replay_encoder_->Initialize(
+            hw_cfg, device_, context_, packet_callback, false);
+        if (!nvenc_active_) {
             std::cerr << "[CaptureEngine] "
-                      << EncoderVendorName(encoder_vendor) << ' '
+                      << EncoderVendorName(selection.encoder_vendor) << ' '
                       << VideoCodecName(config.video_codec)
                       << " hardware initialization failed";
             const std::string detail = replay_encoder_->GetLastError();
             if (!detail.empty()) std::cerr << ": " << detail;
             std::cerr << std::endl;
-        }
-        if (nvenc_active_ && replay_encoder_cpu_input_
-            && !EnsureStagingTexture()) {
-            std::cerr << "[CaptureEngine] Hybrid hardware replay requires a "
-                         "readback texture, but creation failed" << std::endl;
-            return false;
+            const auto raw_capacity = CalculateRawReplayCapacity(
+                width_, height_, 4, fps_, buffer_seconds_,
+                config.max_buffer_mb);
+            std::ostringstream reason;
+            if (!detail.empty()) reason << detail << ". ";
+            reason << "The requested " << VideoCodecName(config.video_codec)
+                   << " encoder on the selected "
+                   << EncoderVendorName(selection.capture_vendor)
+                   << " adapter did not initialize. Automatic codec, "
+                      "cross-adapter, and raw replay fallbacks are disabled";
+            if (!raw_capacity.meets_requested_duration) {
+                reason << "; the legacy raw budget would hold only "
+                       << raw_capacity.capacity_milliseconds << " ms of the "
+                       << (static_cast<uint64_t>(buffer_seconds_) * 1000ULL)
+                       << " ms requested";
+            }
+            reason << '.';
+            return FailStartup(
+                ClassifyReplayInitializationFailure(detail), reason.str());
         }
 
-        if (!nvenc_active_ && config.video_codec != VideoCodec::H264) {
-            std::cerr << "[CaptureEngine] Requested "
-                      << VideoCodecName(config.video_codec)
-                      << " could not initialize on the selected "
-                      << EncoderVendorName(encoder_vendor) << " device. "
-                         "Refusing a silent H.264 fallback." << std::endl;
-            return false;
+        active_replay_capability_ = EvaluateActiveReplayCapability(
+            selection, replay_encoder_->GetActiveEncoderInfo(), true,
+            static_cast<uint64_t>(capture_generation_.load()) + 1ULL);
+        if (!active_replay_capability_.initialized) {
+            return FailStartup(active_replay_capability_.error,
+                "The initialized encoder did not match the requested codec, "
+                "backend, or selected capture adapter.");
         }
 
-        if (nvenc_active_) {
+        {
             // Capacity: 2x time-based frame count gives comfortable headroom.
             // At 1080p/60fps/30s: 3600 slots × ~33KB avg = ~120MB.
             // (vs ~14GB raw BGRA at same settings)
@@ -438,47 +487,6 @@ namespace fthr {
             std::cout << "[CaptureEngine] " << active.name
                 << " active. Encoded ring: " << capacity
                 << " slots. Raw FramePool: skipped." << std::endl;
-        }
-        else {
-            // ------------------------------------------------------------------
-            // x264 fallback: allocate raw BGRA FramePool
-            // ------------------------------------------------------------------
-            replay_encoder_cpu_input_ = false;
-            if (!EnsureStagingTexture()) {
-                std::cerr << "[CaptureEngine] Software fallback requires a "
-                             "readback texture, but creation failed" << std::endl;
-                return false;
-            }
-            std::cout << "[CaptureEngine] Hardware replay unavailable - using x264 fallback." << std::endl;
-
-            const size_t bytes_per_frame = static_cast<size_t>(width_)
-                * static_cast<size_t>(height_) * 4;
-            const size_t time_frames = static_cast<size_t>(buffer_seconds_) * fps_;
-            const size_t budget_bytes = static_cast<size_t>(config.max_buffer_mb) * 1024ULL * 1024ULL;
-            const size_t budget_frames = (bytes_per_frame > 0)
-                ? (budget_bytes / bytes_per_frame)
-                : time_frames;
-
-            max_frames_ = std::min(time_frames, budget_frames);
-            if (max_frames_ == 0) {
-                std::cerr << "[CaptureEngine] Memory budget too small - clamping to 1 frame" << std::endl;
-                max_frames_ = 1;
-            }
-
-            const float effective_s = static_cast<float>(max_frames_) / static_cast<float>(fps_);
-            if (max_frames_ < time_frames) {
-                std::cerr << "[CaptureEngine] WARNING: memory cap limits buffer to "
-                    << effective_s << "s (requested " << buffer_seconds_ << "s)" << std::endl;
-            }
-            else {
-                std::cout << "[CaptureEngine] FramePool: " << effective_s << "s ("
-                    << max_frames_ << " frames, "
-                    << (max_frames_ * bytes_per_frame / 1024 / 1024) << " MB)" << std::endl;
-            }
-
-            frame_pool_.Allocate(max_frames_, bytes_per_frame);
-            ring_head_.store(0, std::memory_order_relaxed);
-            ring_count_.store(0, std::memory_order_relaxed);
         }
 
         // ------------------------------------------------------------------
@@ -2411,36 +2419,6 @@ namespace fthr {
         capture_adapter_vendor_ = EncoderVendorFromPciVendorId(
             capture_desc.VendorId);
         nvidia_device_ = capture_adapter_vendor_ == EncoderVendor::Nvidia;
-        if (capture_adapter_vendor_ == EncoderVendor::Intel && !nvenc_device_) {
-            // Preserve the existing hybrid-GPU behavior: capture on the selected
-            // Intel display adapter, with a separate NVIDIA NVENC device and the
-            // existing CPU-input path. An AMD-owned monitor stays on AMD AMF;
-            // machine-wide GPU enumeration must not override monitor ownership.
-            IDXGIAdapter1* encoder_adapter = nullptr;
-            for (UINT index = 0;
-                 factory->EnumAdapters1(index, &encoder_adapter) != DXGI_ERROR_NOT_FOUND;
-                 ++index) {
-                DXGI_ADAPTER_DESC1 encoder_desc{};
-                encoder_adapter->GetDesc1(&encoder_desc);
-                if (encoder_desc.VendorId == 0x10DE) {
-                    hr = D3D11CreateDevice(
-                        encoder_adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
-                        nullptr, 0, D3D11_SDK_VERSION,
-                        &nvenc_device_, &feature_level, &nvenc_context_);
-                    encoder_adapter->Release();
-                    encoder_adapter = nullptr;
-                    if (SUCCEEDED(hr)) {
-                        std::cout << '[' << backend_name
-                                  << "] Separate NVIDIA NVENC device ready "
-                                     "(existing CPU-input path)" << std::endl;
-                    }
-                    break;
-                }
-                encoder_adapter->Release();
-                encoder_adapter = nullptr;
-            }
-        }
-
         DXGI_OUTPUT_DESC output_desc{};
         (*selected_output)->GetDesc(&output_desc);
         width_ = static_cast<uint32_t>(
@@ -2467,13 +2445,10 @@ namespace fthr {
     // Sets up Windows Graphics Capture for the exact persistent monitor selection.
     //
     // Key advantage over DXGI OutputDuplication:
-    //   - On Optimus, we create the D3D11 device on the NVIDIA adapter.
-    //     WGC internally copies the composited frame (Intel) into our NVIDIA
-    //     device VRAM. NVENC then reads from that same NVIDIA device → GPU
-    //     zero-copy. No CPU involvement, no Intel GPU in the hot path.
+    //   - The D3D11 device is created on the exact selected monitor adapter.
     //   - Event-driven (FrameArrived) — no 300 iteration/sec polling loop.
     //
-    // Sets device_, context_, nvidia_device_, width_, height_.
+    // Sets device_, context_, capture adapter identity, width_, height_.
     // Does NOT create staging_texture_ or duplication_ (not needed on this path).
     // ===========================================================================
 
@@ -2500,29 +2475,6 @@ namespace fthr {
         const HMONITOR hmonitor = reinterpret_cast<HMONITOR>(
             resolved_monitor_.hmonitor);
         HRESULT hr = S_OK;
-
-        // --- Step 3b: Staging texture for Optimus CPU-readback path ---
-        // On Optimus the WGC device is Intel; NVENC is on NVIDIA.
-        // CaptureThreadWGC needs to Map the frame to CPU memory for EncodeFrameCPU.
-        if (!nvidia_device_ && nvenc_device_) {
-            D3D11_TEXTURE2D_DESC desc{};
-            desc.Width            = width_;
-            desc.Height           = height_;
-            desc.MipLevels        = 1;
-            desc.ArraySize        = 1;
-            desc.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
-            desc.SampleDesc.Count = 1;
-            desc.Usage            = D3D11_USAGE_STAGING;
-            desc.CPUAccessFlags   = D3D11_CPU_ACCESS_READ;
-            hr = device_->CreateTexture2D(&desc, nullptr, &staging_texture_);
-            if (FAILED(hr)) {
-                std::cerr << "[WGC] Staging texture creation failed: 0x"
-                          << std::hex << hr << std::dec << std::endl;
-                // Non-fatal: will fall back to x264 (staging_texture_ stays null)
-            } else {
-                std::cout << "[WGC] Staging texture created for Optimus CPU-readback" << std::endl;
-            }
-        }
 
         // --- Step 4-8: WinRT session setup (exception-safe) ---
         wgc_state_ = std::make_unique<WGCState>();
@@ -2652,14 +2604,9 @@ namespace fthr {
     // QPC frame rate limiter, extracts the ID3D11Texture2D from the WGC surface,
     // and routes it into NVENC (GPU zero-copy) or the x264 frame pool.
     //
-    // On desktop NVIDIA (single GPU):
-    //   Frame arrives in NVIDIA VRAM (same device as NVENC).
-    //   CopyResource is GPU-to-GPU — no CPU stall. (GPU zero-copy path)
-    //
-    // On Optimus + WGC + NVENC:
-    //   WGC frame pool uses default (Intel) adapter — NVIDIA can't capture the display.
-    //   CopyResource into staging texture on Intel, Map to CPU, EncodeFrameCPU into NVENC.
-    //   Still hardware H.264, only the pixel copy touches the CPU.
+    // A supported public-alpha run always routes the WGC texture into the
+    // hardware encoder on that same D3D11 device. Legacy CPU-input/raw branches
+    // are unreachable because initialization fails closed before threads start.
     // ===========================================================================
 
     void CaptureEngine::CaptureThreadWGC() {
@@ -2922,88 +2869,18 @@ namespace fthr {
             return false;
         }
 
-        // --- Step 1: Enumerate adapters, detect Optimus (same as InitializeWGC) ---
-        IDXGIFactory1* factory = nullptr;
-        HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory);
+        // Create one WGC device and keep replay encoding on that exact adapter.
+        // Do not enumerate another vendor merely because it exists elsewhere in
+        // the machine; cross-adapter window capture is not alpha-qualified.
+        D3D_FEATURE_LEVEL feature_level{};
+        HRESULT hr = D3D11CreateDevice(
+            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+            nullptr, 0, D3D11_SDK_VERSION,
+            &device_, &feature_level, &context_);
         if (FAILED(hr)) {
-            std::cerr << "[WinCapture] CreateDXGIFactory1 failed: 0x"
+            std::cerr << "[WinCapture] D3D11CreateDevice failed: 0x"
                       << std::hex << hr << std::dec << std::endl;
             return false;
-        }
-
-        IDXGIAdapter1* nvidia_adapter = nullptr;
-        bool has_intel = false;
-        {
-            IDXGIAdapter1* a = nullptr;
-            for (UINT i = 0; factory->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; ++i) {
-                DXGI_ADAPTER_DESC1 desc; a->GetDesc1(&desc);
-                char name[256] = {};
-                WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name)-1, nullptr, nullptr);
-                std::cout << "[WinCapture] Adapter " << i << ": " << name << std::endl;
-                if (desc.VendorId == 0x10DE && !nvidia_adapter) {
-                    nvidia_adapter = a; a->AddRef();
-                }
-                if (desc.VendorId == 0x8086) has_intel = true;
-                a->Release();
-            }
-        }
-        factory->Release();
-
-        bool is_optimus = nvidia_adapter && has_intel;
-
-        // --- Step 2: Create D3D11 device ---
-        //
-        // WGC delivers frames on the device the frame pool is created on.
-        // On Optimus: the display is driven by Intel, so WGC must use the Intel
-        // (default) adapter for its device — using NVIDIA here causes 0 frames.
-        // Keep a separate NVIDIA device for NVENC (CPU-input path).
-        //
-        // On desktop NVIDIA (single GPU): default adapter IS NVIDIA, GPU zero-copy.
-        D3D_FEATURE_LEVEL feature_level;
-
-        if (nvidia_adapter && !is_optimus) {
-            hr = D3D11CreateDevice(nvidia_adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
-                nullptr, 0, D3D11_SDK_VERSION, &device_, &feature_level, &context_);
-            nvidia_adapter->Release();
-            nvidia_adapter = nullptr;
-            if (SUCCEEDED(hr)) {
-                nvidia_device_ = true;
-                std::cout << "[WinCapture] D3D11 on NVIDIA adapter (GPU zero-copy)" << std::endl;
-            } else {
-                std::cerr << "[WinCapture] NVIDIA device creation failed (0x"
-                          << std::hex << hr << std::dec << ") — trying default" << std::endl;
-            }
-        }
-        else if (is_optimus) {
-            std::cout << "[WinCapture] Optimus — WGC device on default (Intel) adapter, "
-                         "NVENC on separate NVIDIA device" << std::endl;
-            hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-                nullptr, 0, D3D11_SDK_VERSION, &device_, &feature_level, &context_);
-            if (FAILED(hr)) {
-                std::cerr << "[WinCapture] Default adapter D3D11 failed: 0x"
-                          << std::hex << hr << std::dec << std::endl;
-                nvidia_adapter->Release();
-                return false;
-            }
-            hr = D3D11CreateDevice(nvidia_adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
-                nullptr, 0, D3D11_SDK_VERSION, &nvenc_device_, &feature_level, &nvenc_context_);
-            nvidia_adapter->Release();
-            nvidia_adapter = nullptr;
-            if (FAILED(hr)) {
-                std::cerr << "[WinCapture] NVIDIA device for NVENC failed — will use x264" << std::endl;
-            }
-        }
-
-        if (nvidia_adapter) { nvidia_adapter->Release(); nvidia_adapter = nullptr; }
-
-        if (!device_) {
-            hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-                nullptr, 0, D3D11_SDK_VERSION, &device_, &feature_level, &context_);
-            if (FAILED(hr)) {
-                std::cerr << "[WinCapture] D3D11CreateDevice failed: 0x"
-                          << std::hex << hr << std::dec << std::endl;
-                return false;
-            }
         }
         capture_adapter_vendor_ = QueryD3D11DeviceVendor(device_);
         nvidia_device_ = capture_adapter_vendor_ == EncoderVendor::Nvidia;
@@ -3033,31 +2910,6 @@ namespace fthr {
             width_  = static_cast<uint32_t>(sz.Width);
             height_ = static_cast<uint32_t>(sz.Height);
             std::cout << "[WinCapture] Window content size: " << width_ << "x" << height_ << std::endl;
-
-            // 6. Staging texture for CPU-readback paths (Optimus or x264 fallback).
-            //    Created on the WGC device; used in CaptureThreadWGC() Map/Unmap.
-            //    Not needed on a same-adapter NVIDIA or AMD hardware path.
-            if (capture_adapter_vendor_ != EncoderVendor::Nvidia
-                && capture_adapter_vendor_ != EncoderVendor::Amd) {
-                D3D11_TEXTURE2D_DESC tdesc{};
-                tdesc.Width            = width_;
-                tdesc.Height           = height_;
-                tdesc.MipLevels        = 1;
-                tdesc.ArraySize        = 1;
-                tdesc.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
-                tdesc.SampleDesc.Count = 1;
-                tdesc.Usage            = D3D11_USAGE_STAGING;
-                tdesc.CPUAccessFlags   = D3D11_CPU_ACCESS_READ;
-                hr = device_->CreateTexture2D(&tdesc, nullptr, &staging_texture_);
-                if (FAILED(hr)) {
-                    std::cerr << "[WinCapture] Staging texture creation failed: 0x"
-                              << std::hex << hr << std::dec << std::endl;
-                    // Non-fatal: x264 fallback will fail at Map(), but NVENC Optimus needs it.
-                    // Leave staging_texture_ null and proceed — NVENC check happens after.
-                } else {
-                    std::cout << "[WinCapture] Staging texture created for CPU-readback" << std::endl;
-                }
-            }
 
             // 7. Frame pool: 2 slots, free-threaded.
             //    See InitializeWGC() comment on why CreateFreeThreaded is required.
