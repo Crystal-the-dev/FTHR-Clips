@@ -14,6 +14,7 @@
     <ClCompile Include="tests\windows_monitor_resolver_test.cpp" />
     <ClCompile Include="..\FTHRclips\src\encoded_ring_buffer.cpp" />
     <ClCompile Include="..\FTHRclips\src\encoded_video_config.cpp" />
+    <ClCompile Include="..\FTHRclips\src\nvenc_codec_config.cpp" />
     <ClCompile Include="..\FTHRclips\src\windows_monitor_resolver.cpp" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
@@ -53,7 +54,7 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <AdditionalIncludeDirectories>$(ProjectDir)..\FTHRclips\include;$(ProjectDir)..\FTHRclips\third_party\ffmpeg\include;$(ProjectDir)..\..\FTHRcapture_common;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\FTHRclips\include;$(ProjectDir)..\FTHRclips\include\nvenc;$(ProjectDir)..\FTHRclips\third_party\ffmpeg\include;$(ProjectDir)..\..\FTHRcapture_common;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -69,7 +70,7 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <AdditionalIncludeDirectories>$(ProjectDir)..\FTHRclips\include;$(ProjectDir)..\FTHRclips\third_party\ffmpeg\include;$(ProjectDir)..\..\FTHRcapture_common;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\FTHRclips\include;$(ProjectDir)..\FTHRclips\include\nvenc;$(ProjectDir)..\FTHRclips\third_party\ffmpeg\include;$(ProjectDir)..\..\FTHRcapture_common;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
