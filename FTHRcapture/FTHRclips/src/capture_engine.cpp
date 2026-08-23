@@ -47,6 +47,7 @@
 #include <winrt/Windows.Graphics.Capture.h>
 #include <winrt/Windows.Graphics.DirectX.h>
 #include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
+#include <winrt/Windows.Security.Authorization.AppCapabilityAccess.h>
 #include <windows.graphics.directx.direct3d11.interop.h>
 #include <Windows.Graphics.Capture.Interop.h>
 
@@ -61,6 +62,7 @@
 #include "audio_encoder.h"
 #include "clip_audio_manifest.h"
 #include "transactional_save.h"
+#include "windows_capture_border_policy.h"
 #include "replay_interval.h"
 #include <iostream>
 #include <chrono>
@@ -96,6 +98,25 @@ namespace fthr {
         bool                                                              item_closed_registered = false;
         bool                                                              monitor_item = false;
     };
+
+    namespace {
+
+    CaptureBorderAccessStatus ToCaptureBorderAccessStatus(
+            winrt::Windows::Security::Authorization::AppCapabilityAccess::
+                AppCapabilityAccessStatus status) {
+        using SystemStatus = winrt::Windows::Security::Authorization::
+            AppCapabilityAccess::AppCapabilityAccessStatus;
+        switch (status) {
+        case SystemStatus::Allowed: return CaptureBorderAccessStatus::Allowed;
+        case SystemStatus::DeniedBySystem: return CaptureBorderAccessStatus::DeniedBySystem;
+        case SystemStatus::NotDeclaredByApp: return CaptureBorderAccessStatus::NotDeclaredByApp;
+        case SystemStatus::DeniedByUser: return CaptureBorderAccessStatus::DeniedByUser;
+        case SystemStatus::UserPromptRequired: return CaptureBorderAccessStatus::UserPromptRequired;
+        }
+        return CaptureBorderAccessStatus::RequestFailed;
+    }
+
+    }  // namespace
 
 
     // ===========================================================================
@@ -2830,12 +2851,12 @@ namespace fthr {
                     2,
                     sz);
 
-            // 6. Capture session + disable yellow border (Windows 11)
+            // 6. Apply the version-adaptive WGC capture-border policy before
+            // StartCapture. It preserves the OS privacy indicator unless the
+            // running packaged app has explicit Borderless access.
             wgc_state_->session =
                 wgc_state_->frame_pool.CreateCaptureSession(wgc_state_->item);
-
-            try { wgc_state_->session.IsBorderRequired(false); }
-            catch (...) { /* Windows 10 doesn't support this — ignore */ }
+            ApplyCaptureBorderPolicy("monitor");
 
             // 7. Subscribe FrameArrived: only wakes CaptureThread, no encode work here.
             wgc_state_->frame_arrived_token =
@@ -2871,6 +2892,89 @@ namespace fthr {
                   << " capture adapter"
                   << ")" << std::endl;
         return true;
+    }
+
+
+    // ===========================================================================
+    // ApplyCaptureBorderPolicy
+    //
+    // The Windows Graphics Capture border is an OS privacy indicator. This
+    // method uses the documented opt-out only after Windows has granted the
+    // package's graphicsCaptureWithoutBorder capability. It is called for
+    // every fresh WGC session, before StartCapture, and never in the frame path.
+    // ===========================================================================
+
+    void CaptureEngine::ApplyCaptureBorderPolicy(const char* capture_target) {
+        if (!wgc_state_ || !wgc_state_->session) return;
+
+        CaptureBorderPolicyInput input;
+        input.platform = DetectCaptureBorderPlatformCapability();
+        input.access_request_attempted =
+            capture_border_runtime_state_.access_request_attempted;
+        input.access_status = capture_border_runtime_state_.access_status;
+        auto decision = EvaluateCaptureBorderPolicy(input);
+        const bool access_requested_now = decision.request_borderless_access;
+
+        if (decision.request_borderless_access) {
+            capture_border_runtime_state_.access_request_attempted = true;
+            try {
+                const auto status = winrt::Windows::Graphics::Capture::
+                    GraphicsCaptureAccess::RequestAccessAsync(
+                        winrt::Windows::Graphics::Capture::
+                            GraphicsCaptureAccessKind::Borderless).get();
+                capture_border_runtime_state_.access_status =
+                    ToCaptureBorderAccessStatus(status);
+            } catch (winrt::hresult_error const&) {
+                capture_border_runtime_state_.access_status =
+                    CaptureBorderAccessStatus::RequestFailed;
+            } catch (...) {
+                capture_border_runtime_state_.access_status =
+                    CaptureBorderAccessStatus::RequestFailed;
+            }
+            input.access_request_attempted = true;
+            input.access_status = capture_border_runtime_state_.access_status;
+            decision = EvaluateCaptureBorderPolicy(input);
+        }
+
+        if (decision.attempt_disable_border) {
+            input.session_interface_checked = true;
+            try {
+                auto session3 = wgc_state_->session.try_as<
+                    winrt::Windows::Graphics::Capture::IGraphicsCaptureSession3>();
+                input.session_interface_available = static_cast<bool>(session3);
+                if (session3) {
+                    input.property_attempted = true;
+                    try {
+                        session3.IsBorderRequired(false);
+                        input.property_set_succeeded = true;
+                        input.border_required_after_attempt =
+                            session3.IsBorderRequired();
+                    } catch (winrt::hresult_error const&) {
+                        input.property_set_succeeded = false;
+                    } catch (...) {
+                        input.property_set_succeeded = false;
+                    }
+                }
+            } catch (winrt::hresult_error const&) {
+                input.session_interface_available = false;
+            } catch (...) {
+                input.session_interface_available = false;
+            }
+            decision = EvaluateCaptureBorderPolicy(input);
+        }
+
+        std::cout << "[CaptureBorderPolicy] target=" << capture_target
+                  << " os_build=" << input.platform.os_build
+                  << " api_supported=" << (decision.api_build_supported ? "true" : "false")
+                  << " package_identity=" << (input.platform.package_identity ? "true" : "false")
+                  << " capability_declared="
+                  << (input.platform.borderless_capability_declared ? "true" : "false")
+                  << " access=" << CaptureBorderAccessStatusName(input.access_status)
+                  << " access_requested=" << (access_requested_now ? "true" : "false")
+                  << " property_attempted=" << (input.property_attempted ? "true" : "false")
+                  << " effective=" << (decision.effective_borderless ? "true" : "false")
+                  << " reason=" << CaptureBorderPolicyReasonName(decision.reason)
+                  << std::endl;
     }
 
 
@@ -3220,11 +3324,11 @@ namespace fthr {
                     2,
                     sz);
 
-            // 8. Capture session + suppress yellow border (Windows 10 20H2+)
+            // 8. Apply the same version-adaptive border policy as monitor
+            // capture. WGC ownership is independent of UI launch mode.
             wgc_state_->session =
                 wgc_state_->frame_pool.CreateCaptureSession(wgc_state_->item);
-            try { wgc_state_->session.IsBorderRequired(false); }
-            catch (...) { /* not supported on older Windows — silently ignore */ }
+            ApplyCaptureBorderPolicy("window");
 
             // 9. FrameArrived: only wakes CaptureThreadWGC, no encoding work in callback
             wgc_state_->frame_arrived_token =

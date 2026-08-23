@@ -68,6 +68,7 @@
 #include "windows_process_loopback_audio_provider.h"
 #include "audio_ring_buffer.h"   // AudioRingBuffer (raw float32 PCM)
 #include "shared_memory.h"       // typed v4 capture-health flags
+#include "windows_capture_border_policy.h"
 #include "windows_monitor_resolver.h"
 
 
@@ -227,6 +228,7 @@ namespace fthr {
         // -----------------------------------------------------------------------
         bool InitializeWGC();             // WGC capture of the resolved desktop monitor
         bool InitializeWindowCapture();   // WGC window/game capture
+        void ApplyCaptureBorderPolicy(const char* capture_target);
         void ShutdownWGC();
         bool InitializeD3D11();           // DXGI fallback for the resolved adapter/output
         void ShutdownD3D11();
@@ -270,6 +272,7 @@ namespace fthr {
         std::condition_variable wgc_frame_cv_;
         bool                    wgc_frame_ready_;
         std::atomic<bool>       monitor_source_invalidated_{false};
+        CaptureBorderRuntimeState capture_border_runtime_state_;
 
         // -----------------------------------------------------------------------
         // Thread handles
