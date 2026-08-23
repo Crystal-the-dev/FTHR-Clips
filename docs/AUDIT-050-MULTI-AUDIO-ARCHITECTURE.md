@@ -391,15 +391,13 @@ production foundations have subsequently landed, in focused commits:
    mixing; it never infers sources from raw MP4 stream count.
 
 These changes do **not** constitute completion of the approved architecture.
-In particular, production process-loopback activation, dynamic source capture,
-native microphone capture/device identity, real application or microphone
-stems, FFmpeg/QAudioSink editable playback, live playback gain/mute, drift
-qualification, and physical Windows 11/game performance qualification are
-still open. The native muxer is structurally ready for up to eight actual AAC
-sources, but the current production capture path truthfully emits only Default
-Mix. The legacy Python microphone post-save route remains active until its
-native replacement is end-to-end tested; the disabled legacy multiband/null-
-sink path remains disabled.
+In particular, production process-loopback activation, dynamic application
+source capture, FFmpeg/QAudioSink editable playback, live playback gain/mute,
+and physical Windows 11/game performance qualification are still open. The
+native microphone/device-identity stage is recorded separately below. The
+legacy Python microphone post-save route is no longer selected for normal
+Windows capture; it remains as the Linux compatibility implementation. The
+disabled legacy multiband/null-sink path remains disabled.
 
 Therefore AUDIT-050 is **not resolved**, Windows 11 per-app audio is **not
 ready**, and Linux per-app audio remains **not implemented**. Shared Memory v4,
@@ -466,9 +464,9 @@ pair. It appends only actual overlapping app packet snapshots after Default
 Mix, retains the existing `handler_name`/title metadata and manifest UUID/type/
 identity/activity mapping, and never synthesizes a stream for a quiet or failed
 application. The provisional limit means Default Mix plus at most eight admitted
-application stems (nine MP4 audio tracks total). Shared Memory v4, Linux providers,
-native microphone, the final playback mixer, and the legacy disabled multiband
-route were not changed.
+application stems (ten MP4 audio tracks total). Shared Memory v4, Linux providers,
+the final playback mixer, and the legacy disabled multiband route were not
+changed.
 
 ### AUTOMATED TESTED
 
@@ -498,3 +496,127 @@ or NVIDIA video regression with live app stems.
 Until that matrix is executed on a supported Windows 11 machine, the accurate
 status is **CODE READY / WIN11 RUNTIME UNVERIFIED**. AUDIT-050 remains
 **IMPLEMENTATION IN PROGRESS**.
+
+## NATIVE MICROPHONE STEM + COMMON AUDIO CLOCK — 2026-08-23
+
+### IMPLEMENTED
+
+Windows capture now has `AudioSourceType::Microphone` and one native,
+generation-local `WindowsMicrophoneAudioProvider`. It uses shared-mode,
+event-driven WASAPI capture on `eCapture`; no Python `sounddevice`/PortAudio
+stream is opened for normal Windows replay capture. The provider enumerates
+stable Windows endpoint IDs, friendly names, default status, and device state.
+The settings model persists `mic_device_id` in addition to the legacy friendly
+name. A legacy name migrates only when exactly one active native endpoint has
+that name.
+
+An empty ID means **Default microphone** and resolves the current Windows
+default at the next capture generation. A nonempty ID is explicit. If that
+endpoint is missing, native capture fails only the microphone source with a
+diagnostic; it does not silently bind a different device. A device selection or
+gain change requests an engine restart, so a running microphone source never
+switches endpoint or clock domain in place. Endpoint IDs remain runtime/local
+settings data and are deliberately absent from portable MP4 metadata and the
+sidecar manifest.
+
+The provider reads the WASAPI mix format rather than assuming 48 kHz, float,
+mono, or stereo. Float32, PCM16, and PCM32 input are converted exactly once by
+`libswresample` to canonical 48 kHz stereo float. Capture/input gain is applied
+once before encoding; it is not an editor/export gain. A persistent AAC-LC
+packet ring then retains the microphone at 96 kb/s. The canonical stereo layout
+is intentional even for mono voice: it preserves a stable future mixer/mux
+format while using less bitrate than Default Mix's 128 kb/s. A 300-second mic
+ring is roughly 3.4 MiB of compressed payload, not a 110 MiB raw float ring.
+
+`audio_timeline` is the shared QPC-to-sample mapping for Default Mix,
+Microphone, and the existing Windows 11 process-loopback provider. A WASAPI
+packet's QPC timestamp is used directly. A driver that omits it is anchored
+with the same `QueryPerformanceCounter` clock, never a Python/wall-clock
+timeline. Default Mix also fills measured idle endpoint gaps with QPC-timed
+silence, so microphone-only clips still contain the required Default Mix
+stream. The microphone's `AudioDriftController` compares submitted samples to
+QPC, applies `swr_set_compensation` at most every 500 ms, and limits correction
+to 100 ppm. A source beginning late retains its signed presentation offset;
+its audio is not shifted to the start of the video interval.
+
+The native save path snapshots both sources against the exact AUDIT-042 video
+presentation interval, muxes the two AAC streams inside the existing paired
+MP4/manifest transaction, and labels them `Default Mix` (default disposition)
+and `Microphone`. The manifest contains a semantic `microphone` identity,
+source UUID, clip-local activity interval, stream index, and canonical format;
+it contains no raw endpoint GUID.
+
+**Compatibility-model decision.** In this stage `Default Mix` is the native
+render-loopback/system stream and `Microphone` is an independent native stem.
+It does **not** fold microphone samples into Default Mix. This is deliberate:
+the approved source model requires independent stems, and adding a second
+decode/mix/re-encode export path before the planned FFmpeg/QAudioSink mixer
+would add unqualified latency/level behaviour and duplicate voice in the future
+stem mixer. Consequently, an external player which selects only the default
+audio stream will not hear microphone audio automatically. This is a known
+product limitation, not an implicit compatibility claim; completing a
+native compatibility mix remains a follow-up decision.
+
+### AUTOMATED
+
+- Release x64 engine and native test projects build with the production
+  microphone provider. The test project reports **363 native checks**, including
+  six microphone/timeline checks: signed late-source preservation, 100 ppm
+  bounded correction, adjustment-window throttling, drift telemetry, and
+  endpoint/manifest identity separation.
+- The full Python suite passed on this Windows host after adding five native
+  microphone-device parser/migration tests. Targeted post-route, capture
+  settings, settings-manager, and PySide UI smoke coverage also passed.
+- `compileall`, Ruff, shared-memory-v4, engine-response, exception, version,
+  asset, and release-licence gates passed. The licence gate reported one
+  existing warning only: Linux FFmpeg is not vendored on this Windows checkout.
+- Existing Windows 11 process-loopback automated tests remain green; Windows
+  10 build 19045 still does not activate that provider.
+
+### PHYSICALLY VERIFIED ON THIS HOST
+
+Host: Windows 10 Pro build 19045, Intel i9-9900K, NVIDIA RTX 4060 Ti, 1920x1080
+monitor capture. Native enumeration found the active/default endpoint
+`Mikrofon (8- fifine Microphone)` (stable ID retained locally). The saved native
+streams are canonical 48 kHz stereo AAC; PortAudio's WASAPI view of this
+endpoint reports 48 kHz and two input channels. The release engine binary used
+for these runs was built from this worktree.
+
+- A silent-system 8-second smoke produced video plus `Default Mix` and
+  `Microphone`, a paired manifest, and a successful full FFmpeg decode.
+- A controlled 440 Hz system-output tone plus default FIFINE microphone made a
+  valid 30-second H.264 clip: two AAC streams, correct labels/default
+  disposition, manifest, atomic publication, and full decode.
+- A 60-second H.264 clip had two 59.968-second AAC streams under a 60-second
+  video stream. Manifest source time ranges showed a 16.6 ms initial packet
+  boundary offset and the same 16.6 ms offset at the end: no additional
+  measurable mic-to-default drift over the minute. AAC timestamps are
+  quantized to 1024-sample packets (21.33 ms), so this is a timeline bound,
+  not a speech-sync listening claim.
+- Separate 30-second HEVC/NVENC and AV1/NVENC clips also contained both AAC
+  streams, manifest sidecars, and fully decoded successfully.
+
+The host delivered roughly 28.6-28.9 captured video frames/s while configured
+for 60 fps in these desktop qualification runs. Therefore the codec results
+prove native encoder/mux coexistence with microphone capture, **not** a 60-fps
+gaming-performance pass. No claim is made that this is caused by the new audio
+provider without a Default-Mix-only comparison.
+
+### UNVERIFIED / OPEN
+
+- 300-second drift, mic input 44.1 kHz conversion, deterministic mono-device
+  qualification, real speech intelligibility/clipping, and 440 Hz versus 880
+  Hz digital-isolation analysis were not run.
+- Selected-device disconnect/reconnect, default-device change, rapid saves,
+  CPU/working-set/save-latency comparison, and live-game 60-fps regression are
+  not qualified.
+- The Windows 11 process-loopback provider remains automated-only; physical
+  app-stem qualification requires a supported Windows 11 host.
+- Linux PipeWire and the FFmpeg/QAudioSink multi-track playback mixer remain
+  outside this phase. Shared Memory stays v4.
+
+AUDIT-050 remains **IMPLEMENTATION IN PROGRESS**. Native microphone capture is
+**EXPERIMENTAL** until the remaining device/performance matrix and the Default
+Mix compatibility decision are closed. The common audio clock is **QUALIFIED
+for the 60-second Windows-10 observation only**, not for 300 seconds or all
+devices.
