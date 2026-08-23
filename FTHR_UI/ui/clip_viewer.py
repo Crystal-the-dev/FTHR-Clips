@@ -1,9 +1,15 @@
 # clip_viewer.py - FTHR clip editor
 import os, sys, threading, subprocess
+from dataclasses import replace
 from core.ffmpeg_tools import (
     get_ffmpeg_exe, software_video_args, FFmpegUnavailable)
 from core.library_ownership import MediaOwnership, classify_media_path
-from core.audio_manifest import verified_audio_tracks_for_export
+from core.ffmpeg_playback import (
+    FFmpegPlaybackController, PlaybackError, discover_playback_sources,
+)
+from core.playback_mix_model import (
+    PlaybackSource, SourceMixState, ffmpeg_mix_filter, source_icon_key,
+)
 from core.transactional_output import (
     commit_staged_output,
     create_staged_output_path,
@@ -805,6 +811,9 @@ class ShareWindow(QDialog):
     def __init__(self, clip_path: str, start_s: float, end_s: float,
                  crop_rect, settings_info: dict, discord_mode: bool = False,
                  source_volumes: dict | None = None,
+                 source_mutes: dict | None = None,
+                 master_volume: int = 100,
+                 playback_sources: tuple[PlaybackSource, ...] = (),
                  multitrack_audio: bool = False,
                  audio_tracks: tuple[tuple[str, int], ...] = (), parent=None):
         super().__init__(parent,
@@ -823,6 +832,10 @@ class ShareWindow(QDialog):
         self._discord_mode = discord_mode
         self._popup_anim   = None
         self._source_volumes = source_volumes or {}
+        self._source_mutes = source_mutes or {}
+        self._master_volume = master_volume
+        self._playback_sources = tuple(playback_sources)
+        self._preserve_tracks = not discord_mode
         # Clip-local semantic keys and FFmpeg audio-stream positions. This is
         # intentionally supplied by the clip manifest, never by fixed legacy
         # categories or by currently-running processes.
@@ -1014,19 +1027,15 @@ class ShareWindow(QDialog):
         knows to skip the filter and fall through to a stream-copy or
         single-encode path.
         """
-        if not self._multitrack_audio:
+        if not self._multitrack_audio or self._preserve_tracks:
             return [], None
-        filters = []
-        mix_inputs = []
-        for i, (key, stream_index) in enumerate(self._audio_tracks):
-            gain = max(0, self._source_volumes.get(key, 100)) / 100.0
-            filters.append(f'[0:a:{stream_index}]volume={gain:.3f}[a{i}]')
-            mix_inputs.append(f'[a{i}]')
-        filters.append(
-            f'{"".join(mix_inputs)}'
-            f'amix=inputs={len(self._audio_tracks)}:normalize=0[aout]'
-        )
-        return filters, '[aout]'
+        states = {
+            source.source_id: SourceMixState(
+                gain_percent=self._source_volumes.get(source.source_id, 100),
+                muted=self._source_mutes.get(source.source_id, False))
+            for source in self._playback_sources
+        }
+        return ffmpeg_mix_filter(self._playback_sources, states, self._master_volume)
 
     def _export_worker(self):
         try:
@@ -1093,7 +1102,7 @@ class ShareWindow(QDialog):
                    '-t', str(duration_s),
                    '-filter_complex', ';'.join(fc),
                    '-map', '[vout]',
-                   '-map', audio_out if audio_out else '0:a:0?',
+                   '-map', audio_out if audio_out else '0:a?',
                    *software_video_args(bitrate_kbps=video_kbps),
                    '-maxrate', f'{maxrate_kbps}k',
                    '-bufsize', f'{bufsize_kbps}k',
@@ -1112,7 +1121,7 @@ class ShareWindow(QDialog):
                    '-t', str(duration_s),
                    '-filter_complex', ';'.join(filters),
                    '-map', '[vout]' if cr else '0:v:0',
-                   '-map', audio_out if audio_out else '0:a:0?']
+                   '-map', audio_out if audio_out else '0:a?']
             if cr:
                 cmd += software_video_args()
             else:
@@ -1258,12 +1267,15 @@ class VolumePopup(QDialog):
 
     master_changed = Signal(int)            # 0–100
     source_changed = Signal(str, int)       # (source_key, 0–100)
+    source_muted = Signal(str, bool)        # (source_key, muted)
 
     _SOURCES = [('master', 'MASTER')]
 
     def __init__(self, master_vol: int,
                  source_volumes: dict | None = None,
-                 source_tracks: tuple[tuple[str, str], ...] = (),
+                 source_mutes: dict | None = None,
+                 source_tracks: tuple[PlaybackSource, ...] = (),
+                 live_preview: bool = False,
                  parent=None):
         super().__init__(parent,
                          Qt.WindowType.FramelessWindowHint |
@@ -1273,10 +1285,11 @@ class VolumePopup(QDialog):
         self._sliders:  dict[str, QSlider] = {}
         self._values:   dict[str, QLabel]  = {}
         self._source_tracks = tuple(source_tracks)
-        self._build_ui(master_vol, source_volumes or {})
+        self._source_mutes = source_mutes or {}
+        self._build_ui(master_vol, source_volumes or {}, live_preview)
         self.setFixedSize(self.sizeHint())
 
-    def _build_ui(self, master_vol: int, source_volumes: dict):
+    def _build_ui(self, master_vol: int, source_volumes: dict, live_preview: bool):
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 12, 14, 12)
         root.setSpacing(8)
@@ -1287,13 +1300,34 @@ class VolumePopup(QDialog):
             'font-family: "Segoe UI"; letter-spacing: 2px; background: transparent;')
         root.addWidget(title)
 
-        sources = self._SOURCES + list(self._source_tracks)
-        for key, label in sources:
+        sources = [(key, label, None) for key, label in self._SOURCES]
+        sources.extend((source.source_id, self._display_label(source), source)
+                       for source in self._source_tracks)
+        for key, label, source in sources:
             row = QHBoxLayout()
             row.setSpacing(10)
 
+            if source is not None:
+                icon_key = source_icon_key(source)
+                # Manifest icon references are semantic/privacy-safe keys, not
+                # file paths.  A compact glyph keeps the existing panel layout
+                # while reflecting known keys and giving imports an honest
+                # generic fallback.
+                glyph = {
+                    'system': '◖', 'microphone': '●',
+                    'application': '◆', 'track': '◌',
+                }[icon_key]
+                icon = QLabel(glyph)
+                icon.setFixedWidth(12)
+                icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                icon.setToolTip(f'{icon_key.title()} audio source')
+                icon.setStyleSheet(
+                    f'color: {Colors.ACCENT}; font-size: 11px; '
+                    'background: transparent;')
+                row.addWidget(icon)
+
             lbl = QLabel(label)
-            lbl.setFixedWidth(64)
+            lbl.setFixedWidth(64 if source is not None else 76)
             lbl.setStyleSheet(
                 'color: #ffffff; font-size: 8px; font-weight: bold; '
                 'font-family: "Segoe UI"; letter-spacing: 1px; background: transparent;')
@@ -1307,7 +1341,8 @@ class VolumePopup(QDialog):
             else:
                 slider.setValue(int(source_volumes.get(key, 100)))
                 slider.setToolTip(
-                    f'{label.title()} track gain — applied only to this clip export.')
+                    f'{label.title()} track gain for this open clip only.')
+                slider.setEnabled(bool(source and source.available))
             slider.valueChanged.connect(
                 lambda v, k=key, lab=label: self._on_changed(k, v, lab))
             self._sliders[key] = slider
@@ -1323,11 +1358,25 @@ class VolumePopup(QDialog):
             self._values[key] = value_lbl
             row.addWidget(value_lbl)
 
+            if source is not None:
+                mute = QPushButton('MUTE')
+                mute.setCheckable(True)
+                mute.setChecked(bool(self._source_mutes.get(key, False)))
+                mute.setEnabled(source.available)
+                mute.setFixedWidth(42)
+                mute.setStyleSheet(
+                    'QPushButton { color: #777777; background: transparent; border: none; '
+                    'font-size: 7px; font-weight: bold; } '
+                    'QPushButton:checked { color: #cc0000; }')
+                mute.toggled.connect(lambda checked, k=key: self.source_muted.emit(k, checked))
+                row.addWidget(mute)
+
             root.addLayout(row)
 
-        note_text = ('Verified clip tracks — export mix only; live preview uses Default Mix'
-                     if self._source_tracks else
-                     'No verified per-track metadata for this clip')
+        note_text = ('Live editable mix — changes apply only while this clip is open'
+                     if self._source_tracks and live_preview else
+                     'Track controls unavailable; preview falls back to container audio'
+                     if self._source_tracks else 'No audio tracks found in this clip')
         note = QLabel(note_text)
         note.setStyleSheet(
             'color: #666666; font-size: 8px; font-style: italic; '
@@ -1343,6 +1392,12 @@ class VolumePopup(QDialog):
             QSlider::handle:horizontal:hover {{ background: #ffffff; }}
             QSlider::sub-page:horizontal {{ background: {Colors.ACCENT}; }}
         ''')
+
+    @staticmethod
+    def _display_label(source: PlaybackSource) -> str:
+        if source.source_type == 'system' and source.display_name.casefold() == 'default mix':
+            return 'SYSTEM AUDIO'
+        return source.display_name.upper()
 
     def _on_changed(self, key: str, value: int, _label: str):
         self._values[key].setText(f'{value}%')
@@ -1387,12 +1442,13 @@ class ClipViewer(QDialog):
         self._thumb_pixmap = thumb_pixmap
         self._thumb_overlay: QLabel | None = None
         self._thumb_fade_anim: QPropertyAnimation | None = None
-        # A sidecar is authoritative only when it binds the current MP4 hash.
-        # Imported/legacy clips intentionally remain Master-only; a container
-        # stream count is not enough to invent source semantics.
+        # The source rows are filled asynchronously from either a hash-bound
+        # FTHR manifest or actual container metadata. Imported media therefore
+        # gets generic track labels instead of fabricated app identities.
+        self._playback_sources: tuple[PlaybackSource, ...] = ()
         self._audio_tracks: tuple[tuple[str, int], ...] = ()
-        self._audio_track_labels: tuple[tuple[str, str], ...] = ()
-        self._load_manifest_audio_tracks()
+        self._audio_mixer: FFmpegPlaybackController | None = None
+        self._audio_mixer_live = False
 
         self.setWindowTitle(f'FTHR — {Path(clip_path).name}')
         self.setWindowFlags(
@@ -1483,6 +1539,8 @@ class ClipViewer(QDialog):
         # QPushButton emits clicked, so toggling the icon programmatically
         # used to recurse back into _toggle_play.
         self._play_pause_busy = False
+        self._audio_sources_discovered.connect(self._on_audio_sources_discovered)
+        QTimer.singleShot(0, self._discover_audio_sources_async)
 
     # =========================================================================
     # Show / fade-in (consolidated showEvent lives near nativeEvent below)
@@ -1648,7 +1706,8 @@ class ClipViewer(QDialog):
         else:
             self._master_volume = 80
         self._source_volumes: dict[str, int] = {}
-        self._multitrack_audio = len(self._audio_tracks) > 1
+        self._source_mutes: dict[str, bool] = {}
+        self._multitrack_audio = False
         self.vol_btn = QPushButton(f'VOL  {self._master_volume}%  ▾')
         self.vol_btn.setObjectName('volBtn')
         self.vol_btn.setFixedHeight(28)
@@ -2155,8 +2214,12 @@ class ClipViewer(QDialog):
             want_play = state != QMediaPlayer.PlaybackState.PlayingState
             try:
                 if want_play:
+                    if self._audio_mixer is not None:
+                        self._audio_mixer.play(self.player.position())
                     self.player.play()
                 else:
+                    if self._audio_mixer is not None:
+                        self._audio_mixer.pause()
                     self.player.pause()
             except Exception as e:
                 print(f'[ClipViewer] play/pause command rejected: {e}')
@@ -2184,6 +2247,8 @@ class ClipViewer(QDialog):
         # Keep the button visually consistent with whatever the player ends up
         # doing — including auto-stop at end of clip.
         if state == QMediaPlayer.PlaybackState.PlayingState:
+            if self._audio_mixer is not None:
+                self._audio_mixer.play(self.player.position())
             self.play_btn.blockSignals(True)
             self.play_btn.setChecked(True)
             self.play_btn.blockSignals(False)
@@ -2192,6 +2257,8 @@ class ClipViewer(QDialog):
             else:
                 self.play_btn.setText('⏸  PAUSE')
         else:
+            if self._audio_mixer is not None:
+                self._audio_mixer.pause()
             # PausedState OR StoppedState — both show the play glyph.
             self.play_btn.blockSignals(True)
             self.play_btn.setChecked(False)
@@ -2209,6 +2276,9 @@ class ClipViewer(QDialog):
         if self.duration_ms > 0 and self.trim_slider.dragging != 'playhead':
             self.trim_slider.set_playhead(pos / self.duration_ms)
         self.time_label.setText(f'{self._fmt(pos)} / {self._fmt(self.duration_ms)}')
+        if (self._audio_mixer is not None
+                and self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState):
+            self._audio_mixer.sync_to_video_position(pos)
 
     def _on_seek_requested(self, pct: float):
         # Coalesce: the slider can fire this 100+ times per second during a
@@ -2224,6 +2294,8 @@ class ClipViewer(QDialog):
             return
         target = self._pending_seek_ms
         self._pending_seek_ms = None
+        if self._audio_mixer is not None:
+            self._audio_mixer.seek(target)
         try:
             self.player.setPosition(target)
         except Exception as e:
@@ -2254,17 +2326,23 @@ class ClipViewer(QDialog):
         popup = VolumePopup(
             master_vol=self._master_volume,
             source_volumes=self._source_volumes,
-            source_tracks=self._audio_track_labels if self._multitrack_audio else (),
+            source_mutes=self._source_mutes,
+            source_tracks=self._playback_sources,
+            live_preview=self._audio_mixer_live,
             parent=self,
         )
         popup.master_changed.connect(self._on_master_volume_changed)
         popup.source_changed.connect(self._on_source_volume_changed)
+        popup.source_muted.connect(self._on_source_muted)
         popup.show_above(self.vol_btn)
         self._volume_popup = popup
 
     def _on_master_volume_changed(self, value: int):
         self._master_volume = value
-        self.audio_output.setVolume(value / 100.0)
+        if self._audio_mixer is not None:
+            self._audio_mixer.set_master_percent(value)
+        else:
+            self.audio_output.setVolume(value / 100.0)
         self.vol_btn.setText(f'VOL  {value}%  ▾')
         if self.sm:
             self.sm.set('master_volume', value)
@@ -2272,71 +2350,91 @@ class ClipViewer(QDialog):
 
     def _on_source_volume_changed(self, key: str, value: int):
         self._source_volumes[key] = value
+        if self._audio_mixer is not None:
+            self._audio_mixer.set_source_state(key, gain_percent=value)
 
-    def _load_manifest_audio_tracks(self):
-        """Load only a hash-bound audio manifest into export-track controls."""
-        tracks = verified_audio_tracks_for_export(self.clip_path)
-        self._audio_tracks = tuple(
-            (source_uuid, audio_index)
-            for source_uuid, audio_index, _ in tracks)
-        self._audio_track_labels = tuple(
-            (source_uuid, display_name) for source_uuid, _, display_name in tracks)
+    def _on_source_muted(self, key: str, muted: bool):
+        self._source_mutes[key] = muted
+        if self._audio_mixer is not None:
+            self._audio_mixer.set_source_state(key, muted=muted)
 
-    # Signal carries the result of background multi-track detection back to
-    # the UI thread (Qt widget mutation must always happen on the UI thread).
-    _multitrack_detected = Signal(bool)
+    # Discovery and native decoder creation happen away from the UI thread.
+    _audio_sources_discovered = Signal(object, str)
 
-    def _detect_multitrack_audio_async(self):
-        """Kick off ffmpeg-stderr probing on a worker thread.
-
-        The synchronous version of this used to run in __init__ and could
-        block the UI for up to 4 seconds (subprocess timeout). We default to
-        single-track and update the flag asynchronously — by the time the
-        user opens the volume popup, the result is almost always in.
-        """
-        # Connect once. Re-connecting on the second call would silently fire
-        # the slot multiple times, so guard with a flag.
-        if not getattr(self, '_mt_signal_wired', False):
-            self._multitrack_detected.connect(self._on_multitrack_result)
-            self._mt_signal_wired = True
-
+    def _discover_audio_sources_async(self):
         clip_path = self.clip_path
-        signal = self._multitrack_detected
+        signal = self._audio_sources_discovered
 
         def _worker():
             try:
-                ffmpeg = get_ffmpeg_exe()
-            except Exception:
-                signal.emit(False)
-                return
+                signal.emit(discover_playback_sources(clip_path), '')
+            except PlaybackError as error:
+                signal.emit((), str(error))
+
+        threading.Thread(target=_worker, name='FTHR-audio-probe', daemon=True).start()
+
+    def _on_audio_sources_discovered(self, sources, error: str):
+        if error:
+            print(f'[ClipViewer] audio source probe failed: {error}')
+            return
+        self._playback_sources = tuple(sources)
+        self._audio_tracks = tuple(
+            (source.source_id, source.audio_index)
+            for source in self._playback_sources
+            if source.available and source.audio_index is not None)
+        self._multitrack_audio = bool(self._audio_tracks)
+        for source in self._playback_sources:
+            self._source_volumes.setdefault(source.source_id, 100)
+            self._source_mutes.setdefault(source.source_id, False)
+        if self._audio_tracks:
             try:
-                result = subprocess.run(
-                    [ffmpeg, '-hide_banner', '-i', clip_path],
-                    capture_output=True, text=True,
-                    timeout=4,
-                    **_NO_WINDOW,
-                )
-            except Exception:
-                signal.emit(False)
-                return
-            import re
-            stderr = result.stderr or ''
-            count = len(re.findall(r'Stream\s+#\d+:\d+.*?: Audio:', stderr))
-            signal.emit(count >= 2)
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _on_multitrack_result(self, is_multitrack: bool):
-        # A raw FFmpeg stream count has no source semantics. This legacy probe
-        # must never turn on per-track controls without a verified sidecar.
-        self._multitrack_audio = bool(is_multitrack and len(self._audio_tracks) > 1)
-        # The volume popup is the only widget whose appearance depends on this
-        # flag. If it's already open when detection finishes, refresh it so
-        # the per-source sliders enable/disable correctly without a reopen.
+                self._audio_mixer = FFmpegPlaybackController(
+                    self.clip_path, self._playback_sources, self)
+                self._audio_mixer.ready_changed.connect(self._on_audio_mixer_ready)
+                self._audio_mixer.audio_failed.connect(self._on_audio_mixer_failed)
+                self._audio_mixer.source_failed.connect(self._on_audio_source_failed)
+                self._audio_mixer.reached_eof.connect(self._on_audio_mixer_eof)
+                # Avoid QMediaPlayer's one-track audio plus the custom mix.
+                self.audio_output.setVolume(0.0)
+                if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                    self._audio_mixer.play(self.player.position())
+            except PlaybackError as mixer_error:
+                print(f'[ClipViewer] custom audio mixer unavailable: {mixer_error}')
+                self._audio_mixer = None
+                self.audio_output.setVolume(self._master_volume / 100.0)
         if self._volume_popup is not None and self._volume_popup.isVisible():
             self._volume_popup.close()
             self._volume_popup = None
             self._toggle_volume_popup()
+
+    def _on_audio_mixer_ready(self, ready: bool, detail: str):
+        self._audio_mixer_live = ready
+        if not ready:
+            print(f'[ClipViewer] custom audio mixer failed to start: {detail}')
+            self.audio_output.setVolume(self._master_volume / 100.0)
+
+    def _on_audio_mixer_failed(self, detail: str):
+        print(f'[ClipViewer] custom audio mixer error: {detail}')
+        self._audio_mixer_live = False
+        # Keep the video and audio timeline coherent on output-device failure.
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+
+    def _on_audio_source_failed(self, source_id: str):
+        # The bridge continues the healthy stems. Keep this clip-local row
+        # visible but honestly disable its controls rather than inventing audio.
+        self._playback_sources = tuple(
+            replace(source, available=False) if source.source_id == source_id else source
+            for source in self._playback_sources)
+        if self._volume_popup is not None and self._volume_popup.isVisible():
+            self._volume_popup.close()
+            self._volume_popup = None
+            self._toggle_volume_popup()
+
+    def _on_audio_mixer_eof(self):
+        # QMediaPlayer remains the media clock and will normally stop at the
+        # same point. Do not issue a competing seek or restart here.
+        return
 
     # =========================================================================
     # Trim
@@ -2509,7 +2607,7 @@ class ClipViewer(QDialog):
                 '-t', str(duration_s)]
 
         use_video_filter = crop_rect is not None
-        use_audio_filter = self._multitrack_audio
+        use_audio_filter = bool(self._audio_tracks)
 
         if not use_video_filter and not use_audio_filter:
             return base + ['-map', '0:v?', '-map', '0:a?', '-c', 'copy', out_path]
@@ -2521,19 +2619,19 @@ class ClipViewer(QDialog):
             h &= ~1
             filters.append(f'[0:v]crop={w}:{h}:{x}:{y}[vout]')
         if use_audio_filter:
-            mix_inputs = []
-            for i, (key, stream_index) in enumerate(self._audio_tracks):
-                gain = max(0, self._source_volumes.get(key, 100)) / 100.0
-                filters.append(f'[0:a:{stream_index}]volume={gain:.3f}[a{i}]')
-                mix_inputs.append(f'[a{i}]')
-            filters.append(
-                f'{"".join(mix_inputs)}'
-                f'amix=inputs={len(self._audio_tracks)}:normalize=0[aout]'
-            )
+            states = {
+                source.source_id: SourceMixState(
+                    gain_percent=self._source_volumes.get(source.source_id, 100),
+                    muted=self._source_mutes.get(source.source_id, False))
+                for source in self._playback_sources
+            }
+            audio_filters, audio_output = ffmpeg_mix_filter(
+                self._playback_sources, states, self._master_volume)
+            filters.extend(audio_filters)
 
         cmd = base + ['-filter_complex', ';'.join(filters)]
         cmd += ['-map', '[vout]' if use_video_filter else '0:v:0']
-        cmd += ['-map', '[aout]' if use_audio_filter else '0:a?']
+        cmd += ['-map', audio_output if use_audio_filter else '0:a?']
 
         if use_video_filter:
             cmd += video_args
@@ -2640,6 +2738,9 @@ class ClipViewer(QDialog):
             settings_info=settings_info,
             discord_mode=discord_mode,
             source_volumes=self._source_volumes,
+            source_mutes=self._source_mutes,
+            master_volume=self._master_volume,
+            playback_sources=self._playback_sources,
             multitrack_audio=self._multitrack_audio,
             audio_tracks=self._audio_tracks,
             parent=self,
@@ -2750,6 +2851,9 @@ class ClipViewer(QDialog):
             self.player.stop()
         except Exception:
             pass
+        if self._audio_mixer is not None:
+            self._audio_mixer.stop()
+            self._audio_mixer = None
 
     # =========================================================================
     # Window drag / native resize (matches MainWindow)
