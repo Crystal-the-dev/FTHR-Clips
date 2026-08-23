@@ -620,3 +620,165 @@ AUDIT-050 remains **IMPLEMENTATION IN PROGRESS**. Native microphone capture is
 Mix compatibility decision are closed. The common audio clock is **QUALIFIED
 for the 60-second Windows-10 observation only**, not for 300 seconds or all
 devices.
+
+## FFMPEG + QAUDIOSINK MULTI-TRACK PLAYBACK MIXER — 2026-08-23
+
+### IMPLEMENTED
+
+`FTHRPlaybackMixer` is a small native C ABI bridge linked against the pinned
+FFmpeg runtime.  It owns one `AVFormatContext`, one logical decoder and
+`SwrContext` per selected audio stream, and no Qt objects.  It demuxes on one
+bounded worker path, decodes only on demand, converts all selected streams to
+**48 kHz, float32, stereo**, and returns 1,024-frame mixed PCM blocks.  A
+demux pass reads at most 64 packets, and the Qt-facing PCM queue holds at most
+0.5 seconds.  No FFmpeg decoder or mix work runs on the Qt UI thread or a Qt
+audio pull callback.
+
+The mix policy is the same for preview and derived mixed export:
+
+1. each available source receives its current linear gain (or zero when muted);
+2. the sum receives equal-power headroom, `1 / sqrt(active unmuted sources)`;
+3. an instantaneous zero-lookahead hard ceiling clamps it to `±0.98`;
+4. master gain is applied last.
+
+This deliberately does not normalize individual stems or introduce lookahead
+latency.  The zero-lookahead clamp is clipping protection, not a loudness
+processor.  FFmpeg's derived-export graph uses the equivalent `amix` headroom,
+`alimiter=limit=0.98:level=disabled`, and master `volume` stages.
+
+`FFmpegPlaybackController` owns the one `QAudioSink`.  It requests 48 kHz
+float stereo from the default device and falls back to 48 kHz signed 16-bit
+stereo only if required.  Its pull `QIODevice` only removes queued bytes.
+Underrun is recoverable when more data arrives; output open/I/O/fatal errors
+report a clean audio failure.  Closing a viewer clears the queue, signals the
+daemon decoder worker, joins for at most 0.5 seconds, stops the sink, and
+releases the native FFmpeg handle.
+
+`QMediaPlayer` remains video renderer and the **only clock master**.  Its own
+audio output is muted only when the custom mixer is ready, preventing the
+single-track QMediaPlayer output from playing alongside the mixer.  The mixer
+uses the displayed position and its queue-adjusted decoded position; a drift
+above 120 ms causes a flush-and-seek.  Pause clears queued audio, resume seeks
+to the current video position, and a seek flushes FFmpeg demux/codec/resampler
+state before output resumes.  The viewer has no playback-speed control, so no
+speed-control behavior changed.
+
+The source model is data-driven and clip-local.  A hash-bound FTHR manifest is
+used only when valid; a mismatch falls back to container titles or `Track N`.
+Known manifest icon references are consumed as safe semantic keys
+(`system-audio`, `microphone`, `windows-app-icon`/`generic-app`); they are
+never treated as paths.  System, microphone, application, and generic-track
+markers provide an honest UI fallback.
+
+For the current Windows 10 model, valid `Default Mix` plus `Microphone`
+remains two editable rows because Default Mix is system loopback only.  For a
+future manifest containing application stems, the compatibility `Default Mix`
+row is excluded from the editable mix to avoid duplicate system audio; app
+stems and microphone remain.  Silent rows are not hidden merely because they
+are silent at the current position.  A failed decoder disables only that
+source row and healthy stems continue.
+
+The current volume popup is wired to this model without a layout redesign:
+Master and dynamic source gain/mute values take effect on the next mixer block
+and remain only for the open viewer session.  They do not rewrite media or its
+manifest.  Normal Export and Discord Share create the current compatibility
+mix; a no-edit full-quality Share uses explicit `-map 0:v? -map 0:a?` so it
+preserves every video/audio stem rather than FFmpeg's automatic single-stream
+selection.  Both paths keep the source file unchanged and use the existing
+same-directory transactional publication mechanism.
+
+Windows packaging carries `FTHRPlaybackMixer.dll` in the existing `engine`
+directory.  The Linux CMake/spec/build route now builds and packages the same
+bridge as `libFTHRPlaybackMixer.so`; this is source/packaging integration only,
+not Linux runtime qualification.  Shared Memory stays v4 and capture/recording
+paths are not modified.
+
+### AUTOMATED TESTED
+
+- Deterministic core coverage verifies current Default Mix + Microphone
+  semantics, future app-stem compatibility exclusion, unavailable sources,
+  legacy/import labels, manifest-icon fallbacks, 1/2/4/8-source headroom,
+  gain, mute, master, hard ceiling, mono-to-stereo, 44.1-to-48 kHz reference
+  conversion, bounded queue underruns, fatal output-device reporting, and
+  one-source failure isolation.
+- The production native bridge is exercised against a real synthetic AAC MP4
+  with 440 Hz system and 880 Hz microphone streams.  Frequency analysis proves
+  both sources mix, and proves muting either leaves the other source dominant;
+  a production seek and rapid forward/backward seek sequence return full fresh
+  blocks.
+- Real FFmpeg export coverage builds the viewer's mixed command, creates a
+  staged output, atomically publishes it, verifies exactly one output audio
+  stream, fully decodes it, and hashes the input before/after.  The explicit
+  full-quality mapping is exercised against the same media and retains both
+  input audio stems.
+- The complete Python suite passed on this host.  The Windows Release x64
+  solution built with the new bridge, and `FTHRclips_tests.exe` completed
+  **363 native checks**.  Ruff and `compileall` passed.
+- Version, exception-handling, shared-memory v4, engine-response, generated
+  asset, and release-license gates passed.  The full licence gate reported
+  **160 checks, 0 failures, 1 expected warning**: this Windows checkout does
+  not carry a vendored Linux FFmpeg bundle.  A rebuilt Windows onedir package
+  passed its 84 package licence/Qt/asset checks and contains the bridge.
+
+### WINDOWS RUNTIME VERIFIED
+
+The host's actual default output device accepted the requested `QAudioSink`
+format.  A production controller run on a synthetic two-stem AAC MP4 reached
+`ActiveState`, reported ready, had no audio error, and reported zero queue
+underruns during the 1.8-second observation.  This validates the real
+in-process FFmpeg -> `QAudioSink` data path, not a visual mock or a subprocess
+per stream.
+
+The following 60.011-second synthetic AAC files were decoded through the
+production bridge after the bounded-demux change.  They are offline decoder
+measurements (not QMediaPlayer/video sync or audible device tests) on this
+Windows host:
+
+| Selected stems | Process CPU | Wall time | Working set after decode | Four seeks | Decoder workers |
+| --- | ---: | ---: | ---: | --- | ---: |
+| 1 | 46.875 ms | 58.604 ms | 55,652,352 B | 0.068–0.171 ms, audio returned | 1 |
+| 2 | 93.750 ms | 97.283 ms | 56,221,696 B | 0.107–0.655 ms, audio returned | 1 |
+| 4 | 156.250 ms | 164.778 ms | 58,605,568 B | 0.148–0.768 ms, audio returned | 1 |
+| 8 | 281.250 ms | 306.626 ms | 62,681,088 B | 0.265–1.254 ms, audio returned | 1 |
+
+The seeks were 0→20 s, 20→5 s, 5→45 s, and 45→10 s.  These figures show the
+bounded implementation is not obviously expensive in this controlled decode
+test, but they are not a gaming-performance or long-running real-time audio
+qualification.
+
+### WINDOWS RUNTIME NOT YET VERIFIED
+
+No current physical FTHR `Default Mix` + `Microphone` clip has been opened and
+listened to through this viewer stage.  Therefore simultaneous audibility,
+Mic-only/System-only slider behavior, mute behavior, master behavior, and
+device-loss recovery are **not claimed**.  The inspected existing desktop clip
+has no valid rich manifest and therefore correctly appears as a legacy generic
+audio track; it cannot prove the current semantic two-stem case.
+
+Likewise, the following are still required before this playback stage can be
+called runtime-ready: a real 60-second video-plus-audio sync observation,
+rapid repeated seek while video is playing, a 300-second drift observation,
+full UI responsiveness/listening checks, current Windows 11 app-stem physical
+qualification, and capture/video-save regression smoke with the packaged app.
+
+### LINUX UNVERIFIED
+
+The shared native bridge and PySide controller are intentionally cross-platform
+in structure, and Linux package metadata includes the bridge.  They were not
+compiled, run, or AppImage-qualified on this Windows host.  PipeWire capture,
+Linux audio-device behavior, and Linux packaging/runtime remain outside this
+stage.
+
+### STATUS
+
+- **AUDIT-050:** IMPLEMENTATION IN PROGRESS.
+- **FFmpeg multi-track mixer:** EXPERIMENTAL — real native bridge, isolation,
+  export, and bounded offline 1/2/4/8-stem checks pass; physical editor
+  listening and long video-clock qualification remain.
+- **QAudioSink playback:** EXPERIMENTAL — actual device/synthetic-controller
+  path passed; real FTHR-clip listening and device-loss tests remain.
+- **Default Mix + Microphone playback:** NOT READY — the physical two-stem
+  editor test has not been performed.
+- **Dynamic source model:** READY.
+- **Seek / sync:** UNVERIFIED for real QMediaPlayer video playback.
+- **Mixed export:** READY for the automated real-FFmpeg transactional path.
