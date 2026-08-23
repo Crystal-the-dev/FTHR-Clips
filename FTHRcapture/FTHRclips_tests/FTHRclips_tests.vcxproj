@@ -19,6 +19,7 @@
     <ClCompile Include="tests\qsv_replay_encoder_test.cpp" />
     <ClCompile Include="tests\windows_replay_policy_test.cpp" />
     <ClCompile Include="tests\windows_monitor_resolver_test.cpp" />
+    <ClCompile Include="tests\windows_capture_border_policy_test.cpp" />
     <ClCompile Include="..\FTHRclips\src\encoded_ring_buffer.cpp" />
     <ClCompile Include="..\FTHRclips\src\audio_packet_ring.cpp" />
     <ClCompile Include="..\FTHRclips\src\audio_timeline.cpp" />
@@ -34,6 +35,7 @@
     <ClCompile Include="..\FTHRclips\src\nvenc_codec_config.cpp" />
     <ClCompile Include="..\FTHRclips\src\replay_encoder_policy.cpp" />
     <ClCompile Include="..\FTHRclips\src\windows_monitor_resolver.cpp" />
+    <ClCompile Include="..\FTHRclips\src\windows_capture_border_policy.cpp" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>17.0</VCProjectVersion>
