@@ -13,6 +13,7 @@
   <ItemGroup>
     <ClCompile Include="tests\audio_source_model_test.cpp" />
     <ClCompile Include="tests\windows_audio_session_registry_test.cpp" />
+    <ClCompile Include="tests\windows_process_loopback_audio_provider_test.cpp" />
     <ClCompile Include="tests\amf_replay_encoder_test.cpp" />
     <ClCompile Include="tests\qsv_replay_encoder_test.cpp" />
     <ClCompile Include="tests\windows_replay_policy_test.cpp" />
@@ -20,8 +21,10 @@
     <ClCompile Include="..\FTHRclips\src\encoded_ring_buffer.cpp" />
     <ClCompile Include="..\FTHRclips\src\audio_packet_ring.cpp" />
     <ClCompile Include="..\FTHRclips\src\audio_source_model.cpp" />
+    <ClCompile Include="..\FTHRclips\src\audio_encoder.cpp" />
     <ClCompile Include="..\FTHRclips\src\clip_audio_manifest.cpp" />
     <ClCompile Include="..\FTHRclips\src\windows_audio_session_registry.cpp" />
+    <ClCompile Include="..\FTHRclips\src\windows_process_loopback_audio_provider.cpp" />
     <ClCompile Include="..\FTHRclips\src\encoded_video_config.cpp" />
     <ClCompile Include="..\FTHRclips\src\ffmpeg_amf_replay_encoder.cpp" />
     <ClCompile Include="..\FTHRclips\src\ffmpeg_qsv_replay_encoder.cpp" />
@@ -72,7 +75,7 @@
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>$(ProjectDir)..\FTHRclips\third_party\ffmpeg\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>avcodec.lib;avutil.lib;d3d11.lib;dxgi.lib;User32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>avcodec.lib;avutil.lib;swresample.lib;d3d11.lib;dxgi.lib;User32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -89,7 +92,7 @@
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>$(ProjectDir)..\FTHRclips\third_party\ffmpeg\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>avcodec.lib;avutil.lib;d3d11.lib;dxgi.lib;User32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>avcodec.lib;avutil.lib;swresample.lib;d3d11.lib;dxgi.lib;User32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

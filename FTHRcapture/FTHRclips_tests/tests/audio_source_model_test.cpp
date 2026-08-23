@@ -202,12 +202,23 @@ void NativeManifestBindsTheTemporaryMediaWithoutPrivatePaths() {
     track.snapshot.packets.push_back({{0x11, 0x22}, 0, 1024});
     track.presentation_start_pts_samples = 0;
 
+    auto application_track = track;
+    application_track.source = Source("88888888-8888-4888-8888-888888888888", "Discord");
+    application_track.source.identity.persistent_identity = "discord";
+    application_track.source.identity.icon_reference = "windows-app-icon";
+    application_track.source.state.admitted = true;
+    application_track.source.state.active_in_generation = false;
+    application_track.source.state.first_active_100ns = 150;
+    application_track.source.state.last_active_100ns = 250;
+    application_track.snapshot.source_id = application_track.source.identity.id;
+
     std::string transaction_id;
     std::string error;
     const bool made_transaction = fthr::CreateAudioManifestTransactionId(
         &transaction_id, &error);
     const bool wrote = made_transaction && fthr::WriteClipAudioManifest(
-        media_final, media_partial, manifest_partial, transaction_id, {track}, &error);
+        media_final, media_partial, manifest_partial, transaction_id,
+        {track, application_track}, &error);
     std::ifstream manifest(manifest_partial, std::ios::binary);
     const std::string content((std::istreambuf_iterator<char>(manifest)),
                               std::istreambuf_iterator<char>());
@@ -215,10 +226,13 @@ void NativeManifestBindsTheTemporaryMediaWithoutPrivatePaths() {
         "native manifest uses a fresh valid transaction UUID");
     CheckAudio(content.find("desktop_clip_from_20260823_02-45-00.mp4") != std::string::npos
                    && content.find("Default Mix") != std::string::npos
+                   && content.find("\"stream_index\":2") != std::string::npos
+                   && content.find("\"source_type\":\"application\"") != std::string::npos
+                   && content.find("\"display_name\":\"Discord\"") != std::string::npos
                    && content.find("0f63f6d6210c6220135cdf185527ccc70a3cd26eca1a8b8b68e8ca8c4ba11aa9")
                        != std::string::npos
                    && content.find("C:\\\\") == std::string::npos,
-        "native manifest binds the exact media bytes and portable source semantics");
+        "native manifest maps Default Mix plus an actual application stem without private paths");
     std::filesystem::remove(media_partial, filesystem_error);
     std::filesystem::remove(manifest_partial, filesystem_error);
     std::filesystem::remove(directory, filesystem_error);
