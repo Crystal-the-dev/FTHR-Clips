@@ -93,7 +93,8 @@ No certificate, PFX file, password, timestamp credential, or publisher key is
 stored in this repository. `tools/build_windows_installer.py` accepts an
 operator-owned `--sign-command` / `FTHR_SIGN_COMMAND` template containing
 `{file}` and applies it to the FTHR UI executable, native engine executable,
-and final Setup executable. `--require-signed` makes a missing or invalid
+native playback-mixer DLL, and final Setup executable. `--require-signed` makes
+a missing or invalid
 Authenticode signature fail the release build.
 
 Without that explicit external signing configuration, an artifact is valid for

@@ -12,6 +12,7 @@ executable are unsigned.
 |---|---|---|
 | UI `FTHRClips.exe` | `720d80d33d44955548e6dc3e27488eef5acd6144018ee284e32288949e221273` | Built; unsigned |
 | Native engine `FTHRClips.exe` | `7f9e65ed1bac3b531560d73702e999436e52661f7e361304f331705ce1c87e28` | Built; unsigned |
+| Native playback mixer `FTHRPlaybackMixer.dll` | `891e0228c1336aaa8ebca869a192e758e921e53e45cfea568b4cd65fdff1946c` | Built; unsigned |
 | Setup executable | `57317a37ede5a56dc2c367bc30e8a04e2e28d3572726c56484978eb0901f8152` | Compiled; unsigned |
 | `vc_redist.x64.exe` | `cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b` | Microsoft Authenticode valid; file/product version `14.44.35211.0` |
 

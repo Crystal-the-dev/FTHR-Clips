@@ -233,6 +233,7 @@ def check_bundle(report: Report, bundle: Path, *, require_signed: bool) -> None:
     required = (
         bundle / 'FTHRClips.exe',
         bundle / '_internal' / 'engine' / 'FTHRClips.exe',
+        bundle / '_internal' / 'engine' / 'FTHRPlaybackMixer.dll',
     )
     for path in required:
         if path.exists():
@@ -262,6 +263,10 @@ def check_bundle(report: Report, bundle: Path, *, require_signed: bool) -> None:
     engine = bundle / '_internal' / 'engine' / 'FTHRClips.exe'
     if engine.is_file():
         check_authenticode(report, engine, microsoft=False, require_signed=require_signed)
+    playback_mixer = bundle / '_internal' / 'engine' / 'FTHRPlaybackMixer.dll'
+    if playback_mixer.is_file():
+        check_authenticode(report, playback_mixer, microsoft=False,
+                           require_signed=require_signed)
 
 
 def main() -> int:
