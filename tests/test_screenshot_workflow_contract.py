@@ -18,5 +18,6 @@ def test_screenshot_capture_is_side_band_and_transactional():
     assert 'ScreenshotPngSaveWorker' in MAIN_SOURCE
     assert 'reserve_screenshot_paths' in MAIN_SOURCE
     assert 'pixmap.save(str(raw_path))' not in MAIN_SOURCE
+    assert 'grim capture failed; trying the selected Qt' in MAIN_SOURCE
     assert 'self.capture_card.show_screenshot()' in MAIN_SOURCE
     assert 'self._screenshot_inflight' in MAIN_SOURCE

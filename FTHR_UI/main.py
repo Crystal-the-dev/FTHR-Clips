@@ -2483,11 +2483,9 @@ class MainWindow(QMainWindow):
                     return
                 paths.staged.unlink(missing_ok=True)
                 detail = result.stderr.decode(errors='replace').strip()
-                self._show_screenshot_error(
-                    'MONITOR_NOT_FOUND' if selected_monitor else 'CAPTURE_UNAVAILABLE',
-                    detail or 'grim could not capture the selected output.',
-                )
-                return
+                print(
+                    '[Screenshot] grim capture failed; trying the selected Qt '
+                    f'screen instead: {detail or "no diagnostic"}')
 
         # Resolve the configured monitor afresh for every screenshot.  Windows
         # receives the same stable DISPLAYCONFIG device path that starts replay;
