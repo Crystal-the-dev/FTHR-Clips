@@ -1,7 +1,7 @@
 // save_clip_task.h
 // FTHR Capture Engine - Async SaveClip task queue
 //
-// SaveClipTask supports two video paths and one audio path:
+// SaveClipTask supports two video paths and a bounded set of audio tracks:
 //
 //   VIDEO - use_encoded_path = false (x264 fallback):
 //     start_frame_idx / frame_count index into the raw FramePool.
@@ -10,10 +10,10 @@
 //     encoded_snapshot holds a deep copy of packets from EncodedRingBuffer.
 //     MuxEncodedClip() wraps them in an MP4 with no re-encoding.
 //
-//   AUDIO (both video paths):
-//     audio_snapshot holds raw PCM float32 from AudioRingBuffer.
-//     MuxEncodedClip() encodes it to AAC once on SaveClipThread.
-//     Zero encoding overhead during gameplay - encode only at save time.
+//   AUDIO:
+//     encoded_audio_tracks holds clip-local persistent AAC snapshots.  Each
+//     track owns real source metadata and is muxed without re-encoding.  The
+//     legacy raw-PCM fields remain only for non-production compatibility.
 
 #pragma once
 #ifndef FTHR_SAVE_CLIP_TASK_H
@@ -29,6 +29,7 @@
 #include "encoded_ring_buffer.h"  // EncodedRingSnapshot
 #include "audio_packet_ring.h"    // EncodedAudioSnapshot
 #include "audio_ring_buffer.h"    // AudioPCMSnapshot
+#include "audio_source_model.h"   // AudioSourceMetadata
 
 
 namespace fthr {
@@ -36,6 +37,22 @@ namespace fthr {
 
     // Forward declarations
     struct SharedMemoryLayout;
+
+    // A source exists here only after its provider has emitted real packets for
+    // this capture generation.  `presentation_start_pts_samples` is expressed
+    // in the source's sample-rate timebase and is used to normalize packet PTS
+    // against the video presentation boundary.
+    struct EncodedAudioTrack {
+        AudioSourceMetadata  source;
+        EncodedAudioSnapshot snapshot;
+        int64_t              presentation_start_pts_samples = 0;
+
+        bool valid() const {
+            return source.identity.id.IsValid()
+                && snapshot.valid()
+                && snapshot.source_id == source.identity.id;
+        }
+    };
 
 
     // ---------------------------------------------------------------------------
@@ -79,6 +96,13 @@ namespace fthr {
         bool                 has_encoded_audio = false;
         EncodedAudioSnapshot encoded_audio_snapshot;
         int64_t              audio_presentation_start_pts_samples = 0;
+
+        // AUDIT-050 production replay contract.  Muxing may contain one
+        // Default Mix plus up to seven actual source stems; never category
+        // guesses or silent placeholders.  The legacy single-track fields
+        // above are converted to one Default Mix only while older callers
+        // remain in the tree.
+        std::vector<EncodedAudioTrack> encoded_audio_tracks;
 
         // ------------------------------------------------------------------
         // Shared fields

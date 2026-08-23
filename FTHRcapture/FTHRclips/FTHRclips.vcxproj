@@ -21,6 +21,7 @@
   <ItemGroup>
     <ClInclude Include="include\audio_packet_ring.h" />
     <ClInclude Include="include\audio_source_model.h" />
+    <ClInclude Include="include\clip_audio_manifest.h" />
     <ClInclude Include="include\windows_audio_session_registry.h" />
     <ClInclude Include="include\audio_capture.h" />
     <ClInclude Include="include\audio_encoder.h" />
@@ -44,6 +45,7 @@
   <ItemGroup>
     <ClCompile Include="src\audio_packet_ring.cpp" />
     <ClCompile Include="src\audio_source_model.cpp" />
+    <ClCompile Include="src\clip_audio_manifest.cpp" />
     <ClCompile Include="src\windows_audio_session_registry.cpp" />
     <ClCompile Include="src\audio_capture.cpp" />
     <ClCompile Include="src\audio_encoder.cpp" />

@@ -20,6 +20,7 @@
     <ClCompile Include="..\FTHRclips\src\encoded_ring_buffer.cpp" />
     <ClCompile Include="..\FTHRclips\src\audio_packet_ring.cpp" />
     <ClCompile Include="..\FTHRclips\src\audio_source_model.cpp" />
+    <ClCompile Include="..\FTHRclips\src\clip_audio_manifest.cpp" />
     <ClCompile Include="..\FTHRclips\src\windows_audio_session_registry.cpp" />
     <ClCompile Include="..\FTHRclips\src\encoded_video_config.cpp" />
     <ClCompile Include="..\FTHRclips\src\ffmpeg_amf_replay_encoder.cpp" />

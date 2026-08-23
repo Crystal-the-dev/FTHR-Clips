@@ -1,8 +1,10 @@
 #include "audio_packet_ring.h"
 #include "audio_source_model.h"
+#include "clip_audio_manifest.h"
 #include "transactional_save.h"
 
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 
 namespace {
@@ -171,6 +173,55 @@ void PairedPublicationProtectsTheManifestContract() {
         "failed media publication removes its already-published manifest");
 }
 
+void NativeManifestBindsTheTemporaryMediaWithoutPrivatePaths() {
+    const auto directory = std::filesystem::temp_directory_path()
+        / "fthr-audit050-native-manifest";
+    const auto media_final = directory / "desktop_clip_from_20260823_02-45-00.mp4";
+    const auto media_partial = std::filesystem::path(media_final.wstring() + L".partial");
+    const auto manifest_partial = std::filesystem::path(
+        fthr::AudioManifestPathFor(media_final).wstring() + L".partial");
+    std::error_code filesystem_error;
+    std::filesystem::create_directories(directory, filesystem_error);
+    {
+        std::ofstream media(media_partial, std::ios::binary | std::ios::trunc);
+        media << "fixed media bytes for native manifest binding";
+    }
+    auto source = Source("77777777-7777-4777-8777-777777777777", "Default Mix",
+                         fthr::AudioSourceType::System);
+    source.identity.persistent_identity = "default-mix";
+    source.identity.icon_reference = "system-audio";
+    source.state.admitted = true;
+    source.state.active_in_generation = true;
+    source.state.first_active_100ns = 100;
+    source.state.last_active_100ns = 200;
+    fthr::EncodedAudioTrack track;
+    track.source = source;
+    track.snapshot.source_id = source.identity.id;
+    track.snapshot.format = source.format;
+    track.snapshot.codec_extradata = {0x12, 0x10};
+    track.snapshot.packets.push_back({{0x11, 0x22}, 0, 1024});
+    track.presentation_start_pts_samples = 0;
+
+    std::string transaction_id;
+    std::string error;
+    const bool made_transaction = fthr::CreateAudioManifestTransactionId(
+        &transaction_id, &error);
+    const bool wrote = made_transaction && fthr::WriteClipAudioManifest(
+        media_final, media_partial, manifest_partial, transaction_id, {track}, &error);
+    std::ifstream manifest(manifest_partial, std::ios::binary);
+    const std::string content((std::istreambuf_iterator<char>(manifest)),
+                              std::istreambuf_iterator<char>());
+    CheckAudio(wrote && fthr::AudioSourceId{transaction_id}.IsValid(),
+        "native manifest uses a fresh valid transaction UUID");
+    CheckAudio(content.find("desktop_clip_from_20260823_02-45-00.mp4") != std::string::npos
+                   && content.find("Default Mix") != std::string::npos
+                   && content.find("C:\\\\") == std::string::npos,
+        "native manifest binds a basename and only portable source semantics");
+    std::filesystem::remove(media_partial, filesystem_error);
+    std::filesystem::remove(manifest_partial, filesystem_error);
+    std::filesystem::remove(directory, filesystem_error);
+}
+
 }  // namespace
 
 int RunAudioSourceModelTests() {
@@ -179,6 +230,7 @@ int RunAudioSourceModelTests() {
     SourceLimitAndSanitizationStaySafe();
     EncodedPacketRingIsBoundedAndSnapshotsOverlap();
     PairedPublicationProtectsTheManifestContract();
+    NativeManifestBindsTheTemporaryMediaWithoutPrivatePaths();
     std::cout << "AUDIT-050 audio source model tests: " << audio_source_checks
               << " checks passed" << std::endl;
     return audio_source_checks;
