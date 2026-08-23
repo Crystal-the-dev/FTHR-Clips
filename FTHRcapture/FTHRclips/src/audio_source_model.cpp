@@ -86,8 +86,9 @@ bool AudioSourceRegistry::Discover(AudioSourceMetadata metadata) {
     }
     if (metadata.format.sample_rate == 0 || metadata.format.channels == 0)
         return false;
-    const auto [_, inserted] = sources_.emplace(metadata.identity.id, std::move(metadata));
-    if (inserted) gates_.emplace(_ , AudioActivityGate{});
+    const AudioSourceId id = metadata.identity.id;
+    const auto [_, inserted] = sources_.emplace(id, std::move(metadata));
+    if (inserted) gates_.try_emplace(id);
     return inserted;
 }
 
