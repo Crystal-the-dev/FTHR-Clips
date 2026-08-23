@@ -152,6 +152,11 @@ from core.windows_monitor import (
     normalize_monitor_device_path,
 )
 from core.screenshot_target import build_grim_command, select_qt_screen
+from core.screenshot_save import (
+    ScreenshotPngSaveWorker,
+    ScreenshotSaveError,
+    reserve_screenshot_paths,
+)
 from core.library_ownership import add_import_root, remove_import_root
 from core.mic_recorder import MicRecorder, write_wav
 from core.windows_microphone_devices import (
@@ -1601,6 +1606,8 @@ class MainWindow(QMainWindow):
         self._shutdown_complete = False
         self._shutdown_timer_started = None
         self._tray_icon = None
+        self._screenshot_inflight = False
+        self._screenshot_save_worker = None
         self._lifecycle_log = get_logger('lifecycle')
 
         # -- Frameless window --
@@ -2444,63 +2451,151 @@ class MainWindow(QMainWindow):
             if config else self.extended_clip_duration)
 
     def _on_hotkey_save_screenshot(self):
-        from ui.screenshot_editor import ScreenshotEditor
-        from PySide6.QtCore import QDialog
-
-        timestamp = datetime.now().strftime('%d%b%Y_%H-%M-%S')
-        screenshots_dir = Path.home() / 'FTHR_Clips' / 'Screenshots'
-        screenshots_dir.mkdir(parents=True, exist_ok=True)
-        raw_path = screenshots_dir / f'screenshot_from_{timestamp}.png'
+        if self._screenshot_inflight:
+            print('[Screenshot] Ignored duplicate request while a screenshot is saving.')
+            return
 
         config = self._capture_config.active
         selected_monitor = (
             config.monitor if config is not None
             else self.settings_manager.get('capture_monitor', ''))
-        captured = False
+        try:
+            paths = reserve_screenshot_paths(
+                Path.home() / 'FTHR_Clips' / 'Screenshots')
+        except ScreenshotSaveError as error:
+            self._show_screenshot_error(error.code, error.detail)
+            return
+
         if sys.platform != 'win32':
-            # grim is Wayland-only and often absent. Resolve it explicitly so a
-            # missing tool is a clear message rather than a swallowed
-            # FileNotFoundError that made screenshots silently do nothing.
+            # Preserve the established Wayland capture backend.  Its explicit
+            # -o output is the same selected monitor identity, and it writes
+            # only to the non-library staging path before the editor publishes.
             grim = linux_tools.path('grim')
             if grim:
                 result = subprocess.run(
-                    build_grim_command(grim, str(raw_path), selected_monitor),
+                    build_grim_command(grim, str(paths.staged), selected_monitor),
                     capture_output=True,
                     **_NO_WINDOW,
                 )
-                captured = result.returncode == 0
-                if not captured:
-                    print(f'[Screenshot] grim failed: '
-                          f'{result.stderr.decode(errors="replace").strip()}')
-            else:
-                print(f'[Screenshot] {linux_tools.missing_message("grim")} '
-                      f'Falling back to the Qt screen grab.')
+                if result.returncode == 0 and paths.staged.is_file():
+                    self._screenshot_inflight = True
+                    self._open_screenshot_editor(paths)
+                    return
+                paths.staged.unlink(missing_ok=True)
+                detail = result.stderr.decode(errors='replace').strip()
+                self._show_screenshot_error(
+                    'MONITOR_NOT_FOUND' if selected_monitor else 'CAPTURE_UNAVAILABLE',
+                    detail or 'grim could not capture the selected output.',
+                )
+                return
 
-        if not captured:
-            screens = QApplication.screens()
-            monitors = enumerate_windows_monitors() if sys.platform == 'win32' else ()
-            screen = select_qt_screen(
-                selected_monitor,
-                screens,
-                platform=sys.platform,
-                windows_monitors=monitors,
-                primary=QApplication.primaryScreen(),
+        # Resolve the configured monitor afresh for every screenshot.  Windows
+        # receives the same stable DISPLAYCONFIG device path that starts replay;
+        # no QScreen/DXGI enumeration index is persisted or reused.
+        screen = select_qt_screen(
+            selected_monitor,
+            QApplication.screens(),
+            platform=sys.platform,
+            windows_monitors=(
+                enumerate_windows_monitors() if sys.platform == 'win32' else ()),
+            primary=QApplication.primaryScreen() if not selected_monitor else None,
+        )
+        if screen is None:
+            paths.staged.unlink(missing_ok=True)
+            self._show_screenshot_error(
+                'MONITOR_NOT_FOUND',
+                'The configured capture monitor is unavailable. FTHR did not '
+                'fall back to another display.',
             )
-            if screen:
-                pixmap = screen.grabWindow(0)
-                captured = pixmap.save(str(raw_path))
-
-        if not captured:
-            QMessageBox.warning(self, 'Screenshot Failed',
-                                'The selected capture monitor is unavailable '
-                                'or could not be captured.')
             return
 
-        editor = ScreenshotEditor(str(raw_path), self)
-        if editor.exec() == QDialog.DialogCode.Accepted:
-            self.capture_card.show_screenshot()
-        else:
-            raw_path.unlink(missing_ok=True)
+        try:
+            pixmap = screen.grabWindow(0)
+        except Exception as error:
+            paths.staged.unlink(missing_ok=True)
+            self._show_screenshot_error(
+                'CAPTURE_UNAVAILABLE',
+                f'Could not capture the configured monitor: {error}',
+            )
+            return
+        if pixmap.isNull():
+            paths.staged.unlink(missing_ok=True)
+            self._show_screenshot_error(
+                'CAPTURE_UNAVAILABLE',
+                'The configured monitor returned an empty screenshot.',
+            )
+            return
+
+        image = pixmap.toImage()
+        if image.isNull():
+            paths.staged.unlink(missing_ok=True)
+            self._show_screenshot_error(
+                'CAPTURE_UNAVAILABLE',
+                'The configured monitor could not provide an image.',
+            )
+            return
+
+        self._screenshot_inflight = True
+        worker = ScreenshotPngSaveWorker(image, paths.staged, self)
+        self._screenshot_save_worker = worker
+        worker.succeeded.connect(
+            lambda _staged, target=paths: self._open_screenshot_editor(target))
+        worker.failed.connect(
+            lambda code, detail, target=paths: self._on_screenshot_save_failed(
+                target, code, detail))
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _open_screenshot_editor(self, paths) -> None:
+        """Offer crop/full save only after the complete staged PNG exists."""
+
+        self._screenshot_save_worker = None
+        from ui.screenshot_editor import ScreenshotEditor
+        from PySide6.QtCore import QDialog
+
+        if QPixmap(str(paths.staged)).isNull():
+            paths.staged.unlink(missing_ok=True)
+            self._screenshot_inflight = False
+            self._show_screenshot_error(
+                'IMAGE_ENCODE_FAILED',
+                'The screenshot backend returned an unreadable PNG.',
+            )
+            return
+
+        # Background/tray mode opens only this standalone dialog; it never
+        # builds or restores the deferred library/settings widget tree.
+        parent = self if self._ui_ready else None
+        editor = ScreenshotEditor(str(paths.staged), str(paths.final), parent)
+        try:
+            accepted = editor.exec() == QDialog.DialogCode.Accepted
+            if accepted and paths.final.is_file():
+                self.capture_card.show_screenshot()
+            elif accepted:
+                self._show_screenshot_error(
+                    'WRITE_FAILED',
+                    'The screenshot editor closed without publishing a PNG.',
+                )
+            else:
+                paths.staged.unlink(missing_ok=True)
+        finally:
+            self._screenshot_inflight = False
+
+    def _on_screenshot_save_failed(self, paths, code: str, detail: str) -> None:
+        paths.staged.unlink(missing_ok=True)
+        self._screenshot_save_worker = None
+        self._screenshot_inflight = False
+        self._show_screenshot_error(code, detail)
+
+    def _show_screenshot_error(self, code: str, detail: str) -> None:
+        """Keep screenshot failures actionable when the main window is hidden."""
+
+        print(f'[Screenshot] {code}: {detail}')
+        self.push_error('SCREENSHOT FAILED', f'{code}: {detail}', level='error')
+        QMessageBox.warning(
+            self if self.isVisible() else None,
+            'Screenshot Failed',
+            f'{code}\n\n{detail}',
+        )
 
     def _show_compositor_warning(self):
         from PySide6.QtWidgets import QMessageBox
