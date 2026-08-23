@@ -41,11 +41,13 @@ from typing import Optional
 _NO_WINDOW = {'creationflags': 0x08000000} if sys.platform == 'win32' else {}
 
 _EXE_NAME = 'ffmpeg.exe' if sys.platform == 'win32' else 'ffmpeg'
+_PROBE_NAME = 'ffprobe.exe' if sys.platform == 'win32' else 'ffprobe'
 
 # Resolved lazily, then cached — resolution touches the filesystem and the
 # encoder probe spawns a process; neither should happen per clip.
 _cached_exe: Optional[str] = None
 _cached_encoder: Optional[str] = None
+_cached_probe: Optional[str] = None
 
 
 class FFmpegUnavailable(RuntimeError):
@@ -85,6 +87,12 @@ def _candidate_paths() -> list[Path]:
     return out
 
 
+def _candidate_probe_paths() -> list[Path]:
+    """Return the ffprobe path beside each reviewed ffmpeg location."""
+
+    return [path.with_name(_PROBE_NAME) for path in _candidate_paths()]
+
+
 def get_ffmpeg_exe() -> str:
     """Return a path to a usable ffmpeg binary.
 
@@ -108,6 +116,8 @@ def get_ffmpeg_exe() -> str:
                 _cached_exe = str(cand)
                 return _cached_exe
         except OSError:
+            # Candidate roots can disappear during a packaged-app update;
+            # probe the remaining reviewed locations instead of failing open.
             continue
 
     # System ffmpeg (typical on Linux; also fine for a dev box on Windows).
@@ -122,6 +132,37 @@ def get_ffmpeg_exe() -> str:
         'engine; if this is a source checkout, run the build script or install '
         'ffmpeg and make sure it is on your PATH. Watermark, auto-crop, webcam '
         'overlay and clip export need it.'
+    )
+
+
+def get_ffprobe_exe() -> str:
+    """Return the matching FFprobe binary used for read-only stream metadata.
+
+    Playback decoding never shells out: it runs through the in-process native
+    bridge. FFprobe is used once on a worker to label arbitrary imported
+    streams honestly before the viewer opens its editable source list.
+    """
+
+    global _cached_probe
+    if _cached_probe is not None:
+        return _cached_probe
+    for candidate in _candidate_probe_paths():
+        try:
+            if candidate.is_file():
+                _cached_probe = str(candidate)
+                return _cached_probe
+        except OSError:
+            # Candidate roots can disappear during a packaged-app update;
+            # probe the remaining reviewed locations instead of failing open.
+            continue
+    from shutil import which
+    found = which('ffprobe')
+    if found:
+        _cached_probe = found
+        return _cached_probe
+    raise FFmpegUnavailable(
+        'No ffprobe binary found. FTHR Clips ships one with its reviewed '
+        'FFmpeg runtime; imported multi-track clips need it for honest track labels.'
     )
 
 
@@ -190,6 +231,7 @@ def software_video_args(bitrate_kbps: int = 16000,
 
 def reset_cache() -> None:
     """Clear memoized resolution. Tests only."""
-    global _cached_exe, _cached_encoder
+    global _cached_exe, _cached_encoder, _cached_probe
     _cached_exe = None
     _cached_encoder = None
+    _cached_probe = None

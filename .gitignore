@@ -45,6 +45,7 @@ FTHRcapture/FTHRclips/x64/
 FTHRcapture/FTHRclips/FTHRclips/
 FTHRcapture/FTHRclips_tests/x64/
 FTHRcapture/FTHRclips_tests/FTHRclips_tests/
+FTHRcapture/FTHRPlaybackMixer/x64/
 *.obj
 *.iobj
 *.ipdb

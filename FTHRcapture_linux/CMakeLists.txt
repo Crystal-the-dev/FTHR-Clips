@@ -292,6 +292,13 @@ endif()
 
 add_executable(FTHRclips ${FTHR_ENGINE_SOURCES})
 
+# The editor loads this small bridge into the Python process.  It uses the same
+# pinned LGPL FFmpeg ABI as the capture engine but has no capture/IPC symbols
+# and no Qt dependency: FFmpeg decode/mix happens off the GUI thread while
+# PySide6 QAudioSink owns final device output.
+add_library(FTHRPlaybackMixer SHARED
+    ../FTHRcapture_common/ffmpeg_playback_bridge.cpp)
+
 target_include_directories(FTHRclips PRIVATE
     src/
     ${PROTO_GEN_DIR}/
@@ -310,6 +317,14 @@ target_link_libraries(FTHRclips PRIVATE
 target_compile_options(FTHRclips PRIVATE -Wall -Wextra)
 target_compile_definitions(FTHRclips PRIVATE
     FTHR_EXPERIMENTAL_X11GRAB=$<BOOL:${FTHR_EXPERIMENTAL_X11GRAB}>)
+
+target_include_directories(FTHRPlaybackMixer PRIVATE
+    ${CMAKE_SOURCE_DIR}/../FTHRcapture_common)
+target_include_directories(FTHRPlaybackMixer SYSTEM PRIVATE ${FFMPEG_INCLUDE_DIRS})
+target_link_libraries(FTHRPlaybackMixer PRIVATE
+    $<$<BOOL:${FTHR_FFMPEG_BUNDLED}>:${FTHR_FFMPEG_LINK_LIBRARIES}>
+    $<$<NOT:$<BOOL:${FTHR_FFMPEG_BUNDLED}>>:PkgConfig::FFMPEG>)
+target_compile_options(FTHRPlaybackMixer PRIVATE -Wall -Wextra -Wpedantic)
 
 # ---------------------------------------------------------------------------
 # Runtime library search path — AUDIT-014
@@ -343,10 +358,18 @@ set_target_properties(FTHRclips PROPERTIES
     INSTALL_RPATH_USE_LINK_PATH FALSE
     BUILD_RPATH_USE_ORIGIN TRUE)
 target_link_options(FTHRclips PRIVATE "-Wl,--disable-new-dtags")
+set_target_properties(FTHRPlaybackMixer PROPERTIES
+    BUILD_WITH_INSTALL_RPATH TRUE
+    INSTALL_RPATH "$ORIGIN:$ORIGIN/lib:$ORIGIN/../lib:$ORIGIN/../third_party/ffmpeg/lib"
+    INSTALL_RPATH_USE_LINK_PATH FALSE
+    BUILD_RPATH_USE_ORIGIN TRUE)
+target_link_options(FTHRPlaybackMixer PRIVATE "-Wl,--disable-new-dtags")
 if(FTHR_FFMPEG_BUNDLED)
     # libavdevice has transitive siblings (notably libavfilter).  Give the
     # static linker the same closed pinned search set used by the runtime RPATH.
     target_link_options(FTHRclips PRIVATE
+        "-Wl,-rpath-link,${FTHR_FFMPEG_ROOT}/lib")
+    target_link_options(FTHRPlaybackMixer PRIVATE
         "-Wl,-rpath-link,${FTHR_FFMPEG_ROOT}/lib")
 endif()
 
@@ -397,3 +420,4 @@ if(BUILD_TESTING)
 endif()
 
 install(TARGETS FTHRclips RUNTIME DESTINATION bin)
+install(TARGETS FTHRPlaybackMixer LIBRARY DESTINATION lib)

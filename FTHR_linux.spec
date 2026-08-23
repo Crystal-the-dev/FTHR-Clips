@@ -8,6 +8,7 @@ ROOT       = Path(SPECPATH)
 UI_DIR     = ROOT / 'FTHR_UI'
 ASSETS_DIR = UI_DIR / 'assets'
 ENGINE_BIN = ROOT / 'FTHRcapture_linux' / 'build' / 'FTHRclips'
+PLAYBACK_MIXER = ROOT / 'FTHRcapture_linux' / 'build' / 'libFTHRPlaybackMixer.so'
 
 # Product version comes from FTHR_UI/version.py — never retype it here.
 _sys.path.insert(0, str(UI_DIR))
@@ -107,6 +108,7 @@ a = Analysis(
     pathex=[str(UI_DIR)],
     binaries=[
         (str(ENGINE_BIN), '.'),
+        (str(PLAYBACK_MIXER), '.'),
         (_PORTAUDIO, '.'),
         # The verified LGPL FFmpeg the engine was built against.
         *[(str(p), '.') for p in _FFMPEG_LIBS],
@@ -158,6 +160,7 @@ a = Analysis(
         'core.camera_recorder',
         'core.capture_bridge',
         'core.focus_monitor',
+        'core.ffmpeg_playback',
         'core.game_detector',
         'core.hotkey_manager',
         'core.mic_recorder',

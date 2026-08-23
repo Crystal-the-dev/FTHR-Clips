@@ -18,7 +18,11 @@ from uuid import UUID
 
 MANIFEST_VERSION = 1
 MANIFEST_SUFFIX = '.fthr-audio.json'
-MAX_SOURCES = 8
+# Default Mix + Microphone + the approved eight application stems can produce
+# ten real MP4 audio streams. The reader must accept the same contract as the
+# native muxer; otherwise a valid rich clip would silently fall back to wrong
+# generic playback labels.
+MAX_SOURCES = 10
 _SAFE_TEXT = re.compile(r'^[A-Za-z0-9 ._+()\-]{1,128}$')
 _SOURCE_TYPES = frozenset({'application', 'microphone', 'system'})
 
@@ -85,7 +89,7 @@ def validate_manifest(manifest: dict[str, Any], *, media_path: str | Path | None
         raise AudioManifestError('media_sha256 must be a SHA-256 digest')
     sources = manifest.get('sources')
     if not isinstance(sources, list) or not sources or len(sources) > MAX_SOURCES:
-        raise AudioManifestError('sources must contain between one and eight entries')
+        raise AudioManifestError('sources must contain between one and ten entries')
 
     seen_uuid: set[str] = set()
     seen_stream: set[int] = set()

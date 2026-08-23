@@ -89,6 +89,9 @@ rm -rf build
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DFTHR_FFMPEG_ROOT="$FFMPEG_ROOT"     | grep -E "FFmpeg|error" || true
 cmake --build build -j"$(nproc)" 2>&1 | grep -E "^\[|error:" || true
 [ -x build/FTHRclips ] || { echo "ERROR: engine build produced no binary."; exit 1; }
+[ -f build/libFTHRPlaybackMixer.so ] || {
+    echo "ERROR: playback bridge build produced no library."; exit 1;
+}
 echo "    Engine built: FTHRcapture_linux/build/FTHRclips"
 
 # Prove the engine really links the pinned libraries before we package anything.
@@ -98,6 +101,12 @@ _bad=0
 for so in $(readelf -d build/FTHRclips | grep -oE 'lib(avcodec|avformat|avutil|avdevice|swscale|swresample)\.so\.[0-9]+'); do
     if ! [ -e "$FFMPEG_ROOT/lib/$so" ]; then
         echo "    ERROR: engine needs $so, which is not in the pinned tree"
+        _bad=1
+    fi
+done
+for so in $(readelf -d build/libFTHRPlaybackMixer.so | grep -oE 'lib(avcodec|avformat|avutil|avdevice|swscale|swresample)\.so\.[0-9]+'); do
+    if ! [ -e "$FFMPEG_ROOT/lib/$so" ]; then
+        echo "    ERROR: playback bridge needs $so, which is not in the pinned tree"
         _bad=1
     fi
 done

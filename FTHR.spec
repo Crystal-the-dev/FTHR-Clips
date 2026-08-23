@@ -47,6 +47,8 @@ VSVersionInfo(
 )
 """, encoding='utf-8')
 ENGINE_EXE = ROOT / 'FTHRcapture' / 'x64' / 'Release' / 'FTHRClips.exe'
+PLAYBACK_MIXER = (ROOT / 'FTHRcapture' / 'FTHRPlaybackMixer' / 'x64'
+                  / 'Release' / 'FTHRPlaybackMixer.dll')
 
 # FFmpeg DLLs the C++ engine links against on Windows
 _FFMPEG_BIN  = ROOT / 'FTHRcapture' / 'FTHRclips' / 'third_party' / 'ffmpeg' / 'bin'
@@ -62,6 +64,10 @@ a = Analysis(
     pathex=[str(UI_DIR)],
     binaries=[
         (str(ENGINE_EXE), 'engine'),
+        # In-process FFmpeg decoder bridge used by the Qt clip viewer. It is
+        # built from the pinned LGPL FFmpeg headers/libraries and shares the
+        # exact runtime DLL set already shipped for the capture engine.
+        (str(PLAYBACK_MIXER), 'engine'),
         *[(dll, 'engine') for dll in _FFMPEG_DLLS],
         *[(exe, 'engine') for exe in _FFMPEG_TOOLS],
     ],
@@ -111,6 +117,7 @@ a = Analysis(
         'core.camera_recorder',
         'core.capture_bridge',
         'core.focus_monitor',
+        'core.ffmpeg_playback',
         'core.game_detector',
         'core.hotkey_manager',
         'core.mic_recorder',
@@ -199,6 +206,7 @@ coll = COLLECT(
         # Don't UPX-compress these — they either break or gain nothing
         'vcruntime*.dll', 'api-ms-*.dll', 'msvcp*.dll',
         'FTHRClips.exe',  # the Python app launcher
+        'FTHRPlaybackMixer.dll',  # loaded through ctypes at viewer runtime
     ],
     name=APP_ID,
 )
