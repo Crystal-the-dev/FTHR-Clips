@@ -782,3 +782,96 @@ stage.
 - **Dynamic source model:** READY.
 - **Seek / sync:** UNVERIFIED for real QMediaPlayer video playback.
 - **Mixed export:** READY for the automated real-FFmpeg transactional path.
+
+## DYNAMIC VOLUME PANEL + UX WIRING — 2026-08-23
+
+### IMPLEMENTED
+
+The existing clip-viewer Volume popup now consumes only the clip-local
+`PlaybackSource` model.  Its only static row is **Master**; no visible
+Game/Browser/Music/Discord category list remains.  Every other row is bound by
+its stable source UUID/stream-derived source ID, never by display text or raw
+FFmpeg indexes.  Gain and mute events continue directly to the existing
+`FFmpegPlaybackController` state lock, so slider drags do not enqueue decode
+work, scan processes, or rewrite media.
+
+The source model now owns both viewer-facing naming and deterministic order:
+
+1. application stems, in stable container order;
+2. an editable system source;
+3. microphone;
+4. generic imported tracks.
+
+The model retains the existing semantics: current valid Windows 10 `Default
+Mix` + `Microphone` displays as **System Audio** + **Microphone**, because
+Default Mix is system loopback only.  A valid future manifest with application
+stems excludes only its compatibility Default Mix and shows the app stems plus
+microphone.  Legacy/imported clips continue to use verified stream titles or
+`Track N`; invalid/mismatched manifests fall back before the panel is built.
+
+Rows have compact semantic icon markers driven by the manifest's safe icon
+reference (`system-audio`, `microphone`, `windows-app-icon`/`generic-app`) and
+by source-type fallbacks.  The manifest deliberately does not contain file
+paths or executable-owned images, so the viewer never tries to synchronously
+extract external icons.  Long labels are elided to protect the slider/mute
+layout and retain their full text in a tooltip.  Duplicate labels remain
+separate controls because their IDs remain distinct.  Missing/failed streams
+remain visible but are greyed out, show `—`, disable gain/mute controls, and do
+not stop healthy stems.
+
+Mute now has explicit `MUTE`/`MUTED` feedback while preserving the slider's
+stored gain.  Master remains first and uses the existing 0–100 percent model
+where 100% is recorded level; per-source controls use the same bounded range.
+All mix state remains viewer-session-only and survives popup reopen,
+pause/resume, and seek because it is held in the controller/viewer rather than
+in a transient row widget.  Opening another viewer creates a new source model
+and state map.  Viewer teardown, QAudioSink cleanup, bounded 0.5-second worker
+join, mixed export, and explicit preserve-stem Share behavior are unchanged.
+
+### AUTOMATED
+
+- Source-model coverage now proves stable semantic ordering, duplicate display
+  names with separate identities, current Default Mix + Mic inclusion, and
+  Default Mix exclusion once app stems are authoritative.
+- Qt popup coverage exercises actual mute-button clicks, verifies unmute keeps
+  the selected gain, verifies Master is first, and verifies an eight-source
+  layout, long-name elision/tooltip, and disabled unavailable-source state.
+- Existing tests continue to cover legacy/import labels, manifest fallback,
+  semantic icon fallbacks, controller gain/mute/master state, bounded seek,
+  real 440/880 Hz source isolation, real transactional mixed export, and
+  preserve-all-stems mapping.
+
+### PHYSICAL WINDOWS VERIFIED
+
+**Not yet verified.** The accessible user clip directory currently contains a
+legacy MP4 without a valid rich-audio sidecar, not a current `Default Mix` +
+`Microphone` FTHR clip.  No claim is made for audible System/Mic isolation,
+mute, Master, QMediaPlayer-coupled seek, 60-second sync, or viewer-close
+behavior on a physical rich clip.  Those checks require an operator to open
+and listen to a newly saved native two-stem clip in the viewer.
+
+### WIN11 APP-STEM UNVERIFIED
+
+The dynamic data model and ordering are code-ready for a valid Windows 11
+manifest with application stems.  Physical process-loopback capture, app icon
+availability, audible source isolation, and long playback remain unverified on
+a supported Windows 11 host.
+
+### LINUX UNVERIFIED
+
+No Linux GUI/audio-device/AppImage run was performed.  This panel does not add
+PipeWire work or a Linux capture contract; ordinary valid imported multi-track
+files should follow the generic model, but that remains runtime-unqualified.
+
+### STATUS
+
+- **AUDIT-050:** IMPLEMENTATION IN PROGRESS.
+- **Dynamic Volume Panel:** EXPERIMENTAL — model/UI automation passes; physical
+  rich-clip controls are still required.
+- **Windows 10 System + Mic UX:** NOT READY — physical listening/control test
+  has not occurred.
+- **Future Win11 app-stem UX:** CODE READY, runtime unverified.
+- **Multi-track seek/sync:** UNVERIFIED for QMediaPlayer-video coupling.
+- **Mixed export:** READY for the real-FFmpeg automated path.
+- **Multi-audio UX:** NOT READY for a qualified cohort until the current
+  Windows 10 rich-clip verification is performed.
