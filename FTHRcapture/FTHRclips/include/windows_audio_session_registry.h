@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -72,11 +73,18 @@ public:
 
 private:
     class SessionNotification;
+    class SessionEventNotification;
+    struct SessionEventRegistration;
     bool Refresh(WindowsAudioSessionUpdate* update);
     void MarkDirty() { dirty_.store(true, std::memory_order_release); }
 
     void* session_manager_ = nullptr;  // IAudioSessionManager2*
     SessionNotification* notification_ = nullptr;
+    // One registration per live WASAPI session instance. Session-created alone
+    // is insufficient for replay retention: disconnect/state notifications make
+    // an exited source retire while its already-encoded history remains owned by
+    // the AUDIT-050 source registry.
+    std::map<std::wstring, std::unique_ptr<SessionEventRegistration>> session_events_;
     bool started_ = false;
     std::atomic<bool> dirty_{false};
     std::vector<WindowsAudioSessionDescriptor> current_;

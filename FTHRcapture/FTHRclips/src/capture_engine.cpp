@@ -579,6 +579,25 @@ namespace fthr {
                 << "persistent AAC packet replay)"
                 << std::endl;
 
+            windows_application_audio_sources_ =
+                std::make_unique<WindowsApplicationAudioSourceManager>(
+                    capture_generation_.load(std::memory_order_relaxed) + 1,
+                    buffer_seconds_);
+            const auto app_capability = windows_application_audio_sources_->capability();
+            if (!app_capability.api_build_supported) {
+                std::cout << "[CaptureEngine] Windows application audio unavailable on build "
+                    << app_capability.os_build << "; Default Mix remains the only system stem."
+                    << std::endl;
+                windows_application_audio_sources_.reset();
+            } else if (!windows_application_audio_sources_->Start()) {
+                std::cerr << "[CaptureEngine] Windows application-audio manager did not start: "
+                    << windows_application_audio_sources_->last_error() << std::endl;
+                windows_application_audio_sources_.reset();
+            } else {
+                std::cout << "[CaptureEngine] Windows 11 application-audio session manager started."
+                    << std::endl;
+            }
+
         } while (false);
 
         if (!audio_active_) {
@@ -614,7 +633,7 @@ namespace fthr {
     void CaptureEngine::Shutdown() {
         const bool has_resources = capture_thread_ || encode_thread_
             || save_clip_thread_ || device_ || context_ || wgc_state_
-            || replay_encoder_ || audio_active_ || nvenc_device_
+            || replay_encoder_ || audio_active_ || windows_application_audio_sources_ || nvenc_device_
             || nvenc_context_;
         if (!has_resources) return;
 
@@ -661,6 +680,9 @@ namespace fthr {
         //   2. Finalize encoder (flushes partial AAC frame)
         //   3. compressed packet ring is released with the generation
         if (audio_active_) {
+            // The Windows 11 application providers have independent bounded
+            // capture waits. Stop them before Default Mix disappears.
+            windows_application_audio_sources_.reset();
             audio_capture_.Stop();
             default_mix_audio_encoder_.Finalize();
             audio_capture_.Shutdown();
@@ -668,6 +690,9 @@ namespace fthr {
             default_mix_audio_source_ = {};
             audio_active_ = false;
             std::cout << "[CaptureEngine] Audio pipeline stopped." << std::endl;
+        }
+        else {
+            windows_application_audio_sources_.reset();
         }
 
         ring_head_.store(0, std::memory_order_relaxed);
@@ -886,6 +911,21 @@ namespace fthr {
                                 default_mix_track.snapshot.last_pts_samples)
                                 * 10'000'000ULL / sample_rate));
                         task.encoded_audio_tracks.push_back(std::move(default_mix_track));
+                        if (windows_application_audio_sources_) {
+                            auto application_tracks =
+                                windows_application_audio_sources_->TakeTracksForInterval(
+                                    start_qpc_s, end_qpc_s);
+                            for (auto& track : application_tracks) {
+                                if (task.encoded_audio_tracks.size()
+                                        >= kMaxClipAudioTracks) {
+                                    std::cerr << "[SaveClip] Application audio source limit reached; "
+                                                 "additional source history was not muxed."
+                                        << std::endl;
+                                    break;
+                                }
+                                task.encoded_audio_tracks.push_back(std::move(track));
+                            }
+                        }
                         std::cout << "[SaveClip] Persistent AAC snapshot: "
                             << task.encoded_audio_snapshot.packets.size()
                             << " packets, PTS " << start_pts << " - " << end_pts
@@ -1579,7 +1619,7 @@ namespace fthr {
         };
 
         if (has_contract_audio_tracks) {
-            if (task.encoded_audio_tracks.size() > kMaxRetainedAudioSources) {
+            if (task.encoded_audio_tracks.size() > kMaxClipAudioTracks) {
                 SetEngineError(task.shared_memory,
                     L"The clip contains more audio tracks than the supported alpha limit.");
                 avformat_free_context(fmt_ctx);

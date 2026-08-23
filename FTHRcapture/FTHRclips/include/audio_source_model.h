@@ -17,6 +17,10 @@
 namespace fthr {
 
 inline constexpr uint32_t kMaxRetainedAudioSources = 8;
+// Default Mix is mandatory compatibility audio, not an application-source
+// admission. A completed clip can therefore carry it plus the eight real app
+// stems permitted by the provisional AUDIT-050 source cap.
+inline constexpr uint32_t kMaxClipAudioTracks = kMaxRetainedAudioSources + 1;
 
 enum class AudioSourceType : uint8_t {
     Application,

@@ -63,6 +63,7 @@
 #include "audio_capture.h"       // AudioCapture (WASAPI loopback -> PCM ring)
 #include "audio_encoder.h"
 #include "audio_packet_ring.h"
+#include "windows_process_loopback_audio_provider.h"
 #include "audio_ring_buffer.h"   // AudioRingBuffer (raw float32 PCM)
 #include "shared_memory.h"       // typed v4 capture-health flags
 #include "windows_monitor_resolver.h"
@@ -350,6 +351,10 @@ namespace fthr {
         AudioEncoder                      default_mix_audio_encoder_;
         std::unique_ptr<EncodedAudioPacketRing> default_mix_audio_ring_;
         AudioSourceMetadata               default_mix_audio_source_;
+        // Windows 11 only. This owns real process-loopback providers; Windows
+        // 10 remains Default-Mix-only and never attempts their activation.
+        std::unique_ptr<WindowsApplicationAudioSourceManager>
+            windows_application_audio_sources_;
 
         // -----------------------------------------------------------------------
         // Continuous recording state

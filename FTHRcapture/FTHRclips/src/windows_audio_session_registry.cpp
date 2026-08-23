@@ -65,6 +65,15 @@ std::wstring ExecutableBasename(uint32_t process_id) {
     return std::filesystem::path(path).filename().wstring();
 }
 
+std::wstring SessionInstanceKey(IAudioSessionControl2* control) {
+    if (!control) return {};
+    LPWSTR instance_id = nullptr;
+    if (FAILED(control->GetSessionInstanceIdentifier(&instance_id)) || !instance_id) return {};
+    std::wstring result(instance_id);
+    CoTaskMemFree(instance_id);
+    return result;
+}
+
 uint32_t ParentProcessId(uint32_t process_id) {
     const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snapshot == INVALID_HANDLE_VALUE) return 0;
@@ -193,6 +202,59 @@ private:
     WindowsAudioSessionRegistry* owner_;
 };
 
+class WindowsAudioSessionRegistry::SessionEventNotification final
+    : public IAudioSessionEvents {
+public:
+    explicit SessionEventNotification(WindowsAudioSessionRegistry* owner) : owner_(owner) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
+        if (!object) return E_POINTER;
+        *object = nullptr;
+        if (iid == IID_IUnknown || iid == __uuidof(IAudioSessionEvents)) {
+            *object = static_cast<IAudioSessionEvents*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG refs = --refs_;
+        if (refs == 0) delete this;
+        return refs;
+    }
+    HRESULT STDMETHODCALLTYPE OnDisplayNameChanged(LPCWSTR, LPCGUID) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnIconPathChanged(LPCWSTR, LPCGUID) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnSimpleVolumeChanged(float, BOOL, LPCGUID) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnChannelVolumeChanged(DWORD, float[], DWORD, LPCGUID) override {
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnGroupingParamChanged(LPCGUID, LPCGUID) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnStateChanged(AudioSessionState) override {
+        if (owner_) owner_->MarkDirty();
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnSessionDisconnected(AudioSessionDisconnectReason) override {
+        if (owner_) owner_->MarkDirty();
+        return S_OK;
+    }
+
+private:
+    std::atomic<ULONG> refs_{1};
+    WindowsAudioSessionRegistry* owner_;
+};
+
+struct WindowsAudioSessionRegistry::SessionEventRegistration {
+    IAudioSessionControl* control = nullptr;
+    SessionEventNotification* notification = nullptr;
+
+    ~SessionEventRegistration() {
+        if (control && notification) control->UnregisterAudioSessionNotification(notification);
+        if (notification) notification->Release();
+        if (control) control->Release();
+    }
+};
+
 WindowsAudioSessionRegistry::WindowsAudioSessionRegistry() = default;
 
 WindowsAudioSessionRegistry::~WindowsAudioSessionRegistry() {
@@ -236,6 +298,7 @@ void WindowsAudioSessionRegistry::Stop() {
     notification_ = nullptr;
     if (manager) manager->Release();
     session_manager_ = nullptr;
+    session_events_.clear();
     current_.clear();
     started_ = false;
     dirty_.store(false, std::memory_order_release);
@@ -271,6 +334,7 @@ bool WindowsAudioSessionRegistry::Refresh(WindowsAudioSessionUpdate* update) {
     }
 
     std::map<std::string, WindowsAudioSessionDescriptor> groups;
+    std::map<std::wstring, bool> live_session_instances;
     for (int index = 0; index < count; ++index) {
         ComPtr<IAudioSessionControl> control;
         ComPtr<IAudioSessionControl2> control2;
@@ -278,6 +342,23 @@ bool WindowsAudioSessionRegistry::Refresh(WindowsAudioSessionUpdate* update) {
             continue;
         DWORD pid = 0;
         if (FAILED(control2->GetProcessId(&pid)) || pid == 0) continue;
+        const std::wstring session_instance = SessionInstanceKey(control2.Get());
+        if (!session_instance.empty()) {
+            live_session_instances.emplace(session_instance, true);
+            if (!session_events_.count(session_instance)) {
+                auto registration = std::make_unique<SessionEventRegistration>();
+                registration->control = control.Get();
+                registration->control->AddRef();
+                registration->notification = new SessionEventNotification(this);
+                const HRESULT notification_hr = registration->control
+                    ->RegisterAudioSessionNotification(registration->notification);
+                if (FAILED(notification_hr)) {
+                    registration.reset();
+                } else {
+                    session_events_.emplace(session_instance, std::move(registration));
+                }
+            }
+        }
         const std::wstring executable = ExecutableBasename(pid);
         if (executable.empty()) continue;
         const uint32_t root_pid = ProcessGroupRoot(pid, executable);
@@ -295,6 +376,10 @@ bool WindowsAudioSessionRegistry::Refresh(WindowsAudioSessionUpdate* update) {
         AudioSessionState state = AudioSessionStateInactive;
         if (SUCCEEDED(control->GetState(&state)) && state == AudioSessionStateActive)
             descriptor.currently_active = true;
+    }
+    for (auto it = session_events_.begin(); it != session_events_.end();) {
+        if (!live_session_instances.count(it->first)) it = session_events_.erase(it);
+        else ++it;
     }
 
     std::map<std::string, bool> previous;
