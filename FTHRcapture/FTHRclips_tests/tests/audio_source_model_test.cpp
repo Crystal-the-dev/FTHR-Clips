@@ -1,5 +1,6 @@
 #include "audio_packet_ring.h"
 #include "audio_source_model.h"
+#include "transactional_save.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -106,6 +107,70 @@ void EncodedPacketRingIsBoundedAndSnapshotsOverlap() {
         "snapshot carries codec configuration and overlapping packets");
 }
 
+void PairedPublicationProtectsTheManifestContract() {
+    std::vector<std::pair<std::filesystem::path, std::filesystem::path>> renames;
+    fthr::transactional_save::FileOps operations;
+    operations.exists = [](const std::filesystem::path&, std::error_code&) {
+        return false;
+    };
+    operations.remove = [](const std::filesystem::path&, std::error_code&) {
+        return true;
+    };
+    operations.rename_no_replace = [&](const std::filesystem::path& from,
+                                        const std::filesystem::path& to,
+                                        std::error_code&) {
+        renames.emplace_back(from, to);
+        return true;
+    };
+    bool writer_saw_paired_partials = false;
+    const auto result = fthr::transactional_save::RunPair(
+        L"capture_clip_from_20260823_02-30-00.mp4",
+        L"capture_clip_from_20260823_02-30-00.mp4.fthr-audio.json",
+        [&](const std::filesystem::path& media_partial,
+            const std::filesystem::path& manifest_partial,
+            std::string&) {
+            writer_saw_paired_partials = media_partial.extension() == L".partial"
+                && manifest_partial.extension() == L".partial";
+            return true;
+        },
+        operations);
+    CheckAudio(result.success && writer_saw_paired_partials,
+        "paired transaction gives the writer both unpublished paths");
+    CheckAudio(renames.size() == 2
+                   && renames[0].second == result.manifest_final_path
+                   && renames[1].second == result.media_final_path,
+        "manifest is published before the completed media artifact");
+
+    int rename_attempts = 0;
+    bool orphan_manifest_removed = false;
+    operations.rename_no_replace = [&](const std::filesystem::path&,
+                                        const std::filesystem::path&,
+                                        std::error_code& error) {
+        ++rename_attempts;
+        if (rename_attempts == 2) {
+            error = std::make_error_code(std::errc::io_error);
+            return false;
+        }
+        return true;
+    };
+    operations.remove = [&](const std::filesystem::path& path, std::error_code&) {
+        if (path.extension() == L".json") orphan_manifest_removed = true;
+        return true;
+    };
+    const auto failed_media_publish = fthr::transactional_save::RunPair(
+        L"capture_clip_from_20260823_02-30-01.mp4",
+        L"capture_clip_from_20260823_02-30-01.mp4.fthr-audio.json",
+        [](const std::filesystem::path&, const std::filesystem::path&, std::string&) {
+            return true;
+        },
+        operations);
+    CheckAudio(!failed_media_publish.success
+                   && failed_media_publish.failure
+                       == fthr::transactional_save::PairFailure::PublishMedia
+                   && orphan_manifest_removed,
+        "failed media publication removes its already-published manifest");
+}
+
 }  // namespace
 
 int RunAudioSourceModelTests() {
@@ -113,6 +178,7 @@ int RunAudioSourceModelTests() {
     EndedHistorySurvivesAndGenerationDoesNotMix();
     SourceLimitAndSanitizationStaySafe();
     EncodedPacketRingIsBoundedAndSnapshotsOverlap();
+    PairedPublicationProtectsTheManifestContract();
     std::cout << "AUDIT-050 audio source model tests: " << audio_source_checks
               << " checks passed" << std::endl;
     return audio_source_checks;

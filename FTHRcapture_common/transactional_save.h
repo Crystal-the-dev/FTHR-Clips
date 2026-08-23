@@ -54,6 +54,44 @@ struct Result {
 
 using Writer = std::function<bool(const fs::path&, std::string&)>;
 
+// A native multi-audio clip is a pair: the media file and its adjacent
+// source-to-stream manifest.  Publishing the manifest first means a completed
+// MP4 is never visible without its authoritative track mapping.  A crash in
+// the narrow interval between the two renames can leave only an orphaned
+// sidecar, which startup recovery may safely remove because the media file is
+// still absent.
+enum class PairFailure {
+    None,
+    InspectMediaDestination,
+    MediaDestinationExists,
+    InspectManifestDestination,
+    ManifestDestinationExists,
+    InspectMediaTemporary,
+    MediaTemporaryExists,
+    InspectManifestTemporary,
+    ManifestTemporaryExists,
+    Writer,
+    PublishManifest,
+    PublishMedia,
+};
+
+struct PairResult {
+    bool success = false;
+    PairFailure failure = PairFailure::None;
+    fs::path media_final_path;
+    fs::path media_temporary_path;
+    fs::path manifest_final_path;
+    fs::path manifest_temporary_path;
+    std::string writer_error;
+    std::error_code operation_error;
+    std::error_code cleanup_error;
+};
+
+using PairWriter = std::function<bool(
+    const fs::path& media_temporary_path,
+    const fs::path& manifest_temporary_path,
+    std::string&)>;
+
 inline fs::path TemporaryPathFor(const fs::path& final_path) {
     fs::path temporary_path = final_path;
     temporary_path += kPartialSuffix;
@@ -181,6 +219,116 @@ inline Result Run(
     return result;
 }
 
+inline void CleanupPairTemporary(PairResult& result, const FileOps& ops) {
+    std::error_code error;
+    if (!ops.remove(result.media_temporary_path, error) && !result.cleanup_error) {
+        result.cleanup_error = error ? error : std::make_error_code(std::errc::io_error);
+    }
+    error.clear();
+    if (!ops.remove(result.manifest_temporary_path, error) && !result.cleanup_error) {
+        result.cleanup_error = error ? error : std::make_error_code(std::errc::io_error);
+    }
+}
+
+inline PairResult RunPair(
+    const fs::path& media_final_path,
+    const fs::path& manifest_final_path,
+    const PairWriter& writer,
+    const FileOps& ops = DefaultFileOps()) {
+    PairResult result;
+    result.media_final_path = media_final_path;
+    result.manifest_final_path = manifest_final_path;
+    result.media_temporary_path = TemporaryPathFor(media_final_path);
+    result.manifest_temporary_path = TemporaryPathFor(manifest_final_path);
+
+    std::error_code error;
+    if (ops.exists(result.media_final_path, error)) {
+        result.failure = PairFailure::MediaDestinationExists;
+        return result;
+    }
+    if (error) {
+        result.failure = PairFailure::InspectMediaDestination;
+        result.operation_error = error;
+        return result;
+    }
+    error.clear();
+    if (ops.exists(result.manifest_final_path, error)) {
+        result.failure = PairFailure::ManifestDestinationExists;
+        return result;
+    }
+    if (error) {
+        result.failure = PairFailure::InspectManifestDestination;
+        result.operation_error = error;
+        return result;
+    }
+    error.clear();
+    if (ops.exists(result.media_temporary_path, error)) {
+        result.failure = PairFailure::MediaTemporaryExists;
+        return result;
+    }
+    if (error) {
+        result.failure = PairFailure::InspectMediaTemporary;
+        result.operation_error = error;
+        return result;
+    }
+    error.clear();
+    if (ops.exists(result.manifest_temporary_path, error)) {
+        result.failure = PairFailure::ManifestTemporaryExists;
+        return result;
+    }
+    if (error) {
+        result.failure = PairFailure::InspectManifestTemporary;
+        result.operation_error = error;
+        return result;
+    }
+
+    bool writer_succeeded = false;
+    try {
+        writer_succeeded = writer(
+            result.media_temporary_path, result.manifest_temporary_path, result.writer_error);
+    }
+    catch (const std::exception& exception) {
+        result.writer_error = exception.what();
+    }
+    catch (...) {
+        result.writer_error = "Media/manifest writer raised an unknown exception";
+    }
+    if (!writer_succeeded) {
+        result.failure = PairFailure::Writer;
+        CleanupPairTemporary(result, ops);
+        return result;
+    }
+
+    // Manifest first: never make a completed media artifact observable without
+    // its binding metadata.  The later media rename is no-replace and durable.
+    error.clear();
+    if (!ops.rename_no_replace(
+            result.manifest_temporary_path, result.manifest_final_path, error)) {
+        result.failure = PairFailure::PublishManifest;
+        result.operation_error = error ? error : std::make_error_code(std::errc::io_error);
+        CleanupPairTemporary(result, ops);
+        return result;
+    }
+    error.clear();
+    if (!ops.rename_no_replace(result.media_temporary_path, result.media_final_path, error)) {
+        result.failure = PairFailure::PublishMedia;
+        result.operation_error = error ? error : std::make_error_code(std::errc::io_error);
+        // The media was not published, therefore the just-published manifest is
+        // an orphan.  Best-effort removal keeps recovery deterministic.
+        std::error_code manifest_cleanup_error;
+        if (!ops.remove(result.manifest_final_path, manifest_cleanup_error) && !result.cleanup_error) {
+            result.cleanup_error = manifest_cleanup_error
+                ? manifest_cleanup_error
+                : std::make_error_code(std::errc::io_error);
+        }
+        CleanupPairTemporary(result, ops);
+        return result;
+    }
+
+    result.success = true;
+    return result;
+}
+
 inline std::string DescribeFailure(const Result& result) {
     const std::string final_path = Utf8Path(result.final_path);
     const std::string temporary_path = Utf8Path(result.temporary_path);
@@ -204,6 +352,49 @@ inline std::string DescribeFailure(const Result& result) {
         return "Could not atomically finalize clip '" + final_path + "' from '"
             + temporary_path + "': " + result.operation_error.message();
     case Failure::None:
+        break;
+    }
+    return {};
+}
+
+inline std::string DescribeFailure(const PairResult& result) {
+    const std::string media = Utf8Path(result.media_final_path);
+    const std::string manifest = Utf8Path(result.manifest_final_path);
+    switch (result.failure) {
+    case PairFailure::InspectMediaDestination:
+        return "Could not inspect final clip path '" + media + "': "
+            + result.operation_error.message();
+    case PairFailure::MediaDestinationExists:
+        return "Final clip already exists and was not overwritten: '" + media + "'";
+    case PairFailure::InspectManifestDestination:
+        return "Could not inspect final audio manifest path '" + manifest + "': "
+            + result.operation_error.message();
+    case PairFailure::ManifestDestinationExists:
+        return "Final audio manifest already exists and was not overwritten: '" + manifest + "'";
+    case PairFailure::InspectMediaTemporary:
+        return "Could not inspect temporary clip path '" + Utf8Path(result.media_temporary_path)
+            + "': " + result.operation_error.message();
+    case PairFailure::MediaTemporaryExists:
+        return "Temporary clip already exists and was not overwritten: '"
+            + Utf8Path(result.media_temporary_path) + "'";
+    case PairFailure::InspectManifestTemporary:
+        return "Could not inspect temporary audio manifest path '"
+            + Utf8Path(result.manifest_temporary_path) + "': "
+            + result.operation_error.message();
+    case PairFailure::ManifestTemporaryExists:
+        return "Temporary audio manifest already exists and was not overwritten: '"
+            + Utf8Path(result.manifest_temporary_path) + "'";
+    case PairFailure::Writer:
+        return result.writer_error.empty()
+            ? "Media/manifest writer failed before publication"
+            : result.writer_error;
+    case PairFailure::PublishManifest:
+        return "Could not publish the audio manifest '" + manifest + "': "
+            + result.operation_error.message();
+    case PairFailure::PublishMedia:
+        return "Could not finalize clip '" + media + "' after its manifest: "
+            + result.operation_error.message();
+    case PairFailure::None:
         break;
     }
     return {};
