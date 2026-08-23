@@ -69,6 +69,36 @@ def test_main_window_constructs_with_side_effect_boundaries(
     assert window.settings_manager.config_file.parent == tmp_path / '.fthr'
 
 
+def test_background_start_defers_main_ui_but_keeps_core_services(
+        qtbot, monkeypatch, tmp_path):
+    """Windows-login mode must not build the library/editor before restore."""
+    monkeypatch.setenv('USERPROFILE', str(tmp_path))
+    monkeypatch.setenv('HOME', str(tmp_path))
+
+    import main
+
+    monkeypatch.setattr(main, 'CaptureCardClient', _CaptureCardStub)
+    monkeypatch.setattr(main, 'CaptureBridge', _CaptureBridgeStub)
+    monkeypatch.setattr(main.MainWindow, '_setup_hotkeys', lambda _self: None)
+    monkeypatch.setattr(main.MainWindow, '_start_mic_recorder',
+                        lambda _self: None)
+    monkeypatch.setattr(main.MainWindow, 'start_engine', lambda _self: None)
+    monkeypatch.setattr(main.MainWindow, 'stop_engine', lambda _self: None)
+
+    window = main.MainWindow(background_start=True)
+    qtbot.addWidget(window)
+
+    assert window.centralWidget() is None
+    assert not hasattr(window, 'clip_grid')
+    assert window._background_services_started
+
+    # Keep the test Qt application alive while the app-level cleanup runs.
+    monkeypatch.setattr(main.QApplication, 'instance', staticmethod(lambda: None))
+    window._perform_full_shutdown()
+    window._shutdown_requested = True
+    window.close()
+
+
 def test_share_dialog_constructs_and_emits_selection(qtbot):
     from ui.clip_viewer import ShareModeDialog
 

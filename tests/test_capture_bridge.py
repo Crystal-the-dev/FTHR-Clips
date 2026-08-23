@@ -37,6 +37,14 @@ def test_set_encoder_config_auto_maps_to_zero():
     assert layout.cfg_codec_pref == 0
 
 
+def test_request_engine_shutdown_uses_only_the_existing_command_field():
+    layout, buf = _make_fake_layout()
+    bridge = _FakeBridge(layout)
+
+    assert bridge.request_engine_shutdown()
+    assert layout.ui_command == CommandType.SHUTDOWN
+
+
 def test_get_active_codec_reads_string():
     layout, buf = _make_fake_layout()
     bridge = _FakeBridge(layout)
