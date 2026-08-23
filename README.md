@@ -54,7 +54,7 @@ Grab the latest build from the [Releases](https://github.com/FTHR-Community/FTHR
 | Platform | File |
 |----------|------|
 | Linux (experimental Wayland) | `FTHRClips-1.0.0-alpha-x86_64.AppImage` |
-| Windows 10/11 (qualified NVIDIA cohort) | `FTHRClips_Setup.exe` |
+| Windows 10/11 (qualified NVIDIA cohort) | `FTHRClips-Setup-<version>-x64.exe` |
 
 ---
 
@@ -96,7 +96,12 @@ one of the protocols above are therefore unsupported in this alpha.
 
 ## Windows Setup
 
-Run `FTHRClips_Setup.exe` and click through the installer. Global hotkeys work out of the box.
+Run `FTHRClips-Setup-<version>-x64.exe` and follow the setup steps. FTHR Clips
+installs for all users under Program Files and subsequent downloads of the same
+product update or repair that installation rather than creating a second entry.
+The uninstaller keeps clips, screenshots and exports. It keeps FTHR settings by
+default as well; removing settings/cache is an explicit choice. Global hotkeys
+work out of the box.
 
 **Requirements:** Windows 10 version 1903+ or Windows 11. Native NVIDIA
 H.264/HEVC/AV1 on a same-adapter display is the physically qualified alpha

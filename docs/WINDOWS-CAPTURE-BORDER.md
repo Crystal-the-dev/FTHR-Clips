@@ -53,6 +53,8 @@ borderless access request. A later identity-capable installer may set that build
 flag **only** when its manifest declares `graphicsCaptureWithoutBorder`; the
 runtime still checks package identity, OS build, consent result and the optional
 `IGraphicsCaptureSession3` interface before changing the session property.
+The current Inno lifecycle and the deferred sparse-package decision are recorded
+in [`WINDOWS-INSTALLER-LIFECYCLE.md`](WINDOWS-INSTALLER-LIFECYCLE.md).
 
 ## Runtime policy and recovery
 

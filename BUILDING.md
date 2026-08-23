@@ -48,6 +48,10 @@ Every FFmpeg file is verified against the sha256 in `tools/ffmpeg_manifest.json`
 A mismatch aborts: it means either a corrupt download or a different build from
 the one the licence paperwork describes.
 
+On Windows, the separately mutable Microsoft VC++ permalink is verified by a
+valid Microsoft Authenticode signature and its exact SHA-256/version is
+recorded locally before it can enter an installer.
+
 ### Verify before releasing — either platform
 
 ```bash
@@ -130,8 +134,24 @@ Remove-Item "$int\libopencv_dnn*","$int\libopencv_ml*","$int\libopencv_calib3d*"
 
 ### 3. Create the installer
 
-Open **Inno Setup Compiler** → `installer_windows.iss` → Build → Compile.
-Output: `Output\FTHRClips_Setup_Windows.exe`.
+Use the release build entrypoint:
+
+```powershell
+python tools/build_windows_installer.py
+```
+
+It verifies the Microsoft VC++ redistributable, the bundle licence manifest,
+and the Windows lifecycle contract before invoking Inno Setup. Output:
+`Output\FTHRClips-Setup-1.0.0-alpha-x64.exe` for the current version.
+
+For a publishable artifact, provide the operator-owned signing command and
+require a valid signature; no certificate belongs in this repository:
+
+```powershell
+python tools/build_windows_installer.py `
+  --sign-command '<your approved signing command containing {file}>' `
+  --require-signed
+```
 
 > `installer_windows.iss` carries the product version as a literal because Inno
 > Setup cannot import Python. `tools/verify_version_consistency.py` fails the
@@ -140,8 +160,15 @@ Output: `Output\FTHRClips_Setup_Windows.exe`.
 ### What the installer contains
 
 Windows DXGI capture engine · Python runtime and dependencies · Qt6 Widgets (no
-Wayland/QML) · Visual C++ redistributable · Start Menu and optional desktop
-shortcut · uninstaller (removes `%APPDATA%\fthr`).
+Wayland/QML) · Microsoft Visual C++ redistributable · Start Menu and optional
+desktop shortcut · versioned Inno uninstaller. Clips, screenshots, exports and
+sidecars under `%USERPROFILE%\FTHR_Clips` are never uninstaller targets;
+settings/cache in `%USERPROFILE%\.fthr` are retained unless the user explicitly
+chooses their removal.
+
+See [`docs/WINDOWS-INSTALLER-LIFECYCLE.md`](docs/WINDOWS-INSTALLER-LIFECYCLE.md)
+for update, repair, legacy-install, autostart, signing, and package-identity
+decisions.
 
 ### Notes
 

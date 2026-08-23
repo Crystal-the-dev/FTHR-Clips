@@ -105,7 +105,9 @@ Everything else below is either already green or is honest, tracked work.
 | # | Gate | Status |
 |---|---|---|
 | 6.1 | Windows engine builds clean (MSBuild, Release x64) | **PASS** — rebuilt at the product-truth HEAD with VS 2022 Build Tools. |
-| 6.2 | Windows bundle builds clean (PyInstaller) | **NOT RUN for current source** — an older onedir artifact passes 84/84 licence/Qt/asset checks, but does not prove this fix-pass bundle or installer lifecycle. |
+| 6.2 | Windows bundle builds clean (PyInstaller) | **PASS (2026-08-24)** — the current onedir bundle passed the Windows licence/asset gate and the installer lifecycle artifact gate; its UI and engine hashes are recorded in `WINDOWS-INSTALLER-LIFECYCLE-QUALIFICATION-2026-08-24.md`. |
+| 6.2a | Windows installer input/lifecycle contract | **PASS (source contract)** — stable AppId, update/repair/downgrade policy, safe data boundary, autostart ownership, VC++ guard, legacy opt-in and package metadata are verified by `tools/verify_windows_installer_lifecycle.py`; this is not a physical install claim. |
+| 6.2b | Windows Authenticode signing | **DECISION REQUIRED** — build support accepts an external operator-owned signing command, but no release signing identity is configured in the repository or this checkout. Unsigned artifacts are local-qualification only. |
 | 6.3 | Linux engine builds clean (CMake, Release) | **PARTIAL** — current source built and passed tests in a WSL development build using system FFmpeg. The required pinned-FFmpeg Release rebuild was not run. |
 | 6.4 | Linux AppImage builds | **NOT RUN for current source** — historical artifact evidence does not qualify the X11-disabled/audio-corrected build. |
 | 6.5 | CI green on all jobs | **NOT RUN** — the workflow has never executed; there is no remote yet |
@@ -116,8 +118,8 @@ Everything else below is either already green or is honest, tracked work.
 |---|---|---|
 | 7.1 | Windows: GUI launches | **NOT RUN** |
 | 7.2 | Windows: a real clip is captured via the hotkey and plays back | **PARTIAL** — current engine qualification captured and fully decoded 15 H.264/HEVC/AV1 files with audio, including 30/60-second saves. It used the qualification bridge, not the GUI hotkey/player flow. |
-| 7.3 | Windows: installer install → launch → update → uninstall | **NOT RUN** |
-| 7.4 | Windows: uninstall removes what it claims to | **NOT RUN** |
+| 7.3 | Windows: installer install → launch → update → uninstall | **PARTIAL (2026-08-24)** — a real existing-install update, default uninstall, fresh reinstall and checked legacy cleanup ran successfully against the generated Setup executable. Installed-app identity, Start Menu, exact autostart ownership and clip/settings snapshots were checked. Installed GUI/tray/capture launch remains `NOT RUN`; see `WINDOWS-INSTALLER-LIFECYCLE-QUALIFICATION-2026-08-24.md`. |
+| 7.4 | Windows: uninstall removes what it claims to | **PARTIAL (2026-08-24)** — default uninstall removed product registration, Program Files payload, common shortcuts and the exact Run value while preserving the recorded clip and `.fthr` state snapshots. The optional interactive settings/cache-removal choice and a custom install location remain `NOT RUN`. |
 | 7.5 | Linux: engine starts and captures on a real compositor | **NOT RUN** — WSLg exposes neither supported Wayland protocol; current alpha source refuses x11grab and exits after bounded recovery. Hyprland/KDE/GNOME remain `NOT RUN`. |
 | 7.5b | Linux: a clip is saved, decodes, and contains a picture | **NOT RUN for current source** — older black-frame x11grab clips are historical and do not qualify the alpha-safe build. |
 | 7.6 | Linux: AppImage launches and captures | **NOT RUN for current source** |
