@@ -7,12 +7,11 @@
 
 ## Scope and stop rule
 
-This document records focused validation spikes for the proposed clean-sheet
-multi-audio architecture. It is not an implementation specification and does
-not authorize wiring prototype code into the production capture or viewer
-paths. The existing mixed-audio alpha path, AUDIT-022/023/035 capture-health
-behavior, AUDIT-024 bounded Wayland behavior, AUDIT-028 transactional saves,
-and Shared Memory v4 remain unchanged.
+This document records focused validation spikes and, after the approved
+architecture decision, the implementation/qualification ledger for the
+clean-sheet multi-audio architecture. The existing mixed-audio alpha path,
+AUDIT-022/023/035 capture-health behavior, AUDIT-024 bounded Wayland behavior,
+AUDIT-028 transactional saves, and Shared Memory v4 remain unchanged.
 
 The phase stops after the evidence below. A product owner must approve the
 architecture and the resulting Windows capability model before the full
@@ -382,16 +381,25 @@ production foundations have subsequently landed, in focused commits:
    persistent in-process AAC packets rather than a long raw-PCM replay ring.
    Its MP4 stream is labelled `Default Mix` and carries default disposition.
    Preserve-mode export explicitly maps every audio stream, so FFmpeg automatic
-   stream selection cannot delete stems.
+   stream selection cannot delete stems; and
+5. a native multi-track mux contract, version-1 manifest producer, and paired
+   same-directory publication boundary. The manifest is SHA-256-bound to the
+   temporary MP4, then published before the MP4; a failed final media publish
+   removes that orphaned manifest. Startup recovery removes only old,
+   FTHR-named orphan sidecars whose corresponding MP4 is absent. The viewer
+   reads a validated manifest to expose real track labels for export-only
+   mixing; it never infers sources from raw MP4 stream count.
 
 These changes do **not** constitute completion of the approved architecture.
 In particular, production process-loopback activation, dynamic source capture,
-native microphone capture/device identity, multi-stream mux and manifest
-publication, FFmpeg/QAudioSink editable playback, dynamic mixer UI, mixed and
-preserve-track export UX, drift qualification, and physical Windows 11/game
-performance qualification are still open. The legacy Python microphone
-post-save route remains active until its native replacement is end-to-end
-tested; the disabled legacy multiband/null-sink path remains disabled.
+native microphone capture/device identity, real application or microphone
+stems, FFmpeg/QAudioSink editable playback, live playback gain/mute, drift
+qualification, and physical Windows 11/game performance qualification are
+still open. The native muxer is structurally ready for up to eight actual AAC
+sources, but the current production capture path truthfully emits only Default
+Mix. The legacy Python microphone post-save route remains active until its
+native replacement is end-to-end tested; the disabled legacy multiband/null-
+sink path remains disabled.
 
 Therefore AUDIT-050 is **not resolved**, Windows 11 per-app audio is **not
 ready**, and Linux per-app audio remains **not implemented**. Shared Memory v4,

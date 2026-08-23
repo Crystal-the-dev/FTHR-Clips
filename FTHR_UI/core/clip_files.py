@@ -10,6 +10,7 @@ from pathlib import Path
 VIDEO_SUFFIXES = ('.mp4', '.mkv', '.avi')
 IMAGE_SUFFIXES = ('.png', '.jpg', '.jpeg')
 PARTIAL_SUFFIX = '.partial'
+_AUDIO_MANIFEST_SUFFIX = '.fthr-audio.json'
 _FTHR_CLIP_MARKER = '_clip_from_'
 DEFAULT_PARTIAL_MAX_AGE_SECONDS = 24 * 60 * 60
 
@@ -55,6 +56,18 @@ def is_fthr_owned_partial_path(path: str | Path) -> bool:
     return name.endswith('.mp4.partial') and _FTHR_CLIP_MARKER in name
 
 
+def is_fthr_owned_orphan_audio_manifest_path(path: str | Path) -> bool:
+    """Return whether a sidecar can be safely recovered when its MP4 is absent.
+
+    A paired native save publishes the manifest immediately before the MP4. A
+    hard process kill in that narrow window leaves this harmless orphan. The
+    marker requirement keeps third-party sidecars outside FTHR's ownership.
+    """
+
+    name = Path(path).name.casefold()
+    return name.endswith('.mp4' + _AUDIO_MANIFEST_SUFFIX) and _FTHR_CLIP_MARKER in name
+
+
 def cleanup_stale_partial_clips(
     clips_root: str | Path,
     *,
@@ -87,17 +100,25 @@ def cleanup_stale_partial_clips(
     failures: list[tuple[Path, str]] = []
 
     try:
-        candidates = tuple(root.rglob('*.mp4.partial'))
+        candidates = tuple(root.rglob('*.mp4.partial')) + tuple(
+            root.rglob('*.mp4' + _AUDIO_MANIFEST_SUFFIX))
     except OSError as error:
         return PartialCleanupResult(
             removed=(), failures=((root, str(error)),))
 
     for candidate in candidates:
-        if not is_fthr_owned_partial_path(candidate) or candidate.is_symlink():
+        is_partial = is_fthr_owned_partial_path(candidate)
+        is_orphan_manifest = is_fthr_owned_orphan_audio_manifest_path(candidate)
+        if (not is_partial and not is_orphan_manifest) or candidate.is_symlink():
             continue
         try:
             if not candidate.is_file() or candidate.stat().st_mtime > cutoff:
                 continue
+            if is_orphan_manifest:
+                media = candidate.with_name(
+                    candidate.name[:-len(_AUDIO_MANIFEST_SUFFIX)])
+                if media.exists():
+                    continue
             candidate.unlink()
             removed.append(candidate)
         except OSError as error:

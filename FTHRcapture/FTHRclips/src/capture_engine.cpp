@@ -59,6 +59,7 @@
 #include "audio_capture.h"
 #include "audio_ring_buffer.h"
 #include "audio_encoder.h"
+#include "clip_audio_manifest.h"
 #include "transactional_save.h"
 #include "replay_interval.h"
 #include <iostream>
@@ -516,8 +517,27 @@ namespace fthr {
                 break;
             }
 
-            AudioSourceId default_mix_id{
-                "00000000-0000-4000-8000-000000000001"};
+            std::string default_mix_uuid;
+            std::string default_mix_uuid_error;
+            if (!CreateAudioManifestTransactionId(
+                    &default_mix_uuid, &default_mix_uuid_error)) {
+                std::cerr << "[CaptureEngine] Could not create Default Mix source UUID: "
+                    << default_mix_uuid_error << std::endl;
+                audio_capture_.Shutdown();
+                break;
+            }
+            AudioSourceId default_mix_id{default_mix_uuid};
+            default_mix_audio_source_ = {};
+            default_mix_audio_source_.identity.id = default_mix_id;
+            default_mix_audio_source_.identity.type = AudioSourceType::System;
+            default_mix_audio_source_.identity.persistent_identity = "default-mix";
+            default_mix_audio_source_.identity.display_name = "Default Mix";
+            default_mix_audio_source_.identity.icon_reference = "system-audio";
+            default_mix_audio_source_.format = {
+                audio_capture_.GetSampleRate(), audio_capture_.GetChannels(), "fltp"};
+            default_mix_audio_source_.state.health = AudioSourceHealth::Active;
+            default_mix_audio_source_.state.admitted = true;
+            default_mix_audio_source_.state.active_in_generation = true;
             default_mix_audio_ring_ = std::make_unique<EncodedAudioPacketRing>(
                 default_mix_id,
                 capture_generation_.load(std::memory_order_relaxed) + 1,
@@ -645,6 +665,7 @@ namespace fthr {
             default_mix_audio_encoder_.Finalize();
             audio_capture_.Shutdown();
             default_mix_audio_ring_.reset();
+            default_mix_audio_source_ = {};
             audio_active_ = false;
             std::cout << "[CaptureEngine] Audio pipeline stopped." << std::endl;
         }
@@ -848,6 +869,23 @@ namespace fthr {
                     task.audio_presentation_start_pts_samples = start_pts;
                     task.has_encoded_audio = task.encoded_audio_snapshot.valid();
                     if (task.has_encoded_audio) {
+                        EncodedAudioTrack default_mix_track;
+                        default_mix_track.source = default_mix_audio_source_;
+                        default_mix_track.snapshot = task.encoded_audio_snapshot;
+                        default_mix_track.presentation_start_pts_samples = start_pts;
+                        // The source interval reflects the packet timeline that
+                        // actually survived in this clip, not a guessed requested
+                        // duration.  Default Mix is a real aggregate loopback
+                        // stream and therefore remains present even for silence.
+                        default_mix_track.source.state.first_active_100ns = static_cast<int64_t>(
+                            origin_qpc + (static_cast<uint64_t>(
+                                default_mix_track.snapshot.first_pts_samples)
+                                * 10'000'000ULL / sample_rate));
+                        default_mix_track.source.state.last_active_100ns = static_cast<int64_t>(
+                            origin_qpc + (static_cast<uint64_t>(
+                                default_mix_track.snapshot.last_pts_samples)
+                                * 10'000'000ULL / sample_rate));
+                        task.encoded_audio_tracks.push_back(std::move(default_mix_track));
                         std::cout << "[SaveClip] Persistent AAC snapshot: "
                             << task.encoded_audio_snapshot.packets.size()
                             << " packets, PTS " << start_pts << " - " << end_pts
@@ -962,6 +1000,60 @@ namespace fthr {
     // ===========================================================================
 
     bool CaptureEngine::ProcessSaveClipTask(const SaveClipTask& task) {
+        if (task.use_encoded_path && !task.encoded_audio_tracks.empty()) {
+            std::string transaction_id;
+            std::string transaction_error;
+            if (!CreateAudioManifestTransactionId(&transaction_id, &transaction_error)) {
+                SetEngineError(task.shared_memory,
+                    L"Could not prepare the audio manifest transaction for this clip.");
+                std::cerr << "[SaveClip] " << transaction_error << std::endl;
+                return false;
+            }
+            const auto manifest_path = AudioManifestPathFor(task.output_path);
+            const auto result = transactional_save::RunPair(
+                task.output_path,
+                manifest_path,
+                [this, &task, &transaction_id](
+                    const std::filesystem::path& media_temporary_path,
+                    const std::filesystem::path& manifest_temporary_path,
+                    std::string& writer_error) {
+                    if (!MuxEncodedClip(task, media_temporary_path.wstring())) {
+                        writer_error = "The temporary clip could not be muxed.";
+                        return false;
+                    }
+                    return WriteClipAudioManifest(
+                        task.output_path,
+                        media_temporary_path,
+                        manifest_temporary_path,
+                        transaction_id,
+                        task.encoded_audio_tracks,
+                        &writer_error);
+                });
+            if (result.cleanup_error) {
+                std::wcerr << L"[SaveClip] Secondary paired cleanup failure for "
+                    << result.media_temporary_path.wstring() << L": "
+                    << result.cleanup_error.value() << std::endl;
+            }
+            if (result.success) return true;
+            if (result.failure != transactional_save::PairFailure::Writer
+                    || !result.writer_error.empty()) {
+                const std::string detail = transactional_save::DescribeFailure(result);
+                const int required = MultiByteToWideChar(
+                    CP_UTF8, 0, detail.c_str(), -1, nullptr, 0);
+                std::wstring wide_detail;
+                if (required > 0) {
+                    wide_detail.resize(static_cast<size_t>(required));
+                    MultiByteToWideChar(CP_UTF8, 0, detail.c_str(), -1,
+                        wide_detail.data(), required);
+                }
+                SetEngineError(task.shared_memory,
+                    wide_detail.empty()
+                        ? L"The clip and its audio manifest could not be finalized."
+                        : wide_detail.c_str());
+            }
+            return false;
+        }
+
         const auto result = transactional_save::Run(
             task.output_path,
             [this, &task](const std::filesystem::path& temporary_path,
@@ -1208,13 +1300,15 @@ namespace fthr {
         // negative PTS and the MP4 edit list hides them without re-encoding.
         // ------------------------------------------------------------------
 
-        // Declare write_audio early - used in Step D (alignment) and Step 2b (stream).
+        // Legacy raw PCM remains only for the non-production compatibility path.
+        // The normal AUDIT-050 contract carries one Default Mix plus actual
+        // source tracks in their own persistent AAC packet snapshots.
         const bool write_legacy_audio = task.has_audio
             && task.audio_snapshot.valid
             && !task.audio_snapshot.samples.empty();
-        const bool write_packet_audio = task.has_encoded_audio
-            && task.encoded_audio_snapshot.valid();
-        const bool write_audio = write_legacy_audio || write_packet_audio;
+        const bool has_contract_audio_tracks = !task.encoded_audio_tracks.empty();
+        const bool write_packet_audio = has_contract_audio_tracks
+            || (task.has_encoded_audio && task.encoded_audio_snapshot.valid());
 
         const int64_t pts_offset = snap.presentation_start_pts;
 
@@ -1452,115 +1546,158 @@ namespace fthr {
         // collect the resulting AAC packets, then set codecpar->extradata
         // from the encoder's ASC before calling avformat_write_header().
         // ------------------------------------------------------------------
-        AVStream* audio_stream = nullptr;
-        std::vector<std::vector<uint8_t>> aac_packets;
-        std::vector<int64_t>              aac_pts_list;
-        std::vector<int64_t>              aac_duration_list;
-        std::vector<uint8_t>              audio_extradata;
-        uint32_t                          audio_sample_rate = 0;
-        uint32_t                          audio_channels = 0;
+        struct MuxAudioTrack {
+            AudioSourceMetadata metadata;
+            AVStream* stream = nullptr;
+            std::vector<std::vector<uint8_t>> packets;
+            std::vector<int64_t> packet_pts;
+            std::vector<int64_t> packet_durations;
+            std::vector<uint8_t> extradata;
+            uint32_t sample_rate = 0;
+            uint32_t channels = 0;
+            int64_t output_pts_offset = 0;
+            bool is_default_mix = false;
+        };
+        std::vector<MuxAudioTrack> mux_audio_tracks;
 
-        if (write_packet_audio) {
-            const auto& encoded = task.encoded_audio_snapshot;
-            audio_sample_rate = encoded.format.sample_rate;
-            audio_channels = encoded.format.channels;
-            audio_extradata = encoded.codec_extradata;
-            for (const auto& packet : encoded.packets) {
+        const auto append_persistent_track = [&](const EncodedAudioTrack& contract,
+                                                  bool is_default_mix) {
+            MuxAudioTrack output;
+            output.metadata = contract.source;
+            output.sample_rate = contract.snapshot.format.sample_rate;
+            output.channels = contract.snapshot.format.channels;
+            output.extradata = contract.snapshot.codec_extradata;
+            output.output_pts_offset = -contract.presentation_start_pts_samples;
+            output.is_default_mix = is_default_mix;
+            for (const auto& packet : contract.snapshot.packets) {
                 if (packet.data.empty() || packet.duration_samples <= 0) continue;
-                aac_packets.push_back(packet.data);
-                aac_pts_list.push_back(packet.pts_samples);
-                aac_duration_list.push_back(packet.duration_samples);
+                output.packets.push_back(packet.data);
+                output.packet_pts.push_back(packet.pts_samples);
+                output.packet_durations.push_back(packet.duration_samples);
             }
-            audio_output_pts_offset = -task.audio_presentation_start_pts_samples;
+            if (!output.packets.empty()) mux_audio_tracks.push_back(std::move(output));
+        };
+
+        if (has_contract_audio_tracks) {
+            if (task.encoded_audio_tracks.size() > kMaxRetainedAudioSources) {
+                SetEngineError(task.shared_memory,
+                    L"The clip contains more audio tracks than the supported alpha limit.");
+                avformat_free_context(fmt_ctx);
+                return false;
+            }
+            for (size_t index = 0; index < task.encoded_audio_tracks.size(); ++index) {
+                const auto& contract = task.encoded_audio_tracks[index];
+                if (!contract.valid()) {
+                    SetEngineError(task.shared_memory,
+                        L"An audio track no longer matches this capture generation.");
+                    avformat_free_context(fmt_ctx);
+                    return false;
+                }
+                const bool is_default_mix = index == 0;
+                if (is_default_mix
+                        && (contract.source.identity.type != AudioSourceType::System
+                            || contract.source.identity.persistent_identity != "default-mix"
+                            || contract.source.identity.display_name != "Default Mix")) {
+                    SetEngineError(task.shared_memory,
+                        L"The Default Mix track is missing from the audio capture contract.");
+                    avformat_free_context(fmt_ctx);
+                    return false;
+                }
+                append_persistent_track(contract, is_default_mix);
+            }
+            if (mux_audio_tracks.empty()) {
+                SetEngineError(task.shared_memory,
+                    L"No valid AAC packets were available for the captured audio tracks.");
+                avformat_free_context(fmt_ctx);
+                return false;
+            }
             std::cout << "[MuxEncodedClip] Using persistent AAC replay: "
-                << aac_packets.size() << " packets" << std::endl;
+                << mux_audio_tracks.size() << " track(s)" << std::endl;
+        }
+        else if (write_packet_audio) {
+            // Compatibility for a queued task created before the structured
+            // contract was introduced. New saves always use the branch above.
+            EncodedAudioTrack legacy;
+            legacy.snapshot = task.encoded_audio_snapshot;
+            legacy.presentation_start_pts_samples = task.audio_presentation_start_pts_samples;
+            legacy.source.identity.id = legacy.snapshot.source_id;
+            legacy.source.identity.type = AudioSourceType::System;
+            legacy.source.identity.persistent_identity = "default-mix";
+            legacy.source.identity.display_name = "Default Mix";
+            legacy.source.identity.icon_reference = "system-audio";
+            legacy.source.format = legacy.snapshot.format;
+            legacy.source.state.admitted = true;
+            legacy.source.state.first_active_100ns = 0;
+            legacy.source.state.last_active_100ns = 0;
+            append_persistent_track(legacy, true);
         }
         else if (write_legacy_audio) {
+            MuxAudioTrack output;
             const uint32_t sr = task.audio_snapshot.sample_rate;
             const uint32_t ch = task.audio_snapshot.channels;
-            audio_sample_rate = sr;
-            audio_channels = ch;
-
-            // Encode the aligned PCM window to AAC
+            output.sample_rate = sr;
+            output.channels = ch;
+            output.is_default_mix = true;
             AudioEncoder aac_enc;
             bool enc_ok = aac_enc.Initialize(
                 sr, ch, task.audio_bitrate_kbps,
                 [&](const uint8_t* data, uint32_t size, int64_t pts) {
-                    aac_packets.push_back(std::vector<uint8_t>(data, data + size));
-                    aac_pts_list.push_back(pts);
-                    aac_duration_list.push_back(1024);
+                    output.packets.push_back(std::vector<uint8_t>(data, data + size));
+                    output.packet_pts.push_back(pts);
+                    output.packet_durations.push_back(1024);
                 });
-
             if (enc_ok) {
-                // Feed the aligned PCM window sample-by-sample in one call.
-                // audio_aligned_start_sample is the frame index in the snapshot.
-                const int64_t start_frame = audio_aligned_start_sample;
                 const int64_t total_frames = static_cast<int64_t>(
                     task.audio_snapshot.samples.size()) / static_cast<int64_t>(ch);
-                const int64_t frames_to_encode = total_frames - start_frame;
-
+                const int64_t frames_to_encode = total_frames - audio_aligned_start_sample;
                 if (frames_to_encode > 0) {
-                    const float* pcm_start =
-                        task.audio_snapshot.samples.data()
-                        + static_cast<size_t>(start_frame) * ch;
-                    const uint32_t num_samples =
-                        static_cast<uint32_t>(frames_to_encode) * ch;
-                    aac_enc.EncodeSamples(pcm_start, num_samples);
+                    const float* pcm_start = task.audio_snapshot.samples.data()
+                        + static_cast<size_t>(audio_aligned_start_sample) * ch;
+                    aac_enc.EncodeSamples(pcm_start,
+                        static_cast<uint32_t>(frames_to_encode) * ch);
                 }
                 aac_enc.Finalize();
-
-                std::cout << "[MuxEncodedClip] AAC encoded on SaveClipThread: "
-                    << aac_packets.size() << " packets from "
-                    << frames_to_encode << " PCM frames" << std::endl;
+                output.extradata = aac_enc.GetExtradata();
+                output.output_pts_offset = audio_output_pts_offset;
+                if (!output.packets.empty()) mux_audio_tracks.push_back(std::move(output));
             }
-            else {
-                std::cerr << "[MuxEncodedClip] AudioEncoder init failed - "
-                    << "writing video-only" << std::endl;
-            }
-            audio_extradata = aac_enc.GetExtradata();
         }
 
-        if (!aac_packets.empty()) {
-            audio_stream = avformat_new_stream(fmt_ctx, nullptr);
-            if (!audio_stream) {
-                std::cerr << "[MuxEncodedClip] avformat_new_stream (audio) failed"
-                    << std::endl;
-                aac_packets.clear();
-                aac_pts_list.clear();
-                aac_duration_list.clear();
+        for (auto& audio : mux_audio_tracks) {
+            audio.stream = avformat_new_stream(fmt_ctx, nullptr);
+            if (!audio.stream) {
+                SetEngineError(task.shared_memory,
+                    L"Could not create the clip audio stream.");
+                avformat_free_context(fmt_ctx);
+                return false;
             }
-            else {
-                audio_stream->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
-                audio_stream->codecpar->codec_id = AV_CODEC_ID_AAC;
-                audio_stream->codecpar->sample_rate = static_cast<int>(audio_sample_rate);
-                audio_stream->codecpar->ch_layout.nb_channels = static_cast<int>(audio_channels);
-                audio_stream->codecpar->ch_layout.order = AV_CHANNEL_ORDER_UNSPEC;
-                audio_stream->codecpar->frame_size = 1024;
-                audio_stream->codecpar->format = AV_SAMPLE_FMT_FLTP;
-                audio_stream->time_base = AVRational{ 1, static_cast<int>(audio_sample_rate) };
-                audio_stream->disposition |= AV_DISPOSITION_DEFAULT;
-                av_dict_set(&audio_stream->metadata, "handler_name", "Default Mix", 0);
-                av_dict_set(&audio_stream->metadata, "title", "Default Mix", 0);
-
-                if (!audio_extradata.empty()) {
-                    audio_stream->codecpar->extradata = static_cast<uint8_t*>(
-                        av_malloc(audio_extradata.size() + AV_INPUT_BUFFER_PADDING_SIZE));
-                    if (!audio_stream->codecpar->extradata) {
-                        std::cerr << "[MuxEncodedClip] audio extradata allocation failed"
-                            << std::endl;
-                        aac_packets.clear();
-                        aac_pts_list.clear();
-                        aac_duration_list.clear();
-                        audio_stream = nullptr;
-                    } else {
-                        memcpy(audio_stream->codecpar->extradata,
-                            audio_extradata.data(), audio_extradata.size());
-                        memset(audio_stream->codecpar->extradata + audio_extradata.size(),
-                            0, AV_INPUT_BUFFER_PADDING_SIZE);
-                        audio_stream->codecpar->extradata_size =
-                            static_cast<int>(audio_extradata.size());
-                    }
+            audio.stream->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+            audio.stream->codecpar->codec_id = AV_CODEC_ID_AAC;
+            audio.stream->codecpar->sample_rate = static_cast<int>(audio.sample_rate);
+            audio.stream->codecpar->ch_layout.nb_channels = static_cast<int>(audio.channels);
+            audio.stream->codecpar->ch_layout.order = AV_CHANNEL_ORDER_UNSPEC;
+            audio.stream->codecpar->frame_size = 1024;
+            audio.stream->codecpar->format = AV_SAMPLE_FMT_FLTP;
+            audio.stream->time_base = AVRational{1, static_cast<int>(audio.sample_rate)};
+            if (audio.is_default_mix) audio.stream->disposition |= AV_DISPOSITION_DEFAULT;
+            const std::string name = audio.is_default_mix
+                ? "Default Mix" : audio.metadata.identity.display_name;
+            av_dict_set(&audio.stream->metadata, "handler_name", name.c_str(), 0);
+            av_dict_set(&audio.stream->metadata, "title", name.c_str(), 0);
+            if (!audio.extradata.empty()) {
+                audio.stream->codecpar->extradata = static_cast<uint8_t*>(
+                    av_malloc(audio.extradata.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+                if (!audio.stream->codecpar->extradata) {
+                    SetEngineError(task.shared_memory,
+                        L"Could not allocate clip audio stream metadata.");
+                    avformat_free_context(fmt_ctx);
+                    return false;
                 }
+                memcpy(audio.stream->codecpar->extradata,
+                    audio.extradata.data(), audio.extradata.size());
+                memset(audio.stream->codecpar->extradata + audio.extradata.size(),
+                    0, AV_INPUT_BUFFER_PADDING_SIZE);
+                audio.stream->codecpar->extradata_size = static_cast<int>(audio.extradata.size());
             }
         }
 
@@ -1624,7 +1761,8 @@ namespace fthr {
             << (static_cast<double>(task.duration_seconds) * video_fps)
             << std::endl;
         std::cout << "Audio stream              : "
-            << (audio_stream ? "YES" : "NO") << std::endl;
+            << (mux_audio_tracks.empty() ? "NO" : "YES")
+            << " (" << mux_audio_tracks.size() << " track(s))" << std::endl;
 
         // Compute average PTS delta to verify actual capture rate.
         {
@@ -1756,30 +1894,30 @@ namespace fthr {
             return fail_media_write(L"writing video data to", -1);
 
         // ------------------------------------------------------------------
-        // Step 4b: Write pre-encoded AAC packets
-        //
-        // aac_packets were encoded in Step 2b from the aligned PCM window.
-        // PTS starts at 0 in AudioEncoder. Add the wall-clock overlap offset
-        // when audio began after the requested video presentation boundary.
-        // audio_stream->time_base = {1, sample_rate} so no rescaling needed.
-        // Reuses the same AVPacket struct as the video loop above.
+        // Step 4b: Write each pre-encoded AAC source track. Every source uses
+        // its own sample-rate timebase and preserves its AAC packet duration;
+        // there is no cross-source downmix or re-encode in the save path.
         // ------------------------------------------------------------------
         int audio_packet_count = 0;
 
-        if (audio_stream && !aac_packets.empty()) {
-            for (size_t i = 0; i < aac_packets.size(); i++) {
-                const auto& pkt_data = aac_packets[i];
-                if (pkt_data.empty()) continue;
+        for (const auto& audio : mux_audio_tracks) {
+            if (!audio.stream || audio.packets.empty()) continue;
+            int track_packet_count = 0;
+            int64_t total_track_samples = 0;
+            for (size_t i = 0; i < audio.packets.size(); i++) {
+                const auto& pkt_data = audio.packets[i];
+                if (pkt_data.empty() || i >= audio.packet_pts.size()
+                        || i >= audio.packet_durations.size()) continue;
 
                 ret = av_new_packet(av_pkt, static_cast<int>(pkt_data.size()));
                 if (ret < 0)
                     return fail_media_write(L"allocating an audio packet for", ret);
 
                 memcpy(av_pkt->data, pkt_data.data(), pkt_data.size());
-                av_pkt->pts = aac_pts_list[i] + audio_output_pts_offset;
-                av_pkt->dts = aac_pts_list[i] + audio_output_pts_offset;
-                av_pkt->duration = aac_duration_list[i];
-                av_pkt->stream_index = audio_stream->index;
+                av_pkt->pts = audio.packet_pts[i] + audio.output_pts_offset;
+                av_pkt->dts = audio.packet_pts[i] + audio.output_pts_offset;
+                av_pkt->duration = audio.packet_durations[i];
+                av_pkt->stream_index = audio.stream->index;
                 av_pkt->flags = 0;
 
                 ret = av_interleaved_write_frame(fmt_ctx, av_pkt);
@@ -1787,14 +1925,16 @@ namespace fthr {
                 if (ret < 0)
                     return fail_media_write(L"writing audio data to", ret);
                 audio_packet_count++;
+                track_packet_count++;
+                total_track_samples += audio.packet_durations[i];
             }
 
-            const double audio_written_s =
-                std::accumulate(aac_duration_list.begin(), aac_duration_list.end(), 0.0)
-                / audio_sample_rate;
-            std::cout << "[MuxEncodedClip] Audio packets written: "
-                << audio_packet_count
-                << " (" << audio_written_s << "s)" << std::endl;
+            const double audio_written_s = audio.sample_rate > 0
+                ? static_cast<double>(total_track_samples) / audio.sample_rate : 0.0;
+            std::cout << "[MuxEncodedClip] Audio track '"
+                << (audio.is_default_mix ? "Default Mix" : audio.metadata.identity.display_name)
+                << "': " << track_packet_count << " packets ("
+                << audio_written_s << "s)" << std::endl;
         }
 
         av_packet_free(&av_pkt);

@@ -3,6 +3,7 @@ import os, sys, threading, subprocess
 from core.ffmpeg_tools import (
     get_ffmpeg_exe, software_video_args, FFmpegUnavailable)
 from core.library_ownership import MediaOwnership, classify_media_path
+from core.audio_manifest import verified_audio_tracks_for_export
 from core.transactional_output import (
     commit_staged_output,
     create_staged_output_path,
@@ -1251,8 +1252,8 @@ class ShareWindow(QDialog):
 
 class VolumePopup(QDialog):
     """
-    Floating master-volume popup. Semantic per-source labels stay hidden
-    until a future container contract can prove what each stream represents.
+    Floating volume popup. Per-source labels are shown only when a verified
+    clip-side manifest proves their stream identity.
     """
 
     master_changed = Signal(int)            # 0–100
@@ -1262,7 +1263,7 @@ class VolumePopup(QDialog):
 
     def __init__(self, master_vol: int,
                  source_volumes: dict | None = None,
-                 multitrack_available: bool = False,
+                 source_tracks: tuple[tuple[str, str], ...] = (),
                  parent=None):
         super().__init__(parent,
                          Qt.WindowType.FramelessWindowHint |
@@ -1271,7 +1272,7 @@ class VolumePopup(QDialog):
             'QDialog { background-color: #0a0a0a; border: 1px solid #ffffff; }')
         self._sliders:  dict[str, QSlider] = {}
         self._values:   dict[str, QLabel]  = {}
-        self._multitrack = multitrack_available
+        self._source_tracks = tuple(source_tracks)
         self._build_ui(master_vol, source_volumes or {})
         self.setFixedSize(self.sizeHint())
 
@@ -1286,7 +1287,8 @@ class VolumePopup(QDialog):
             'font-family: "Segoe UI"; letter-spacing: 2px; background: transparent;')
         root.addWidget(title)
 
-        for key, label in self._SOURCES:
+        sources = self._SOURCES + list(self._source_tracks)
+        for key, label in sources:
             row = QHBoxLayout()
             row.setSpacing(10)
 
@@ -1304,22 +1306,8 @@ class VolumePopup(QDialog):
                 slider.setValue(master_vol)
             else:
                 slider.setValue(int(source_volumes.get(key, 100)))
-                # The slider is interactive whether or not multi-track
-                # audio is present. It always persists and is always
-                # passed to ffmpeg at export. When the source clip is
-                # single-track, ffmpeg simply applies one volume filter
-                # to the only audio stream — still useful for muting or
-                # boosting the entire mix per-source-style.
-                if not self._multitrack:
-                    slider.setToolTip(
-                        f'{label.title()}: setting saved with the clip. '
-                        'Will apply per-track once multi-track capture is '
-                        'available; currently affects the export mix as a whole.'
-                    )
-                else:
-                    slider.setToolTip(
-                        f'{label.title()} track gain — applied at export.'
-                    )
+                slider.setToolTip(
+                    f'{label.title()} track gain — applied only to this clip export.')
             slider.valueChanged.connect(
                 lambda v, k=key, lab=label: self._on_changed(k, v, lab))
             self._sliders[key] = slider
@@ -1337,7 +1325,9 @@ class VolumePopup(QDialog):
 
             root.addLayout(row)
 
-        note_text = 'Per-track controls unavailable without verified track metadata'
+        note_text = ('Verified clip tracks — export mix only; live preview uses Default Mix'
+                     if self._source_tracks else
+                     'No verified per-track metadata for this clip')
         note = QLabel(note_text)
         note.setStyleSheet(
             'color: #666666; font-size: 8px; font-style: italic; '
@@ -1397,6 +1387,12 @@ class ClipViewer(QDialog):
         self._thumb_pixmap = thumb_pixmap
         self._thumb_overlay: QLabel | None = None
         self._thumb_fade_anim: QPropertyAnimation | None = None
+        # A sidecar is authoritative only when it binds the current MP4 hash.
+        # Imported/legacy clips intentionally remain Master-only; a container
+        # stream count is not enough to invent source semantics.
+        self._audio_tracks: tuple[tuple[str, int], ...] = ()
+        self._audio_track_labels: tuple[tuple[str, str], ...] = ()
+        self._load_manifest_audio_tracks()
 
         self.setWindowTitle(f'FTHR — {Path(clip_path).name}')
         self.setWindowFlags(
@@ -1652,10 +1648,7 @@ class ClipViewer(QDialog):
         else:
             self._master_volume = 80
         self._source_volumes: dict[str, int] = {}
-        self._audio_tracks: tuple[tuple[str, int], ...] = ()
-        # Stream count alone cannot prove semantic identities. Keep the alpha
-        # editor master-only until the future track contract carries metadata.
-        self._multitrack_audio = False
+        self._multitrack_audio = len(self._audio_tracks) > 1
         self.vol_btn = QPushButton(f'VOL  {self._master_volume}%  ▾')
         self.vol_btn.setObjectName('volBtn')
         self.vol_btn.setFixedHeight(28)
@@ -2261,7 +2254,7 @@ class ClipViewer(QDialog):
         popup = VolumePopup(
             master_vol=self._master_volume,
             source_volumes=self._source_volumes,
-            multitrack_available=self._multitrack_audio,
+            source_tracks=self._audio_track_labels if self._multitrack_audio else (),
             parent=self,
         )
         popup.master_changed.connect(self._on_master_volume_changed)
@@ -2279,9 +2272,15 @@ class ClipViewer(QDialog):
 
     def _on_source_volume_changed(self, key: str, value: int):
         self._source_volumes[key] = value
-        if self.sm:
-            self.sm.set('source_volumes', dict(self._source_volumes))
-            self.sm.save_settings()
+
+    def _load_manifest_audio_tracks(self):
+        """Load only a hash-bound audio manifest into export-track controls."""
+        tracks = verified_audio_tracks_for_export(self.clip_path)
+        self._audio_tracks = tuple(
+            (source_uuid, audio_index)
+            for source_uuid, audio_index, _ in tracks)
+        self._audio_track_labels = tuple(
+            (source_uuid, display_name) for source_uuid, _, display_name in tracks)
 
     # Signal carries the result of background multi-track detection back to
     # the UI thread (Qt widget mutation must always happen on the UI thread).
@@ -2328,7 +2327,9 @@ class ClipViewer(QDialog):
         threading.Thread(target=_worker, daemon=True).start()
 
     def _on_multitrack_result(self, is_multitrack: bool):
-        self._multitrack_audio = is_multitrack
+        # A raw FFmpeg stream count has no source semantics. This legacy probe
+        # must never turn on per-track controls without a verified sidecar.
+        self._multitrack_audio = bool(is_multitrack and len(self._audio_tracks) > 1)
         # The volume popup is the only widget whose appearance depends on this
         # flag. If it's already open when detection finishes, refresh it so
         # the per-source sliders enable/disable correctly without a reopen.

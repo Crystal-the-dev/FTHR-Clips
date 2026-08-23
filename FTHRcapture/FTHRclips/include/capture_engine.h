@@ -349,6 +349,7 @@ namespace fthr {
         AudioCapture                     audio_capture_;
         AudioEncoder                      default_mix_audio_encoder_;
         std::unique_ptr<EncodedAudioPacketRing> default_mix_audio_ring_;
+        AudioSourceMetadata               default_mix_audio_source_;
 
         // -----------------------------------------------------------------------
         // Continuous recording state

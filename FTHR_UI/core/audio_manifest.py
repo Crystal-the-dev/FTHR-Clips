@@ -140,6 +140,27 @@ def read_manifest_for_media(media_path: str | Path) -> dict[str, Any] | None:
         return None
 
 
+def verified_audio_tracks_for_export(
+    media_path: str | Path,
+) -> tuple[tuple[str, int, str], ...]:
+    """Return clip-local export tracks only from a hash-bound manifest.
+
+    ``stream_index`` in the manifest is an absolute MP4 index. FFmpeg's
+    ``0:a:N`` selector is audio-relative, so callers receive the semantic
+    ordering paired with a deterministic ``N``. An absent or stale sidecar
+    yields no tracks rather than inferred labels.
+    """
+
+    manifest = read_manifest_for_media(media_path)
+    if not manifest:
+        return ()
+    sources = sorted(manifest['sources'], key=lambda source: source['stream_index'])
+    return tuple(
+        (source['source_uuid'], audio_index, source['display_name'])
+        for audio_index, source in enumerate(sources)
+    )
+
+
 def _validate_source(source: Any, seen_uuid: set[str], seen_stream: set[int]) -> None:
     if not isinstance(source, dict):
         raise AudioManifestError('source must be an object')

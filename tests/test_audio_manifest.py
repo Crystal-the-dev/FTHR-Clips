@@ -14,6 +14,7 @@ from core.audio_manifest import (
     manifest_path_for,
     read_manifest_for_media,
     validate_manifest,
+    verified_audio_tracks_for_export,
     write_manifest_atomic,
 )
 
@@ -77,3 +78,19 @@ def test_manifest_rejects_duplicate_streams_and_more_than_eight_sources(tmp_path
                            .__dict__ for index in range(9)]
     with pytest.raises(AudioManifestError, match='between one and eight'):
         validate_manifest(manifest, media_path=media)
+
+
+def test_verified_export_tracks_use_manifest_order_not_raw_stream_labels(tmp_path):
+    media = tmp_path / 'clip.mp4'
+    media.write_bytes(b'finished clip bytes')
+    manifest = build_manifest(
+        media_path=media, transaction_id=str(uuid4()),
+        sources=[_entry(stream_index=3, name='Discord'), _entry(stream_index=1, name='VALORANT')])
+    write_manifest_atomic(manifest, media)
+
+    tracks = verified_audio_tracks_for_export(media)
+
+    assert tracks[0][1:] == (0, 'VALORANT')
+    assert tracks[1][1:] == (1, 'Discord')
+    media.write_bytes(b'replaced')
+    assert verified_audio_tracks_for_export(media) == ()

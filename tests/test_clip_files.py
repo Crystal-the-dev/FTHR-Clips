@@ -10,6 +10,7 @@ import pytest
 from core.clip_files import (
     cleanup_stale_partial_clips,
     is_completed_video_path,
+    is_fthr_owned_orphan_audio_manifest_path,
     is_fthr_owned_partial_path,
     is_library_media_path,
     is_partial_clip_path,
@@ -86,6 +87,32 @@ def test_cleanup_failure_is_secondary_and_reported(
     assert result.failures[0][0] == partial
     assert 'still locked' in result.failures[0][1]
     assert partial.exists()
+
+
+def test_startup_cleanup_removes_only_old_orphaned_fthr_audio_manifests(tmp_path: Path) -> None:
+    old_orphan = (
+        tmp_path / 'Desktop' / 'desktop_clip_from_11Aug2026_12-00-00.mp4.fthr-audio.json'
+    )
+    paired_manifest = (
+        tmp_path / 'Desktop' / 'desktop_clip_from_11Aug2026_12-01-00.mp4.fthr-audio.json'
+    )
+    paired_media = tmp_path / 'Desktop' / 'desktop_clip_from_11Aug2026_12-01-00.mp4'
+    unrelated = tmp_path / 'Desktop' / 'manual-recording.mp4.fthr-audio.json'
+    old_orphan.parent.mkdir()
+    for path in (old_orphan, paired_manifest, paired_media, unrelated):
+        path.write_bytes(b'fixture')
+    now = 2_000_000.0
+    for path in (old_orphan, paired_manifest, paired_media, unrelated):
+        os.utime(path, (now - 90_000, now - 90_000))
+
+    assert is_fthr_owned_orphan_audio_manifest_path(old_orphan)
+    assert not is_fthr_owned_orphan_audio_manifest_path(unrelated)
+    result = cleanup_stale_partial_clips(tmp_path, now=now)
+
+    assert result.removed == (old_orphan,)
+    assert not old_orphan.exists()
+    assert paired_manifest.exists()
+    assert unrelated.exists()
 
 
 def test_negative_cleanup_age_is_rejected(tmp_path: Path) -> None:

@@ -215,8 +215,10 @@ void NativeManifestBindsTheTemporaryMediaWithoutPrivatePaths() {
         "native manifest uses a fresh valid transaction UUID");
     CheckAudio(content.find("desktop_clip_from_20260823_02-45-00.mp4") != std::string::npos
                    && content.find("Default Mix") != std::string::npos
+                   && content.find("0f63f6d6210c6220135cdf185527ccc70a3cd26eca1a8b8b68e8ca8c4ba11aa9")
+                       != std::string::npos
                    && content.find("C:\\\\") == std::string::npos,
-        "native manifest binds a basename and only portable source semantics");
+        "native manifest binds the exact media bytes and portable source semantics");
     std::filesystem::remove(media_partial, filesystem_error);
     std::filesystem::remove(manifest_partial, filesystem_error);
     std::filesystem::remove(directory, filesystem_error);
