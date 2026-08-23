@@ -114,6 +114,8 @@ def write_manifest_atomic(manifest: dict[str, Any], media_path: str | Path) -> P
         try:
             temporary.unlink(missing_ok=True)
         except OSError:
+            # A failed secondary cleanup cannot make a manifest appear valid;
+            # keep the original publication error as the actionable failure.
             pass
         raise AudioManifestError(f'could not publish manifest: {error}') from error
     return destination
@@ -133,6 +135,8 @@ def read_manifest_for_media(media_path: str | Path) -> dict[str, Any] | None:
         validate_manifest(manifest, media_path=media_path)
         return manifest
     except (OSError, json.JSONDecodeError, AudioManifestError):
+        # Sidecars are optional for legacy/imported clips. A stale/corrupt
+        # sidecar must cleanly fall back to MP4 metadata, never invent tracks.
         return None
 
 
