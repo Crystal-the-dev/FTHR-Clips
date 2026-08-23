@@ -63,13 +63,21 @@ class SingleInstance:
     It never raises: if the platform primitive is unavailable for any
     reason we fail *open* (return True) rather than refusing to start the
     app — a broken guard must not be the thing that keeps a user from
-    recording.
+    recording. The optional primitive names let tests coexist with an
+    installed, running FTHR instance; production callers use the defaults.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        win_mutex_name: str = _WIN_MUTEX_NAME,
+        lock_file: Path = _LOCK_FILE,
+    ) -> None:
         self._acquired = False
         self._handle: Optional[int] = None      # Windows mutex HANDLE
         self._fd: Optional[int] = None          # Linux lock-file fd
+        self._win_mutex_name = win_mutex_name
+        self._lock_file = Path(lock_file)
 
     # ── public API ────────────────────────────────────────────────────────
 
@@ -155,7 +163,7 @@ class SingleInstance:
 
             # CreateMutexW returns a valid handle even when the mutex already
             # exists, so the only signal is the last error.
-            handle = kernel32.CreateMutexW(None, False, _WIN_MUTEX_NAME)
+            handle = kernel32.CreateMutexW(None, False, self._win_mutex_name)
             last_error = ctypes.get_last_error()
             if not handle:
                 return True   # fail open: cannot create the primitive at all
@@ -173,10 +181,10 @@ class SingleInstance:
         except ImportError:
             return True   # fail open (no flock on this platform)
         try:
-            _LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self._lock_file.parent.mkdir(parents=True, exist_ok=True)
             # 0o600: the lock lives in the user's own state dir; no reason for
             # any other account to read or write it.
-            fd = os.open(str(_LOCK_FILE), os.O_RDWR | os.O_CREAT, 0o600)
+            fd = os.open(str(self._lock_file), os.O_RDWR | os.O_CREAT, 0o600)
         except OSError:
             return True   # fail open: read-only home shouldn't block startup
         try:

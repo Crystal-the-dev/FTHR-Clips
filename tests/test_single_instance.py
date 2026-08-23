@@ -5,9 +5,11 @@ engine and — on Linux — the second one unlinking and rebinding the first one
 hotkey socket.
 """
 import os
+from pathlib import Path
 import signal
 import sys
 import subprocess
+import tempfile
 import textwrap
 import time
 
@@ -16,8 +18,19 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'FTHR_UI'))
 from core.single_instance import SingleInstance  # noqa: E402
 
 
+_TEST_WIN_MUTEX = f'Local\\FTHR_Clips_Test_{os.getpid()}'
+_TEST_LOCK_FILE = Path(tempfile.gettempdir()) / f'fthr-instance-test-{os.getpid()}.lock'
+
+
+def _guard() -> SingleInstance:
+    return SingleInstance(
+        win_mutex_name=_TEST_WIN_MUTEX,
+        lock_file=_TEST_LOCK_FILE,
+    )
+
+
 def test_first_acquire_succeeds():
-    guard = SingleInstance()
+    guard = _guard()
     try:
         assert guard.acquire() is True
     finally:
@@ -27,7 +40,7 @@ def test_first_acquire_succeeds():
 def test_acquire_is_idempotent_for_the_same_owner():
     """Re-acquiring from the instance that already holds the lock must not
     report a conflict with itself."""
-    guard = SingleInstance()
+    guard = _guard()
     try:
         assert guard.acquire() is True
         assert guard.acquire() is True
@@ -37,18 +50,18 @@ def test_acquire_is_idempotent_for_the_same_owner():
 
 def test_release_is_safe_without_acquire():
     # Exit paths call release() unconditionally; it must never raise.
-    SingleInstance().release()
+    _guard().release()
 
 
 def test_double_release_is_safe():
-    guard = SingleInstance()
+    guard = _guard()
     guard.acquire()
     guard.release()
     guard.release()
 
 
 def test_context_manager_releases():
-    with SingleInstance() as guard:
+    with _guard() as guard:
         assert guard._acquired is True
     assert guard._acquired is False
 
@@ -66,8 +79,12 @@ def test_second_process_is_refused_while_first_holds_lock():
     child_code = textwrap.dedent(f'''
         import sys
         sys.path.insert(0, {ui_dir!r})
+        from pathlib import Path
         from core.single_instance import SingleInstance
-        g = SingleInstance()
+        g = SingleInstance(
+            win_mutex_name={_TEST_WIN_MUTEX!r},
+            lock_file=Path({str(_TEST_LOCK_FILE)!r}),
+        )
         print('ACQUIRED' if g.acquire() else 'REFUSED', flush=True)
         sys.stdin.readline()
         g.release()
@@ -82,7 +99,7 @@ def test_second_process_is_refused_while_first_holds_lock():
         assert first == 'ACQUIRED', f'child failed to take the lock: {first!r}'
 
         # While the child holds it, this process must be refused.
-        guard = SingleInstance()
+        guard = _guard()
         try:
             assert guard.acquire() is False, \
                 'second instance was allowed to start while the first was running'
@@ -112,8 +129,12 @@ def test_lock_is_released_when_holder_dies():
     child_code = textwrap.dedent(f'''
         import os, sys
         sys.path.insert(0, {ui_dir!r})
+        from pathlib import Path
         from core.single_instance import SingleInstance
-        g = SingleInstance()
+        g = SingleInstance(
+            win_mutex_name={_TEST_WIN_MUTEX!r},
+            lock_file=Path({str(_TEST_LOCK_FILE)!r}),
+        )
         print('ACQUIRED' if g.acquire() else 'REFUSED', os.getpid(), flush=True)
         sys.stdin.readline()
     ''')
@@ -143,7 +164,7 @@ def test_lock_is_released_when_holder_dies():
         pass
     _wait_for_pid_gone(holder_pid, timeout=10)
 
-    guard = SingleInstance()
+    guard = _guard()
     try:
         assert guard.acquire() is True, \
             'lock survived the death of its holder — users would be locked out after a crash'

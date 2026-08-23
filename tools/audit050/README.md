@@ -1,7 +1,8 @@
 # AUDIT-050 spike harnesses
 
-These harnesses are isolated evidence tools. They are not imported by the
-production engine, viewer, packager, or Shared Memory contract.
+These retained qualification harnesses are isolated evidence tools. They are
+not imported by the production engine, viewer, packager, or Shared Memory
+contract.
 
 From the repository root:
 
@@ -25,5 +26,5 @@ matrix takes about two minutes on the qualification host:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\audit050\run_windows_spikes.ps1 -RunAacBenchmark
 ```
 
-All output media, CSV files, executables, and temporary publication cases are
-created below the user TEMP directory.
+All compiler intermediates, output media, CSV files, executables, and temporary
+publication cases are created below the user TEMP directory.

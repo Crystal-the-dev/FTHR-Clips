@@ -138,14 +138,19 @@ Visual Studio 2022 + Python 3.14. See [`BUILDING.md`](BUILDING.md) for the full 
 
 ```
 ┌─────────────────────┐     Shared Memory (v4)     ┌────────────────────────┐
-│   FTHR_UI (Python)  │ ◄─────────────────────────► │  FTHRcapture (C++)     │
-│   PySide6 frontend  │                              │  wlr-screencopy engine │
-│   Settings / Upload │     Unix Socket (hotkeys)    │  FFmpeg encoder        │
-│   Clip browser      │ ◄────────────────────────    │  Output-monitor audio  │
+│   FTHR_UI (Python)  │ ◄─────────────────────────► │  Native capture engine │
+│   PySide6 frontend  │                              │  Windows: WGC + GPU    │
+│   Settings / Upload │                              │  Linux: Wayland/X11    │
+│   Clip browser      │                              │  Platform audio input  │
 └─────────────────────┘                              └────────────────────────┘
 ```
 
-The C++ capture engine runs as a separate process and communicates with the Python UI via shared memory. Hotkeys are received by the UI via a Unix socket and forwarded as commands through shared memory.
+The native capture engine runs as a separate process and communicates with the
+Python UI via shared memory. Windows uses WGC/DXGI capture with the selected
+NVENC, AMF, or QSV encoder and WASAPI audio. Linux uses its Wayland or X11
+capture path with FFmpeg and PulseAudio/PipeWire. Platform hotkey activation is
+forwarded by the UI through the same shared-memory command contract; Linux also
+uses an owner-only Unix socket for compositor key bindings.
 
 ---
 

@@ -13,7 +13,8 @@ $devcmd = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio' -Recurse `
 if (-not $devcmd) { throw 'Visual Studio VsDevCmd.bat was not found.' }
 
 function Invoke-Cl([string]$commandBody) {
-    $command = 'call "{0}" -arch=x64 -host_arch=x64 && {1}' -f $devcmd, $commandBody
+    $command = 'call "{0}" -arch=x64 -host_arch=x64 && cd /d "{1}" && {2}' -f `
+        $devcmd, $buildRoot, $commandBody
     & cmd.exe /d /s /c $command
     if ($LASTEXITCODE -ne 0) { throw "Native spike compilation failed ($LASTEXITCODE)." }
 }

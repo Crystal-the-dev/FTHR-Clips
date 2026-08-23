@@ -16,7 +16,7 @@ New-Item -ItemType Directory -Path $buildRoot | Out-Null
 $src = (Resolve-Path (Join-Path $PSScriptRoot 'ffmpeg_audio_mix_probe.cpp')).Path
 $exe = Join-Path $buildRoot 'ffmpeg_audio_mix_probe.exe'
 $csv = Join-Path $buildRoot 'mix.csv'
-$command = 'call "{0}" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /MD /W4 /O2 /I"{1}" "{2}" /Fe:"{3}" /link /LIBPATH:"{4}" avformat.lib avcodec.lib avutil.lib swresample.lib' -f $devcmd, $ffmpegInclude, $src, $exe, $ffmpegLib
+$command = 'call "{0}" -arch=x64 -host_arch=x64 && cd /d "{1}" && cl /nologo /std:c++17 /EHsc /MD /W4 /O2 /I"{2}" "{3}" /Fe:"{4}" /link /LIBPATH:"{5}" avformat.lib avcodec.lib avutil.lib swresample.lib' -f $devcmd, $buildRoot, $ffmpegInclude, $src, $exe, $ffmpegLib
 & cmd.exe /d /s /c $command
 if ($LASTEXITCODE -ne 0) { throw "Playback native probe compilation failed ($LASTEXITCODE)." }
 $env:Path = "$ffmpegBin;$env:Path"

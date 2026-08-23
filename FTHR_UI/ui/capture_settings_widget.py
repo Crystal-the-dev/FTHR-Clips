@@ -750,12 +750,10 @@ class CaptureSettingsWidget(QWidget):
         self.restart_engine_requested.emit()
 
     def _on_retry_hardware_encoding(self):
-        print("[UI] Retry hardware encoding requested")
         self.retry_hardware_encoding.emit()
 
     def _update_bitrate(self):
         bitrate = self.BITRATE_PRESETS[self.current_resolution][self.current_bitrate_level]
-        print(f"→ Bitrate set to: {bitrate} kbps ({bitrate / 1000:.1f} Mbps)")
         self.bitrate_changed.emit(bitrate)
 
     def _get_dims(self, name):

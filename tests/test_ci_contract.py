@@ -7,6 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+AUDIT050_TOOLS = ROOT / "tools" / "audit050"
 
 
 def _workflow() -> str:
@@ -48,3 +49,17 @@ def test_release_ci_runs_response_and_exception_contracts() -> None:
 
     assert "verify_engine_response_contract.py" in release_job
     assert "verify_exception_handling.py" in release_job
+
+
+def test_native_spike_compilers_keep_intermediates_below_temp() -> None:
+    windows_spikes = (AUDIT050_TOOLS / "run_windows_spikes.ps1").read_text(
+        encoding="utf-8"
+    )
+    playback_spike = (AUDIT050_TOOLS / "run_playback_spike.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert '&& cd /d "{1}" && {2}' in windows_spikes
+    assert "$devcmd, $buildRoot, $commandBody" in windows_spikes
+    assert '&& cd /d "{1}" && cl ' in playback_spike
+    assert "-f $devcmd, $buildRoot, $ffmpegInclude" in playback_spike
