@@ -20,6 +20,7 @@ int RunWindowsReplayPolicyTests();
 int RunAudioSourceModelTests();
 int RunWindowsAudioSessionRegistryTests();
 int RunWindowsProcessLoopbackAudioProviderTests();
+int RunWindowsMicrophoneAudioProviderTests();
 
 namespace {
 
@@ -449,9 +450,11 @@ int main() {
     const int audio_source_checks = RunAudioSourceModelTests();
     const int windows_audio_checks = RunWindowsAudioSessionRegistryTests();
     const int windows_process_loopback_checks = RunWindowsProcessLoopbackAudioProviderTests();
-    std::cout << "FTHRclips_tests: 89 scenarios passed ("
+    const int windows_microphone_checks = RunWindowsMicrophoneAudioProviderTests();
+    std::cout << "FTHRclips_tests: native suites completed ("
               << (checks + amf_checks + qsv_checks + policy_checks + audio_source_checks
                   + windows_audio_checks + windows_process_loopback_checks)
+                  + windows_microphone_checks
               << " checks total)" << std::endl;
     return 0;
 }
