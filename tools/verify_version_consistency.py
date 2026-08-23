@@ -24,7 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'FTHR_UI'))
 
-from version import __version__ as EXPECTED  # noqa: E402
+from version import __version__ as EXPECTED, windows_file_version  # noqa: E402
 
 
 class Report:
@@ -62,6 +62,28 @@ def check_literal_pattern(rep: Report, rel: str, pattern: str, label: str) -> No
         rep.fail(f'{label}: {rel} says {sorted(set(bad))}, expected {EXPECTED!r}')
     else:
         rep.ok(f'{label}: {rel} -> {EXPECTED}')
+
+
+def check_numeric_installer_version(rep: Report) -> None:
+    """Keep Setup.exe's numeric PE version tied to version.py as well.
+
+    Inno Setup needs four numeric fields for VERSIONINFO while the product
+    version can include ``-alpha``.  ``windows_file_version()`` owns that
+    conversion, so a second literal cannot silently drift.
+    """
+    text = _read('installer_windows.iss')
+    if text is None:
+        rep.fail('installer numeric version: installer_windows.iss not found')
+        return
+    matches = re.findall(
+        r'(?m)^VersionInfo(?:Product)?Version=(\d+\.\d+\.\d+\.\d+)\s*$', text)
+    expected = '.'.join(str(part) for part in windows_file_version())
+    if not matches:
+        rep.fail('installer numeric version: no VersionInfoVersion directive')
+    elif any(value != expected for value in matches):
+        rep.fail(f'installer numeric version: {sorted(set(matches))!r}, expected {expected!r}')
+    else:
+        rep.ok(f'installer numeric version: {expected}')
 
 
 def check_no_hardcoded(rep: Report, rel: str, label: str) -> None:
@@ -108,6 +130,7 @@ def main() -> int:
     check_literal_pattern(
         rep, 'installer_windows.iss',
         r'#define\s+MyAppVersion\s+"([^"]+)"', 'installer')
+    check_numeric_installer_version(rep)
     check_literal_pattern(
         rep, 'RELEASE_NOTES.md',
         r'(?m)^#+\s*(?:FTHR Clips\s+)?v?(\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?)',

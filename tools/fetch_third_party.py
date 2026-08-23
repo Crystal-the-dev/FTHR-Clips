@@ -33,6 +33,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -52,6 +53,7 @@ MANIFEST_LINUX = ROOT / 'tools' / 'ffmpeg_manifest_linux.json'
 FFMPEG_LINUX_DIR = ROOT / 'FTHRcapture_linux' / 'third_party' / 'ffmpeg'
 
 VCREDIST_URL = 'https://aka.ms/vs/17/release/vc_redist.x64.exe'
+VCREDIST_METADATA = REDIST_DIR / 'vc_redist.x64.json'
 
 
 def _sha256(path: Path) -> str:
@@ -76,6 +78,96 @@ def _download(url: str, dest: Path) -> None:
                 print(f'\r  {pct:3d}%  {done / 1e6:.1f} / {total / 1e6:.1f} MB',
                       end='', flush=True)
         print()
+
+
+def _windows_powershell() -> str:
+    """Prefer the inbox Windows PowerShell Authenticode implementation.
+
+    A developer's PATH can resolve ``powershell.exe`` to a bundled PowerShell
+    Core runtime whose Security module lacks the Windows trust provider.  The
+    inbox binary is the one that owns the native Authenticode provider.
+    """
+    candidate = Path(os.environ.get('SystemRoot', r'C:\Windows')) / (
+        'System32/WindowsPowerShell/v1.0/powershell.exe')
+    return str(candidate) if candidate.is_file() else 'powershell.exe'
+
+
+def _windows_powershell_module_path() -> str:
+    system_root = Path(os.environ.get('SystemRoot', r'C:\Windows'))
+    program_files = Path(os.environ.get('ProgramFiles', r'C:\Program Files'))
+    return ';'.join((
+        str(program_files / 'WindowsPowerShell' / 'Modules'),
+        str(system_root / 'System32' / 'WindowsPowerShell' / 'v1.0' / 'Modules'),
+    ))
+
+
+def _verify_vcredist(path: Path) -> dict[str, str]:
+    """Verify the mutable Microsoft permalink before we package its result.
+
+    Microsoft deliberately services the v14 redistributable at a stable URL,
+    so pinning one SHA-256 in git would either reject a supported security
+    update or encourage a blind manifest edit.  The trusted workflow is:
+    HTTPS to Microsoft's documented permalink, a valid Windows trust-chain
+    signature from Microsoft Corporation, and a locally recorded exact hash
+    and file/product version for the produced installer.
+    """
+    with path.open('rb') as fh:
+        if fh.read(2) != b'MZ':
+            raise RuntimeError('downloaded file is not a Windows executable')
+
+    details: dict[str, str] = {
+        'source_url': VCREDIST_URL,
+        'sha256': _sha256(path),
+        'bytes': str(path.stat().st_size),
+        'authenticode_status': 'not-checked-off-windows',
+        'signer_subject': '',
+        'file_version': '',
+        'product_version': '',
+    }
+    if os.name != 'nt':
+        return details
+
+    # Pass the path in a one-process environment variable rather than splicing
+    # it into a PowerShell command string. A source-tree path with
+    # spaces/apostrophes cannot alter the verification command this way.
+    command = (
+        "$ErrorActionPreference = 'Stop'; "
+        "Import-Module Microsoft.PowerShell.Security -ErrorAction Stop; "
+        "$target = $env:FTHR_VCREDIST_VERIFY_PATH; "
+        "$signature = Get-AuthenticodeSignature -LiteralPath $target; "
+        "$item = Get-Item -LiteralPath $target; "
+        "[PSCustomObject]@{status=[string]$signature.Status; "
+        "subject=if ($signature.SignerCertificate) {[string]$signature.SignerCertificate.Subject} else {''}; "
+        "file_version=[string]$item.VersionInfo.FileVersion; "
+        "product_version=[string]$item.VersionInfo.ProductVersion} | ConvertTo-Json -Compress"
+    )
+    env = os.environ.copy()
+    # Do not let a bundled PowerShell Core module path shadow Windows
+    # PowerShell's native Authenticode provider.
+    env['PSModulePath'] = _windows_powershell_module_path()
+    env['FTHR_VCREDIST_VERIFY_PATH'] = str(path.resolve())
+    result = subprocess.run([_windows_powershell(), '-NoProfile', '-Command', command],
+                            capture_output=True, text=True, timeout=30, env=env)
+    if result.returncode != 0:
+        raise RuntimeError(
+            result.stderr.strip() or 'could not inspect VC++ Authenticode signature')
+    try:
+        signature = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError('could not parse VC++ Authenticode metadata') from exc
+    status = str(signature.get('status', ''))
+    subject = str(signature.get('subject', ''))
+    if status != 'Valid' or 'Microsoft Corporation' not in subject:
+        raise RuntimeError(
+            'VC++ redistributable does not have a valid Microsoft Corporation '
+            f'Authenticode signature (status={status!r}, subject={subject!r})')
+    details.update({
+        'authenticode_status': status,
+        'signer_subject': subject,
+        'file_version': str(signature.get('file_version', '')),
+        'product_version': str(signature.get('product_version', '')),
+    })
+    return details
 
 
 def _ensure_linux_ffmpeg_aliases(
@@ -287,21 +379,31 @@ def fetch_ffmpeg_linux(force: bool) -> int:
 
 def fetch_vcredist(force: bool) -> int:
     dest = REDIST_DIR / 'vc_redist.x64.exe'
+    downloaded = False
     if dest.is_file() and not force:
         print(f'vc_redist.x64.exe already present ({dest.stat().st_size / 1e6:.1f} MB).')
-        return 0
-    print('MSVC 2022 x64 redistributable (Microsoft, redistributable licence)')
-    _download(VCREDIST_URL, dest)
-    # Microsoft serves this from a permalink that follows the latest servicing
-    # release, so there is no stable hash to pin. Sanity-check it is a PE.
-    with dest.open('rb') as fh:
-        if fh.read(2) != b'MZ':
-            print('ERROR: downloaded file is not a Windows executable.',
-                  file=sys.stderr)
+    else:
+        print('MSVC 2022 x64 redistributable (Microsoft, redistributable licence)')
+        _download(VCREDIST_URL, dest)
+        downloaded = True
+    try:
+        metadata = _verify_vcredist(dest)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        print(f'ERROR: VC++ redistributable verification failed: {exc}',
+              file=sys.stderr)
+        if downloaded:
             dest.unlink(missing_ok=True)
-            return 1
-    print(f'Installed into {dest.relative_to(ROOT)} '
-          f'({dest.stat().st_size / 1e6:.1f} MB)')
+        return 1
+    REDIST_DIR.mkdir(parents=True, exist_ok=True)
+    VCREDIST_METADATA.write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+    print(f'Verified {dest.relative_to(ROOT)} '
+          f'({dest.stat().st_size / 1e6:.1f} MB, sha256 {metadata["sha256"]})')
+    if metadata['authenticode_status'] == 'Valid':
+        print(f'  Authenticode: {metadata["signer_subject"]}; '
+              f'FileVersion={metadata["file_version"] or "unknown"}')
+    else:
+        print('  Authenticode: not checked (non-Windows host); verify on Windows before packaging.')
     return 0
 
 
