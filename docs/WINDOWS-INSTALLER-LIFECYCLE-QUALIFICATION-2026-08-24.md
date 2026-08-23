@@ -38,6 +38,13 @@ Before any installer action, the retained user-data snapshots were:
 The snapshot values were identical after every physical install, update,
 uninstall, reinstall and legacy-cleanup action below.
 
+After that physical matrix, the full Python test suite imported the UI entry
+point twice and appended two startup-banner lines (148 bytes) to the existing
+`%USERPROFILE%\.fthr\logs\fthr.log`. This was a test-host logging side effect,
+not an installer action; no clip, setting, thumbnail or installer operation
+changed it. The log was intentionally left intact rather than editing user
+state to make a later snapshot appear unchanged.
+
 ## Physical lifecycle matrix
 
 | Scenario | Result | Evidence / boundary |
