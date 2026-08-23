@@ -61,6 +61,8 @@
 #include "replay_encoder.h"      // codec-neutral Windows replay encoder seam
 #include "encoded_ring_buffer.h" // EncodedRingBuffer
 #include "audio_capture.h"       // AudioCapture (WASAPI loopback -> PCM ring)
+#include "audio_encoder.h"
+#include "audio_packet_ring.h"
 #include "audio_ring_buffer.h"   // AudioRingBuffer (raw float32 PCM)
 #include "shared_memory.h"       // typed v4 capture-health flags
 #include "windows_monitor_resolver.h"
@@ -332,9 +334,9 @@ namespace fthr {
         // -----------------------------------------------------------------------
         // Audio capture pipeline
         //
-        // AudioCapture (WASAPI) pushes raw float32 PCM into AudioRingBuffer.
-        // No encoding during gameplay - zero CPU overhead on hot path.
-        // MuxEncodedClip() encodes PCM -> AAC once on SaveClipThread at save time.
+        // AudioCapture feeds a persistent AAC-LC encoder into a bounded packet
+        // ring. The source timeline starts at the first WASAPI QPC timestamp
+        // and is snapshotted with the selected video interval.
         //
         // audio_active_ is true only when all components initialized successfully.
         //
@@ -347,8 +349,8 @@ namespace fthr {
         // -----------------------------------------------------------------------
         bool                             audio_active_;
         AudioCapture                     audio_capture_;
-        std::unique_ptr<AudioRingBuffer> audio_ring_;
-        uint64_t                         audio_sync_epoch_frames_; // audio frames already in ring when video t=0 begins
+        AudioEncoder                      default_mix_audio_encoder_;
+        std::unique_ptr<EncodedAudioPacketRing> default_mix_audio_ring_;
 
         // -----------------------------------------------------------------------
         // Continuous recording state

@@ -30,6 +30,7 @@
 #pragma comment(lib, "propsys.lib")
 
 #include "audio_capture.h"
+#include "audio_encoder.h"
 #include "audio_ring_buffer.h"
 
 #include <iostream>
@@ -219,9 +220,13 @@ namespace fthr {
             << mix_fmt->wBitsPerSample << "-bit "
             << (is_float ? "float" : "integer") << std::endl;
 
-        if (!is_float) {
-            std::cerr << "[AudioCapture] WARNING: device is not float32. "
-                << "Audio may be distorted." << std::endl;
+        if (!is_float || mix_fmt->wBitsPerSample != 32) {
+            // Passing integer endpoint bytes through reinterpret_cast<float*>
+            // used to create corrupt audio. Do not silently do that while the
+            // canonical resampler path is being selected for this generation.
+            std::cerr << "[AudioCapture] Unsupported non-float32 endpoint format; "
+                << "audio capture is disabled rather than distorted." << std::endl;
+            return false;
         }
 
         // Step 7: Initialize IAudioClient in loopback event-driven mode
@@ -263,10 +268,6 @@ namespace fthr {
 
     bool AudioCapture::Initialize(AudioRingBuffer* ring,
         const AudioCaptureConfig& config) {
-        if (!ring) {
-            std::cerr << "[AudioCapture] ring must not be null" << std::endl;
-            return false;
-        }
         ring_      = ring;
         device_id_ = config.device_id;
 
@@ -289,13 +290,17 @@ namespace fthr {
         return true;
     }
 
+    void AudioCapture::SetEncoder(AudioEncoder* encoder) {
+        encoder_ = encoder;
+    }
+
 
     // ===========================================================================
     // Start
     // ===========================================================================
 
     bool AudioCapture::Start() {
-        if (!audio_client_ || !capture_client_) {
+        if (!audio_client_ || !capture_client_ || (!ring_ && !encoder_)) {
             std::cerr << "[AudioCapture] Start() called before Initialize()"
                 << std::endl;
             return false;
@@ -358,6 +363,8 @@ namespace fthr {
         sample_rate_ = 0;
         channels_    = 0;
         ring_        = nullptr;
+        encoder_     = nullptr;
+        timeline_origin_qpc_100ns_.store(0, std::memory_order_release);
         device_lost_.store(false, std::memory_order_relaxed);
     }
 
@@ -454,10 +461,8 @@ namespace fthr {
                             InjectSilence(frames, qpc_position);
                         }
                         else {
-                            ring_->Push(
-                                reinterpret_cast<const float*>(data),
-                                frames,
-                                qpc_position);
+                            SubmitSamples(reinterpret_cast<const float*>(data),
+                                frames, qpc_position);
                         }
                     }
 
@@ -548,7 +553,7 @@ namespace fthr {
     // ===========================================================================
 
     void AudioCapture::InjectSilence(uint32_t num_frames, uint64_t qpc_100ns) {
-        if (!ring_ || num_frames == 0) return;
+        if ((!ring_ && !encoder_) || num_frames == 0) return;
 
         const uint64_t ticks_per_frame = (sample_rate_ > 0)
             ? (10000000ULL / static_cast<uint64_t>(sample_rate_)) : 208ULL;
@@ -560,9 +565,25 @@ namespace fthr {
 
         while (remaining > 0) {
             const uint32_t chunk = std::min(remaining, buf_frames);
-            ring_->Push(silence_buf_.data(), chunk, current_qpc);
+            SubmitSamples(silence_buf_.data(), chunk, current_qpc);
             current_qpc += static_cast<uint64_t>(chunk) * ticks_per_frame;
             remaining -= chunk;
+        }
+    }
+
+    void AudioCapture::SubmitSamples(const float* interleaved_data,
+        uint32_t frame_count, uint64_t qpc_100ns) {
+        if (!interleaved_data || frame_count == 0) return;
+        if (qpc_100ns > 0) {
+            uint64_t expected = 0;
+            timeline_origin_qpc_100ns_.compare_exchange_strong(
+                expected, qpc_100ns, std::memory_order_release,
+                std::memory_order_relaxed);
+        }
+        if (encoder_) {
+            encoder_->EncodeSamples(interleaved_data, frame_count * channels_);
+        } else if (ring_) {
+            ring_->Push(interleaved_data, frame_count, qpc_100ns);
         }
     }
 

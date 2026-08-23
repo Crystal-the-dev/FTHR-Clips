@@ -66,6 +66,8 @@
 #include <cstring>
 #include <cwctype>
 #include <algorithm>
+#include <cmath>
+#include <numeric>
 #include <sstream>
 
 extern "C" {
@@ -492,10 +494,11 @@ namespace fthr {
         // ------------------------------------------------------------------
         // Initialize audio capture pipeline BEFORE starting video thread.
         //
-        // PCM-first design (Shadowplay approach):
-        //   AudioCapture (WASAPI) pushes raw float32 PCM into AudioRingBuffer.
-        //   No encoding during gameplay = zero CPU overhead on hot path.
-        //   MuxEncodedClip() runs AAC encoding once on SaveClipThread at save time.
+        // Persistent AAC replay design:
+        //   AudioCapture (WASAPI) -> AudioEncoder -> EncodedAudioPacketRing.
+        //   The bounded compressed ring protects 300-second replay memory.
+        //   Save snapshots packets directly; it never rebuilds a long raw-PCM
+        //   window on the save thread.
         //
         // Audio is optional - failure falls through to video-only mode.
         // Skipped entirely when config.audio_enabled = false (user disabled in Settings).
@@ -504,28 +507,48 @@ namespace fthr {
             std::cout << "[CaptureEngine] Audio capture disabled by user settings." << std::endl;
         }
         else do {
-            // 32s + 4s headroom of PCM at 48kHz stereo = ~13.8 MB
-            const uint32_t audio_capacity =
-                static_cast<uint32_t>((buffer_seconds_ + 4) * 48000);
-
-            audio_ring_ = std::make_unique<AudioRingBuffer>(
-                audio_capacity, 48000, 2, 0);
-
             AudioCaptureConfig audio_cfg;
             audio_cfg.bitrate_kbps = 128;
 
-            if (!audio_capture_.Initialize(audio_ring_.get(), audio_cfg)) {
+            if (!audio_capture_.Initialize(nullptr, audio_cfg)) {
                 std::cerr << "[CaptureEngine] AudioCapture init failed - "
                     << "audio disabled" << std::endl;
-                audio_ring_.reset();
                 break;
             }
+
+            AudioSourceId default_mix_id{
+                "00000000-0000-4000-8000-000000000001"};
+            default_mix_audio_ring_ = std::make_unique<EncodedAudioPacketRing>(
+                default_mix_id,
+                capture_generation_.load(std::memory_order_relaxed) + 1,
+                AudioSourceFormat{audio_capture_.GetSampleRate(),
+                                  audio_capture_.GetChannels(), "fltp"},
+                buffer_seconds_);
+            if (!default_mix_audio_encoder_.Initialize(
+                    audio_capture_.GetSampleRate(), audio_capture_.GetChannels(),
+                    audio_cfg.bitrate_kbps,
+                    [this](const uint8_t* data, uint32_t size, int64_t pts) {
+                        if (default_mix_audio_ring_) {
+                            default_mix_audio_ring_->Push(
+                                {std::vector<uint8_t>(data, data + size), pts, 1024});
+                        }
+                    })) {
+                std::cerr << "[CaptureEngine] Persistent AAC encoder init failed - "
+                    << "audio disabled" << std::endl;
+                audio_capture_.Shutdown();
+                default_mix_audio_ring_.reset();
+                break;
+            }
+            default_mix_audio_ring_->SetCodecExtradata(
+                default_mix_audio_encoder_.GetExtradata());
+            audio_capture_.SetEncoder(&default_mix_audio_encoder_);
 
             if (!audio_capture_.Start()) {
                 std::cerr << "[CaptureEngine] AudioCapture start failed - "
                     << "audio disabled" << std::endl;
                 audio_capture_.Shutdown();
-                audio_ring_.reset();
+                default_mix_audio_encoder_.Finalize();
+                default_mix_audio_ring_.reset();
                 break;
             }
 
@@ -533,7 +556,7 @@ namespace fthr {
             std::cout << "[CaptureEngine] Audio capture active ("
                 << audio_capture_.GetSampleRate() << "Hz, "
                 << audio_capture_.GetChannels() << "ch, "
-                << "PCM ring buffer, AAC encoding deferred to save time)"
+                << "persistent AAC packet replay)"
                 << std::endl;
 
         } while (false);
@@ -616,11 +639,12 @@ namespace fthr {
         // Stop audio pipeline. Order matters:
         //   1. Stop WASAPI thread (no more EncodeSamples calls after this)
         //   2. Finalize encoder (flushes partial AAC frame)
-        //   3. audio_ring_ destroyed with the unique_ptr
+        //   3. compressed packet ring is released with the generation
         if (audio_active_) {
             audio_capture_.Stop();
+            default_mix_audio_encoder_.Finalize();
             audio_capture_.Shutdown();
-            audio_ring_.reset();
+            default_mix_audio_ring_.reset();
             audio_active_ = false;
             std::cout << "[CaptureEngine] Audio pipeline stopped." << std::endl;
         }
@@ -803,26 +827,32 @@ namespace fthr {
             replay_encoder_->GetEncodeEpoch(
                 task.video_qpc_epoch, task.video_qpc_freq);
 
-            // Snapshot the PCM ring buffer.
-            // Raw PCM is copied here; AAC encoding happens on SaveClipThread.
-            // Request 2s of audio headroom for timestamp alignment between
-            // the video packet and WASAPI sample clocks.
-            // capture clocks. MuxEncodedClip intersects the result with the
-            // requested video presentation window using QPC alignment.
-            if (audio_active_ && audio_ring_ && !audio_capture_.IsDeviceLost()) {
-                task.audio_snapshot = audio_ring_->TakeSnapshot(
-                    static_cast<double>(duration_seconds) + 2.0,
-                    task.encoded_snapshot.presentation_end_qpc_s);
-                task.has_audio = task.audio_snapshot.valid
-                    && !task.audio_snapshot.samples.empty();
-                task.audio_bitrate_kbps = 128;
-
-                if (task.has_audio) {
-                    std::cout << "[SaveClip] Audio PCM snapshot: "
-                        << task.audio_snapshot.samples.size() / 2
-                        << " frames, QPC window "
-                        << task.audio_snapshot.qpc_start_s << "s - "
-                        << task.audio_snapshot.qpc_end_s   << "s" << std::endl;
+            // Snapshot the persistent AAC packet ring against the exact video
+            // presentation interval. Audio PTS are sample positions relative
+            // to the first timestamped WASAPI packet in this generation.
+            if (audio_active_ && default_mix_audio_ring_
+                    && !audio_capture_.IsDeviceLost()) {
+                const uint64_t origin_qpc = audio_capture_.GetTimelineOriginQpc100ns();
+                const double start_qpc_s = task.encoded_snapshot.presentation_start_qpc_s;
+                const double end_qpc_s = task.encoded_snapshot.presentation_end_qpc_s;
+                const uint32_t sample_rate = audio_capture_.GetSampleRate();
+                if (origin_qpc > 0 && start_qpc_s > 0.0 && end_qpc_s > start_qpc_s
+                        && sample_rate > 0) {
+                    const double origin_s = static_cast<double>(origin_qpc) / 10'000'000.0;
+                    const int64_t start_pts = std::max<int64_t>(0, static_cast<int64_t>(
+                        std::llround((start_qpc_s - origin_s) * sample_rate)));
+                    const int64_t end_pts = std::max(start_pts + 1, static_cast<int64_t>(
+                        std::llround((end_qpc_s - origin_s) * sample_rate)));
+                    task.encoded_audio_snapshot = default_mix_audio_ring_->TakeSnapshot(
+                        start_pts, end_pts);
+                    task.audio_presentation_start_pts_samples = start_pts;
+                    task.has_encoded_audio = task.encoded_audio_snapshot.valid();
+                    if (task.has_encoded_audio) {
+                        std::cout << "[SaveClip] Persistent AAC snapshot: "
+                            << task.encoded_audio_snapshot.packets.size()
+                            << " packets, PTS " << start_pts << " - " << end_pts
+                            << std::endl;
+                    }
                 }
             }
             else if (audio_active_ && audio_capture_.IsDeviceLost()) {
@@ -879,18 +909,10 @@ namespace fthr {
         task.shared_memory = shared_memory;
         task.task_id = next_task_id_.fetch_add(1);
 
-        // Audio snapshot - same logic as NVENC path (2s extra for alignment headroom)
-        if (audio_active_ && audio_ring_ && !audio_capture_.IsDeviceLost()) {
-            // The raw ring keeps its existing one-second overwrite guard.
-            // Align audio to that same safe end instead of the live audio head.
-            task.audio_snapshot = audio_ring_->TakeSnapshot(
-                static_cast<double>(duration_seconds) + 2.0,
-                std::max(0.0, save_qpc_s - 1.0));
-            task.has_audio = task.audio_snapshot.valid
-                && !task.audio_snapshot.samples.empty();
-            task.audio_bitrate_kbps = 128;
-        }
-        else if (audio_active_ && audio_capture_.IsDeviceLost()) {
+        // The public alpha does not automatically select the raw-video path.
+        // Preserve its video-only behavior instead of reintroducing a long
+        // raw PCM ring solely for a non-production fallback.
+        if (audio_active_ && audio_capture_.IsDeviceLost()) {
             std::cerr << "[SaveClip] Audio device lost - saving clip without audio" << std::endl;
         }
 
@@ -1187,9 +1209,12 @@ namespace fthr {
         // ------------------------------------------------------------------
 
         // Declare write_audio early - used in Step D (alignment) and Step 2b (stream).
-        const bool write_audio = task.has_audio
+        const bool write_legacy_audio = task.has_audio
             && task.audio_snapshot.valid
             && !task.audio_snapshot.samples.empty();
+        const bool write_packet_audio = task.has_encoded_audio
+            && task.encoded_audio_snapshot.valid();
+        const bool write_audio = write_legacy_audio || write_packet_audio;
 
         const int64_t pts_offset = snap.presentation_start_pts;
 
@@ -1221,7 +1246,7 @@ namespace fthr {
         int64_t audio_aligned_start_sample = 0;
         int64_t audio_output_pts_offset = 0;
 
-        if (write_audio) {
+        if (write_legacy_audio) {
             const int64_t total_snap_frames = static_cast<int64_t>(
                 task.audio_snapshot.samples.size())
                 / static_cast<int64_t>(task.audio_snapshot.channels);
@@ -1430,10 +1455,31 @@ namespace fthr {
         AVStream* audio_stream = nullptr;
         std::vector<std::vector<uint8_t>> aac_packets;
         std::vector<int64_t>              aac_pts_list;
+        std::vector<int64_t>              aac_duration_list;
+        std::vector<uint8_t>              audio_extradata;
+        uint32_t                          audio_sample_rate = 0;
+        uint32_t                          audio_channels = 0;
 
-        if (write_audio) {
+        if (write_packet_audio) {
+            const auto& encoded = task.encoded_audio_snapshot;
+            audio_sample_rate = encoded.format.sample_rate;
+            audio_channels = encoded.format.channels;
+            audio_extradata = encoded.codec_extradata;
+            for (const auto& packet : encoded.packets) {
+                if (packet.data.empty() || packet.duration_samples <= 0) continue;
+                aac_packets.push_back(packet.data);
+                aac_pts_list.push_back(packet.pts_samples);
+                aac_duration_list.push_back(packet.duration_samples);
+            }
+            audio_output_pts_offset = -task.audio_presentation_start_pts_samples;
+            std::cout << "[MuxEncodedClip] Using persistent AAC replay: "
+                << aac_packets.size() << " packets" << std::endl;
+        }
+        else if (write_legacy_audio) {
             const uint32_t sr = task.audio_snapshot.sample_rate;
             const uint32_t ch = task.audio_snapshot.channels;
+            audio_sample_rate = sr;
+            audio_channels = ch;
 
             // Encode the aligned PCM window to AAC
             AudioEncoder aac_enc;
@@ -1442,6 +1488,7 @@ namespace fthr {
                 [&](const uint8_t* data, uint32_t size, int64_t pts) {
                     aac_packets.push_back(std::vector<uint8_t>(data, data + size));
                     aac_pts_list.push_back(pts);
+                    aac_duration_list.push_back(1024);
                 });
 
             if (enc_ok) {
@@ -1470,36 +1517,48 @@ namespace fthr {
                 std::cerr << "[MuxEncodedClip] AudioEncoder init failed - "
                     << "writing video-only" << std::endl;
             }
+            audio_extradata = aac_enc.GetExtradata();
+        }
 
-            if (!aac_packets.empty()) {
-                audio_stream = avformat_new_stream(fmt_ctx, nullptr);
-                if (!audio_stream) {
-                    std::cerr << "[MuxEncodedClip] avformat_new_stream (audio) failed"
-                        << std::endl;
-                    aac_packets.clear();
-                    aac_pts_list.clear();
-                }
-                else {
-                    audio_stream->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
-                    audio_stream->codecpar->codec_id = AV_CODEC_ID_AAC;
-                    audio_stream->codecpar->sample_rate = static_cast<int>(sr);
-                    audio_stream->codecpar->ch_layout.nb_channels = static_cast<int>(ch);
-                    audio_stream->codecpar->ch_layout.order = AV_CHANNEL_ORDER_UNSPEC;
-                    audio_stream->codecpar->frame_size = 1024;
-                    audio_stream->codecpar->format = AV_SAMPLE_FMT_FLTP;
-                    audio_stream->time_base = AVRational{ 1, static_cast<int>(sr) };
+        if (!aac_packets.empty()) {
+            audio_stream = avformat_new_stream(fmt_ctx, nullptr);
+            if (!audio_stream) {
+                std::cerr << "[MuxEncodedClip] avformat_new_stream (audio) failed"
+                    << std::endl;
+                aac_packets.clear();
+                aac_pts_list.clear();
+                aac_duration_list.clear();
+            }
+            else {
+                audio_stream->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+                audio_stream->codecpar->codec_id = AV_CODEC_ID_AAC;
+                audio_stream->codecpar->sample_rate = static_cast<int>(audio_sample_rate);
+                audio_stream->codecpar->ch_layout.nb_channels = static_cast<int>(audio_channels);
+                audio_stream->codecpar->ch_layout.order = AV_CHANNEL_ORDER_UNSPEC;
+                audio_stream->codecpar->frame_size = 1024;
+                audio_stream->codecpar->format = AV_SAMPLE_FMT_FLTP;
+                audio_stream->time_base = AVRational{ 1, static_cast<int>(audio_sample_rate) };
+                audio_stream->disposition |= AV_DISPOSITION_DEFAULT;
+                av_dict_set(&audio_stream->metadata, "handler_name", "Default Mix", 0);
+                av_dict_set(&audio_stream->metadata, "title", "Default Mix", 0);
 
-                    // Set ASC extradata from the encoder we just ran
-                    auto extradata = aac_enc.GetExtradata();
-                    if (!extradata.empty()) {
-                        audio_stream->codecpar->extradata = static_cast<uint8_t*>(
-                            av_malloc(extradata.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+                if (!audio_extradata.empty()) {
+                    audio_stream->codecpar->extradata = static_cast<uint8_t*>(
+                        av_malloc(audio_extradata.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+                    if (!audio_stream->codecpar->extradata) {
+                        std::cerr << "[MuxEncodedClip] audio extradata allocation failed"
+                            << std::endl;
+                        aac_packets.clear();
+                        aac_pts_list.clear();
+                        aac_duration_list.clear();
+                        audio_stream = nullptr;
+                    } else {
                         memcpy(audio_stream->codecpar->extradata,
-                            extradata.data(), extradata.size());
-                        memset(audio_stream->codecpar->extradata + extradata.size(),
+                            audio_extradata.data(), audio_extradata.size());
+                        memset(audio_stream->codecpar->extradata + audio_extradata.size(),
                             0, AV_INPUT_BUFFER_PADDING_SIZE);
                         audio_stream->codecpar->extradata_size =
-                            static_cast<int>(extradata.size());
+                            static_cast<int>(audio_extradata.size());
                     }
                 }
             }
@@ -1719,7 +1778,7 @@ namespace fthr {
                 memcpy(av_pkt->data, pkt_data.data(), pkt_data.size());
                 av_pkt->pts = aac_pts_list[i] + audio_output_pts_offset;
                 av_pkt->dts = aac_pts_list[i] + audio_output_pts_offset;
-                av_pkt->duration = 1024;
+                av_pkt->duration = aac_duration_list[i];
                 av_pkt->stream_index = audio_stream->index;
                 av_pkt->flags = 0;
 
@@ -1731,8 +1790,8 @@ namespace fthr {
             }
 
             const double audio_written_s =
-                audio_packet_count * 1024.0
-                / task.audio_snapshot.sample_rate;
+                std::accumulate(aac_duration_list.begin(), aac_duration_list.end(), 0.0)
+                / audio_sample_rate;
             std::cout << "[MuxEncodedClip] Audio packets written: "
                 << audio_packet_count
                 << " (" << audio_written_s << "s)" << std::endl;

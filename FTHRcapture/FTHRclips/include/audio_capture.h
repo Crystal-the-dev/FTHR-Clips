@@ -50,6 +50,7 @@ namespace fthr {
 
     // Forward declaration
     class AudioRingBuffer;
+    class AudioEncoder;
 
 
     // ---------------------------------------------------------------------------
@@ -80,10 +81,15 @@ namespace fthr {
         ~AudioCapture();
 
         // Initialize WASAPI loopback capture.
-        // ring:   AudioRingBuffer to push raw PCM into. Must remain valid until Stop().
-        //         AudioCapture writes float32 PCM directly - no encoding on this thread.
+        // ring:   legacy raw-PCM destination. New replay paths pass nullptr and
+        //         attach an AudioEncoder before Start(). At least one destination
+        //         must be configured before Start().
         // config: device selection and format preferences.
         bool Initialize(AudioRingBuffer* ring, const AudioCaptureConfig& config);
+
+        // Attach the persistent AAC encoder after Initialize() reveals the
+        // endpoint's actual format and before Start() begins capture.
+        void SetEncoder(AudioEncoder* encoder);
 
         // Start the capture thread. Call after Initialize() succeeds.
         // Returns true if the thread started successfully.
@@ -107,6 +113,12 @@ namespace fthr {
         // Cleared by Shutdown() so a fresh Initialize()+Start() starts clean.
         bool     IsDeviceLost()  const { return device_lost_.load(std::memory_order_relaxed); }
 
+        // QPC (100ns) of the first submitted audio frame for this generation.
+        // A value of zero means no timestamped packet has arrived yet.
+        uint64_t GetTimelineOriginQpc100ns() const {
+            return timeline_origin_qpc_100ns_.load(std::memory_order_acquire);
+        }
+
 
     private:
         // -----------------------------------------------------------------------
@@ -117,6 +129,8 @@ namespace fthr {
         // Write 'num_frames' frames of silence to the encoder.
         // Used when WASAPI returns a silent buffer or no data is available.
         void InjectSilence(uint32_t num_frames, uint64_t qpc_100ns = 0);
+        void SubmitSamples(const float* interleaved_data, uint32_t frame_count,
+                           uint64_t qpc_100ns);
 
         // Create WASAPI COM objects (enumerator, device, audio_client, capture_client,
         // buffer_event). Sets sample_rate_, channels_, silence_buf_.
@@ -150,6 +164,7 @@ namespace fthr {
         // Ring buffer reference (not owned) - receives raw PCM float32
         // -----------------------------------------------------------------------
         AudioRingBuffer* ring_;
+        AudioEncoder* encoder_ = nullptr;
 
         // -----------------------------------------------------------------------
         // Actual device format (read from mix_format_ during Initialize)
@@ -163,6 +178,7 @@ namespace fthr {
         std::thread       capture_thread_;
         std::atomic<bool> running_{ false };
         std::atomic<bool> device_lost_{ false };
+        std::atomic<uint64_t> timeline_origin_qpc_100ns_{ 0 };
 
         // Stored from the last Initialize() call so recovery can re-open the same
         // device (or fall back to default if empty).

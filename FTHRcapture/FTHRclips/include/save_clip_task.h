@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "encoded_ring_buffer.h"  // EncodedRingSnapshot
+#include "audio_packet_ring.h"    // EncodedAudioSnapshot
 #include "audio_ring_buffer.h"    // AudioPCMSnapshot
 
 
@@ -71,6 +72,13 @@ namespace fthr {
         bool             has_audio = false;
         AudioPCMSnapshot audio_snapshot;
         uint32_t         audio_bitrate_kbps = 128;
+
+        // Persistent AAC replay path. The packet snapshot is selected against
+        // the same QPC presentation interval as video; PTS are source timeline
+        // samples and are normalized by MuxEncodedClip without re-encoding.
+        bool                 has_encoded_audio = false;
+        EncodedAudioSnapshot encoded_audio_snapshot;
+        int64_t              audio_presentation_start_pts_samples = 0;
 
         // ------------------------------------------------------------------
         // Shared fields

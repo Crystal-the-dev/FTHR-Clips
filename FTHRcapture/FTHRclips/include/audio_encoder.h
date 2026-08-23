@@ -81,7 +81,8 @@ namespace fthr {
         bool Initialize(uint32_t       sample_rate,
                         uint32_t       channels,
                         uint32_t       bitrate_kbps,
-                        PacketCallback callback);
+                        PacketCallback callback,
+                        int64_t        initial_pts_samples = 0);
 
         // Feed raw interleaved float32 PCM samples into the encoder.
         // pcm_data:    pointer to interleaved samples (L,R,L,R,...) as float32

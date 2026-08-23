@@ -70,13 +70,14 @@ namespace fthr {
     bool AudioEncoder::Initialize(uint32_t       sample_rate,
         uint32_t       channels,
         uint32_t       bitrate_kbps,
-        PacketCallback callback)
+        PacketCallback callback,
+        int64_t        initial_pts_samples)
     {
         if (initialized_) {
             Finalize();
         }
 
-        if (!callback) {
+        if (!callback || sample_rate == 0 || channels == 0 || channels > 8) {
             std::cerr << "[AudioEncoder] PacketCallback must not be null" << std::endl;
             return false;
         }
@@ -85,7 +86,7 @@ namespace fthr {
         sample_rate_ = sample_rate;
         channels_ = channels;
         bitrate_kbps_ = bitrate_kbps;
-        pts_samples_ = 0;
+        pts_samples_ = initial_pts_samples;
         accum_frames_ = 0;
 
         // ------------------------------------------------------------------
@@ -254,20 +255,12 @@ namespace fthr {
 
         // De-interleave: WASAPI stores L0,R0,L1,R1,...
         // FFmpeg AAC expects separate planes: [all L] [all R]
-        if (channels_ == 2) {
-            float* ch0 = reinterpret_cast<float*>(frame_->data[0]);
-            float* ch1 = reinterpret_cast<float*>(frame_->data[1]);
-            const float* src = accum_buf_.data();
-            for (uint32_t i = 0; i < frame_size; i++) {
-                ch0[i] = src[i * 2 + 0];
-                ch1[i] = src[i * 2 + 1];
+        for (uint32_t channel = 0; channel < channels_; ++channel) {
+            float* destination = reinterpret_cast<float*>(frame_->extended_data[channel]);
+            const float* source = accum_buf_.data();
+            for (uint32_t sample = 0; sample < frame_size; ++sample) {
+                destination[sample] = source[sample * channels_ + channel];
             }
-        }
-        else {
-            // Mono or other channel count: copy directly
-            float* ch0 = reinterpret_cast<float*>(frame_->data[0]);
-            const float* src = accum_buf_.data();
-            std::memcpy(ch0, src, frame_size * sizeof(float));
         }
 
         frame_->pts = pts_samples_;

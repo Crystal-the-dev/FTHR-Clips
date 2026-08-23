@@ -804,7 +804,8 @@ class ShareWindow(QDialog):
     def __init__(self, clip_path: str, start_s: float, end_s: float,
                  crop_rect, settings_info: dict, discord_mode: bool = False,
                  source_volumes: dict | None = None,
-                 multitrack_audio: bool = False, parent=None):
+                 multitrack_audio: bool = False,
+                 audio_tracks: tuple[tuple[str, int], ...] = (), parent=None):
         super().__init__(parent,
                          Qt.WindowType.FramelessWindowHint |
                          Qt.WindowType.Tool)
@@ -821,7 +822,11 @@ class ShareWindow(QDialog):
         self._discord_mode = discord_mode
         self._popup_anim   = None
         self._source_volumes = source_volumes or {}
-        self._multitrack_audio = bool(multitrack_audio)
+        # Clip-local semantic keys and FFmpeg audio-stream positions. This is
+        # intentionally supplied by the clip manifest, never by fixed legacy
+        # categories or by currently-running processes.
+        self._audio_tracks = tuple(audio_tracks)
+        self._multitrack_audio = bool(multitrack_audio and self._audio_tracks)
 
         self.setFixedSize(340, 242)
         self._build_ui()
@@ -1001,15 +1006,6 @@ class ShareWindow(QDialog):
             self._export_started = True
             threading.Thread(target=self._export_worker, daemon=True).start()
 
-    # Track order must match the stream order the engine writes into the clip.
-    # Windows: per-app WASAPI loopback streams (game, browser, music, discord).
-    # Linux:   PulseAudio desktop capture + Python mic mux — always 2 streams.
-    _AUDIO_TRACK_ORDER = (
-        ('game', 'browser', 'music', 'discord')
-        if sys.platform == 'win32' else
-        ('desktop', 'mic')
-    )
-
     def _build_audio_filter_chain(self) -> tuple[list[str], str | None]:
         """Return (filter snippets, output label) for the per-source audio mix.
 
@@ -1021,13 +1017,13 @@ class ShareWindow(QDialog):
             return [], None
         filters = []
         mix_inputs = []
-        for i, key in enumerate(self._AUDIO_TRACK_ORDER):
+        for i, (key, stream_index) in enumerate(self._audio_tracks):
             gain = max(0, self._source_volumes.get(key, 100)) / 100.0
-            filters.append(f'[0:a:{i}]volume={gain:.3f}[a{i}]')
+            filters.append(f'[0:a:{stream_index}]volume={gain:.3f}[a{i}]')
             mix_inputs.append(f'[a{i}]')
         filters.append(
             f'{"".join(mix_inputs)}'
-            f'amix=inputs={len(self._AUDIO_TRACK_ORDER)}:normalize=0[aout]'
+            f'amix=inputs={len(self._audio_tracks)}:normalize=0[aout]'
         )
         return filters, '[aout]'
 
@@ -1129,7 +1125,10 @@ class ShareWindow(QDialog):
             cmd = [ffmpeg, '-y',
                    '-ss', str(self._start_s), '-i', self._clip_path,
                    '-t', str(duration_s),
-                   '-c', 'copy', staged]
+                   # FFmpeg's automatic stream choice keeps only one audio
+                   # stream. Preserve every existing video/audio stream in a
+                   # no-edit share rather than silently deleting future stems.
+                   '-map', '0:v?', '-map', '0:a?', '-c', 'copy', staged]
 
         self._pending_export_out = staged
         try:
@@ -1653,6 +1652,7 @@ class ClipViewer(QDialog):
         else:
             self._master_volume = 80
         self._source_volumes: dict[str, int] = {}
+        self._audio_tracks: tuple[tuple[str, int], ...] = ()
         # Stream count alone cannot prove semantic identities. Keep the alpha
         # editor master-only until the future track contract carries metadata.
         self._multitrack_audio = False
@@ -2495,15 +2495,6 @@ class ClipViewer(QDialog):
             daemon=True,
         ).start()
 
-    # Stream order must match what the engine writes.
-    # Windows: per-process WASAPI loopback (game, browser, music, discord).
-    # Linux: PulseAudio desktop + mic mux = 2 streams, always in this order.
-    _AUDIO_TRACK_ORDER = (
-        ('game', 'browser', 'music', 'discord')
-        if sys.platform == 'win32' else
-        ('desktop', 'mic')
-    )
-
     def _build_export_cmd(self, ffmpeg: str, start_s: float, duration_s: float,
                           out_path: str, crop_rect, video_args: list) -> list:
         """Compose an ffmpeg command for the editor's export pipeline.
@@ -2520,7 +2511,7 @@ class ClipViewer(QDialog):
         use_audio_filter = self._multitrack_audio
 
         if not use_video_filter and not use_audio_filter:
-            return base + ['-c', 'copy', out_path]
+            return base + ['-map', '0:v?', '-map', '0:a?', '-c', 'copy', out_path]
 
         filters: list[str] = []
         if use_video_filter:
@@ -2530,18 +2521,18 @@ class ClipViewer(QDialog):
             filters.append(f'[0:v]crop={w}:{h}:{x}:{y}[vout]')
         if use_audio_filter:
             mix_inputs = []
-            for i, key in enumerate(self._AUDIO_TRACK_ORDER):
+            for i, (key, stream_index) in enumerate(self._audio_tracks):
                 gain = max(0, self._source_volumes.get(key, 100)) / 100.0
-                filters.append(f'[0:a:{i}]volume={gain:.3f}[a{i}]')
+                filters.append(f'[0:a:{stream_index}]volume={gain:.3f}[a{i}]')
                 mix_inputs.append(f'[a{i}]')
             filters.append(
                 f'{"".join(mix_inputs)}'
-                f'amix=inputs={len(self._AUDIO_TRACK_ORDER)}:normalize=0[aout]'
+                f'amix=inputs={len(self._audio_tracks)}:normalize=0[aout]'
             )
 
         cmd = base + ['-filter_complex', ';'.join(filters)]
         cmd += ['-map', '[vout]' if use_video_filter else '0:v:0']
-        cmd += ['-map', '[aout]' if use_audio_filter else '0:a:0?']
+        cmd += ['-map', '[aout]' if use_audio_filter else '0:a?']
 
         if use_video_filter:
             cmd += video_args
@@ -2649,6 +2640,7 @@ class ClipViewer(QDialog):
             discord_mode=discord_mode,
             source_volumes=self._source_volumes,
             multitrack_audio=self._multitrack_audio,
+            audio_tracks=self._audio_tracks,
             parent=self,
         )
         sw.export_error.connect(self.export_error)
