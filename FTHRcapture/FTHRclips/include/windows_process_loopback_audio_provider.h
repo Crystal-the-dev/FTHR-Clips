@@ -10,6 +10,7 @@
 #define FTHR_WINDOWS_PROCESS_LOOPBACK_AUDIO_PROVIDER_H
 
 #include "audio_packet_ring.h"
+#include "audio_timeline.h"
 #include "audio_source_model.h"
 #include "save_clip_task.h"
 #include "windows_audio_session_registry.h"
@@ -35,19 +36,6 @@ struct WindowsProcessLoopbackProviderConfig {
     uint32_t bitrate_kbps = 128;
     AudioSourceMetadata source;
 };
-
-// Source-sample bounds for one video presentation interval. `start_pts_samples`
-// is intentionally allowed to be negative: when an app first becomes audible
-// after the clip starts, the muxer uses that negative presentation boundary to
-// retain the true leading timestamp gap rather than pulling the stem to t=0.
-struct AudioSourcePresentationRange {
-    int64_t start_pts_samples = 0;
-    int64_t end_pts_samples = 0;
-};
-
-AudioSourcePresentationRange MapAudioSourcePresentationRange(
-    double presentation_start_qpc_s, double presentation_end_qpc_s,
-    uint64_t source_timeline_origin_100ns, uint32_t sample_rate);
 
 // Owns one real Windows process-loopback IAudioClient.  It does not create an
 // AAC encoder or replay ring until the common activity gate admits the source,

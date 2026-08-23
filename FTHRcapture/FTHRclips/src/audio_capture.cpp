@@ -32,11 +32,14 @@
 #include "audio_capture.h"
 #include "audio_encoder.h"
 #include "audio_ring_buffer.h"
+#include "audio_timeline.h"
 
 #include <iostream>
 #include <vector>
 #include <cstring>
 #include <cassert>
+#include <algorithm>
+#include <limits>
 
 
 // ---------------------------------------------------------------------------
@@ -416,6 +419,34 @@ namespace fthr {
             // Inner capture loop — runs until the device is lost or Stop() is called
             // ------------------------------------------------------------------
             bool device_error = false;
+            // A render endpoint can legitimately stop producing WASAPI
+            // packets when every application is silent. Keep the Default Mix
+            // source continuous in the same QPC domain so a microphone-only
+            // clip still has its mandatory compatibility stream. This is not
+            // a second clock: synthetic silence only fills measured gaps
+            // between QPC-stamped endpoint packets.
+            uint64_t next_timeline_100ns = CurrentAudioTimeline100ns();
+            const auto advance_timeline = [this](uint64_t timestamp, uint32_t frames) {
+                if (sample_rate_ == 0) return timestamp;
+                return timestamp + (static_cast<uint64_t>(frames) * 10'000'000ULL)
+                    / static_cast<uint64_t>(sample_rate_);
+            };
+            const auto fill_silence_until = [this, &next_timeline_100ns, &advance_timeline](
+                                               uint64_t end_100ns) {
+                if (end_100ns == 0 || sample_rate_ == 0) return;
+                if (next_timeline_100ns == 0) {
+                    next_timeline_100ns = end_100ns;
+                    return;
+                }
+                if (end_100ns <= next_timeline_100ns) return;
+                const uint64_t frames64 = ((end_100ns - next_timeline_100ns)
+                    * static_cast<uint64_t>(sample_rate_)) / 10'000'000ULL;
+                if (frames64 == 0) return;
+                const uint32_t frames = static_cast<uint32_t>(std::min<uint64_t>(
+                    frames64, static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())));
+                InjectSilence(frames, next_timeline_100ns);
+                next_timeline_100ns = advance_timeline(next_timeline_100ns, frames);
+            };
 
             while (running_.load(std::memory_order_relaxed) && !device_error) {
 
@@ -438,6 +469,13 @@ namespace fthr {
                     break;
                 }
 
+                // When the default render endpoint is totally idle it can
+                // report no packet on both an event wake and a timeout. The
+                // gap is real timeline silence, not a missing source.
+                if (next_packet_size == 0) {
+                    fill_silence_until(CurrentAudioTimeline100ns());
+                }
+
                 while (next_packet_size > 0) {
 
                     BYTE*  data  = nullptr;
@@ -457,12 +495,33 @@ namespace fthr {
                     if (frames > 0) {
                         const bool is_silent =
                             (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0 || !data;
-                        if (is_silent) {
-                            InjectSilence(frames, qpc_position);
+                        const uint64_t packet_qpc = qpc_position != 0
+                            ? qpc_position : CurrentAudioTimeline100ns();
+                        fill_silence_until(packet_qpc);
+
+                        // A packet that arrived while we were maintaining a
+                        // silent timeline can overlap the filled boundary by
+                        // a few endpoint frames. Discard only that duplicate
+                        // prefix; never rewind encoder PTS or introduce a
+                        // second clock.
+                        uint32_t skip_frames = 0;
+                        if (packet_qpc < next_timeline_100ns && sample_rate_ > 0) {
+                            const uint64_t overlap_frames = ((next_timeline_100ns - packet_qpc)
+                                * static_cast<uint64_t>(sample_rate_)) / 10'000'000ULL;
+                            skip_frames = static_cast<uint32_t>(std::min<uint64_t>(
+                                overlap_frames, frames));
                         }
-                        else {
-                            SubmitSamples(reinterpret_cast<const float*>(data),
-                                frames, qpc_position);
+                        const uint32_t submit_frames = frames - skip_frames;
+                        if (submit_frames > 0) {
+                            const uint64_t submit_qpc = advance_timeline(packet_qpc, skip_frames);
+                            if (is_silent) {
+                                InjectSilence(submit_frames, submit_qpc);
+                            } else {
+                                SubmitSamples(reinterpret_cast<const float*>(data)
+                                        + static_cast<size_t>(skip_frames) * channels_,
+                                    submit_frames, submit_qpc);
+                            }
+                            next_timeline_100ns = advance_timeline(submit_qpc, submit_frames);
                         }
                     }
 
@@ -574,6 +633,10 @@ namespace fthr {
     void AudioCapture::SubmitSamples(const float* interleaved_data,
         uint32_t frame_count, uint64_t qpc_100ns) {
         if (!interleaved_data || frame_count == 0) return;
+        // Some virtual/device drivers omit pu64QPCPosition. A zero timestamp
+        // must not make the persistent AAC ring unsaveable: use the same QPC
+        // clock at capture time instead of creating a separate wall clock.
+        if (qpc_100ns == 0) qpc_100ns = CurrentAudioTimeline100ns();
         if (qpc_100ns > 0) {
             uint64_t expected = 0;
             timeline_origin_qpc_100ns_.compare_exchange_strong(

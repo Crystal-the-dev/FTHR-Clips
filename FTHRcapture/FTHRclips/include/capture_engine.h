@@ -63,6 +63,8 @@
 #include "audio_capture.h"       // AudioCapture (WASAPI loopback -> PCM ring)
 #include "audio_encoder.h"
 #include "audio_packet_ring.h"
+#include "audio_timeline.h"
+#include "windows_microphone_audio_provider.h"
 #include "windows_process_loopback_audio_provider.h"
 #include "audio_ring_buffer.h"   // AudioRingBuffer (raw float32 PCM)
 #include "shared_memory.h"       // typed v4 capture-health flags
@@ -106,6 +108,12 @@ namespace fthr {
         // argv[14]: 0 = disable WASAPI loopback audio capture entirely.
         // Useful when the user turns off audio in settings (no system audio in clips).
         bool audio_enabled = true;
+
+        // Stable native eCapture endpoint ID. Empty means the documented
+        // "Default microphone" policy. An explicit missing ID never falls
+        // back to another microphone.
+        std::wstring microphone_endpoint_id;
+        uint32_t microphone_gain_percent = 100;
 
         // Stable Windows monitor device interface path from the UI. Resolved
         // into transient HMONITOR/LUID/DXGI objects for each capture generation.
@@ -351,6 +359,10 @@ namespace fthr {
         AudioEncoder                      default_mix_audio_encoder_;
         std::unique_ptr<EncodedAudioPacketRing> default_mix_audio_ring_;
         AudioSourceMetadata               default_mix_audio_source_;
+        // Endpoint IDs remain local setup details and never cross the manifest
+        // or the frozen Shared Memory v4 boundary.
+        std::unique_ptr<WindowsMicrophoneAudioProvider> microphone_audio_source_;
+        AudioSourceMetadata               microphone_audio_metadata_;
         // Windows 11 only. This owns real process-loopback providers; Windows
         // 10 remains Default-Mix-only and never attempts their activation.
         std::unique_ptr<WindowsApplicationAudioSourceManager>

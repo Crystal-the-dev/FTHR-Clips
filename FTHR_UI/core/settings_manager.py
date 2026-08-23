@@ -37,7 +37,10 @@ class SettingsManager:
                 'save_screenshot': 'F11'
             },
             'quick_crop': None,      # dict {x,y,w,h,src_w,src_h} or None
-            'mic_device_name': None, # str device name, or None for system default
+            # Stable native endpoint ID on Windows. The friendly name remains
+            # only for display and one-time migration of older settings files.
+            'mic_device_id': None,
+            'mic_device_name': None, # str display name, or None for system default
             'mic_volume': 100,       # 0–200 (scaled in callbacks)
             'mic_loopback': False,   # real-time monitor: hear your own mic
             # 'stretch' = fill the target rect, distort if aspect differs.

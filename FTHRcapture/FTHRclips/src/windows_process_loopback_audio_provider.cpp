@@ -48,8 +48,8 @@ namespace fthr {
 
 namespace {
 
-constexpr uint32_t kCanonicalSampleRate = 48000;
-constexpr uint32_t kCanonicalChannels = 2;
+constexpr uint32_t kCanonicalSampleRate = kCanonicalAudioSampleRate;
+constexpr uint32_t kCanonicalChannels = kCanonicalAudioChannels;
 constexpr DWORD kActivationTimeoutMs = 5000;
 constexpr DWORD kCaptureWaitMs = 250;
 constexpr uint32_t kMaxRecoveryAttempts = 3;
@@ -183,23 +183,6 @@ struct ProcessLoopbackSession {
 };
 
 }  // namespace
-
-AudioSourcePresentationRange MapAudioSourcePresentationRange(
-    double presentation_start_qpc_s, double presentation_end_qpc_s,
-    uint64_t source_timeline_origin_100ns, uint32_t sample_rate) {
-    AudioSourcePresentationRange result;
-    if (source_timeline_origin_100ns == 0 || sample_rate == 0
-            || presentation_end_qpc_s <= presentation_start_qpc_s) {
-        return result;
-    }
-    const double origin_s = static_cast<double>(source_timeline_origin_100ns) / 10'000'000.0;
-    result.start_pts_samples = static_cast<int64_t>(std::llround(
-        (presentation_start_qpc_s - origin_s) * sample_rate));
-    result.end_pts_samples = std::max<int64_t>(result.start_pts_samples + 1,
-        static_cast<int64_t>(std::llround(
-            (presentation_end_qpc_s - origin_s) * sample_rate)));
-    return result;
-}
 
 struct WindowsProcessLoopbackAudioProvider::Impl {
     explicit Impl(WindowsProcessLoopbackProviderConfig initial,

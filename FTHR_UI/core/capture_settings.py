@@ -43,6 +43,7 @@ class CaptureConfig:
     monitor: str
     scaling: str
     audio_enabled: bool
+    microphone_endpoint_id: str = ''
     normal_clip_seconds: int = 30
     extended_clip_seconds: int = 60
 

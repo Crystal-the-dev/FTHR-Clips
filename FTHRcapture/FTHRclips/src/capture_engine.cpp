@@ -579,6 +579,47 @@ namespace fthr {
                 << "persistent AAC packet replay)"
                 << std::endl;
 
+            std::string microphone_uuid;
+            std::string microphone_uuid_error;
+            if (!CreateAudioManifestTransactionId(&microphone_uuid, &microphone_uuid_error)) {
+                std::cerr << "[CaptureEngine] Could not create Microphone source UUID: "
+                    << microphone_uuid_error << std::endl;
+            } else {
+                microphone_audio_metadata_ = {};
+                microphone_audio_metadata_.identity.id = AudioSourceId{microphone_uuid};
+                microphone_audio_metadata_.identity.type = AudioSourceType::Microphone;
+                microphone_audio_metadata_.identity.persistent_identity = "microphone";
+                microphone_audio_metadata_.identity.display_name = "Microphone";
+                microphone_audio_metadata_.identity.icon_reference = "microphone";
+                microphone_audio_metadata_.format = {
+                    kCanonicalAudioSampleRate, kCanonicalAudioChannels, "fltp"};
+                microphone_audio_metadata_.state.health = AudioSourceHealth::Discovered;
+
+                WindowsMicrophoneAudioProviderConfig microphone_config;
+                microphone_config.generation = capture_generation_.load(
+                    std::memory_order_relaxed) + 1;
+                microphone_config.endpoint_id = config.microphone_endpoint_id;
+                microphone_config.use_default_endpoint = config.microphone_endpoint_id.empty();
+                microphone_config.retention_seconds = buffer_seconds_;
+                microphone_config.bitrate_kbps = 96;
+                microphone_config.input_gain = std::clamp(
+                    static_cast<float>(config.microphone_gain_percent) / 100.0f,
+                    0.0f, 2.0f);
+                microphone_config.source = microphone_audio_metadata_;
+                microphone_audio_source_ = std::make_unique<WindowsMicrophoneAudioProvider>(
+                    std::move(microphone_config));
+                if (!microphone_audio_source_->Start()) {
+                    std::cerr << "[CaptureEngine] Native microphone provider did not start: "
+                        << microphone_audio_source_->last_error() << std::endl;
+                    microphone_audio_source_.reset();
+                } else {
+                    std::cout << "[CaptureEngine] Native microphone provider starting ("
+                        << (config.microphone_endpoint_id.empty() ? "Default microphone"
+                                                                   : "explicit endpoint")
+                        << ")." << std::endl;
+                }
+            }
+
             windows_application_audio_sources_ =
                 std::make_unique<WindowsApplicationAudioSourceManager>(
                     capture_generation_.load(std::memory_order_relaxed) + 1,
@@ -683,16 +724,19 @@ namespace fthr {
             // The Windows 11 application providers have independent bounded
             // capture waits. Stop them before Default Mix disappears.
             windows_application_audio_sources_.reset();
+            microphone_audio_source_.reset();
             audio_capture_.Stop();
             default_mix_audio_encoder_.Finalize();
             audio_capture_.Shutdown();
             default_mix_audio_ring_.reset();
             default_mix_audio_source_ = {};
+            microphone_audio_metadata_ = {};
             audio_active_ = false;
             std::cout << "[CaptureEngine] Audio pipeline stopped." << std::endl;
         }
         else {
             windows_application_audio_sources_.reset();
+            microphone_audio_source_.reset();
         }
 
         ring_head_.store(0, std::memory_order_relaxed);
@@ -884,11 +928,10 @@ namespace fthr {
                 const uint32_t sample_rate = audio_capture_.GetSampleRate();
                 if (origin_qpc > 0 && start_qpc_s > 0.0 && end_qpc_s > start_qpc_s
                         && sample_rate > 0) {
-                    const double origin_s = static_cast<double>(origin_qpc) / 10'000'000.0;
-                    const int64_t start_pts = std::max<int64_t>(0, static_cast<int64_t>(
-                        std::llround((start_qpc_s - origin_s) * sample_rate)));
-                    const int64_t end_pts = std::max(start_pts + 1, static_cast<int64_t>(
-                        std::llround((end_qpc_s - origin_s) * sample_rate)));
+                    const auto range = MapAudioSourcePresentationRange(
+                        start_qpc_s, end_qpc_s, origin_qpc, sample_rate);
+                    const int64_t start_pts = std::max<int64_t>(0, range.start_pts_samples);
+                    const int64_t end_pts = std::max(start_pts + 1, range.end_pts_samples);
                     task.encoded_audio_snapshot = default_mix_audio_ring_->TakeSnapshot(
                         start_pts, end_pts);
                     task.audio_presentation_start_pts_samples = start_pts;
@@ -911,6 +954,16 @@ namespace fthr {
                                 default_mix_track.snapshot.last_pts_samples)
                                 * 10'000'000ULL / sample_rate));
                         task.encoded_audio_tracks.push_back(std::move(default_mix_track));
+                        if (microphone_audio_source_) {
+                            if (const auto microphone_track =
+                                    microphone_audio_source_->TakeTrackForInterval(
+                                        start_qpc_s, end_qpc_s, microphone_audio_metadata_)) {
+                                task.encoded_audio_tracks.push_back(*microphone_track);
+                            } else if (!microphone_audio_source_->last_error().empty()) {
+                                std::cerr << "[SaveClip] Native microphone unavailable: "
+                                    << microphone_audio_source_->last_error() << std::endl;
+                            }
+                        }
                         if (windows_application_audio_sources_) {
                             auto application_tracks =
                                 windows_application_audio_sources_->TakeTracksForInterval(
@@ -930,7 +983,15 @@ namespace fthr {
                             << task.encoded_audio_snapshot.packets.size()
                             << " packets, PTS " << start_pts << " - " << end_pts
                             << std::endl;
+                    } else {
+                        std::cerr << "[SaveClip] Default Mix AAC ring had no packets for "
+                            << "presentation PTS " << start_pts << " - " << end_pts
+                            << std::endl;
                     }
+                } else {
+                    std::cerr << "[SaveClip] Default Mix timeline is not ready; origin="
+                        << origin_qpc << ", video interval=" << start_qpc_s << " - "
+                        << end_qpc_s << ", sample_rate=" << sample_rate << std::endl;
                 }
             }
             else if (audio_active_ && audio_capture_.IsDeviceLost()) {

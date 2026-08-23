@@ -98,7 +98,7 @@ namespace fthr {
         int64_t              audio_presentation_start_pts_samples = 0;
 
         // AUDIT-050 production replay contract.  Muxing may contain one
-        // Default Mix plus up to eight actual application stems; never category
+        // Default Mix, native Microphone, and up to eight actual application stems; never category
         // guesses or silent placeholders.  The legacy single-track fields
         // above are converted to one Default Mix only while older callers
         // remain in the tree.

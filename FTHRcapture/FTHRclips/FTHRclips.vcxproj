@@ -24,6 +24,8 @@
     <ClInclude Include="include\clip_audio_manifest.h" />
     <ClInclude Include="include\windows_audio_session_registry.h" />
     <ClInclude Include="include\windows_process_loopback_audio_provider.h" />
+    <ClInclude Include="include\windows_microphone_audio_provider.h" />
+    <ClInclude Include="include\audio_timeline.h" />
     <ClInclude Include="include\audio_capture.h" />
     <ClInclude Include="include\audio_encoder.h" />
     <ClInclude Include="include\audio_ring_buffer.h" />
@@ -49,6 +51,8 @@
     <ClCompile Include="src\clip_audio_manifest.cpp" />
     <ClCompile Include="src\windows_audio_session_registry.cpp" />
     <ClCompile Include="src\windows_process_loopback_audio_provider.cpp" />
+    <ClCompile Include="src\windows_microphone_audio_provider.cpp" />
+    <ClCompile Include="src\audio_timeline.cpp" />
     <ClCompile Include="src\audio_capture.cpp" />
     <ClCompile Include="src\audio_encoder.cpp" />
     <ClCompile Include="src\audio_ring_buffer.cpp" />

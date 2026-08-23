@@ -153,6 +153,10 @@ from core.windows_monitor import (
 from core.screenshot_target import build_grim_command, select_qt_screen
 from core.library_ownership import add_import_root, remove_import_root
 from core.mic_recorder import MicRecorder, write_wav
+from core.windows_microphone_devices import (
+    list_native_microphones,
+    migrate_legacy_microphone_name,
+)
 from core.ffmpeg_tools import (
     get_ffmpeg_exe, software_video_args, FFmpegUnavailable)
 from ui.capture_card_client import CaptureCardClient
@@ -2560,11 +2564,18 @@ class MainWindow(QMainWindow):
             scaling=self.settings_manager.get('scaling_mode', 'stretch'),
             audio_enabled=bool(
                 self.settings_manager.get('audio_capture_enabled', True)),
+            microphone_endpoint_id=str(
+                self.settings_manager.get('mic_device_id') or ''),
             normal_clip_seconds=self.clip_duration,
             extended_clip_seconds=self.extended_clip_duration,
         )
 
     def _apply_active_audio_state(self, config: CaptureConfig) -> None:
+        # Windows now owns the microphone natively inside the capture engine.
+        # The legacy Python recorder remains only for the Linux fallback path.
+        if sys.platform == 'win32':
+            MicRecorder().stop()
+            return
         recorder = MicRecorder()
         if config.audio_enabled:
             if not recorder.is_running():
@@ -2644,6 +2655,12 @@ class MainWindow(QMainWindow):
         encoder_preset = launch_config.preset
         multiband_arg = '0'
         audio_arg = '1' if launch_config.audio_enabled else '0'
+        microphone_id_arg = launch_config.microphone_endpoint_id
+        try:
+            microphone_gain = int(self.settings_manager.get('mic_volume', 100))
+        except (TypeError, ValueError):
+            microphone_gain = 100
+        microphone_gain_arg = str(max(0, min(200, microphone_gain)))
         try:
             # A process/backend restart starts a new replay generation. Keep the
             # one-per-incident recovery budget, but never carry stale buffer age.
@@ -2663,7 +2680,8 @@ class MainWindow(QMainWindow):
                  str(launch_config.bitrate_kbps), str(max_buffer_mb),
                  mode_arg, hwnd_arg, scale_arg, capture_monitor,
                  str(codec_pref_int), str(encoder_preset),
-                 multiband_arg, audio_arg],
+                 multiband_arg, audio_arg,
+                 microphone_id_arg, microphone_gain_arg],
                 **popen_options
             )
             # Poll for connection in a background thread so the UI stays responsive.
@@ -2695,6 +2713,13 @@ class MainWindow(QMainWindow):
                             self._pending_launch_generation = _my_gen
                             self._set_status('CAPTURE STARTING', status_idle_qss())
                             self._set_rec_dot_state('disconnected')
+                            # Native endpoint discovery is intentionally
+                            # deferred until the normal engine is already
+                            # running. Settings-page construction must not
+                            # launch a second capture executable merely to
+                            # enumerate microphones.
+                            QTimer.singleShot(
+                                0, self._settings_page_widget._populate_mic_devices)
                             QTimer.singleShot(2000, self._check_hardware_encoding_status)
                             if not self._startup_sound_played:
                                 self._startup_sound_played = True
@@ -2852,6 +2877,11 @@ class MainWindow(QMainWindow):
     # =======================================================================
 
     def _start_mic_recorder(self):
+        if sys.platform == 'win32':
+            # Native WASAPI capture starts with the engine so microphone and
+            # video share one generation-local QPC timeline. Do not create a
+            # second PortAudio ring that could later post-mix stale audio.
+            return
         if not MicRecorder.is_available():
             print('[Mic] sounddevice not installed — mic-in-clips disabled')
             self.push_error(
@@ -3205,7 +3235,8 @@ class MainWindow(QMainWindow):
             audio_on=(active_config.audio_enabled if active_config else
                       self.settings_manager.get('audio_capture_enabled', True)),
             multiband_enabled=False,
-            mic_running=(MicRecorder.is_available() and MicRecorder().is_running()),
+            mic_running=(sys.platform != 'win32' and MicRecorder.is_available()
+                         and MicRecorder().is_running()),
             watermark=self.settings_manager.get('watermark_enabled', False),
             auto_crop=self.settings_manager.get('auto_crop_enabled', False),
             camera=self.settings_manager.get('camera_enabled', False),
@@ -5584,33 +5615,88 @@ class _SettingsPage(QWidget):
     # -- Microphone helpers --
 
     def _populate_mic_devices(self):
-        """Re-scan input devices and refill the combo."""
-        # Capture the *intended* selection: prefer the saved settings name
-        # over the combo's current text, so a deferred first run still ends
-        # up on the user's previously-chosen device. Manual refresh (button)
-        # falls through to the current selection in the combo.
-        intended = None
-        if self.sm is not None:
-            saved = self.sm.get('mic_device_name')
-            if saved:
-                intended = saved
-        if intended is None and self.mic_combo.count():
-            intended = self.mic_combo.currentText()
+        """Re-scan input devices while preserving a stable native ID on Windows."""
+        saved_id = self.sm.get('mic_device_id') if self.sm is not None else None
+        saved_name = self.sm.get('mic_device_name') if self.sm is not None else None
+        previous_name = self.mic_combo.currentText() if self.mic_combo.count() else None
+
+        native_endpoints = []
+        if sys.platform == 'win32':
+            main_window = self.window()
+            engine_path = getattr(main_window, 'engine_path', None)
+            if engine_path and getattr(main_window, 'engine_process', None) is not None:
+                try:
+                    native_endpoints = list_native_microphones(engine_path)
+                except RuntimeError as exc:
+                    print(f'[Mic] Native endpoint scan failed: {exc}')
+
+        legacy_indices = {}
+        if _SD_AVAILABLE:
+            try:
+                for index, device in enumerate(_sd.query_devices()):
+                    if device.get('max_input_channels', 0) > 0:
+                        legacy_indices.setdefault(device['name'], []).append(index)
+            except Exception as exc:
+                print(f'Mic scan failed: {exc}')
+
+        if sys.platform == 'win32' and not saved_id:
+            migrated_id = migrate_legacy_microphone_name(saved_name, native_endpoints)
+            if migrated_id and self.sm is not None:
+                self.sm.set('mic_device_id', migrated_id)
+                self.sm.save_settings()
+                saved_id = migrated_id
 
         self.mic_combo.blockSignals(True)
         self.mic_combo.clear()
-        self.mic_combo.addItem('System Default', userData=None)
-        if _SD_AVAILABLE:
-            try:
-                for i, dev in enumerate(_sd.query_devices()):
-                    if dev.get('max_input_channels', 0) > 0:
-                        self.mic_combo.addItem(dev['name'], userData=i)
-            except Exception as e:
-                print(f'Mic scan failed: {e}')
-        if intended:
-            idx = self.mic_combo.findText(intended)
-            if idx >= 0:
-                self.mic_combo.setCurrentIndex(idx)
+        default_data = {'endpoint_id': None, 'legacy_index': None,
+                        'display_name': 'System Default'}
+        self.mic_combo.addItem('System Default', userData=default_data)
+        if native_endpoints:
+            active_ids = set()
+            for endpoint in native_endpoints:
+                if not endpoint.is_active:
+                    continue
+                active_ids.add(endpoint.endpoint_id)
+                indices = legacy_indices.get(endpoint.display_name, [])
+                legacy_index = indices[0] if len(indices) == 1 else None
+                self.mic_combo.addItem(endpoint.display_name, userData={
+                    'endpoint_id': endpoint.endpoint_id,
+                    'legacy_index': legacy_index,
+                    'display_name': endpoint.display_name,
+                })
+            # Explicit selections remain explicit even after a USB/Bluetooth
+            # device disappears. Passing this ID to the engine produces a
+            # clear native failure instead of silently following Default.
+            if saved_id and saved_id not in active_ids:
+                self.mic_combo.addItem(f'{saved_name or "Selected microphone"} (unavailable)',
+                                       userData={
+                                           'endpoint_id': saved_id,
+                                           'legacy_index': None,
+                                           'display_name': saved_name or 'Microphone',
+                                       })
+        elif _SD_AVAILABLE:
+            # Linux remains on the legacy PortAudio path for this phase.
+            for name, indices in legacy_indices.items():
+                if len(indices) == 1:
+                    self.mic_combo.addItem(name, userData={
+                        'endpoint_id': None,
+                        'legacy_index': indices[0],
+                        'display_name': name,
+                    })
+
+        selected = 0
+        for index in range(self.mic_combo.count()):
+            data = self.mic_combo.itemData(index)
+            if isinstance(data, dict) and saved_id and data.get('endpoint_id') == saved_id:
+                selected = index
+                break
+            if (not saved_id and saved_name and isinstance(data, dict)
+                    and data.get('display_name') == saved_name):
+                selected = index
+                break
+            if not saved_id and not saved_name and previous_name == self.mic_combo.itemText(index):
+                selected = index
+        self.mic_combo.setCurrentIndex(selected)
         self.mic_combo.blockSignals(False)
         if not self._mic_combo_connected:
             self.mic_combo.currentIndexChanged.connect(
@@ -5628,11 +5714,17 @@ class _SettingsPage(QWidget):
         for slider in self.sound_sliders.values():
             slider.blockSignals(True)
         try:
+            endpoint_id = self.sm.get('mic_device_id')
             name = self.sm.get('mic_device_name')
-            if name:
-                idx = self.mic_combo.findText(name)
-                if idx >= 0:
+            for idx in range(self.mic_combo.count()):
+                data = self.mic_combo.itemData(idx)
+                if isinstance(data, dict) and endpoint_id and data.get('endpoint_id') == endpoint_id:
                     self.mic_combo.setCurrentIndex(idx)
+                    break
+                if (isinstance(data, dict) and not endpoint_id and name
+                        and data.get('display_name') == name):
+                    self.mic_combo.setCurrentIndex(idx)
+                    break
             vol = int(self.sm.get('mic_volume', 100))
             self.mic_vol_slider.setValue(vol)
             self.mic_vol_value.setText(f'{vol}%')
@@ -5665,13 +5757,18 @@ class _SettingsPage(QWidget):
     def _save_audio_settings(self):
         if self.sm is None:
             return
-        name = self.mic_combo.currentText()
-        self.sm.set('mic_device_name', None if name == 'System Default' else name)
+        data = self.mic_combo.currentData()
+        endpoint_id = data.get('endpoint_id') if isinstance(data, dict) else None
+        display_name = data.get('display_name') if isinstance(data, dict) else None
+        self.sm.set('mic_device_id', endpoint_id)
+        self.sm.set('mic_device_name', display_name if endpoint_id else None)
         self.sm.set('mic_volume', self.mic_vol_slider.value())
         self.sm.set('mic_loopback', self.mic_loopback_check.isChecked())
         self.sm.save_settings()
-        # Push updates to the always-on background recorder so future clips
-        # use the newly-selected device and gain.
+        # Linux still owns its temporary legacy recorder. Windows applies the
+        # requested endpoint/input gain only on the next engine generation.
+        if sys.platform == 'win32':
+            return
         try:
             from core.mic_recorder import MicRecorder
             if MicRecorder.is_available():
@@ -5683,7 +5780,12 @@ class _SettingsPage(QWidget):
             print(f'[Mic] settings push failed: {e}')
 
     def _selected_mic_index(self):
-        return self.mic_combo.currentData() if self.mic_combo.count() else None
+        data = self.mic_combo.currentData() if self.mic_combo.count() else None
+        return data.get('legacy_index') if isinstance(data, dict) else data
+
+    def _selected_mic_endpoint_id(self):
+        data = self.mic_combo.currentData() if self.mic_combo.count() else None
+        return data.get('endpoint_id') if isinstance(data, dict) else None
 
     def _on_mic_volume_changed(self, v: int):
         self.mic_vol_value.setText(f'{v}%')
@@ -5711,6 +5813,11 @@ class _SettingsPage(QWidget):
             self._stop_loopback()
             self._start_loopback(idx)
         self._save_audio_settings()
+        if sys.platform == 'win32':
+            # Explicit/default microphone changes intentionally create a new
+            # capture generation. A running native source is never silently
+            # rebound to another endpoint or clock domain.
+            self.audio_capture_changed.emit(True)
 
     def _start_loopback(self, device_index):
         self._stop_loopback()

@@ -27,6 +27,9 @@
 //            aspect ratio from the captured source.
 //   argv[10] monitor_path   Stable normalized Windows monitor device path.
 //   argv[11] codec_pref     0 = auto/H.264, 1 = H.264, 2 = HEVC, 3 = AV1.
+//   argv[15] microphone_endpoint_id  Empty = Default microphone; otherwise a
+//            stable native eCapture endpoint ID selected by the settings page.
+//   argv[16] microphone_gain_percent Capture-input gain, clamped to 0-200.
 //
 // Threading:
 //   This file runs entirely on the main thread.
@@ -35,6 +38,9 @@
 #include "shared_memory.h"
 #include "capture_engine.h"
 #include "hardware_encoder.h"  // DetectNVENC() for pre-init logging
+#include "windows_microphone_audio_provider.h"
+#include <algorithm>
+#include <cstring>
 #include <iostream>
 #include <Windows.h>
 
@@ -71,6 +77,60 @@ static std::wstring ParseArgUtf8(int argc, char* argv[], int index) {
     return value;
 }
 
+static std::string Utf8FromWide(const std::wstring& value) {
+    if (value.empty()) return {};
+    const int length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+        value.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (length <= 1) return {};
+    std::string result(static_cast<size_t>(length), '\0');
+    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.c_str(), -1,
+            result.data(), length, nullptr, nullptr) != length) {
+        return {};
+    }
+    result.pop_back();
+    return result;
+}
+
+static std::string EscapeJson(const std::string& value) {
+    std::string result;
+    result.reserve(value.size() + 8);
+    for (const unsigned char character : value) {
+        switch (character) {
+        case '\\': result += "\\\\"; break;
+        case '"': result += "\\\""; break;
+        case '\n': result += "\\n"; break;
+        case '\r': result += "\\r"; break;
+        case '\t': result += "\\t"; break;
+        default:
+            if (character >= 0x20) result.push_back(static_cast<char>(character));
+            break;
+        }
+    }
+    return result;
+}
+
+static int ListMicrophones() {
+    std::vector<fthr::WindowsMicrophoneEndpoint> endpoints;
+    std::string error;
+    if (!fthr::EnumerateWindowsMicrophoneEndpoints(&endpoints, &error)) {
+        std::cerr << "{\"schema_version\":1,\"error\":\""
+                  << EscapeJson(error) << "\"}" << std::endl;
+        return 1;
+    }
+    std::cout << "{\"schema_version\":1,\"microphones\":[";
+    for (size_t index = 0; index < endpoints.size(); ++index) {
+        const auto& endpoint = endpoints[index];
+        if (index) std::cout << ',';
+        std::cout << "{\"endpoint_id\":\"" << EscapeJson(Utf8FromWide(endpoint.endpoint_id))
+                  << "\",\"display_name\":\"" << EscapeJson(endpoint.display_name)
+                  << "\",\"device_state\":" << endpoint.device_state
+                  << ",\"is_default\":" << (endpoint.is_default ? "true" : "false")
+                  << '}';
+    }
+    std::cout << "]}" << std::endl;
+    return 0;
+}
+
 static void PrintConfig(const fthr::CaptureConfig& cfg) {
     std::cout << "  Framerate    : " << cfg.framerate << " fps" << std::endl;
     std::cout << "  Buffer       : " << cfg.buffer_seconds << " sec" << std::endl;
@@ -100,6 +160,12 @@ static void PrintConfig(const fthr::CaptureConfig& cfg) {
     std::cout << "  Audio        : "
               << (cfg.audio_enabled ? "Enabled" : "Disabled (user setting)")
               << std::endl;
+    if (cfg.audio_enabled) {
+        std::cout << "  Microphone   : "
+                  << (cfg.microphone_endpoint_id.empty() ? "Default microphone"
+                                                         : "Explicit native endpoint")
+                  << std::endl;
+    }
     if (!cfg.monitor_device_path.empty()) {
         std::wcout << L"  Monitor path : " << cfg.monitor_device_path << std::endl;
     }
@@ -111,6 +177,9 @@ static void PrintConfig(const fthr::CaptureConfig& cfg) {
 // ---------------------------------------------------------------------------
 
 int main(int argc, char* argv[]) {
+    if (argc == 2 && std::strcmp(argv[1], "--list-microphones") == 0) {
+        return ListMicrophones();
+    }
     std::cout << "FTHR Capture Engine starting..." << std::endl;
 
     // ------------------------------------------------------------------
@@ -167,6 +236,9 @@ int main(int argc, char* argv[]) {
         break;
     }
     config.audio_enabled = (ParseArgU32(argc, argv, 14, 1) != 0);
+    config.microphone_endpoint_id = ParseArgUtf8(argc, argv, 15);
+    config.microphone_gain_percent = std::min<uint32_t>(
+        ParseArgU32(argc, argv, 16, 100), 200);
 
     // ------------------------------------------------------------------
     // 2. Validate all parameters - clamp to safe ranges
