@@ -95,14 +95,15 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QScrollArea, QFrame, QMessageBox, QComboBox,
     QGraphicsOpacityEffect, QSizePolicy, QStackedWidget,
     QCheckBox, QSlider,
-    QToolButton, QButtonGroup, QFileDialog, QLineEdit,
+    QToolButton, QButtonGroup, QFileDialog, QLineEdit, QMenu,
+    QSystemTrayIcon,
 )
 from PySide6.QtCore import (
     QTimer, Signal, Qt, QPoint, QPointF, QSize, QRect,
     QPropertyAnimation, QAbstractAnimation, QEasingCurve,
     QParallelAnimationGroup,
 )
-from PySide6.QtGui import QPixmap, QFontDatabase, QCursor, QPainter, QPen, QColor, QIcon, QBrush, QPolygonF, QPalette, QKeySequence
+from PySide6.QtGui import QPixmap, QFontDatabase, QCursor, QPainter, QPen, QColor, QIcon, QBrush, QPolygonF, QPalette, QKeySequence, QAction
 
 from version import (
     __version__ as APP_VERSION, APP_NAME, BUILD_DATE,
@@ -1590,9 +1591,17 @@ class MainWindow(QMainWindow):
     # this signal instead is guaranteed to queue fn onto the main thread.
     _ui_call = Signal(object)
 
-    def __init__(self):
+    def __init__(self, *, background_start: bool = False):
         super().__init__()
         self._ui_call.connect(lambda fn: fn())
+        self._background_start = background_start
+        self._ui_ready = False
+        self._background_services_started = False
+        self._shutdown_requested = False
+        self._shutdown_complete = False
+        self._shutdown_timer_started = None
+        self._tray_icon = None
+        self._lifecycle_log = get_logger('lifecycle')
 
         # -- Frameless window --
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
@@ -1766,10 +1775,11 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f'{APP_NAME} {APP_VERSION}')
         self.setMinimumSize(1100, 720)
 
-        self._setup_ui()
-        self._load_saved_theme()
-        self._apply_styles()
+        if not self._background_start:
+            self.ensure_main_ui()
         self._setup_hotkeys()
+        self._start_background_services()
+        self._create_system_tray()
         if not _check_linux_input_group():
             QTimer.singleShot(1500, self._warn_input_group)
 
@@ -1801,6 +1811,96 @@ class MainWindow(QMainWindow):
         self._save_poll_timer.setInterval(50)
         self._save_poll_timer.timeout.connect(self._on_save_poll_tick)
         self._published_final_clips: set[str] = set()
+
+    def ensure_main_ui(self) -> None:
+        """Build the heavy library/settings UI only when a window is needed.
+
+        The capture engine, hotkeys, upload queue and tray deliberately do not
+        depend on this tree.  A Windows-login ``--background`` launch can
+        therefore fill replay history without constructing thumbnails, editor
+        controls or settings widgets first.
+        """
+        if self._ui_ready:
+            return
+        self._setup_ui()
+        self._load_saved_theme()
+        self._apply_styles()
+        self._ui_ready = True
+        is_connected = getattr(self.bridge, 'is_connected', lambda: False)
+        if self.bridge and is_connected():
+            QTimer.singleShot(
+                0, self._settings_page_widget._populate_mic_devices)
+
+    def _start_background_services(self) -> None:
+        """Start services that must survive hiding or deferred UI creation."""
+        if self._background_services_started:
+            return
+        self.upload_manager.upload_finished.connect(self._on_upload_finished)
+        self.upload_manager.upload_error.connect(self._on_upload_error)
+        self.upload_manager.start()
+        self._background_services_started = True
+
+    def _create_system_tray(self) -> bool:
+        """Create one native Windows tray icon for the process lifetime."""
+        if self._tray_icon is not None:
+            return True
+        if (sys.platform != 'win32'
+                or not QSystemTrayIcon.isSystemTrayAvailable()):
+            print('[Lifecycle] System tray unavailable; normal close remains enabled')
+            return False
+
+        icon_path = Path(__file__).parent / 'assets' / 'fthr_logo.ico'
+        icon = QIcon(str(icon_path)) if icon_path.exists() else self.windowIcon()
+        if icon.isNull():
+            print('[Lifecycle] System tray unavailable: FTHR icon could not load')
+            return False
+
+        tray = QSystemTrayIcon(icon, self)
+        tray.setToolTip('FTHR Clips — replay capture is running')
+        menu = QMenu()
+        open_action = QAction('Open FTHR', menu)
+        open_action.triggered.connect(self.restore_main_window)
+        save_action = QAction('Save Clip', menu)
+        save_action.triggered.connect(self._on_hotkey_save_clip)
+        library_action = QAction('Open Clips', menu)
+        library_action.triggered.connect(self._open_clip_library)
+        exit_action = QAction('Exit FTHR', menu)
+        exit_action.triggered.connect(self.request_full_exit)
+        menu.addAction(open_action)
+        menu.addAction(save_action)
+        menu.addAction(library_action)
+        menu.addSeparator()
+        menu.addAction(exit_action)
+        tray.setContextMenu(menu)
+        tray.activated.connect(self._on_tray_activated)
+        tray.show()
+        self._tray_icon = tray
+        print('[Lifecycle] TrayReady')
+        return True
+
+    def _on_tray_activated(self, reason) -> None:
+        if reason in {
+                QSystemTrayIcon.ActivationReason.Trigger,
+                QSystemTrayIcon.ActivationReason.DoubleClick}:
+            self.restore_main_window()
+
+    def restore_main_window(self) -> None:
+        """Restore the existing UI without restarting the capture generation."""
+        self.ensure_main_ui()
+        self.setWindowState(
+            self.windowState() & ~Qt.WindowState.WindowMinimized)
+        if self.isMaximized() or self._background_start:
+            self.showMaximized()
+        else:
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        self._background_start = False
+        print('[Lifecycle] WindowRestored')
+
+    def _open_clip_library(self) -> None:
+        self.restore_main_window()
+        self.main_stack.setCurrentIndex(0)
 
     # =======================================================================
     # UI layout
@@ -2004,23 +2104,13 @@ class MainWindow(QMainWindow):
             self._on_audio_capture_changed)
         self.main_stack.addWidget(self._settings_page_widget)
 
-        # Wire upload manager → clip grid + start
-        self.upload_manager.upload_finished.connect(self._on_upload_finished)
-        def _on_upload_error(title: str, detail: str, level: str, clip_path: str):
-            if title == 'UPLOAD NOT CONFIGURED':
-                actions = [('OPEN UPLOAD SETTINGS', self._toggle_settings_page)]
-            elif title == 'UPLOAD FAILED' and clip_path:
-                actions = [('RETRY NOW', lambda p=clip_path: self.upload_manager.enqueue_upload(p))]
-            else:
-                actions = []
-            self.push_error(title, detail, level, actions=actions)
-
-        self.upload_manager.upload_error.connect(_on_upload_error)
+        # The manager itself starts before the optional UI exists, so background
+        # replay and uploads do not depend on this screen.  These bindings are
+        # the view-specific half and are created only with the library grid.
         self.clip_grid.clip_upload_requested.connect(self.upload_manager.enqueue_upload)
         self.clip_grid.set_upload_checker(self.upload_manager.is_uploaded)
         self.clip_grid.set_upload_enabled_checker(
             lambda: self.settings_manager.get('upload_enabled', False))
-        self.upload_manager.start()
 
         root.addWidget(self.main_stack, stretch=1)
 
@@ -2271,6 +2361,8 @@ class MainWindow(QMainWindow):
         self._dot_anim.start()
 
     def _set_rec_dot_state(self, state: str):
+        if not hasattr(self, 'rec_dot'):
+            return
         # Top bar is white, so the muted-state color must be a dark tone — using
         # white here was the source of the "no dot visible while disconnected" bug.
         colors = {
@@ -2718,8 +2810,9 @@ class MainWindow(QMainWindow):
                             # running. Settings-page construction must not
                             # launch a second capture executable merely to
                             # enumerate microphones.
-                            QTimer.singleShot(
-                                0, self._settings_page_widget._populate_mic_devices)
+                            if self._ui_ready:
+                                QTimer.singleShot(
+                                    0, self._settings_page_widget._populate_mic_devices)
                             QTimer.singleShot(2000, self._check_hardware_encoding_status)
                             if not self._startup_sound_played:
                                 self._startup_sound_played = True
@@ -2798,21 +2891,30 @@ class MainWindow(QMainWindow):
                 pass
 
     def stop_engine(self):
+        process = self.engine_process
+        graceful_requested = False
+        request_shutdown = getattr(self.bridge, 'request_engine_shutdown', None)
+        if sys.platform == 'win32' and callable(request_shutdown):
+            graceful_requested = request_shutdown()
+        if process:
+            try:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                print('[Lifecycle] Engine graceful shutdown timed out; escalating')
+                process.terminate()
+                try:
+                    process.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    try:
+                        process.wait(timeout=0.5)  # reap — no zombie on Linux
+                    except subprocess.TimeoutExpired:
+                        print('[Lifecycle] Engine could not be reaped before exit')
+            print('[Lifecycle] EngineStopped '
+                  f'graceful={graceful_requested} code={process.returncode}')
+            self.engine_process = None
         if self.bridge:
             self.bridge.shutdown()
-        if self.engine_process:
-            self.engine_process.terminate()
-            try:
-                self.engine_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.engine_process.kill()
-                try:
-                    self.engine_process.wait(timeout=2)  # reap — no zombie on Linux
-                except subprocess.TimeoutExpired:
-                    pass
-            self.engine_process = None
-        else:
-            pass  # no known PID — do not kill by name to avoid affecting other instances
         self._close_engine_startup_output()
 
     def _restart_capture_engine(self):
@@ -2925,7 +3027,8 @@ class MainWindow(QMainWindow):
     # =======================================================================
 
     def _save_clip(self, duration_seconds: int = 30):
-        if not self.bridge or not self.bridge.is_connected():
+        is_connected = getattr(self.bridge, 'is_connected', lambda: False)
+        if not self.bridge or not is_connected():
             self.push_error(
                 'NOTHING TO CLIP',
                 'Buffer is empty — let the engine run for at least 5 seconds first.',
@@ -2984,11 +3087,16 @@ class MainWindow(QMainWindow):
         capture_mode = self.settings_manager.get('capture_mode', 'desktop')
 
         if capture_mode == 'window':
-            idx = self.source_popup.window_combo.currentIndex()
-            if 0 <= idx < len(self.source_popup._window_list):
-                raw_name  = self.source_popup._window_list[idx]['display_name']
+            if hasattr(self, 'source_popup'):
+                idx = self.source_popup.window_combo.currentIndex()
+                if 0 <= idx < len(self.source_popup._window_list):
+                    raw_name = self.source_popup._window_list[idx]['display_name']
+                else:
+                    raw_name = 'Unknown'
             else:
-                raw_name  = 'Unknown'
+                # Background replay has no source popup.  Its launch settings
+                # remain the capture authority, including the saved window name.
+                raw_name = self.settings_manager.get('target_window_name', 'Unknown')
             game_name    = _sanitize_foldername(raw_name)
             clips_folder = clips_root / game_name
             filename     = f'{game_name}_clip_from_{timestamp}.mp4'
@@ -3225,8 +3333,9 @@ class MainWindow(QMainWindow):
                   f'timeout warning was premature')
 
         print(f'Base clip committed: {output_path.name}')
-        self.clip_grid._known_files = None
-        self.clip_grid._load_clips()
+        if hasattr(self, 'clip_grid'):
+            self.clip_grid._known_files = None
+            self.clip_grid._load_clips()
 
         # Pick the post-processing route. Exactly one runs — see
         # select_post_route() for why that exclusivity is load-bearing.
@@ -3300,8 +3409,9 @@ class MainWindow(QMainWindow):
         warnings = self._clip_readiness.warnings(clip_path)
         print(f'Clip ready: {os.path.basename(clip_path)}')
         self.clip_saved.emit(clip_path)
-        self.clip_grid._known_files = None
-        self.clip_grid._load_clips()
+        if hasattr(self, 'clip_grid'):
+            self.clip_grid._known_files = None
+            self.clip_grid._load_clips()
         if warnings:
             self._set_status('SAVED WITH WARNING', status_warning_qss())
             self.push_error(
@@ -3342,11 +3452,24 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(2000, self._update_status)
             self.capture_card.show_upload(os.path.basename(path))
             # Refresh the badge on the matching clip card if it's visible
-            widget = self.clip_grid._thumb_widgets.get(path)
+            widget = (self.clip_grid._thumb_widgets.get(path)
+                      if hasattr(self, 'clip_grid') else None)
             if widget:
                 widget.set_uploaded(True)
         else:
             print(f'[Upload] Failed — {msg}  ({path})')
+
+    def _on_upload_error(
+            self, title: str, detail: str, level: str, clip_path: str) -> None:
+        if title == 'UPLOAD NOT CONFIGURED':
+            actions = [('OPEN UPLOAD SETTINGS', self.restore_main_window)]
+        elif title == 'UPLOAD FAILED' and clip_path:
+            actions = [
+                ('RETRY NOW',
+                 lambda p=clip_path: self.upload_manager.enqueue_upload(p))]
+        else:
+            actions = []
+        self.push_error(title, detail, level, actions=actions)
 
     # -- Mic post-mux --
 
@@ -3942,7 +4065,8 @@ class MainWindow(QMainWindow):
                 actions=[('RESTART ENGINE', self._restart_capture_engine)],
             )
             return
-        if not self.bridge or not self.bridge.is_connected():
+        is_connected = getattr(self.bridge, 'is_connected', lambda: False)
+        if not self.bridge or not is_connected():
             self._reconnect_counter = getattr(self, '_reconnect_counter', 0) + 1
             # Only try to reconnect while an engine process actually exists —
             # on Linux a crashed engine leaves its /dev/shm segment behind
@@ -3984,9 +4108,10 @@ class MainWindow(QMainWindow):
                 new_enc_text = f'{codec} — P{preset}'
             else:
                 new_enc_text = codec
-            lbl = self._settings_page_widget.active_encoder_lbl
-            if lbl.text() != new_enc_text:
-                lbl.setText(new_enc_text)
+            if self._ui_ready:
+                lbl = self._settings_page_widget.active_encoder_lbl
+                if lbl.text() != new_enc_text:
+                    lbl.setText(new_enc_text)
         if self.is_capturing:
             frames = status.get('frames_captured', 0)
             snapshot = self._capture_health.observe(
@@ -4049,7 +4174,7 @@ class MainWindow(QMainWindow):
                          CaptureHealthState.RECOVERING,
                      }
                      else status_warning_qss())
-            if self.status_label.text() != new_text:
+            if self._ui_ready and self.status_label.text() != new_text:
                 self.status_label.setText(new_text)
                 # setStyleSheet triggers a full re-style of the label and is
                 # expensive (~1ms). Only call it on actual style transitions —
@@ -4087,6 +4212,9 @@ class MainWindow(QMainWindow):
                     'engine-owned and a manual process restart is available')
 
     def _set_status(self, text: str, style: str):
+        if not hasattr(self, 'status_label'):
+            print(f'[Lifecycle] Status={text}')
+            return
         self.status_label.setText(text)
         # Skip the QSS reapply when the style didn't change (CONNECTING ticks
         # every 500ms during reconnect would otherwise re-style on every tick).
@@ -4134,7 +4262,10 @@ class MainWindow(QMainWindow):
     def push_error(self, title: str, detail: str,
                    level: str = 'error',
                    actions: list[tuple[str, callable]] | None = None) -> None:
-        self.error_bar.push(title, detail, level, actions or [])
+        if hasattr(self, 'error_bar'):
+            self.error_bar.push(title, detail, level, actions or [])
+        else:
+            print(f'[Lifecycle] {level.upper()}: {title}: {detail}')
 
     # =======================================================================
     # Hardware encoding detection
@@ -4291,32 +4422,113 @@ class MainWindow(QMainWindow):
     # Shutdown
     # =======================================================================
 
-    def closeEvent(self, event):
-        self.status_timer.stop()
-        # Stop polling before anything is torn down, and abandon the in-flight
-        # save explicitly. The engine may still finish it — we simply stop
-        # caring, rather than blocking the shutdown on a verdict that may never
-        # come. Nothing here waits on the engine, so a save in flight cannot
-        # deadlock the exit.
-        self._save_poll_timer.stop()
-        self._save_state.cancel_active(time.monotonic(), reason='shutdown')
+    _FINALIZATION_GRACE_SECONDS = 1.5
+
+    def request_full_exit(self) -> None:
+        """Make full exit visually immediate, then clean up on the event loop."""
+        if self._shutdown_requested:
+            return
+        self._shutdown_requested = True
+        self._shutdown_timer_started = time.monotonic()
+        print('[Lifecycle] ShutdownRequested')
+        self._lifecycle_log.info('ShutdownRequested')
+
+        # The user must never watch a frozen main window while a bounded engine
+        # or finalization cleanup is in progress. Hiding is intentionally
+        # separate from cleanup; X remains a tray action, and only this path
+        # reaches QApplication.quit().
+        self.hide()
+        if self._tray_icon is not None:
+            self._tray_icon.hide()
+        self._shutdown_mark('UIHidden')
+        QTimer.singleShot(0, self._perform_full_shutdown)
+
+    def _shutdown_mark(self, phase: str) -> None:
+        started = self._shutdown_timer_started
+        elapsed = (float(time.monotonic()) - float(started)
+                   if started is not None else 0.0)
+        elapsed_text = f'{elapsed:.3f}'
+        print(f'[Lifecycle] {phase} +{elapsed:.3f}s')
+        self._lifecycle_log.info('%s +%ss', phase, elapsed_text)
+
+    def _wait_for_finalization_grace(self) -> None:
+        """Give atomic clip finalization a short shared grace period.
+
+        Workers write through staging paths, so a worker that cannot finish in
+        this grace window cannot publish a corrupt final-looking file. The
+        next startup retains its normal stale-partial recovery responsibility.
+        """
+        deadline = time.monotonic() + self._FINALIZATION_GRACE_SECONDS
+        for worker in list(getattr(self, '_mux_threads', ())):
+            if not worker.is_alive():
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            worker.join(timeout=remaining)
+        still_running = sum(
+            worker.is_alive() for worker in getattr(self, '_mux_threads', ()))
+        if still_running:
+            print('[Lifecycle] FinalizationGraceExpired '
+                  f'workers={still_running}; staged work was not published')
+        self._shutdown_mark('FinalizationGraceComplete')
+
+    def _perform_full_shutdown(self) -> None:
+        """One idempotent, bounded shutdown sequence for tray and app exit."""
+        if self._shutdown_complete:
+            return
+        self._shutdown_complete = True
+        self.is_capturing = False
+
+        if hasattr(self, 'status_timer'):
+            self.status_timer.stop()
+        if hasattr(self, '_save_poll_timer'):
+            self._save_poll_timer.stop()
+        if hasattr(self, '_save_state'):
+            self._save_state.cancel_active(time.monotonic(), reason='shutdown')
+        self._shutdown_mark('SaveCommandsStopped')
+
         self.hotkey_manager.cleanup()
-        # Wait for pending clip post-processing (mic mux / finalize) before
-        # exiting — daemon threads killed mid-write corrupt the clip. Typical
-        # case: user hits the hotkey and immediately closes the window.
-        for t in getattr(self, '_mux_threads', []):
-            if t.is_alive():
-                print('[Exit] Waiting for clip post-processing to finish…')
-                t.join(timeout=15.0)
+        self._shutdown_mark('HotkeysStopped')
+        self._wait_for_finalization_grace()
         try:
             if MicRecorder.is_available():
                 MicRecorder().stop()
         except Exception:
             pass
+        self._shutdown_mark('MicrophoneStopped')
+
         self.upload_manager.stop()
+        self._shutdown_mark('UploadsStopped')
         self.capture_card.close()
+        self._shutdown_mark('CaptureCardStopped')
         self.stop_engine()
-        event.accept()
+        self._shutdown_mark('EngineStopped')
+
+        if self._tray_icon is not None:
+            self._tray_icon.hide()
+            self._tray_icon.deleteLater()
+            self._tray_icon = None
+        self._shutdown_mark('TrayRemoved')
+        self._shutdown_mark('ShutdownComplete')
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    def closeEvent(self, event):
+        if self._shutdown_requested:
+            event.accept()
+            return
+        if self._tray_icon is not None and self._tray_icon.isVisible():
+            event.ignore()
+            self.hide()
+            print('[Lifecycle] WindowHiddenToTray')
+            self._lifecycle_log.info('WindowHiddenToTray')
+            return
+        # A system with no tray cannot recover a hidden window; use the same
+        # immediate-visual-response full-exit path instead.
+        event.ignore()
+        self.request_full_exit()
 
 
 # ---------------------------------------------------------------------------
@@ -4510,38 +4722,27 @@ class _SettingsPage(QWidget):
     encoder_config_changed    = Signal()
     audio_capture_changed     = Signal(bool)
 
-    _AUTOSTART_KEY  = r'Software\Microsoft\Windows\CurrentVersion\Run'
-    _AUTOSTART_NAME = 'FTHRClips'
-
     def _init_autostart_checkbox(self):
-        try:
-            import winreg
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, self._AUTOSTART_KEY)
-            winreg.QueryValueEx(key, self._AUTOSTART_NAME)
-            winreg.CloseKey(key)
-            self.autostart_check.setChecked(True)
-        except (FileNotFoundError, OSError):
-            self.autostart_check.setChecked(False)
+        from core.windows_autostart import is_packaged_launch, read_enabled
+        packaged = is_packaged_launch()
+        self.autostart_check.setEnabled(packaged)
+        self.autostart_check.setToolTip(
+            'Available in installed FTHR builds.' if packaged else
+            'Development runs never modify Windows startup registration.')
+        self.autostart_check.setChecked(read_enabled())
 
     def _on_autostart_changed(self, state):
-        try:
-            import winreg
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, self._AUTOSTART_KEY,
-                                 0, winreg.KEY_SET_VALUE)
-            try:
-                if state == 2:  # Qt.CheckState.Checked
-                    exe = sys.executable
-                    winreg.SetValueEx(key, self._AUTOSTART_NAME, 0, winreg.REG_SZ,
-                                      f'"{exe}"')
-                else:
-                    try:
-                        winreg.DeleteValue(key, self._AUTOSTART_NAME)
-                    except FileNotFoundError:
-                        pass
-            finally:
-                winreg.CloseKey(key)
-        except OSError:
-            pass
+        from core.windows_autostart import read_enabled, set_enabled
+        requested = state == Qt.CheckState.Checked.value
+        if set_enabled(requested):
+            print(f'[Lifecycle] AutostartChanged enabled={requested}')
+            return
+        # Registry write failures and an externally stale entry are reflected
+        # immediately instead of leaving a checkbox that lies about Windows.
+        self.autostart_check.blockSignals(True)
+        self.autostart_check.setChecked(read_enabled())
+        self.autostart_check.blockSignals(False)
+        print('[Lifecycle] Autostart registration could not be changed')
 
     def __init__(self, settings_manager: SettingsManager = None, parent=None):
         super().__init__(parent)
@@ -6304,7 +6505,8 @@ def main():
         _card_main()
         return
 
-    print("Main.py successfully initiated")
+    background_start = '--background' in sys.argv
+    print(f'Main.py successfully initiated background={background_start}')
 
     # Which external helpers resolved to what, and from which PATH. Bug reports
     # saying "screenshots don't work" used to arrive with nothing to go on.
@@ -6313,16 +6515,21 @@ def main():
 
     # A second instance is destructive, not just redundant: two capture
     # engines fight over NVENC and over the single-writer shared-memory
-    # command fields, and on Linux the newcomer steals the hotkey socket
-    # out from under the running instance. Refuse before anything is
-    # started — no engine spawned, no socket bound, no window shown.
+    # command fields. Refuse before anything is started, but ask the owner to
+    # restore its existing window so a normal second launch feels native.
     from core.single_instance import SingleInstance
     instance_guard = SingleInstance()
     if not instance_guard.acquire():
         print('[FTHR] Another instance is already running — exiting.')
-        # QApplication has to exist before any widget, including QMessageBox.
         configure_qt_for_linux_ui()
         _app = QApplication(sys.argv)
+        from core.instance_activation import request_existing_instance_activation
+        if request_existing_instance_activation():
+            print('[Lifecycle] ExistingInstanceActivated')
+            return 0
+        # The owner may be starting up or its local activation endpoint may
+        # have failed. Do not start a competing capture engine; retain a clear
+        # fallback explanation instead.
         from PySide6.QtWidgets import QMessageBox
         QMessageBox.warning(
             None,
@@ -6339,17 +6546,30 @@ def main():
     apply_app_style(app)
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
+    app.setQuitOnLastWindowClosed(False)
+    app_icon = Path(__file__).parent / 'assets' / 'fthr_logo.ico'
+    if app_icon.exists():
+        app.setWindowIcon(QIcon(str(app_icon)))
 
     _load_fonts()
     _prewarm_heavy_modules()
 
-    window = MainWindow()
-    window.showMaximized()
+    from core.instance_activation import InstanceActivationServer
+    activation_server = InstanceActivationServer(parent=app)
+    activation_server.start()
+
+    window = MainWindow(background_start=background_start)
+    activation_server.activation_requested.connect(window.restore_main_window)
+    if not background_start:
+        window.showMaximized()
+    else:
+        print('[Lifecycle] BackgroundStartup')
 
     try:
         return app.exec()
     finally:
-        window.stop_engine()
+        window._perform_full_shutdown()
+        activation_server.stop()
         instance_guard.release()
 
 

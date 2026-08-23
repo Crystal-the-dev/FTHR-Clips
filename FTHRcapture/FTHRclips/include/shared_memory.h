@@ -70,6 +70,9 @@ namespace fthr {
         // cfg_target_height from SharedMemoryLayout and applies them to the
         // next SaveClip call. Currently stubbed in the command loop.
         RECONFIGURE_ENCODER = 10,
+
+        // Requests a clean process exit without changing the v4 layout.
+        SHUTDOWN = 11,
     };
 
 

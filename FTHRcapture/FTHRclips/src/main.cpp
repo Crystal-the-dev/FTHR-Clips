@@ -413,7 +413,8 @@ int main(int argc, char* argv[]) {
     // ------------------------------------------------------------------
     // 5. Command loop - polls shared memory for UI commands
     // ------------------------------------------------------------------
-    while (true) {
+    bool shutdown_requested = false;
+    while (!shutdown_requested) {
 
         if (layout->ui_command != fthr::CommandType::NONE) {
 
@@ -469,6 +470,13 @@ int main(int argc, char* argv[]) {
                 layout->engine_response = fthr::ResponseType::STATUS_UPDATE;
                 break;
 
+            case fthr::CommandType::SHUTDOWN:
+                // Leaving this loop reaches CaptureEngine::Shutdown(), which
+                // owns capture, audio and queued-save cleanup in one order.
+                std::cout << "[Cmd] SHUTDOWN" << std::endl;
+                shutdown_requested = true;
+                break;
+
             default:
                 std::cout << "[Cmd] Unknown command: " << static_cast<int>(current_cmd)
                     << std::endl;
@@ -491,7 +499,7 @@ int main(int argc, char* argv[]) {
         Sleep(20);
     }
 
-    // Unreachable - Python calls TerminateProcess() on shutdown.
+    layout->is_initialized = false;
     engine.Shutdown();
     memory.Shutdown();
 

@@ -91,7 +91,9 @@ inline void set_engine_string(SharedMemoryLayout* layout, const std::string& tex
 enum class CommandType : uint32_t {
     NONE=0, START_RECORDING=1, STOP_RECORDING=2, SAVE_CLIP=3,
     SET_RESOLUTION=4, SET_QUALITY=5, SET_FRAMERATE=6, SET_HOTKEY=7,
-    SET_TARGET_WINDOW=8, GET_STATUS=9, RECONFIGURE_ENCODER=10
+    SET_TARGET_WINDOW=8, GET_STATUS=9, RECONFIGURE_ENCODER=10,
+    // Kept in lockstep with the Windows command enum; Linux does not issue it.
+    SHUTDOWN=11
 };
 
 enum class ResponseType : uint32_t {

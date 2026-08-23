@@ -39,6 +39,7 @@ class CommandType(IntEnum):
     SET_TARGET_WINDOW = 8
     GET_STATUS = 9
     RECONFIGURE_ENCODER = 10
+    SHUTDOWN = 11
 
 
 class ResponseType(IntEnum):
@@ -362,6 +363,22 @@ class CaptureBridge:
             return False
         self._layout.ui_command = CommandType.START_RECORDING
         return True
+
+    def request_engine_shutdown(self) -> bool:
+        """Ask the native engine to leave its command loop cleanly.
+
+        This uses the existing command channel only; the v4 shared-memory
+        layout remains byte-for-byte unchanged.  The caller still owns the
+        bounded process wait and escalation policy.
+        """
+        if not self.is_connected():
+            return False
+        try:
+            self._layout.ui_command = CommandType.SHUTDOWN
+            return True
+        except Exception as e:
+            self._log_read_error_once('request_engine_shutdown', e)
+            return False
 
     # -- The save response channel -------------------------------------------
     #
