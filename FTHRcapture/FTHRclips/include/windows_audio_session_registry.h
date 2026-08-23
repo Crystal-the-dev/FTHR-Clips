@@ -1,0 +1,88 @@
+// windows_audio_session_registry.h
+// Runtime-only WASAPI session discovery for AUDIT-050 Windows audio providers.
+
+#pragma once
+#ifndef FTHR_WINDOWS_AUDIO_SESSION_REGISTRY_H
+#define FTHR_WINDOWS_AUDIO_SESSION_REGISTRY_H
+
+#include "audio_source_model.h"
+
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace fthr {
+
+inline constexpr uint32_t kProcessLoopbackMinimumBuild = 20348;
+
+struct WindowsProcessLoopbackCapability {
+    uint32_t os_build = 0;
+    bool api_build_supported = false;
+    // Runtime activation remains a separate check; a build number alone must
+    // never be reported as an active per-application capture source.
+    bool activation_verified = false;
+};
+
+WindowsProcessLoopbackCapability DetectWindowsProcessLoopbackCapability();
+bool IsWindowsProcessLoopbackBuildSupported(uint32_t os_build);
+
+struct WindowsAudioSessionDescriptor {
+    uint32_t process_id = 0;             // generation-local; never persisted
+    uint32_t process_group_root_id = 0;  // generation-local; never persisted
+    std::string runtime_group_key;       // generation-local; never persisted
+    AudioSourceIdentity identity;
+    bool currently_active = false;
+};
+
+struct WindowsAudioSessionUpdate {
+    std::vector<WindowsAudioSessionDescriptor> current;
+    std::vector<std::string> appeared_runtime_groups;
+    std::vector<std::string> disappeared_runtime_groups;
+};
+
+// Local policy helpers. These require no network/service lookup and provide a
+// deterministic presentation/group identity once the provider has inspected a
+// process.  They intentionally accept only executable basenames.
+std::string NormalizeWindowsExecutableIdentity(const std::wstring& executable_basename);
+std::string ResolveWindowsAudioSourceName(const std::wstring& executable_basename);
+std::string BuildWindowsRuntimeGroupKey(uint32_t root_process_id,
+                                        const std::wstring& executable_basename);
+
+class WindowsAudioSessionRegistry {
+public:
+    WindowsAudioSessionRegistry();
+    ~WindowsAudioSessionRegistry();
+
+    WindowsAudioSessionRegistry(const WindowsAudioSessionRegistry&) = delete;
+    WindowsAudioSessionRegistry& operator=(const WindowsAudioSessionRegistry&) = delete;
+
+    // Start registers IAudioSessionNotification and captures an initial
+    // snapshot. Callers own COM apartment setup and must call Stop on that
+    // same apartment thread.
+    bool Start();
+    void Stop();
+
+    bool needs_refresh() const { return dirty_.load(std::memory_order_acquire); }
+    // Enumerates only on initial start or a session-created notification; it
+    // is not an aggressive periodic process scan.
+    bool RefreshIfNeeded(WindowsAudioSessionUpdate* update);
+    const std::string& last_error() const { return last_error_; }
+
+private:
+    class SessionNotification;
+    bool Refresh(WindowsAudioSessionUpdate* update);
+    void MarkDirty() { dirty_.store(true, std::memory_order_release); }
+
+    void* session_manager_ = nullptr;  // IAudioSessionManager2*
+    SessionNotification* notification_ = nullptr;
+    bool started_ = false;
+    std::atomic<bool> dirty_{false};
+    std::vector<WindowsAudioSessionDescriptor> current_;
+    std::string last_error_;
+};
+
+}  // namespace fthr
+
+#endif  // FTHR_WINDOWS_AUDIO_SESSION_REGISTRY_H

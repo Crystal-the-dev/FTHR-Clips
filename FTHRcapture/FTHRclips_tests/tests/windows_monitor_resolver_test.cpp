@@ -18,6 +18,7 @@ int RunAmfReplayEncoderTests();
 int RunQsvReplayEncoderTests();
 int RunWindowsReplayPolicyTests();
 int RunAudioSourceModelTests();
+int RunWindowsAudioSessionRegistryTests();
 
 namespace {
 
@@ -445,8 +446,10 @@ int main() {
     const int qsv_checks = RunQsvReplayEncoderTests();
     const int policy_checks = RunWindowsReplayPolicyTests();
     const int audio_source_checks = RunAudioSourceModelTests();
-    std::cout << "FTHRclips_tests: 86 scenarios passed ("
-              << (checks + amf_checks + qsv_checks + policy_checks + audio_source_checks)
+    const int windows_audio_checks = RunWindowsAudioSessionRegistryTests();
+    std::cout << "FTHRclips_tests: 88 scenarios passed ("
+              << (checks + amf_checks + qsv_checks + policy_checks + audio_source_checks
+                  + windows_audio_checks)
               << " checks total)" << std::endl;
     return 0;
 }
