@@ -64,7 +64,7 @@ def test_manifest_detects_media_replacement_and_falls_back_cleanly(tmp_path):
     assert read_manifest_for_media(media) is None
 
 
-def test_manifest_rejects_duplicate_streams_and_more_than_eight_sources(tmp_path):
+def test_manifest_rejects_duplicate_streams_and_more_than_ten_sources(tmp_path):
     media = tmp_path / 'clip.mp4'
     media.write_bytes(b'finished clip bytes')
     manifest = build_manifest(
@@ -75,8 +75,11 @@ def test_manifest_rejects_duplicate_streams_and_more_than_eight_sources(tmp_path
         validate_manifest(manifest, media_path=media)
 
     manifest['sources'] = [_entry(stream_index=index + 2, name=f'App {index}')
-                           .__dict__ for index in range(9)]
-    with pytest.raises(AudioManifestError, match='between one and eight'):
+                           .__dict__ for index in range(10)]
+    validate_manifest(manifest)
+
+    manifest['sources'].append(_entry(stream_index=12, name='App 10').__dict__)
+    with pytest.raises(AudioManifestError, match='between one and ten'):
         validate_manifest(manifest, media_path=media)
 
 
