@@ -50,7 +50,7 @@ existing audit. Historical IDs are not renumbered merely to close gaps.
 | AUDIT-047 | Linux encoded snapshot copies hold the ring mutex | Open, P2 |
 | AUDIT-048 | Windows monitor identity and adapter/output mapping | Resolved; stable monitor-device-path mapping and real two-monitor capture verified |
 | AUDIT-049 | Windows vendor/codec hardware replay and hybrid-GPU policy | Open, P0; NVIDIA H.264/HEVC/AV1 integrated and physically verified, six AMD/Intel vendor/codec combinations plus hybrid qualification remain |
-| AUDIT-050 | Multi-Audio Architecture Validation | Implementation in progress; source/manifest/session/AAC-default-mix and paired multi-track mux foundations landed, but Windows 11 runtime, native mic, actual multi-stem providers/playback and qualification remain open |
+| AUDIT-050 | Multi-Audio Architecture Validation | Implementation in progress; source/manifest/session/AAC-default-mix, paired multi-track mux, and code-ready Windows 11 process-loopback app-stem provider landed. Physical Windows 11 source isolation/performance/runtime qualification, native mic, playback mixer, and Linux provider remain open. |
 
 When allocating a new ID, search the full history and this map first. A missing
 standalone report does not make a referenced or reserved ID reusable.

@@ -406,3 +406,95 @@ ready**, and Linux per-app audio remains **not implemented**. Shared Memory v4,
 AUDIT-022/023/035 health behavior, AUDIT-024, AUDIT-028, AUDIT-042,
 AUDIT-048, and AUDIT-049 are not intentionally changed by this foundation
 work.
+
+## WINDOWS 11 APP-STEM IMPLEMENTATION — 2026-08-23
+
+### CODE IMPLEMENTED
+
+`WindowsApplicationAudioSourceManager` now owns one
+`WindowsAudioSessionRegistry` for a capture generation and joins its
+deterministic, root-PID-scoped application groups to one
+`WindowsProcessLoopbackAudioProvider` each. The provider uses the documented
+`ActivateAudioInterfaceAsync` contract with `VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK`,
+`AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`, a `VT_BLOB`
+`AUDIOCLIENT_ACTIVATION_PARAMS`, and
+`PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE`.
+
+The local Windows SDK declaration says this mode includes audio rendered by the
+target process and its child processes. FTHR targets the registry's same-
+executable process-tree root, rather than an arbitrary child session PID, so
+same-executable helper/render descendants remain one source. The SDK does not
+state a separate guarantee for children created after activation; that behavior
+is explicitly part of the physical Windows 11 validation matrix below.
+
+Windows build capability is checked before manager startup. On Windows 10
+build 19045 (and every build below the documented 20348 floor), the manager is
+not created and no process-loopback activation is attempted: Default Mix
+remains the only system-audio source. A capable build is still not reported as
+an active source until asynchronous activation, format setup, meaningful audio,
+and AAC packet production all succeed.
+
+Each provider reads the returned `WAVEFORMATEX` rather than assuming
+float32/48 kHz/stereo. It supports float32, PCM16, and PCM32 input and converts
+once with libswresample to canonical 48 kHz stereo float before activity
+measurement and AAC-LC encoding. Packed 24-bit/unknown formats fail the one
+source honestly instead of byte reinterpretation. A silent discovered session
+allocates neither a persistent AAC encoder nor a replay packet ring.
+
+After two meaningful blocks pass the existing hysteretic source gate, the
+provider creates one in-process AAC-LC 128 kb/s encoder and one bounded
+`EncodedAudioPacketRing`. It buffers only the two short gate blocks; no long
+raw PCM history is stored. Its QPC 100-ns origin is the first pending
+meaningful block. Save derives signed source sample bounds from the same video
+presentation QPC interval. A source first audible at 15 s of a 30 s clip gets
+a negative presentation boundary and therefore keeps a 15 s timestamp gap in
+the MP4 rather than being shifted to t=0.
+
+Session-created, state-change, and disconnect notifications mark the single
+registry dirty. The manager refreshes only after those notifications, not by
+periodic process enumeration. A disappeared runtime group stops its bounded
+provider then marks the source ended; its AAC packet ring and source metadata
+remain generation-local until normal replay expiry. A later process restart
+gets a fresh source UUID under the existing root-PID grouping rule, avoiding an
+unsafe PID-reuse/name-only merge. Failed activation, format, device, or service
+recovery affects only that source. Activation waits at most five seconds;
+capture waits at most 250 ms; recoverable device/service failures retry at most
+three times with a stop-aware bounded delay.
+
+The native save path preserves the existing transactional MP4-plus-manifest
+pair. It appends only actual overlapping app packet snapshots after Default
+Mix, retains the existing `handler_name`/title metadata and manifest UUID/type/
+identity/activity mapping, and never synthesizes a stream for a quiet or failed
+application. The provisional limit means Default Mix plus at most eight admitted
+application stems (nine MP4 audio tracks total). Shared Memory v4, Linux providers,
+native microphone, the final playback mixer, and the legacy disabled multiband
+route were not changed.
+
+### AUTOMATED TESTED
+
+The native `FTHRclips_tests` suite now covers unsupported-versus-supported
+capability gating, deterministic provider candidates, root targeting,
+activity hysteresis, silent-source exclusion, signed late-source timeline
+mapping, exit-history retention, restart isolation, failure isolation,
+per-generation isolation, deterministic source admission limits, and
+manifest-safe source identities. Existing AUDIT-050 source/ring, manifest,
+paired-publication, mux, export-map, and session-registry tests remain in the
+same Release x64 suite.
+
+The complete Windows Release x64 engine build and native suite compile with
+the production provider. This proves API/header/link integration and the
+deterministic logic only; it is not a source-isolation runtime result.
+
+### REAL WIN11 VERIFIED
+
+**Not verified.** The available qualification host is Windows 10 build 19045.
+The existing isolated probe returned `PROCESS_LOOPBACK_ACTIVATE_FAILED
+0x8000000E`, as expected for that unsupported host. No Windows 11 run has yet
+proven 440/880 Hz isolation, absence of cross-contamination, silent-session
+exclusion in an actual saved MP4, app exit/restart, future-child behavior,
+default-device/service loss, 30/60/300-second timing drift, AAC hot-path cost,
+or NVIDIA video regression with live app stems.
+
+Until that matrix is executed on a supported Windows 11 machine, the accurate
+status is **CODE READY / WIN11 RUNTIME UNVERIFIED**. AUDIT-050 remains
+**IMPLEMENTATION IN PROGRESS**.
