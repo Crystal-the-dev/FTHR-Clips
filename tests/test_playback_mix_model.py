@@ -21,6 +21,7 @@ from core.playback_mix_model import (
     mix_interleaved_float,
     mono_to_stereo,
     resample_linear,
+    source_display_name,
     source_icon_key,
 )
 from core.ffmpeg_playback import (
@@ -52,6 +53,7 @@ def test_current_windows_default_mix_and_microphone_are_both_editable():
     )
     assert [(source.display_name, source.source_type) for source in sources] == [
         ('Default Mix', 'system'), ('Microphone', 'microphone')]
+    assert source_display_name(sources[0]) == 'System Audio'
 
 
 def test_rich_app_stems_exclude_only_compatibility_default_mix():
@@ -62,6 +64,23 @@ def test_rich_app_stems_exclude_only_compatibility_default_mix():
     )
     assert [source.display_name for source in sources] == [
         'VALORANT', 'Discord', 'Microphone']
+
+
+def test_dynamic_source_order_is_semantic_and_never_uses_display_name_as_identity():
+    sources = build_playback_sources(
+        _manifest((1, 'microphone', 'Microphone'), (2, 'system', 'Default Mix'),
+                  (3, 'application', 'Discord'), (4, 'application', 'Discord')),
+        tuple(_stream(index) for index in range(1, 5)),
+    )
+    # Two duplicate human labels are distinct rows; stable stream order is the
+    # tiebreaker. The compatibility Default Mix is absent because application
+    # stems are authoritative; microphone follows the application rows.
+    assert [(source.display_name, source.source_type, source.container_index)
+            for source in sources] == [
+        ('Discord', 'application', 3), ('Discord', 'application', 4),
+        ('Microphone', 'microphone', 1),
+    ]
+    assert sources[0].source_id != sources[1].source_id
 
 
 def test_manifest_keeps_unavailable_source_visible_but_not_mixable():

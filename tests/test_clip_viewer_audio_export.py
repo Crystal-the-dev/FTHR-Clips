@@ -20,10 +20,33 @@ def test_dynamic_volume_popup_has_real_source_mute_controls(qtbot):
     qtbot.addWidget(popup)
     seen = []
     popup.source_muted.connect(lambda key, muted: seen.append((key, muted)))
-    # The signal is source-ID based, not a fixed category name, so it remains
-    # safe for manifest stems and imported clips alike.
-    popup.source_muted.emit('mic', True)
-    assert seen == [('mic', True)]
+    popup._mute_buttons['mic'].click()
+    assert seen == [('mic', False)]
+    assert popup._mute_buttons['mic'].text() == 'MUTE'
+    assert popup._sliders['mic'].value() == 70
+    popup._mute_buttons['mic'].click()
+    assert seen[-1] == ('mic', True)
+    assert popup._mute_buttons['mic'].text() == 'MUTED'
+    assert popup._sliders['mic'].value() == 70
+
+
+def test_volume_popup_handles_long_names_eight_rows_and_unavailable_source(qtbot):
+    sources = tuple(
+        PlaybackSource(f'app-{index}', f'Long Application Source Name {index}',
+                       'application', index + 1, index)
+        for index in range(8)
+    )
+    unavailable = PlaybackSource(
+        'missing', 'A Source That Cannot Be Decoded', 'track', 10, 9, available=False)
+    popup = VolumePopup(80, source_tracks=sources + (unavailable,), live_preview=True)
+    qtbot.addWidget(popup)
+    assert popup._row_order[0] == 'master'
+    assert popup._row_order[1:9] == [source.source_id for source in sources]
+    assert popup._labels['app-0'].toolTip() == 'LONG APPLICATION SOURCE NAME 0'
+    assert popup._labels['app-0'].text() != popup._labels['app-0'].toolTip()
+    assert popup._sliders['missing'].isEnabled() is False
+    assert popup._mute_buttons['missing'].isEnabled() is False
+    assert popup._values['missing'].text() == '—'
 
 
 def test_one_failed_source_is_disabled_without_removing_healthy_source():
