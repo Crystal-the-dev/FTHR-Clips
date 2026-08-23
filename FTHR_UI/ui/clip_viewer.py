@@ -8,7 +8,8 @@ from core.ffmpeg_playback import (
     FFmpegPlaybackController, PlaybackError, discover_playback_sources,
 )
 from core.playback_mix_model import (
-    PlaybackSource, SourceMixState, ffmpeg_mix_filter, source_icon_key,
+    PlaybackSource, SourceMixState, ffmpeg_mix_filter, source_display_name,
+    source_icon_key,
 )
 from core.transactional_output import (
     commit_staged_output,
@@ -34,6 +35,7 @@ from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtGui import (
     QPainter, QBrush, QPen, QColor, QFont, QPixmap, QImage, QPolygon, QDrag, QIcon,
+    QFontMetrics,
 )
 
 from ui.style import Colors, Fonts, Sizes
@@ -1284,6 +1286,9 @@ class VolumePopup(QDialog):
             'QDialog { background-color: #0a0a0a; border: 1px solid #ffffff; }')
         self._sliders:  dict[str, QSlider] = {}
         self._values:   dict[str, QLabel]  = {}
+        self._labels:   dict[str, QLabel]  = {}
+        self._mute_buttons: dict[str, QPushButton] = {}
+        self._row_order: list[str] = []
         self._source_tracks = tuple(source_tracks)
         self._source_mutes = source_mutes or {}
         self._build_ui(master_vol, source_volumes or {}, live_preview)
@@ -1304,6 +1309,7 @@ class VolumePopup(QDialog):
         sources.extend((source.source_id, self._display_label(source), source)
                        for source in self._source_tracks)
         for key, label, source in sources:
+            self._row_order.append(key)
             row = QHBoxLayout()
             row.setSpacing(10)
 
@@ -1314,11 +1320,11 @@ class VolumePopup(QDialog):
                 # while reflecting known keys and giving imports an honest
                 # generic fallback.
                 glyph = {
-                    'system': '◖', 'microphone': '●',
+                    'system': '⌁', 'microphone': '●',
                     'application': '◆', 'track': '◌',
                 }[icon_key]
                 icon = QLabel(glyph)
-                icon.setFixedWidth(12)
+                icon.setFixedWidth(14)
                 icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 icon.setToolTip(f'{icon_key.title()} audio source')
                 icon.setStyleSheet(
@@ -1326,11 +1332,24 @@ class VolumePopup(QDialog):
                     'background: transparent;')
                 row.addWidget(icon)
 
-            lbl = QLabel(label)
-            lbl.setFixedWidth(64 if source is not None else 76)
+            label_width = 76 if source is None else 78
+            lbl = QLabel()
+            lbl.setFixedWidth(label_width)
             lbl.setStyleSheet(
                 'color: #ffffff; font-size: 8px; font-weight: bold; '
                 'font-family: "Segoe UI"; letter-spacing: 1px; background: transparent;')
+            visible_label = QFontMetrics(lbl.font()).elidedText(
+                label, Qt.TextElideMode.ElideRight, label_width)
+            lbl.setText(visible_label)
+            lbl.setToolTip(label)
+            lbl.setAccessibleName(f'{label} source volume')
+            if source is not None:
+                self._labels[key] = lbl
+                if not source.available:
+                    lbl.setStyleSheet(
+                        'color: #666666; font-size: 8px; font-weight: bold; '
+                        'font-family: "Segoe UI"; letter-spacing: 1px; background: transparent;')
+                    lbl.setToolTip(f'{label} is unavailable in this clip.')
             row.addWidget(lbl)
 
             slider = QSlider(Qt.Orientation.Horizontal)
@@ -1341,7 +1360,8 @@ class VolumePopup(QDialog):
             else:
                 slider.setValue(int(source_volumes.get(key, 100)))
                 slider.setToolTip(
-                    f'{label.title()} track gain for this open clip only.')
+                    f'{label} gain for this open clip only.')
+                slider.setAccessibleName(f'{label} volume')
                 slider.setEnabled(bool(source and source.available))
             slider.valueChanged.connect(
                 lambda v, k=key, lab=label: self._on_changed(k, v, lab))
@@ -1353,8 +1373,11 @@ class VolumePopup(QDialog):
             value_lbl.setAlignment(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             value_lbl.setStyleSheet(
-                f'color: {Colors.ACCENT}; font-size: 9px; '
+                f'color: {Colors.ACCENT if source is None or source.available else "#666666"}; font-size: 9px; '
                 f'font-family: "Segoe UI"; background: transparent;')
+            if source is not None and not source.available:
+                value_lbl.setText('—')
+                value_lbl.setToolTip('The stored audio stream is unavailable.')
             self._values[key] = value_lbl
             row.addWidget(value_lbl)
 
@@ -1362,18 +1385,26 @@ class VolumePopup(QDialog):
                 mute = QPushButton('MUTE')
                 mute.setCheckable(True)
                 mute.setChecked(bool(self._source_mutes.get(key, False)))
+                mute.setText('MUTED' if mute.isChecked() else 'MUTE')
                 mute.setEnabled(source.available)
                 mute.setFixedWidth(42)
+                mute.setAccessibleName(f'Mute {label}')
                 mute.setStyleSheet(
                     'QPushButton { color: #777777; background: transparent; border: none; '
                     'font-size: 7px; font-weight: bold; } '
                     'QPushButton:checked { color: #cc0000; }')
-                mute.toggled.connect(lambda checked, k=key: self.source_muted.emit(k, checked))
+                self._mute_buttons[key] = mute
+                mute.toggled.connect(
+                    lambda checked, k=key, button=mute: self._on_mute_toggled(k, button, checked))
                 row.addWidget(mute)
 
             root.addLayout(row)
 
+        unavailable = sum(not source.available for source in self._source_tracks)
         note_text = ('Live editable mix — changes apply only while this clip is open'
+                     if self._source_tracks and live_preview and not unavailable else
+                     f'{unavailable} source{"s" if unavailable != 1 else ""} unavailable; '
+                     'remaining tracks continue to play'
                      if self._source_tracks and live_preview else
                      'Track controls unavailable; preview falls back to container audio'
                      if self._source_tracks else 'No audio tracks found in this clip')
@@ -1395,9 +1426,7 @@ class VolumePopup(QDialog):
 
     @staticmethod
     def _display_label(source: PlaybackSource) -> str:
-        if source.source_type == 'system' and source.display_name.casefold() == 'default mix':
-            return 'SYSTEM AUDIO'
-        return source.display_name.upper()
+        return source_display_name(source).upper()
 
     def _on_changed(self, key: str, value: int, _label: str):
         self._values[key].setText(f'{value}%')
@@ -1405,6 +1434,10 @@ class VolumePopup(QDialog):
             self.master_changed.emit(value)
         else:
             self.source_changed.emit(key, value)
+
+    def _on_mute_toggled(self, key: str, button: QPushButton, muted: bool):
+        button.setText('MUTED' if muted else 'MUTE')
+        self.source_muted.emit(key, muted)
 
     def show_above(self, anchor_widget: QWidget):
         """Pop up just above the anchor widget so it doesn't overlap the trim bar."""

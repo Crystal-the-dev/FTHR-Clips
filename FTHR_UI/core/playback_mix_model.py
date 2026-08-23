@@ -79,6 +79,42 @@ def source_icon_key(source: PlaybackSource) -> str:
     return 'track'
 
 
+def source_display_name(source: PlaybackSource) -> str:
+    """Return the viewer label for one clip-local source.
+
+    The native Windows 10 manifest calls its system loopback source
+    ``Default Mix``.  That is correct container metadata but is not the best
+    control label: users are adjusting system audio, not a compatibility
+    implementation detail.  All other names remain the verified manifest or
+    container-provided name unchanged.
+    """
+
+    if source.source_type == 'system' and source.display_name.casefold() == 'default mix':
+        return 'System Audio'
+    return source.display_name
+
+
+def order_playback_sources(sources: Sequence[PlaybackSource]) -> tuple[PlaybackSource, ...]:
+    """Apply the deterministic source order used by the dynamic volume panel.
+
+    Application stems lead because they are the most specific editable audio.
+    The system source follows when it is genuinely editable, then microphone,
+    then generic imported tracks.  Container index is the stable tie-breaker;
+    display text is intentionally never used as identity.
+    """
+
+    priority = {'application': 0, 'system': 1, 'microphone': 2, 'track': 3}
+    return tuple(sorted(
+        sources,
+        key=lambda source: (
+            priority.get(source.source_type, 4),
+            source.container_index if source.container_index is not None else 2**31 - 1,
+            source.audio_index if source.audio_index is not None else 2**31 - 1,
+            source.source_id,
+        ),
+    ))
+
+
 def build_playback_sources(
     manifest: dict[str, Any] | None,
     streams: Sequence[ProbedAudioStream],
@@ -118,16 +154,19 @@ def build_playback_sources(
                 icon_reference=entry.get('icon_reference'),
                 available=stream is not None,
             ))
-        return tuple(sources)
+        return order_playback_sources(sources)
 
-    return tuple(PlaybackSource(
-        source_id=f'stream:{stream.container_index}',
-        display_name=(stream.title.strip() if stream.title and stream.title.strip()
-                      else f'Track {stream.audio_index + 1}'),
-        source_type='track',
-        container_index=stream.container_index,
-        audio_index=stream.audio_index,
-    ) for stream in streams)
+    return order_playback_sources(tuple(
+        PlaybackSource(
+            source_id=f'stream:{stream.container_index}',
+            display_name=(stream.title.strip() if stream.title and stream.title.strip()
+                          else f'Track {stream.audio_index + 1}'),
+            source_type='track',
+            container_index=stream.container_index,
+            audio_index=stream.audio_index,
+        )
+        for stream in streams
+    ))
 
 
 def source_gain(source: PlaybackSource, states: dict[str, SourceMixState]) -> float:
