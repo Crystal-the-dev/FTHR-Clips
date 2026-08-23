@@ -341,11 +341,9 @@ namespace fthr {
         // audio_active_ is true only when all components initialized successfully.
         //
         // A/V sync epoch:
-        //   audio_sync_epoch_frames_ is the audio ring's head_ value at the moment
-        //   audio_capture_.Start() returns. Video PTS starts from 0 on the first
-        //   EncodeFrame call, which happens AFTER audio has already accumulated
-        //   frames during NVENC init. Subtracting this offset from the audio
-        //   frame count aligns both clocks to the same t=0.
+        //   AudioCapture records the first WASAPI QPC position. SaveClip
+        //   converts the video presentation interval into source-sample PTS
+        //   from that common monotonic clock before snapshotting AAC packets.
         // -----------------------------------------------------------------------
         bool                             audio_active_;
         AudioCapture                     audio_capture_;

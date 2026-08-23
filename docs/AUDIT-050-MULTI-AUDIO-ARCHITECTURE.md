@@ -1,7 +1,7 @@
 # AUDIT-050 — Multi-Audio Architecture Validation
 
-**Status:** DECISION REQUIRED
-**Date:** 2026-08-22
+**Status:** IMPLEMENTATION IN PROGRESS — QUALIFICATION OPEN
+**Date:** 2026-08-23
 **Branch at start:** `fix/windows-alpha-hardware-paths`
 **Starting HEAD:** `2e6e9cad986436428c0f092aac6d7fa5e9399f2c`
 
@@ -363,3 +363,38 @@ PipeWire/AppImage matrix.
 This document and isolated spike harnesses may be committed as AUDIT-050
 evidence. No production implementation, UI redesign, Shared Memory v5, or
 legacy-audio deletion is allowed in this phase.
+
+## Approved implementation progress — 2026-08-23
+
+The product owner approved Model A after the validation spikes. The following
+production foundations have subsequently landed, in focused commits:
+
+1. a generation-local common audio-source model, hysteretic activity gate,
+   deterministic eight-source admission boundary, and bounded timestamped AAC
+   packet ring;
+2. a version-1, SHA-256-bound, privacy-bounded audio manifest contract and
+   reader. A missing, stale, corrupt, or mismatched sidecar is rejected and
+   must fall back to ordinary container metadata;
+3. Windows session-discovery infrastructure based on `IAudioSessionManager2`
+   initial enumeration plus `IAudioSessionNotification`, with build capability
+   detection for the documented process-loopback API floor; and
+4. the existing Windows default-mix hardware replay path now retains
+   persistent in-process AAC packets rather than a long raw-PCM replay ring.
+   Its MP4 stream is labelled `Default Mix` and carries default disposition.
+   Preserve-mode export explicitly maps every audio stream, so FFmpeg automatic
+   stream selection cannot delete stems.
+
+These changes do **not** constitute completion of the approved architecture.
+In particular, production process-loopback activation, dynamic source capture,
+native microphone capture/device identity, multi-stream mux and manifest
+publication, FFmpeg/QAudioSink editable playback, dynamic mixer UI, mixed and
+preserve-track export UX, drift qualification, and physical Windows 11/game
+performance qualification are still open. The legacy Python microphone
+post-save route remains active until its native replacement is end-to-end
+tested; the disabled legacy multiband/null-sink path remains disabled.
+
+Therefore AUDIT-050 is **not resolved**, Windows 11 per-app audio is **not
+ready**, and Linux per-app audio remains **not implemented**. Shared Memory v4,
+AUDIT-022/023/035 health behavior, AUDIT-024, AUDIT-028, AUDIT-042,
+AUDIT-048, and AUDIT-049 are not intentionally changed by this foundation
+work.
