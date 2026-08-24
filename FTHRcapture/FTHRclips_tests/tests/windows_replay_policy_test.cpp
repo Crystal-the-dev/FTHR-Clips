@@ -1,4 +1,6 @@
 #include "replay_encoder.h"
+#include "encoded_ring_buffer.h"
+#include "frame_rate_scheduler.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -97,6 +99,44 @@ void RawCapacityNeverOverclaimsConfiguredHistory() {
         "raw replay fallback is disabled for the public alpha");
 }
 
+int CountScheduledFrames(int host_fps, int target_fps, int seconds) {
+    constexpr int64_t ticks_per_second = 90000000;
+    fthr::FrameRateScheduler scheduler(ticks_per_second / target_fps);
+    int accepted = 0;
+    for (int frame = 0; frame < host_fps * seconds; ++frame) {
+        const int64_t now = static_cast<int64_t>(frame)
+            * ticks_per_second / host_fps;
+        if (scheduler.ShouldCapture(now)) ++accepted;
+    }
+    return accepted;
+}
+
+void DeadlineSchedulerPreservesCadenceAcrossRefreshRates() {
+    CheckPolicy(CountScheduledFrames(90, 60, 2) == 120,
+        "90 Hz input preserves a 60 fps deadline cadence");
+    CheckPolicy(CountScheduledFrames(144, 60, 2) == 120,
+        "144 Hz input preserves a 60 fps deadline cadence");
+    CheckPolicy(CountScheduledFrames(60, 120, 2) == 120,
+        "target above host refresh accepts every available frame");
+
+    fthr::FrameRateScheduler scheduler(10);
+    CheckPolicy(scheduler.ShouldCapture(0) && !scheduler.ShouldCapture(9)
+            && scheduler.ShouldCapture(10),
+        "deadline scheduler accepts the first frame and exact deadlines");
+    CheckPolicy(scheduler.ShouldCapture(1000) && !scheduler.ShouldCapture(1001),
+        "a long stall advances missed deadlines without a catch-up burst");
+}
+
+void EncodedReplayCapacityHasBoundedHeadroom() {
+    CheckPolicy(fthr::CalculateEncodedReplaySlotCapacity(30, 60) == 2100,
+        "30-second replay keeps five seconds of bounded headroom");
+    CheckPolicy(fthr::CalculateEncodedReplaySlotCapacity(300, 60) == 18300,
+        "long replay does not reserve a second full history");
+    CheckPolicy(fthr::CalculateEncodedReplaySlotCapacity(0, 60) == 0
+            && fthr::CalculateEncodedReplaySlotCapacity(30, 0) == 0,
+        "invalid replay timing cannot allocate a ring");
+}
+
 void ActiveTruthAndGenerationAreScoped() {
     const auto selected = fthr::SelectWindowsReplayPolicy(
         EncoderVendor::Amd, VideoCodec::AV1);
@@ -159,6 +199,8 @@ int RunWindowsReplayPolicyTests() {
     MissingRuntimeAndUnsupportedCodecStayFailed();
     CaptureAdapterCannotBeStolenByAnotherVendor();
     RawCapacityNeverOverclaimsConfiguredHistory();
+    DeadlineSchedulerPreservesCadenceAcrossRefreshRates();
+    EncodedReplayCapacityHasBoundedHeadroom();
     ActiveTruthAndGenerationAreScoped();
     ProductionThreeByThreeMatrixAndRegressionsHold();
     std::cout << "Windows replay policy tests: " << policy_checks

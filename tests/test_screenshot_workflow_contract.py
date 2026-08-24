@@ -7,11 +7,13 @@ TARGET_SOURCE = (ROOT / 'FTHR_UI' / 'core' / 'screenshot_target.py').read_text(
     encoding='utf-8')
 
 
-def test_selected_monitor_is_resolved_fresh_without_primary_fallback():
+def test_selected_monitor_is_resolved_fresh_without_cross_monitor_fallback():
     assert 'if not selected_monitor:' in TARGET_SOURCE
     assert "return None" in TARGET_SOURCE
+    assert 'expected_geometry' in TARGET_SOURCE
+    assert "getattr(matched_monitor, 'primary', False)" in TARGET_SOURCE
     assert 'enumerate_windows_monitors()' in MAIN_SOURCE
-    assert 'primary=QApplication.primaryScreen() if not selected_monitor else None' in MAIN_SOURCE
+    assert 'primary=QApplication.primaryScreen()' in MAIN_SOURCE
 
 
 def test_screenshot_capture_is_side_band_and_transactional():

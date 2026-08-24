@@ -102,6 +102,16 @@ def test_handler_redacts_even_when_the_call_site_forgot(tmp_path):
     assert 'upload failed' in written
 
 
+def test_handler_preserves_numeric_placeholder_types(tmp_path):
+    log_file = tmp_path / 'fthr.log'
+    assert configure(log_file=log_file) is True
+    get_logger('test').info('frames=%d luma=%.2f', 27, 12.5)
+    logging.getLogger().handlers[0].flush()
+
+    written = log_file.read_text(encoding='utf-8')
+    assert 'frames=27 luma=12.50' in written
+
+
 # ---------------------------------------------------------------------------
 # Restraint — a 50 ms poll must not produce a 50 ms log
 # ---------------------------------------------------------------------------

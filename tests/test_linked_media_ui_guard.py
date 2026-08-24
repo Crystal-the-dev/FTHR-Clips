@@ -48,3 +48,11 @@ def test_finalizing_card_cannot_open_or_delete(qapp, tmp_path, monkeypatch):
     assert opened == []
     assert removed == []
     assert source.exists()
+
+
+def test_delayed_thumbnail_fade_is_cancelled_with_deleted_card(qtbot):
+    card = ClipThumbnail('placeholder.mp4')
+    card.fade_in(delay_ms=50)
+    card.deleteLater()
+
+    qtbot.wait(100)

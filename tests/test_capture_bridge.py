@@ -58,6 +58,21 @@ def test_get_active_codec_empty_when_not_set():
     assert bridge.get_active_codec() == ''
 
 
+def test_get_status_returns_stable_python_numeric_types():
+    layout, buf = _make_fake_layout()
+    bridge = _FakeBridge(layout)
+    layout.frames_captured = 27
+    layout.capture_generation = 3
+    layout.content_luma_mean = 12.5
+
+    status = bridge.get_status()
+
+    assert status['frames_captured'] == 27
+    assert type(status['frames_captured']) is int
+    assert type(status['capture_generation']) is int
+    assert type(status['content_luma_mean']) is float
+
+
 def test_set_encoder_config_clamps_preset():
     layout, buf = _make_fake_layout()
     bridge = _FakeBridge(layout)

@@ -12,6 +12,9 @@ def test_monitor_choices_use_normalized_stable_device_paths():
             friendly_name="Secondary Panel",
             monitor_device_path=r"  \\?\DISPLAY#ABC/DEF  ",
             active=True,
+            x=-2560,
+            width=2560,
+            height=1080,
         )
     ]
 
@@ -19,6 +22,8 @@ def test_monitor_choices_use_normalized_stable_device_paths():
 
     assert choices[0].device_path == r"\\?\display#abc\def"
     assert choices[0].gdi_name == r"\\.\DISPLAY2"
+    assert (choices[0].x, choices[0].y,
+            choices[0].width, choices[0].height) == (-2560, 0, 2560, 1080)
 
 
 def test_monitor_choices_exclude_inactive_and_deduplicate_paths():
