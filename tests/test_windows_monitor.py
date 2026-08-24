@@ -1,6 +1,7 @@
 from core.windows_monitor import (
     DisplayDeviceRecord,
     build_monitor_choices,
+    default_windows_monitor_path,
     normalize_monitor_device_path,
 )
 
@@ -42,3 +43,18 @@ def test_monitor_choices_exclude_inactive_and_deduplicate_paths():
 
 def test_normalize_monitor_device_path_rejects_blank_values():
     assert normalize_monitor_device_path("  ") == ""
+
+
+def test_default_monitor_prefers_primary_then_first_active():
+    choices = build_monitor_choices([
+        DisplayDeviceRecord(
+            'DISPLAY2', 'Secondary', r'\\?\DISPLAY#SECOND', True,
+            primary=False),
+        DisplayDeviceRecord(
+            'DISPLAY1', 'Primary', r'\\?\DISPLAY#PRIMARY', True,
+            primary=True),
+    ])
+
+    assert default_windows_monitor_path(choices) == r'\\?\display#primary'
+    assert default_windows_monitor_path(choices[:1]) == r'\\?\display#second'
+    assert default_windows_monitor_path([]) == ''

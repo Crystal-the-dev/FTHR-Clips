@@ -60,7 +60,6 @@ class SettingsManager:
             'sound_volume_clip':        100,  # 0–100, FTHR notification sounds
             'sound_volume_screenshot':  100,
             'sound_volume_error':       100,
-            'sound_volume_startup':     100,
             'notification_monitor': 'auto',  # 'auto' = highest refresh rate, or screen name e.g. 'DP-3'
             # Windows: stable monitor device path. Linux: wl_output name.
             'capture_monitor': '',
@@ -139,8 +138,7 @@ class SettingsManager:
     def save_settings(self):
         """Save current settings to file"""
         self.config_file.parent.mkdir(parents=True, exist_ok=True)
-        # Drop anything starting with "_" — those are runtime-only scratch values
-        # that have no business being written to disk. works on my machine ✓
+        # Drop runtime-only scratch values before persisting user settings.
         persistable = {k: v for k, v in self.settings.items() if not k.startswith('_')}
         # Write to a temp file first, then atomically replace.
         # A crash or SIGKILL during a direct write truncates the JSON and
@@ -150,8 +148,6 @@ class SettingsManager:
             with open(tmp, 'w') as f:
                 json.dump(persistable, f, indent=2)
             os.replace(str(tmp), str(self.config_file))
-            print(f"✓ Settings saved to {self.config_file}")
-            return True
         except Exception as e:
             print(f"Failed to save settings: {e}")
             try:
@@ -159,6 +155,13 @@ class SettingsManager:
             except OSError:
                 pass
             return False
+        try:
+            print(f"[Settings] Saved to {self.config_file}")
+        except Exception:
+            # A console encoding failure cannot turn a committed write into a
+            # reported settings failure.
+            pass
+        return True
     
     def get(self, key: str, default=None):
         """Get a setting value"""

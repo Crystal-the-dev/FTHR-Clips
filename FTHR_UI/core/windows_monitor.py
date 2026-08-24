@@ -189,3 +189,14 @@ def enumerate_windows_monitor_records() -> list[DisplayDeviceRecord]:
 
 def enumerate_windows_monitors() -> list[MonitorChoice]:
     return build_monitor_choices(enumerate_windows_monitor_records())
+
+
+def default_windows_monitor_path(
+        choices: Iterable[MonitorChoice] | None = None) -> str:
+    """Return the primary stable monitor path, or the first active fallback."""
+    available = list(
+        enumerate_windows_monitors() if choices is None else choices)
+    if not available:
+        return ''
+    selected = next((choice for choice in available if choice.primary), available[0])
+    return selected.device_path

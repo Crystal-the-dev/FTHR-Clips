@@ -148,6 +148,7 @@ from core.presets_manager import PresetsManager, PRESET_KEYS
 from core.settings_manager import SettingsManager
 from core.theme_manager import ThemeManager
 from core.windows_monitor import (
+    default_windows_monitor_path,
     enumerate_windows_monitors,
     normalize_monitor_device_path,
 )
@@ -1106,12 +1107,7 @@ class SourcePopup(_PopupPanel):
                 )
                 saved_mon = legacy.device_path if legacy else saved_mon
             if self.monitor_combo.count() and self.monitor_combo.findData(saved_mon) < 0:
-                primary_index = next(
-                    (index for index, choice in enumerate(monitor_choices)
-                     if choice.primary),
-                    0,
-                )
-                saved_mon = self.monitor_combo.itemData(primary_index)
+                saved_mon = default_windows_monitor_path(monitor_choices)
             if saved_mon != self.cur_monitor:
                 self.cur_monitor = saved_mon
                 self.sm.set('capture_monitor', saved_mon)
@@ -1774,8 +1770,6 @@ class MainWindow(QMainWindow):
         self.is_capturing    = True
         self.capture_card    = CaptureCardClient(self.settings_manager)
         self._encoder_type   = 'DETECTING'
-        self._startup_sound_played = False
-
         # Window drag state
         self._drag_pos: QPoint | None = None
 
@@ -2390,16 +2384,12 @@ class MainWindow(QMainWindow):
     # =======================================================================
 
     def _warn_input_group(self):
-        from PySide6.QtWidgets import QMessageBox
-        msg = QMessageBox(self)
-        msg.setWindowTitle('Hotkeys Disabled')
-        msg.setText(
-            'Global hotkeys are disabled because your user is not in the <b>input</b> group.<br><br>'
-            'Run this command, then log out and back in:<br>'
-            '<code>sudo usermod -aG input $USER</code>'
+        self.push_error(
+            'HOTKEYS DISABLED',
+            'Your user is not in the input group. Run '
+            '`sudo usermod -aG input $USER`, then log out and back in.',
+            level='warning',
         )
-        msg.setIcon(QMessageBox.Icon.Warning)
-        msg.exec()
 
     def _warn_no_engine(self):
         if getattr(sys, 'frozen', False):
@@ -2436,7 +2426,8 @@ class MainWindow(QMainWindow):
 
         # Warn if key features are limited on the current compositor
         from core.compositor import detect_compositor as _dc, has_xtools as _hx
-        if _dc() not in ('hyprland', 'x11') and not _hx():
+        if (sys.platform != 'win32'
+                and _dc() not in ('hyprland', 'x11') and not _hx()):
             from PySide6.QtCore import QTimer as _QT
             _QT.singleShot(2000, self._show_compositor_warning)
 
@@ -2596,7 +2587,6 @@ class MainWindow(QMainWindow):
         )
 
     def _show_compositor_warning(self):
-        from PySide6.QtWidgets import QMessageBox
         from core.compositor import detect_compositor
         comp = detect_compositor()
         comp_name = {
@@ -2604,20 +2594,13 @@ class MainWindow(QMainWindow):
             'gnome':           'GNOME',
             'wayland-unknown': 'your Wayland compositor',
         }.get(comp, comp)
-        msg = QMessageBox(self)
-        msg.setWindowTitle('Limited Feature Support')
-        msg.setIcon(QMessageBox.Icon.Information)
-        msg.setText(
-            f'<b>FTHR Clips is running on {comp_name}.</b><br><br>'
-            f'Game detection and focus monitoring require <b>xdotool</b>.<br><br>'
-            f'Install it with your package manager:<br>'
-            f'<code>sudo pacman -S xdotool</code>  (Arch)<br>'
-            f'<code>sudo apt install xdotool</code>  (Debian/Ubuntu)<br>'
-            f'<code>sudo dnf install xdotool</code>  (Fedora)<br><br>'
-            f'Hotkeys work via the Unix socket — see Settings → Hotkeys for setup.'
+        self.push_error(
+            'LIMITED FEATURE SUPPORT',
+            f'FTHR Clips is running on {comp_name}. Game detection and focus '
+            'monitoring need xdotool; install it with your package manager. '
+            'Hotkeys remain available through the Unix socket.',
+            level='warning',
         )
-        msg.setStandardButtons(QMessageBox.StandardButton.Ok)
-        msg.exec()
 
     def _on_game_appeared(self, window: dict):
         self._pending_game_window = window
@@ -2736,6 +2719,12 @@ class MainWindow(QMainWindow):
         return True
 
     def _requested_capture_config(self) -> CaptureConfig:
+        monitor = self.settings_manager.get('capture_monitor', '')
+        if sys.platform == 'win32' and not normalize_monitor_device_path(monitor):
+            monitor = default_windows_monitor_path()
+            if monitor:
+                self.settings_manager.set('capture_monitor', monitor)
+                self.settings_manager.save_settings()
         return CaptureConfig(
             fps=self.capture_fps,
             buffer_seconds=compute_buffer_seconds(
@@ -2745,7 +2734,7 @@ class MainWindow(QMainWindow):
             bitrate_kbps=self.capture_bitrate,
             codec=self.settings_manager.get('codec_pref', 'auto'),
             preset=int(self.settings_manager.get('encoder_preset', 4)),
-            monitor=self.settings_manager.get('capture_monitor', ''),
+            monitor=monitor,
             scaling=self.settings_manager.get('scaling_mode', 'stretch'),
             audio_enabled=bool(
                 self.settings_manager.get('audio_capture_enabled', True)),
@@ -2907,11 +2896,6 @@ class MainWindow(QMainWindow):
                                 QTimer.singleShot(
                                     0, self._settings_page_widget._populate_mic_devices)
                             QTimer.singleShot(2000, self._check_hardware_encoding_status)
-                            if not self._startup_sound_played:
-                                self._startup_sound_played = True
-                                from ui.capture_card import _play_sound, _SND_STARTUP
-                                vol = self.settings_manager.get('sound_volume_startup', 100)
-                                _play_sound(_SND_STARTUP, vol)
                             for warning in startup_warnings:
                                 self.push_error(
                                     warning.title,
@@ -5497,7 +5481,6 @@ class _SettingsPage(QWidget):
             ('Clip Captured',       'clip'),
             ('Screenshot Captured', 'screenshot'),
             ('Error Sound',         'error'),
-            ('Startup Sound',       'startup'),
         ]:
             row = QHBoxLayout()
             row.setSpacing(8)

@@ -62,13 +62,11 @@ _SND_DIR        = Path(__file__).parent.parent / 'assets' / 'sounds'
 _SND_CLIP       = _SND_DIR / 'clip_captured.wav'
 _SND_SCREENSHOT = _SND_DIR / 'screenshot_saved.wav'
 _SND_ERROR      = _SND_DIR / 'error.wav'
-_SND_STARTUP    = _SND_DIR / 'startup.wav'
 
 _SND_VOLUME_KEYS = {
     _SND_CLIP:       'sound_volume_clip',
     _SND_SCREENSHOT: 'sound_volume_screenshot',
     _SND_ERROR:      'sound_volume_error',
-    _SND_STARTUP:    'sound_volume_startup',
 }
 
 _MCI_ALIAS = 'fthr_card'

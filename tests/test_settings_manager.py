@@ -53,3 +53,17 @@ def test_old_config_gets_extended_clip_length_default(tmp_path, monkeypatch):
     sm = SettingsManager()
     assert sm.get('extended_clip_length') == 60
     assert sm.get('clip_length') == 30  # existing value unaffected
+
+
+def test_console_failure_does_not_reclassify_a_successful_write(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr('pathlib.Path.home', lambda: tmp_path)
+    manager = SettingsManager()
+
+    def broken_print(*_args, **_kwargs):
+        raise UnicodeEncodeError('test', 'x', 0, 1, 'unencodable')
+
+    monkeypatch.setattr('builtins.print', broken_print)
+
+    assert manager.save_settings() is True
+    assert manager.config_file.is_file()

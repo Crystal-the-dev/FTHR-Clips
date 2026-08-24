@@ -72,7 +72,6 @@ CUSTOMIZABLE_SOUNDS: dict[str, str] = {
     'clip_captured':       'Clip Captured',
     'screenshot_captured': 'Screenshot Captured',
     'error':               'Error',
-    'startup':             'Startup',
 }
 
 # Supported formats
