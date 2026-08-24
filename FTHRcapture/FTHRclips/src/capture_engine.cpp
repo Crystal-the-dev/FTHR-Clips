@@ -64,6 +64,7 @@
 #include "transactional_save.h"
 #include "windows_capture_border_policy.h"
 #include "replay_interval.h"
+#include "frame_rate_scheduler.h"
 #include <iostream>
 #include <chrono>
 #include <cstring>
@@ -2383,8 +2384,7 @@ namespace fthr {
         const int64_t target_qpc = static_cast<int64_t>(
             (target_ms / 1000.0) * static_cast<double>(qpc_freq.QuadPart));
 
-        LARGE_INTEGER last_capture_time;
-        QueryPerformanceCounter(&last_capture_time);
+        FrameRateScheduler frame_scheduler(target_qpc);
 
         std::cout << "[CaptureThread] " << fps_ << " fps ("
             << target_ms << " ms/frame)  "
@@ -2444,13 +2444,12 @@ namespace fthr {
             // dropped frames cost only resource->Release() + ReleaseFrame().
             LARGE_INTEGER now;
             QueryPerformanceCounter(&now);
-            if (now.QuadPart - last_capture_time.QuadPart < target_qpc) {
+            if (!frame_scheduler.ShouldCapture(now.QuadPart)) {
                 resource->Release();
                 duplication_->ReleaseFrame();
                 frames_dropped_.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
-            last_capture_time = now;
 
             ID3D11Texture2D* tex = nullptr;
             hr = resource->QueryInterface(__uuidof(ID3D11Texture2D),
@@ -3034,8 +3033,7 @@ namespace fthr {
         const int64_t target_qpc = static_cast<int64_t>(
             (target_ms / 1000.0) * static_cast<double>(qpc_freq.QuadPart));
 
-        LARGE_INTEGER last_capture;
-        QueryPerformanceCounter(&last_capture);
+        FrameRateScheduler frame_scheduler(target_qpc);
         uint32_t consecutive_frame_errors = 0;
 
         while (running_.load(std::memory_order_relaxed)) {
@@ -3094,11 +3092,10 @@ namespace fthr {
                 // pool slot is freed even when we skip processing this frame.
                 LARGE_INTEGER now;
                 QueryPerformanceCounter(&now);
-                if (now.QuadPart - last_capture.QuadPart < target_qpc) {
+                if (!frame_scheduler.ShouldCapture(now.QuadPart)) {
                     frames_dropped_.fetch_add(1, std::memory_order_relaxed);
                     continue;  // frame destructor returns buffer to pool
                 }
-                last_capture = now;
 
             // Focus gate: when capturing for an anti-cheat game via monitor
             // capture, only encode frames while that game is in the foreground.

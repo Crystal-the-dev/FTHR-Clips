@@ -32,6 +32,7 @@
     <ClInclude Include="include\audio_ring_buffer.h" />
     <ClInclude Include="include\capture_engine.h" />
     <ClInclude Include="include\encoded_ring_buffer.h" />
+    <ClInclude Include="include\frame_rate_scheduler.h" />
     <ClInclude Include="include\encoded_video_config.h" />
     <ClInclude Include="include\encoded_video_config_ffmpeg.h" />
     <ClInclude Include="include\ffmpeg_amf_replay_encoder.h" />
