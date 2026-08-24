@@ -57,7 +57,7 @@ def test_rejects_diagnostically_empty_return(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Must accept — a gate that cries wolf gets deleted
+# Valid documented handlers must remain accepted.
 # ---------------------------------------------------------------------------
 
 def test_accepts_a_documented_cleanup_handler(tmp_path):

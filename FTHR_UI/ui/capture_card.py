@@ -1,22 +1,14 @@
-"""
-capture_card.py — that slick little "CLIP CAPTURED" toast that slides in from
-the corner when you grab a clip. The dopamine hit. The whole vibe.
+"""Animated capture-result notification.
 
-Architecture, because it's not obvious:
-- The card is ONE frameless translucent window and EVERYTHING in it is hand-drawn
-  in paintEvent() with QPainter — the camera icon, the text, the shimmer, the
-  draining progress bar. No child widgets. Drawing it ourselves means it's pixel
-  perfect, themeable, and cheap. Trying to do this shimmer/progress thing with
-  real QWidgets and stylesheets would be a nightmare and look worse.
-- The slide in → hold → slide out motion is a QSequentialAnimationGroup: three
-  animations played back to back (slide in, pause, slide out). Qt does the
-  tweening, we just describe the keyframes.
-- The progress bar drain and the shimmer sweep are driven by their own ~60fps
-  QTimers, kicked off at staggered delays so it all feels choreographed.
+The card is one frameless translucent window. QPainter renders the icon, text,
+shimmer, and progress bar without child widgets, keeping the result themeable
+and inexpensive to animate. A QSequentialAnimationGroup owns the slide-in,
+hold, and slide-out keyframes; independent timers drive the progress and
+shimmer phases.
 
-Heads up: in the real app this whole thing runs in a SEPARATE PROCESS (see
-capture_card_client.py for the why). This file is the actual card; the client is
-the remote control.
+The application runs this widget in a separate process so clip finalization
+cannot stall its event loop. ``capture_card_client.py`` owns that process and
+forwards the public commands below.
 
 Public API:
     card = CaptureCard()
@@ -175,10 +167,9 @@ class CaptureCard(QWidget):
         self._progress_delay.setSingleShot(True)
         self._progress_delay.timeout.connect(self._start_progress)
 
-        # The animation group has NO Qt parent on purpose. That means plain old
-        # Python refcounting owns it: the moment we reassign self._seq, the old
-        # group's refcount hits zero and Qt tears it down cleanly. If we gave it
-        # a Qt parent instead, old animation groups would remain as children and
+        # The animation group deliberately has no Qt parent. Python reference
+        # ownership disposes the previous group when self._seq is replaced. With
+        # a Qt parent, old animation groups would remain as children and
         # compete with the new group for control of self.pos during rapid saves.
         self._seq: QSequentialAnimationGroup | None = None
 
@@ -311,10 +302,8 @@ class CaptureCard(QWidget):
         self._seq.finished.connect(self.hide)
         self._seq.start()
 
-        # The choreography. Shimmer fires 150ms into the slide so it sweeps as the
-        # card arrives (feels reactive, not pre-baked). The progress bar only
-        # starts draining once the card has fully landed — draining mid-slide
-        # looks broken. These two magic numbers are pure feel, tuned by eyeball.
+        # Start the shimmer during arrival, then drain progress only after the
+        # card has landed. These delays are visual timing constants.
         self._shimmer_delay.start(150)
         self._progress_delay.start(_SLIDE_IN + 30)
 

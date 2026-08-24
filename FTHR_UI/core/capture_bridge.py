@@ -131,9 +131,8 @@ else:
 
 
 class CaptureBridge:
-    # Bumped the _v1 suffix the day I changed the struct layout and spent two
-    # hours wondering why an old engine kept reading my new fields wrong.
-    # Versioned name = old + new never accidentally share the same mapping.
+    # The mapping name is versioned so processes with different structure
+    # layouts cannot attach to one another.
     SHARED_MEM_NAME = 'FTHR_SharedMemory_v4'
 
     # Singleton. There is exactly one engine and one mapping, so one bridge.
@@ -216,10 +215,9 @@ class CaptureBridge:
             print(f'mmap failed: {e}')
             return False
         finally:
-            os.close(fd)  # the mmap holds its own ref, so the fd is dead weight now
+            os.close(fd)  # The mmap retains the mapping after the descriptor closes.
 
-        # from_buffer maps the struct directly onto the mmap — zero copy, writes
-        # go straight to shared memory. This is the whole trick.
+        # from_buffer maps the structure directly onto shared memory without a copy.
         self._layout = SharedMemoryLayout.from_buffer(self._linux_mmap)
 
         if not self._layout.is_initialized:

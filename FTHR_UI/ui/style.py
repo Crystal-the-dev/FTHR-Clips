@@ -1,15 +1,11 @@
-"""
-FTHR design tokens — the one file that decides what the whole app looks like.
+"""Shared FTHR design tokens.
 
-Rule of thumb: NO hardcoded colors, fonts, or magic pixel values anywhere else
-in the UI. If you catch yourself typing '#00ffaa' in a widget, stop, and import
-it from here instead. The day we rebrand (or a user themes the app), I do not
-want to grep 40 files. Everything funnels through here, themes patch it, done.
+Widgets should consume the color, font, and spacing tokens from this module so
+theme application and future branding changes remain centralized.
 
-Vibe check (the actual brand identity):
-- Pure black canvas + neutral grays. Matches fthrclips.com. Looks expensive.
-- Teal (#00ffaa) is THE accent — hover, active, the recording dot. Use sparingly,
-  it loses its punch if everything's teal.
+Brand direction:
+- Pure black canvas with neutral grays.
+- Teal (#00ffaa) is the restrained accent for hover, active, and recording state.
 - Oswald for the shouty uppercase labels; Segoe UI for stuff people actually read.
 - Sharp 0px corners everywhere on an 8px grid. Rounded corners are for clouds.
 """

@@ -2,9 +2,8 @@
 
 The app is not an installed package — `FTHR_UI` is a plain source directory
 that main.py runs from, and PyInstaller is pointed at it via `pathex`. Tests
-therefore have to put it on sys.path themselves. Every test module used to do
-its own `sys.path.insert`, which works but makes import order load-bearing.
-Doing it once here is the same trick, just in one place.
+therefore add it to sys.path. Centralizing that setup prevents import order from
+becoming significant.
 
 Existing per-module inserts are harmless duplicates and were left alone.
 """
