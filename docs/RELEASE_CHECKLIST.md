@@ -21,12 +21,13 @@ permissive components.
 The predecessor media had no sufficient redistribution evidence. Every such
 image was replaced with deterministic project-generated artwork, all four MP3s
 were removed in favour of generated WAVs, and Oswald 4.103 was byte-matched to
-its pinned OFL-1.1 upstream. The source and both artifacts pass a per-file
+its pinned OFL-1.1 upstream. The source and built artifacts use a per-file
 hash/licence/origin allowlist; see `AUDIT-013-ASSET-PROVENANCE.md`.
 
 **AUDIT-014 is resolved (2026-08-06).** The Linux engine is compiled against and
 ships a pinned LGPL FFmpeg; a Release build cannot fall back to the
-distribution's GPL one. An AppImage now exists and passes the licence gate.
+distribution's GPL one. A historical AppImage passed the licence gate; the
+current source still requires a new Release AppImage build and runtime test.
 
 AUDIT-013 is **RESOLVED**. The `DO NOT TAG` state above remains because real
 desktop/capture and installer lifecycle gates below are still `NOT RUN` or
@@ -50,10 +51,10 @@ Everything else below is either already green or is honest, tracked work.
 |---|---|---|
 | 1.1 | AUDIT-005 — no GPL FFmpeg anywhere in the tree or the bundle | **PASS** — LGPL `n8.1.2-21-gce3c09c101`, all 10 shipped binaries verified against `tools/ffmpeg_manifest.json` sha256 |
 | 1.2 | `imageio-ffmpeg` absent from the lock files, the environment and the bundle | **PASS** — excluded in `FTHR.spec`, asserted in CI, verified absent from the rebuilt bundle |
-| 1.3 | `tools/verify_release_licenses.py --tree .` | **PASS — current Windows checkout: 76 checks, 0 failed, 1 warning**; the warning is that pinned Linux FFmpeg is not vendored, so this checkout is not a Linux Release input. |
+| 1.3 | `tools/verify_release_licenses.py --tree .` | **PASS — current Windows checkout: 75 checks, 0 failed, 1 warning**; the warning is that pinned Linux FFmpeg is not vendored, so this checkout is not a Linux Release input. |
 | 1.4 | Third-party licence texts ship *inside* the artifact | **PASS** — Windows carries 18 and Linux 17 files under `licenses/`, plus `LICENSE` and `THIRD_PARTY_NOTICES.md` |
 | 1.5 | No distributable described as MIT | **PASS** — README, About dialog and `LICENSE` all state the split; CI greps for regressions |
-| 1.6 | **AUDIT-013 — approved Qt binding/runtime and complete redistribution evidence** | **PASS** — 25 source assets are hash/origin/licence gated; Windows contains exactly 20 and Linux exactly 21 approved asset files |
+| 1.6 | **AUDIT-013 — approved Qt binding/runtime and complete redistribution evidence** | **PASS** — 24 source assets are hash/origin/licence gated; the current Windows bundle contains exactly 19 approved asset files. Current Linux packaging remains `NOT RUN`. |
 
 ## 2. Source control and hygiene
 
@@ -75,7 +76,7 @@ Everything else below is either already green or is honest, tracked work.
 | 3.2 | Clean installs contain only the approved Qt binding | **PASS** — fresh Windows CPython 3.14.3 and Linux CPython 3.12.3 environments contain PySide6 6.11.1 and no PyQt package |
 | 3.3 | `pip check` reports no conflicts | **PASS** |
 | 3.4 | Imports succeed from a clean install | **PASS** — both venvs |
-| 3.5 | Tests run from clean selected-binding environments | **PARTIAL** — current Windows run: 450 passed / 34 skipped. Linux Python suite was not run in a pytest-equipped Linux environment; native Linux CTest is separately green. |
+| 3.5 | Tests run from clean selected-binding environments | **PARTIAL** — current Windows run: 518 passed / 34 skipped. Linux Python suite was not run in a pytest-equipped Linux environment; native Linux CTest is separately green. |
 | 3.6 | PyInstaller analysis succeeds from the locked environment | **PASS** — clean Windows onedir and Linux AppImage builds, exit 0 |
 
 ## 4. Version consistency
@@ -94,18 +95,18 @@ Everything else below is either already green or is honest, tracked work.
 
 | # | Gate | Status |
 |---|---|---|
-| 5.1 | `python -m pytest tests/` green | **PARTIAL** — Windows **450 passed / 34 skipped** at the product-truth HEAD. Linux-specific runtime cases skip on Windows; a full Linux Python run remains `NOT RUN`. |
+| 5.1 | `python -m pytest tests/` green | **PARTIAL** — Windows **518 passed / 34 skipped** at the final-completion HEAD. Linux-specific runtime cases skip on Windows; a full Linux Python run remains `NOT RUN`. |
 | 5.2 | `python -m ruff check .` clean | **PASS** |
 | 5.3 | `python -m compileall FTHR_UI tests tools` clean | **PASS** |
 | 5.4 | `tools/verify_shared_memory_contract.py` | **PASS** — current layout: 29 fields, 2736 B (Windows) / 4272 B (Linux), enums and reserved slots 4–9 intact; still Shared Memory v4. |
-| 5.5 | C++ engines have automated tests | **PASS** — current Windows native suite **82 scenarios / 149 checks**; Linux native CTest **10/10 passed**, including recovery, duration, transactional save, Wayland bounded dispatch, timestamps, and actual short-MP4 integration. |
+| 5.5 | C++ engines have automated tests | **PASS** — current Windows native suite **391 checks**; Linux native CTest **10/10 passed**, including recovery, duration, transactional save, Wayland bounded dispatch, timestamps, and actual short-MP4 integration. |
 
 ## 6. Builds
 
 | # | Gate | Status |
 |---|---|---|
 | 6.1 | Windows engine builds clean (MSBuild, Release x64) | **PASS** — rebuilt at the product-truth HEAD with VS 2022 Build Tools. |
-| 6.2 | Windows bundle builds clean (PyInstaller) | **PASS (2026-08-24)** — the current onedir bundle passed the Windows licence/asset gate and the installer lifecycle artifact gate; its UI and engine hashes are recorded in `WINDOWS-INSTALLER-LIFECYCLE-QUALIFICATION-2026-08-24.md`. |
+| 6.2 | Windows bundle builds clean (PyInstaller) | **PASS (2026-08-24)** — the final-completion onedir bundle passed 83 Windows licence/asset checks and the installer lifecycle artifact gate. Final hashes are reported with the handoff. |
 | 6.2a | Windows installer input/lifecycle contract | **PASS (source contract)** — stable AppId, update/repair/downgrade policy, safe data boundary, autostart ownership, VC++ guard, legacy opt-in and package metadata are verified by `tools/verify_windows_installer_lifecycle.py`; this is not a physical install claim. |
 | 6.2b | Windows Authenticode signing | **DECISION REQUIRED** — build support accepts an external operator-owned signing command, but no release signing identity is configured in the repository or this checkout. Unsigned artifacts are local-qualification only. |
 | 6.3 | Linux engine builds clean (CMake, Release) | **PARTIAL** — current source built and passed tests in a WSL development build using system FFmpeg. The required pinned-FFmpeg Release rebuild was not run. |
@@ -116,8 +117,8 @@ Everything else below is either already green or is honest, tracked work.
 
 | # | Gate | Status |
 |---|---|---|
-| 7.1 | Windows: GUI launches | **NOT RUN** |
-| 7.2 | Windows: a real clip is captured via the hotkey and plays back | **PARTIAL** — current engine qualification captured and fully decoded 15 H.264/HEVC/AV1 files with audio, including 30/60-second saves. It used the qualification bridge, not the GUI hotkey/player flow. |
+| 7.1 | Windows: GUI launches | **PARTIAL** — source-mode normal launch, background launch, tray restore, close-to-tray, and exit passed physically; final installed-package walkthrough remains `NOT RUN`. |
+| 7.2 | Windows: a real clip is captured via the hotkey and plays back | **PARTIAL** — current qualification captured and fully decoded H.264/HEVC/AV1 files, controlled system audio, system-plus-microphone audio, rapid saves, and a 30-second pre-UI tray save. Final packaged hotkey/player listening remains `NOT RUN`. |
 | 7.3 | Windows: installer install → launch → update → uninstall | **PARTIAL (2026-08-24)** — a real existing-install update, default uninstall, fresh reinstall and checked legacy cleanup ran successfully against the generated Setup executable. Installed-app identity, Start Menu, exact autostart ownership and clip/settings snapshots were checked. Installed GUI/tray/capture launch remains `NOT RUN`; see `WINDOWS-INSTALLER-LIFECYCLE-QUALIFICATION-2026-08-24.md`. |
 | 7.4 | Windows: uninstall removes what it claims to | **PARTIAL (2026-08-24)** — default uninstall removed product registration, Program Files payload, common shortcuts and the exact Run value while preserving the recorded clip and `.fthr` state snapshots. The optional interactive settings/cache-removal choice and a custom install location remain `NOT RUN`. |
 | 7.5 | Linux: engine starts and captures on a real compositor | **NOT RUN** — WSLg exposes neither supported Wayland protocol; current alpha source refuses x11grab and exits after bounded recovery. Hyprland/KDE/GNOME remain `NOT RUN`. |
@@ -126,7 +127,7 @@ Everything else below is either already green or is honest, tracked work.
 | 7.7 | Linux: the Linux-only fixes are exercised | **PASS** — single-instance `flock` verified with real processes (acquire → second refused → SIGKILL holder → third acquires; lock `~/.fthr/fthr.lock` uid=you mode=600). Hotkey socket verified at `$XDG_RUNTIME_DIR/fthr/hotkey.sock`, dir 0700, socket 0600, 16 new tests. |
 | 7.7b | Linux: hotkeys actually fire from a compositor bind | **NOT RUN** — no compositor available |
 | 7.7c | Linux: audio capture | **PARTIAL** — current WSL smoke resolved/opened `RDPSink.monitor` at 48 kHz stereo float32 and shut down cleanly. Saving/ffprobing current audio content, PipeWire, device switching and loss remain `NOT RUN`. |
-| 7.8 | Performance / soak measurement | **NOT RUN** — no 2-hour / 50-clip soak on either platform. No performance claim may be published. |
+| 7.8 | Performance / soak measurement | **PARTIAL** — 30/60/300-second replay, 1/2/4/8-track playback, save, screenshot, startup, background lifecycle, and bounded memory measurements are recorded in `FINAL-PERFORMANCE-QUALIFICATION.md`; no 2-hour / 50-clip soak was run. |
 | 7.9 | Quality comparison OpenH264 vs. the old x264 fallback | **NOT RUN** |
 
 > Gates 7.1–7.9 are the honest gap. The alpha has been *built* and its logic is
@@ -141,7 +142,7 @@ Everything else below is either already green or is honest, tracked work.
 
 | # | Gate | Status |
 |---|---|---|
-| 8.1 | `KNOWN_ISSUES.md` reflects reality | **PASS** — updated 2026-08-14; AUDIT-013 is resolved and remaining runtime gaps are listed separately |
+| 8.1 | `KNOWN_ISSUES.md` reflects reality | **PASS** — updated 2026-08-24; remaining hardware, package, Linux-runtime, signing, and soak gaps are listed explicitly. |
 | 8.2 | `RELEASE_NOTES.md` matches what actually ships | review at tag time |
 | 8.3 | `THIRD_PARTY_NOTICES.md` complete and current | **PASS** |
 | 8.4 | `CONTRIBUTING.md` describes the real layout and build | **PASS** |
