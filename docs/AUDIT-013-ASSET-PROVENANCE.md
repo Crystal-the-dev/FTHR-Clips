@@ -55,7 +55,6 @@ installer rather than copied as a standalone artifact file.
 | `FTHR_UI/assets/sounds/clip_captured.wav` | PCM WAV | default clip notification | W, L | MIT; G1 | APPROVED |
 | `FTHR_UI/assets/sounds/error.wav` | PCM WAV | default error notification | W, L | MIT; G1 | APPROVED |
 | `FTHR_UI/assets/sounds/screenshot_saved.wav` | PCM WAV | default screenshot notification | W, L | MIT; G1 | APPROVED |
-| `FTHR_UI/assets/sounds/startup.wav` | PCM WAV | default startup notification | W, L | MIT; G1 | APPROVED |
 | `installer_assets/wizard_banner.bmp` | BMP | Inno Setup wizard image | W Embedded | MIT; G1 | APPROVED |
 | `installer_assets/wizard_small.bmp` | BMP | Inno Setup small wizard image | W Embedded | MIT; G1 | APPROVED |
 

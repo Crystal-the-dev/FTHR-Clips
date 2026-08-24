@@ -75,7 +75,6 @@ def test_bundled_sounds_are_generated_pcm_wav_files():
         'clip_captured.wav',
         'error.wav',
         'screenshot_saved.wav',
-        'startup.wav',
     }
     assert {path.name for path in sound_dir.iterdir()} == expected_names
 

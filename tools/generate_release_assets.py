@@ -399,8 +399,6 @@ def generated_files() -> dict[Path, bytes]:
             sound([(329.63, 0.18), (220.00, 0.28)], 0.015),
         ROOT / 'FTHR_UI' / 'assets' / 'sounds' / 'screenshot_saved.wav':
             sound([(1174.66, 0.09), (1760.00, 0.14)], 0.012),
-        ROOT / 'FTHR_UI' / 'assets' / 'sounds' / 'startup.wav':
-            sound([(440.00, 0.12), (659.25, 0.12), (880.00, 0.22)]),
     }
     files = {
         ROOT / '.github' / 'social_preview.png': social_preview().png(),
