@@ -57,10 +57,12 @@ class CaptureCardClient:
 
     def _launch(self):
         try:
-            # Force XWayland so the card subprocess can position its own window.
-            # On Wayland, compositors ignore client-side move() calls for toplevel
-            # windows and center them instead. xcb/X11 via XWayland respects them.
-            env = {**os.environ, 'QT_QPA_PLATFORM': 'xcb', 'DISPLAY': os.environ.get('DISPLAY', ':0')}
+            env = dict(os.environ)
+            # Force XWayland only on Linux. Windows must retain its native Qt
+            # platform plugin; setting xcb there makes the card process exit.
+            if sys.platform != 'win32' and os.environ.get('WAYLAND_DISPLAY'):
+                env['QT_QPA_PLATFORM'] = 'xcb'
+                env['DISPLAY'] = os.environ.get('DISPLAY', ':0')
             monitor = self._sm.get('notification_monitor', 'auto') if self._sm else 'auto'
             env['FTHR_CARD_SCREEN_NAME'] = monitor
             self._proc = subprocess.Popen(
@@ -120,10 +122,24 @@ class CaptureCardClient:
         self._send(f'prompt|{text}')
 
     def close(self) -> None:
-        self._send('quit')
-        if self._proc:
+        proc = self._proc
+        self._proc = None
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.stdin.write('quit\n')
+            proc.stdin.flush()
+            # The child joins its blocking stdin reader after app.quit(). EOF
+            # releases that reader immediately; leaving the pipe open forced
+            # every normal shutdown to wait for the timeout.
+            proc.stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        try:
+            proc.wait(timeout=0.75)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
             try:
-                self._proc.wait(timeout=2)
+                proc.wait(timeout=0.5)
             except subprocess.TimeoutExpired:
-                self._proc.terminate()
-            self._proc = None
+                proc.kill()

@@ -461,15 +461,15 @@ class CaptureBridge:
         try:
             return {
                 'connected': True,
-                'is_recording': self._layout.is_recording,
-                'frames_captured': self._layout.frames_captured,
-                'nvenc_active': self._layout.nvenc_active,
-                'capture_health_flags': self._layout.capture_health_flags,
-                'capture_generation': self._layout.capture_generation,
-                'content_sample_sequence': self._layout.content_sample_sequence,
-                'content_suspicious_streak': self._layout.content_suspicious_streak,
-                'content_luma_mean': self._layout.content_luma_mean,
-                'content_luma_variance': self._layout.content_luma_variance,
+                'is_recording': bool(self._layout.is_recording),
+                'frames_captured': int(self._layout.frames_captured),
+                'nvenc_active': bool(self._layout.nvenc_active),
+                'capture_health_flags': int(self._layout.capture_health_flags),
+                'capture_generation': int(self._layout.capture_generation),
+                'content_sample_sequence': int(self._layout.content_sample_sequence),
+                'content_suspicious_streak': int(self._layout.content_suspicious_streak),
+                'content_luma_mean': float(self._layout.content_luma_mean),
+                'content_luma_variance': float(self._layout.content_luma_variance),
             }
         except Exception as e:
             self._log_read_error_once('get_status', e)

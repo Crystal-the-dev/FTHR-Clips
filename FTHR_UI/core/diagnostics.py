@@ -142,11 +142,19 @@ class _RedactingFilter(logging.Filter):
             if isinstance(record.msg, str):
                 record.msg = redact_secret(record.msg)
             if record.args:
+                def redact_arg(value):
+                    # Preserve numeric types for logging placeholders such as
+                    # %d and %.2f. Converting every argument to redacted text
+                    # made otherwise valid health diagnostics fail to format.
+                    if value is None or isinstance(value, (bool, int, float)):
+                        return value
+                    return redact_secret(value)
+
                 if isinstance(record.args, dict):
-                    record.args = {k: redact_secret(v)
+                    record.args = {k: redact_arg(v)
                                    for k, v in record.args.items()}
                 else:
-                    record.args = tuple(redact_secret(a) for a in record.args)
+                    record.args = tuple(redact_arg(a) for a in record.args)
         except Exception:  # pragma: no cover
             record.msg = _REDACTED
             record.args = None
