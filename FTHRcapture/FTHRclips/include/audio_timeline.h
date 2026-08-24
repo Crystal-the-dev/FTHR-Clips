@@ -32,6 +32,13 @@ AudioSourcePresentationRange MapAudioSourcePresentationRange(
     double presentation_start_qpc_s, double presentation_end_qpc_s,
     uint64_t source_timeline_origin_100ns, uint32_t sample_rate);
 
+// Converts an AAC/sample position back to the shared QPC timeline. Negative
+// positions are valid for encoder delay and must remain signed during the
+// conversion instead of wrapping through uint64_t.
+int64_t AudioSamplePositionToTimeline100ns(
+    uint64_t source_timeline_origin_100ns, int64_t sample_position,
+    uint32_t sample_rate);
+
 struct AudioDriftCorrection {
     int64_t observed_drift_samples = 0;
     int32_t sample_delta = 0;

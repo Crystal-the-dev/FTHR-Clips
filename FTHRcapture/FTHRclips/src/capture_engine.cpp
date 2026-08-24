@@ -968,14 +968,16 @@ namespace fthr {
                         // actually survived in this clip, not a guessed requested
                         // duration.  Default Mix is a real aggregate loopback
                         // stream and therefore remains present even for silence.
-                        default_mix_track.source.state.first_active_100ns = static_cast<int64_t>(
-                            origin_qpc + (static_cast<uint64_t>(
-                                default_mix_track.snapshot.first_pts_samples)
-                                * 10'000'000ULL / sample_rate));
-                        default_mix_track.source.state.last_active_100ns = static_cast<int64_t>(
-                            origin_qpc + (static_cast<uint64_t>(
-                                default_mix_track.snapshot.last_pts_samples)
-                                * 10'000'000ULL / sample_rate));
+                        default_mix_track.source.state.first_active_100ns =
+                            AudioSamplePositionToTimeline100ns(
+                                origin_qpc,
+                                default_mix_track.snapshot.first_pts_samples,
+                                sample_rate);
+                        default_mix_track.source.state.last_active_100ns =
+                            AudioSamplePositionToTimeline100ns(
+                                origin_qpc,
+                                default_mix_track.snapshot.last_pts_samples,
+                                sample_rate);
                         task.encoded_audio_tracks.push_back(std::move(default_mix_track));
                         if (microphone_audio_source_) {
                             if (const auto microphone_track =

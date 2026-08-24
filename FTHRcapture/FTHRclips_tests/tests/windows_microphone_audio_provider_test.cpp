@@ -24,6 +24,16 @@ void QpcTimelineKeepsLateSourcesAtTheirRealOffset() {
         "shared QPC mapping preserves a microphone that begins halfway through a clip");
 }
 
+void EncoderDelayStaysSignedInManifestTimeline() {
+    constexpr uint64_t origin = 50ULL * 10'000'000ULL;
+    CheckMicrophone(fthr::AudioSamplePositionToTimeline100ns(
+            origin, -1024, fthr::kCanonicalAudioSampleRate) == 499'786'667,
+        "negative AAC encoder delay stays before the source origin without unsigned wrap");
+    CheckMicrophone(fthr::AudioSamplePositionToTimeline100ns(
+            origin, 1024, fthr::kCanonicalAudioSampleRate) == 500'213'333,
+        "positive AAC packet positions map after the source origin");
+}
+
 void DriftCorrectionIsSmallAndBounded() {
     fthr::AudioDriftController controller(48000, 100);
     const auto initial = controller.Observe(10'000'000, 0);
@@ -65,6 +75,7 @@ void ExplicitEndpointIdentityIsNotManifestIdentity() {
 
 int RunWindowsMicrophoneAudioProviderTests() {
     QpcTimelineKeepsLateSourcesAtTheirRealOffset();
+    EncoderDelayStaysSignedInManifestTimeline();
     DriftCorrectionIsSmallAndBounded();
     ExplicitEndpointIdentityIsNotManifestIdentity();
     std::cout << "AUDIT-050 Windows microphone provider tests: "

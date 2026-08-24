@@ -510,12 +510,10 @@ std::optional<EncodedAudioTrack> WindowsMicrophoneAudioProvider::TakeTrackForInt
     // Manifest timing is clip-local packet history, not the lifetime of the
     // endpoint. In particular, a microphone active before the requested
     // replay interval must not be reported as if it began before this clip.
-    source.state.first_active_100ns = static_cast<int64_t>(origin
-        + (static_cast<uint64_t>(snapshot.first_pts_samples) * 10'000'000ULL)
-            / kCanonicalAudioSampleRate);
-    source.state.last_active_100ns = static_cast<int64_t>(origin
-        + (static_cast<uint64_t>(snapshot.last_pts_samples) * 10'000'000ULL)
-            / kCanonicalAudioSampleRate);
+    source.state.first_active_100ns = AudioSamplePositionToTimeline100ns(
+        origin, snapshot.first_pts_samples, kCanonicalAudioSampleRate);
+    source.state.last_active_100ns = AudioSamplePositionToTimeline100ns(
+        origin, snapshot.last_pts_samples, kCanonicalAudioSampleRate);
     EncodedAudioTrack track;
     track.source = std::move(source);
     track.snapshot = std::move(snapshot);

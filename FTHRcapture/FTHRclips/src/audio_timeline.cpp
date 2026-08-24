@@ -54,6 +54,54 @@ AudioSourcePresentationRange MapAudioSourcePresentationRange(
     return result;
 }
 
+int64_t AudioSamplePositionToTimeline100ns(
+    uint64_t source_timeline_origin_100ns, int64_t sample_position,
+    uint32_t sample_rate) {
+    if (source_timeline_origin_100ns == 0 || sample_rate == 0) return 0;
+
+    constexpr int64_t kTimelineUnitsPerSecond = 10'000'000;
+    const int64_t whole_seconds = sample_position / static_cast<int64_t>(sample_rate);
+    const int64_t remaining_samples = sample_position % static_cast<int64_t>(sample_rate);
+    if (whole_seconds > std::numeric_limits<int64_t>::max() / kTimelineUnitsPerSecond) {
+        return std::numeric_limits<int64_t>::max();
+    }
+    if (whole_seconds < std::numeric_limits<int64_t>::min() / kTimelineUnitsPerSecond) {
+        return 0;
+    }
+    const int64_t whole_delta = whole_seconds * kTimelineUnitsPerSecond;
+    const int64_t remainder_delta =
+        (remaining_samples * kTimelineUnitsPerSecond)
+            / static_cast<int64_t>(sample_rate);
+    if (remainder_delta > 0
+            && whole_delta > std::numeric_limits<int64_t>::max() - remainder_delta) {
+        return std::numeric_limits<int64_t>::max();
+    }
+    if (remainder_delta < 0
+            && whole_delta < std::numeric_limits<int64_t>::min() - remainder_delta) {
+        return 0;
+    }
+    const int64_t delta = whole_delta + remainder_delta;
+
+    if (delta >= 0) {
+        const uint64_t positive_delta = static_cast<uint64_t>(delta);
+        const uint64_t maximum = static_cast<uint64_t>(
+            std::numeric_limits<int64_t>::max());
+        if (source_timeline_origin_100ns > maximum - positive_delta) {
+            return std::numeric_limits<int64_t>::max();
+        }
+        return static_cast<int64_t>(source_timeline_origin_100ns + positive_delta);
+    }
+
+    const uint64_t negative_delta = static_cast<uint64_t>(-(delta + 1)) + 1;
+    if (negative_delta >= source_timeline_origin_100ns) return 0;
+    const uint64_t result = source_timeline_origin_100ns - negative_delta;
+    const uint64_t maximum = static_cast<uint64_t>(
+        std::numeric_limits<int64_t>::max());
+    return result > maximum
+        ? std::numeric_limits<int64_t>::max()
+        : static_cast<int64_t>(result);
+}
+
 AudioDriftController::AudioDriftController(uint32_t sample_rate, uint32_t max_ppm)
     : sample_rate_(std::max<uint32_t>(1, sample_rate)),
       max_ppm_(std::clamp<uint32_t>(max_ppm, 1, 500)) {}
