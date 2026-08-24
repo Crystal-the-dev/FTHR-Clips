@@ -11,6 +11,20 @@ def _screen_name(screen: object) -> str:
     return str(name() if callable(name) else name or '')
 
 
+def _screen_geometry(screen: object) -> tuple[int, int, int, int] | None:
+    geometry_getter = getattr(screen, 'geometry', None)
+    if not callable(geometry_getter):
+        return None
+    geometry = geometry_getter()
+    try:
+        return tuple(
+            int(getattr(geometry, part)())
+            for part in ('x', 'y', 'width', 'height')
+        )
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def select_qt_screen(
     selected_monitor: str,
     screens: Sequence[object],
@@ -25,9 +39,11 @@ def select_qt_screen(
     target = selected_monitor
     if platform.startswith('win'):
         selected_key = os.path.normcase(selected_monitor)
+        matched_monitor = None
         for monitor in windows_monitors:
             device_path = os.path.normcase(str(getattr(monitor, 'device_path', '')))
             if device_path == selected_key:
+                matched_monitor = monitor
                 target = str(getattr(monitor, 'gdi_name', ''))
                 break
         else:
@@ -40,6 +56,17 @@ def select_qt_screen(
                 return screen
         elif actual == target:
             return screen
+    if platform.startswith('win') and matched_monitor is not None:
+        expected_geometry = tuple(
+            int(getattr(matched_monitor, part, 0))
+            for part in ('x', 'y', 'width', 'height')
+        )
+        if expected_geometry[2] > 0 and expected_geometry[3] > 0:
+            for screen in screens:
+                if _screen_geometry(screen) == expected_geometry:
+                    return screen
+        if bool(getattr(matched_monitor, 'primary', False)) and primary is not None:
+            return primary
     return None
 
 

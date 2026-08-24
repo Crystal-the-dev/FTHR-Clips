@@ -773,19 +773,34 @@ class ClipThumbnail(QFrame):
         effect = QGraphicsOpacityEffect(self)
         effect.setOpacity(0.0)
         self.setGraphicsEffect(effect)
+        self._fade_effect = effect
 
         def _start():
+            # A library refresh may replace/delete this card before its
+            # staggered delay expires. Do not animate the old Qt effect.
+            if getattr(self, '_fade_effect', None) is not effect:
+                return
             anim = QPropertyAnimation(effect, b'opacity', self)
             anim.setDuration(450)
             anim.setStartValue(0.0)
             anim.setEndValue(1.0)
             anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-            anim.finished.connect(lambda: self.setGraphicsEffect(None))
+
+            def _finish():
+                if getattr(self, '_fade_effect', None) is effect:
+                    self.setGraphicsEffect(None)
+                    self._fade_effect = None
+
+            anim.finished.connect(_finish)
             self._fade_anim = anim
             anim.start()
 
         if delay_ms > 0:
-            QTimer.singleShot(delay_ms, _start)
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(_start)
+            self._fade_timer = timer
+            timer.start(delay_ms)
         else:
             _start()
 

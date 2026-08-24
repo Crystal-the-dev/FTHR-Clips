@@ -2496,7 +2496,7 @@ class MainWindow(QMainWindow):
             platform=sys.platform,
             windows_monitors=(
                 enumerate_windows_monitors() if sys.platform == 'win32' else ()),
-            primary=QApplication.primaryScreen() if not selected_monitor else None,
+            primary=QApplication.primaryScreen(),
         )
         if screen is None:
             paths.staged.unlink(missing_ok=True)
