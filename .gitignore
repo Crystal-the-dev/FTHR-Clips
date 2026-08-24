@@ -47,6 +47,7 @@ FTHRcapture/FTHRclips_tests/x64/
 FTHRcapture/FTHRclips_tests/FTHRclips_tests/
 FTHRcapture/FTHRPlaybackMixer/x64/
 *.obj
+*.o
 *.iobj
 *.ipdb
 *.pdb
@@ -56,6 +57,10 @@ FTHRcapture/FTHRPlaybackMixer/x64/
 *.exp
 *.lastbuildstate
 *.vcxproj.user
+*.tmp
+*.partial
+*.bak
+*.old
 
 # CMake / Linux engine
 FTHRcapture_linux/build/
@@ -92,7 +97,14 @@ env/
 .coverage
 .coverage.*
 htmlcov/
+coverage/
 coverage.xml
+
+# Local qualification and generated test output
+qualification/
+audit-output/
+test_output/
+benchmarks/output/
 
 # ---------------------------------------------------------------------------
 # Runtime / user data — never belongs in the repo

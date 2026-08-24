@@ -28,4 +28,5 @@ yet approved for public distribution.
 
 Linux hotkeys use an owner-only Unix socket and do not require root or membership
 in the `input` group. See `README.md`, `KNOWN_ISSUES.md`, and
-`docs/RELEASE_CHECKLIST.md` before installing or distributing this build.
+`KNOWN_ISSUES.md` and `docs/SUPPORTED_PLATFORMS.md` before installing or
+distributing this build.

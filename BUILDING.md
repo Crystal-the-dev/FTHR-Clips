@@ -65,9 +65,9 @@ python -m pytest tests/
 python -m ruff check .
 ```
 
-All must pass. See [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md) for
-the full gate list. AUDIT-013 selected PySide6/LGPLv3 and hash-locks every
-release asset in `tools/release_asset_manifest.json`. Before packaging, also
+All must pass. [`docs/TESTING.md`](docs/TESTING.md) explains which additional
+checks require real hardware or a desktop session. The release asset manifest
+hash-locks every bundled asset. Before packaging, also
 verify that the committed generated media matches its reviewed source:
 
 ```bash
@@ -342,5 +342,5 @@ Ubuntu 24.04 / WSL2, 2026-08-06:
 | Licence gate | **PASS** — 83 checks, 0 failed, 0 warnings |
 | AppImage produced | **YES** — 219 MB, starts (offscreen), engine loads all 7 bundled FFmpeg libraries |
 
-Full detail in [`docs/SUPPORTED_PLATFORMS.md`](docs/SUPPORTED_PLATFORMS.md) and
-[`docs/AUDIT_REPORT.md`](docs/AUDIT_REPORT.md).
+Full platform detail is in
+[`docs/SUPPORTED_PLATFORMS.md`](docs/SUPPORTED_PLATFORMS.md).

@@ -7,8 +7,7 @@
 
 Date: **2026-08-14**
 
-Status: **RESOLVED IN SOURCE; ARTIFACT VERIFICATION RECORDED IN
-`AUDIT-013-QT-LICENSING.md`**
+Status: **RESOLVED IN SOURCE AND ENFORCED BY RELEASE GATES**
 
 This is an engineering evidence record, not legal advice. The canonical,
 machine-readable inventory is `tools/release_asset_manifest.json`; its SHA-256

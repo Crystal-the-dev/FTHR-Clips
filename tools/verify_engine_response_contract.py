@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify the engine -> UI publication contract in both C++ engines.
 
-The contract (see AUDIT-018 in docs/AUDIT_REPORT.md):
+The engine response-publication contract:
 
     1. write engine_string / engine_param* — the payload
     2. publish engine_response LAST

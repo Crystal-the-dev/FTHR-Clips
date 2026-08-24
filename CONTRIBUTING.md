@@ -2,10 +2,8 @@
 
 Thanks for wanting to contribute. Here's everything you need to know.
 
-> **Before anything else:** read [`docs/SOURCE_OF_TRUTH.md`](docs/SOURCE_OF_TRUTH.md).
-> There are stale copies of this project on the original development machine,
-> one of which documents a directory layout that no longer exists. Make sure
-> you are in the git repository.
+Start from a clean checkout, confirm the current branch and worktree state, and
+do not mix generated build output or personal configuration into source changes.
 
 ## Authoritative layout
 
