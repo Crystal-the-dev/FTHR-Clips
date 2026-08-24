@@ -38,6 +38,7 @@ from core.playback_mix_model import (
 _NO_WINDOW = {'creationflags': subprocess.CREATE_NO_WINDOW} if sys.platform == 'win32' else {}
 _FRAMES_PER_BLOCK = 1024
 _MAX_QUEUED_FRAMES = CANONICAL_SAMPLE_RATE // 2
+_SYNC_RECOVERY_SECONDS = 0.75
 
 
 class PlaybackError(RuntimeError):
@@ -367,6 +368,7 @@ class FFmpegPlaybackController(QObject):
         self._states = {source.source_id: SourceMixState() for source in self.sources}
         self._master_gain = 1.0
         self._mix_lock = threading.Lock()
+        self._sync_guard_until = 0.0
         self._output_device, self._output_format, self._encode_for_device = self._select_output_format()
         self._queue = BoundedPCMQueue(self._output_format.bytesPerFrame())
         self._device = _AudioPullDevice(self._queue, self)
@@ -431,6 +433,7 @@ class FFmpegPlaybackController(QObject):
         self._queue.clear()
         self._discard_output_buffer()
         self._worker.play(position_ms)
+        self._sync_guard_until = time.monotonic() + _SYNC_RECOVERY_SECONDS
         self._sink_timer.start()
 
     def pause(self) -> None:
@@ -442,6 +445,7 @@ class FFmpegPlaybackController(QObject):
         self._queue.clear()
         self._discard_output_buffer()
         self._worker.seek(position_ms)
+        self._sync_guard_until = time.monotonic() + _SYNC_RECOVERY_SECONDS
 
     def sync_to_video_position(self, position_ms: int) -> None:
         # QMediaPlayer is the sole master.  The worker estimate already removes
@@ -449,6 +453,12 @@ class FFmpegPlaybackController(QObject):
         # pulls those bytes.  Treating that buffered audio as already played
         # made the controller seek unnecessarily and left stale pre-seek audio
         # queued in the device, which was audible as short clicks under load.
+        # A hard seek resets decoder, Python queue and device queue.  Give that
+        # pipeline one bounded prebuffer interval before considering another
+        # correction; otherwise frequent QMediaPlayer position signals can
+        # create a seek storm while the sink is still restarting.
+        if time.monotonic() < getattr(self, '_sync_guard_until', 0.0):
+            return
         if abs(self._estimated_output_position_ms() - position_ms) > 120:
             self.seek(position_ms)
 

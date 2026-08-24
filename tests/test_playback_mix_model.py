@@ -195,6 +195,7 @@ def test_video_sync_accounts_for_qaudio_device_buffer(qtbot):
     controller._worker = Worker()
     controller._output_format = OutputFormat()
     controller._sink = Sink()
+    controller._sync_guard_until = 0.0
     sought = []
     controller.seek = sought.append
 
@@ -203,6 +204,21 @@ def test_video_sync_accounts_for_qaudio_device_buffer(qtbot):
     assert sought == []
     controller.sync_to_video_position(700)
     assert sought == [700]
+
+
+def test_video_sync_waits_for_seek_pipeline_to_recover(qtbot):
+    from PySide6.QtCore import QObject
+
+    controller = FFmpegPlaybackController.__new__(FFmpegPlaybackController)
+    QObject.__init__(controller)
+    controller._sync_guard_until = float('inf')
+    controller._estimated_output_position_ms = lambda: 0
+    sought = []
+    controller.seek = sought.append
+
+    controller.sync_to_video_position(2_000)
+
+    assert sought == []
 
 
 def test_seek_discards_python_and_qaudio_buffers_before_decoder_seek(qtbot):
