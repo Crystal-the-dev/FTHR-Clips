@@ -21,9 +21,9 @@ python -m ruff check .
 `tests/conftest.py` sets `QT_QPA_PLATFORM=offscreen`, so widget tests work
 headless without exporting anything.
 
-Current: **112 passed / 27 skipped on Windows**, **138 passed / 1 skipped on
-Linux**. The counts differ because platform-specific tests skip on the other
-platform — that is correct, not a gap.
+Current Windows result: **518 passed / 34 skipped**. Platform-specific tests
+skip on the other operating system; record the result of each release run
+instead of treating this count as a permanent expectation.
 
 ### What the suite covers
 
@@ -90,17 +90,19 @@ FTHRclips <fps> <buffer_s> <w> <h> <bitrate_kbps> <_> <_> <_> <scaling>
 FTHRcapture_linux/build/FTHRclips 30 10 1280 720 6000 0 0 0 0 "" 0 4 0 1
 ```
 
-Expected on a machine with no wlroots compositor:
+Expected on a machine exposing neither supported Wayland protocol:
 
 ```
 [SHM] Created: /dev/shm/FTHR_SharedMemory_v4
 [WlrBackend] zwlr_screencopy_manager_v1 not available — compositor must support wlr-screencopy
 [ExtBackend] ext-image-copy-capture not available
-[Backend] Using x11grab
-[Encoder] Using: av1_nvenc  1280x720  30fps
+[Backend] x11grab disabled for alpha: AUDIT-044 bounded cancellation unresolved
+[Backend] No capture backend available on this system
+[Capture] Recovery exhausted after 3 attempts
+[FTHR] Capture backend stopped; exiting engine
 ```
 
-Then, in another shell, check the shared memory:
+On a supported compositor, check the shared memory while the engine is active:
 
 ```bash
 ls -l /dev/shm/FTHR_SharedMemory_v4      # must be yours, mode 600
