@@ -21,6 +21,20 @@ def _write(path: Path, content: str = '') -> None:
     path.write_text(content, encoding='utf-8')
 
 
+def test_project_license_is_the_approved_gplv3_text():
+    rep = vrl.Report()
+    vrl.check_project_license(ROOT, rep, 'tree')
+    assert not rep.failures, rep.failures
+
+
+def test_project_license_rejects_mit_or_truncated_text(tmp_path):
+    _write(tmp_path / 'LICENSE', 'MIT License\n')
+    rep = vrl.Report()
+    vrl.check_project_license(tmp_path, rep, 'fixture')
+    assert any('not the approved GPL-3.0-only text' in failure
+               for failure in rep.failures)
+
+
 def _manifest_root(tmp_path: Path) -> Path:
     (tmp_path / 'tools').mkdir(parents=True, exist_ok=True)
     shutil.copy2(REAL_MANIFEST, tmp_path / 'tools' / 'qt_runtime_manifest.json')

@@ -322,7 +322,7 @@ def social_preview() -> Canvas:
         c.text(900, y + 13, key, 3, BLACK)
         c.text(980, y + 10, label, 4, WHITE if key == 'F9' else MUTED)
     c.text(24, 608, 'FTHR COMMUNITY', 3, MUTED)
-    c.text(1080, 608, 'MIT SOURCE', 3, WHITE)
+    c.text(1060, 608, 'GPLV3 SOURCE', 3, WHITE)
     return c
 
 

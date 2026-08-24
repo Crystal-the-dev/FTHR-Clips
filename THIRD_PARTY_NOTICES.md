@@ -4,15 +4,15 @@ FTHR Clips bundles and links against third-party software. This file lists
 every component that is **actually distributed** in a release artifact, its
 licence, and where to find the full licence text.
 
-FTHR Clips' own source code is licensed **MIT** (see [`LICENSE`](LICENSE)).
-That does not, by itself, describe the licence of the *downloadable build* —
-see [Licence of the distributed build](#licence-of-the-distributed-build).
+FTHR Clips' own source code is licensed **GPL-3.0-only** (see
+[`LICENSE`](LICENSE)). Third-party components and project assets explicitly
+identified below retain their respective licences.
 
 Full licence texts live in [`licenses/`](licenses/), and are installed
 alongside the application (Windows: `licenses\` in the install directory;
 Linux: `licenses/` inside the AppImage).
 
-Last verified: **2026-08-14**.
+Last verified: **2026-08-24**.
 
 ---
 
@@ -24,9 +24,9 @@ The Qt binding/runtime and FFmpeg are distributed under LGPL options:
 
 | Component | Licence | Consequence for the distributed binary |
 |---|---|---|
-| FFmpeg (dynamically linked) | LGPLv3-or-later | FTHR's application code remains MIT; the LGPL notices, source availability, and relinking conditions apply. |
-| PySide6 / Shiboken (separate extension modules) | LGPL-3.0-only option selected | FTHR's application code remains MIT; recipients may replace the LGPL components and reverse engineer for debugging modifications to them. |
-| Qt 6 (separate shared libraries) | LGPL-3.0-only option selected | FTHR's application code remains MIT; notices, corresponding source, and replaceability/relinking conditions apply. |
+| FFmpeg (dynamically linked) | LGPLv3-or-later | Remains under LGPL; notices, source availability, and relinking conditions apply. |
+| PySide6 / Shiboken (separate extension modules) | LGPL-3.0-only option selected | Remains under LGPL; recipients may replace the components and reverse engineer for debugging modifications to them. |
+| Qt 6 (separate shared libraries) | LGPL-3.0-only option selected | Remains under LGPL; notices, corresponding source, and replaceability/relinking conditions apply. |
 
 The engine FFmpeg build is LGPLv3 with no
 GPL components (see below). It is loaded as separate DLLs/shared libraries, so

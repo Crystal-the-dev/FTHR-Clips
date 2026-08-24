@@ -283,16 +283,18 @@ jobs:
           echo "No oversized blobs in history."
 
       - name: Licence claim sanity (AUDIT-013)
-        # PyQt6 is GPL-3.0-only, so a distributed bundle is GPLv3 as a whole.
-        # Fail loudly if the paperwork starts calling a *download* MIT.
+        # FTHR's project licence is GPL-3.0-only. Generated assets may retain
+        # their explicit MIT grant, so only current application claims belong
+        # in this consistency check.
         run: |
-          if grep -rInE '(download|build|installer|release|binary).{0,40}\bMIT\b' \
-               README.md RELEASE_NOTES.md LICENSE 2>/dev/null \
-             | grep -viE 'not .*MIT|MIT-only|never .*MIT'; then
-            echo "::error::A distributable is described as MIT. PyQt6 makes it GPLv3."
+          grep -q 'GNU GENERAL PUBLIC LICENSE' LICENSE
+          grep -q 'Version 3, 29 June 2007' LICENSE
+          if grep -nE "SOURCE_LICENSE = 'MIT'|FTHR Clips.+source.+MIT|application code remains MIT" \
+               README.md THIRD_PARTY_NOTICES.md FTHR_UI/version.py FTHR_UI/main.py; then
+            echo "::error::FTHR's application licence drifted back to MIT."
             exit 1
           fi
-          echo "No misleading MIT claim about a distributable."
+          echo "GPL-3.0-only project licence declaration is consistent."
 
   # ==========================================================================
   # Tag guard

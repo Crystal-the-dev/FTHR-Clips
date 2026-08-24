@@ -4,6 +4,13 @@ Date: **2026-08-14**
 
 Status: **RESOLVED**
 
+> **Project-licence update (2026-08-24):** the live source tree was directed to
+> use `GPL-3.0-only`; `LICENSE`, README, package notices,
+> About metadata, and release gates now reflect that decision. References to
+> MIT below document the 2026-08-14 Qt migration decision and are retained as
+> historical evidence. The already granted MIT rights in separately identified
+> generated assets remain documented in `licenses/FTHR-GENERATED-ASSETS.txt`.
+
 Technical Qt closure: **complete**. Bundled-asset provenance closure:
 **complete and enforced in source and release artifacts**.
 
@@ -11,7 +18,7 @@ This is an engineering compliance review, not legal advice. Release-readiness
 claims below are limited to facts reproducible from source, official package
 metadata, and inspected artifacts.
 
-## 1. Current project licence and ownership evidence
+## 1. Project licence and ownership evidence at the time of this review
 
 `LICENSE` is the canonical project licence. It applies the OSI-approved MIT
 text to FTHR Clips source attributed to “FTHR-Community”; `README.md` and

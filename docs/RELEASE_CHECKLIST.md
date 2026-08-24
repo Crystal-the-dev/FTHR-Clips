@@ -15,8 +15,8 @@ Legend: `PASS` verified · `FAIL` verified broken · `NOT RUN` never executed �
 
 The Qt blocker has been technically closed by selecting PySide6 6.11.1 under
 its LGPLv3 option and gating both Windows and Linux artifacts. FTHR's own source
-remains MIT and the downloadable bundle includes separately licensed LGPL and
-permissive components.
+now declares `GPL-3.0-only`; bundled third-party components and explicitly
+separate project assets retain the licences recorded in the notices.
 
 The predecessor media had no sufficient redistribution evidence. Every such
 image was replaced with deterministic project-generated artwork, all four MP3s
@@ -51,9 +51,9 @@ Everything else below is either already green or is honest, tracked work.
 |---|---|---|
 | 1.1 | AUDIT-005 — no GPL FFmpeg anywhere in the tree or the bundle | **PASS** — LGPL `n8.1.2-21-gce3c09c101`, all 10 shipped binaries verified against `tools/ffmpeg_manifest.json` sha256 |
 | 1.2 | `imageio-ffmpeg` absent from the lock files, the environment and the bundle | **PASS** — excluded in `FTHR.spec`, asserted in CI, verified absent from the rebuilt bundle |
-| 1.3 | `tools/verify_release_licenses.py --tree .` | **PASS — current Windows checkout: 75 checks, 0 failed, 1 warning**; the warning is that pinned Linux FFmpeg is not vendored, so this checkout is not a Linux Release input. |
-| 1.4 | Third-party licence texts ship *inside* the artifact | **PASS** — Windows carries 18 and Linux 17 files under `licenses/`, plus `LICENSE` and `THIRD_PARTY_NOTICES.md` |
-| 1.5 | No distributable described as MIT | **PASS** — README, About dialog and `LICENSE` all state the split; CI greps for regressions |
+| 1.3 | `tools/verify_release_licenses.py --tree .` | **PASS — current Windows checkout: 77 checks, 0 failed, 1 warning**; the warning is that pinned Linux FFmpeg is not vendored, so this checkout is not a Linux Release input. |
+| 1.4 | Project and third-party licence texts ship *inside* the artifact | **PASS** — Windows carries 19 and Linux 18 files under `licenses/`, plus the GPLv3 `LICENSE` and `THIRD_PARTY_NOTICES.md` |
+| 1.5 | Project licence declaration is consistent | **PASS** — `LICENSE`, README, About dialog and package notices state `GPL-3.0-only`; CI and the release gate reject drift |
 | 1.6 | **AUDIT-013 — approved Qt binding/runtime and complete redistribution evidence** | **PASS** — 24 source assets are hash/origin/licence gated; the current Windows bundle contains exactly 19 approved asset files. Current Linux packaging remains `NOT RUN`. |
 
 ## 2. Source control and hygiene

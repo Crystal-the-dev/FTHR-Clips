@@ -12,9 +12,11 @@ The generator uses simple geometric primitives, an original compact bitmap
 alphabet, and synthesized sine tones. It does not use an external image, icon
 set, sound sample, system font, or other third-party creative-media input.
 
-These generated assets are licensed under the MIT License stated in the root
-LICENSE file. Permission includes use, copying, modification, sublicensing,
-and redistribution subject to that licence's notice condition.
+These generated assets are licensed separately under the MIT License in
+licenses/MIT.txt. Permission includes use, copying, modification, sublicensing,
+and redistribution subject to that licence's notice condition. The root
+LICENSE applies GPL-3.0-only to FTHR's application source and does not replace
+this asset-specific grant.
 
 This notice does not apply to Oswald-Bold.ttf, which is distributed separately
 under the SIL Open Font License 1.1; see Oswald-OFL-1.1.txt.

@@ -4,7 +4,7 @@
 
 **Local instant replay for Windows. Hit a hotkey and save the moment that just happened.**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20experimental-lightgrey)](docs/SUPPORTED_PLATFORMS.md)
 [![Release](https://img.shields.io/github/v/release/FTHR-Community/FTHR-Clips?include_prereleases&label=latest)](https://github.com/FTHR-Community/FTHR-Clips/releases)
 [![CI](https://github.com/FTHR-Community/FTHR-Clips/actions/workflows/ci.yml/badge.svg)](https://github.com/FTHR-Community/FTHR-Clips/actions/workflows/ci.yml)
@@ -169,16 +169,21 @@ Issues and PRs are welcome. Please open an issue first for significant changes s
 
 ## License
 
-**FTHR Clips' own source code is [MIT](LICENSE)** — do whatever you want with it.
+**FTHR Clips' own source code is licensed under the
+[GNU General Public License v3](LICENSE) (`GPL-3.0-only`).** You may use,
+study, modify, and redistribute it under those terms.
 
-**The downloadable builds are not MIT-only.** They bundle third-party
-components with their own licences, including LGPL components:
+Copyright © 2026 FTHR Community. The program comes without warranty; see the
+complete terms in [`LICENSE`](LICENSE).
+
+Downloadable builds contain the GPLv3-licensed FTHR application together with
+third-party components that retain their own licences:
 
 | Component | Licence | Effect on the download |
 |---|---|---|
-| FFmpeg (dynamically linked) | LGPLv3 | Compatible with MIT app code. Notices required. |
-| PySide6 / Shiboken (separate extension modules) | LGPLv3 option selected | Compatible with MIT app code when the LGPL obligations are met. |
-| Qt 6 (separate shared libraries) | LGPLv3 option selected | Compatible with MIT app code when the LGPL obligations are met. |
+| FFmpeg (dynamically linked) | LGPLv3 | Remains under LGPLv3; notices and source availability are required. |
+| PySide6 / Shiboken (separate extension modules) | LGPLv3 option selected | Remains under LGPLv3 with replacement and relinking rights. |
+| Qt 6 (separate shared libraries) | LGPLv3 option selected | Remains under LGPLv3 with replacement and relinking rights. |
 
 The build uses PySide6 6.11.1 as its sole Qt binding and includes the LGPL text,
 notices, exact source locations, and separately replaceable libraries. Bundled

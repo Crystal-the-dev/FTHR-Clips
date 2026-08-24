@@ -62,6 +62,7 @@ REQUIRED_TREE_FILES = (
     'THIRD_PARTY_NOTICES.md',
     'licenses/FFmpeg-LICENSE.txt',
     'licenses/FTHR-GENERATED-ASSETS.txt',
+    'licenses/MIT.txt',
     'licenses/NVIDIA-NVENC-SDK-LICENSE.txt',
     'licenses/OpenH264-LICENSE.txt',
     'licenses/Oswald-OFL-1.1.txt',
@@ -76,6 +77,13 @@ REQUIRED_TREE_FILES = (
     'tools/generate_release_assets.py',
     'tools/qt_runtime_manifest.json',
     'tools/release_asset_manifest.json',
+)
+
+# Exact LF-normalized GPLv3 text supplied for the project licence. Pinning the
+# full document prevents a truncated, edited, or stale MIT licence from being
+# shipped while the UI and README claim GPL-3.0-only.
+PROJECT_LICENSE_SHA256 = (
+    '1b3782ccad7b8614100cda30d3faf42fc39f2e97932908c543005053b654ca68'
 )
 
 # Linux ships its own pinned LGPL FFmpeg (AUDIT-014) with its own manifest.
@@ -125,6 +133,17 @@ class Report:
     def warn(self, msg: str) -> None:
         self.warnings.append(msg)
         print(f'  [WARN] {msg}')
+
+
+def check_project_license(root: Path, rep: Report, label: str) -> None:
+    """Require the complete, approved GPL-3.0-only project licence text."""
+    path = root / 'LICENSE'
+    if not path.is_file():
+        return  # check_files reports the missing paperwork.
+    if _file_sha256(path) == PROJECT_LICENSE_SHA256:
+        rep.ok(f'{label}: approved GPL-3.0-only project licence')
+    else:
+        rep.fail(f'{label}: LICENSE is not the approved GPL-3.0-only text')
 
 
 def _is_ffmpeg_binary(p: Path) -> bool:
@@ -848,6 +867,7 @@ def main() -> int:
     if args.tree:
         root = args.tree.resolve()
         check_files(root, REQUIRED_TREE_FILES, rep, 'tree')
+        check_project_license(root, rep, 'tree')
         check_manifest(root, rep)
         check_linux_manifest(root, rep)
         check_python_sources(root, rep)
@@ -874,6 +894,7 @@ def main() -> int:
                     (root / 'build' / 'AppDir', 'appdir', 'linux')):
                 if cand.is_dir():
                     check_files(cand, REQUIRED_ARTIFACT_FILES, rep, kind)
+                    check_project_license(cand, rep, kind)
                     scan_dir(cand, rep, kind)
                     check_qt_artifact(cand, rep, platform, manifest_root=root)
                     check_asset_artifact(
@@ -882,6 +903,7 @@ def main() -> int:
     if args.windows_dist:
         d = args.windows_dist.resolve()
         check_files(d, REQUIRED_ARTIFACT_FILES, rep, 'windows dist')
+        check_project_license(d, rep, 'windows dist')
         scan_dir(d, rep, 'windows dist')
         check_qt_artifact(d, rep, 'windows', manifest_root=_repo_root())
         check_asset_artifact(
@@ -890,6 +912,7 @@ def main() -> int:
     if args.appdir:
         d = args.appdir.resolve()
         check_files(d, REQUIRED_ARTIFACT_FILES, rep, 'appdir')
+        check_project_license(d, rep, 'appdir')
         scan_dir(d, rep, 'appdir')
         check_qt_artifact(d, rep, 'linux', manifest_root=_repo_root())
         check_asset_artifact(d, rep, 'linux', manifest_root=_repo_root())

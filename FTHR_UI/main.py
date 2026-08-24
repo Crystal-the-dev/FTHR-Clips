@@ -6402,14 +6402,14 @@ class _SettingsPage(QWidget):
         ver_lbl.setStyleSheet(label_display(Colors.TEXT, Fonts.SIZE_H3, 3))
         layout.addWidget(ver_lbl)
 
-        # LGPL/GPL components are bundled; the notices must be reachable from
-        # inside the app, not only from the repository.
-        # FTHR's source stays MIT; bundled PySide6/Qt and media components keep
+        # Licence and warranty notices must be reachable from inside the app,
+        # not only from the repository. Bundled third-party components keep
         # their own licences, documented in the installed notices.
         lic_lbl = QLabel(
-            f'FTHR Clips source: {SOURCE_LICENSE} · this build as distributed: '
-            f'{DISTRIBUTION_LICENSE} — bundled components: see '
-            f'THIRD_PARTY_NOTICES.md in the install folder')
+            f'Copyright © 2026 FTHR Community · FTHR Clips source: '
+            f'{SOURCE_LICENSE} · no warranty · this build as distributed: '
+            f'{DISTRIBUTION_LICENSE}. See LICENSE and THIRD_PARTY_NOTICES.md '
+            f'in the install folder.')
         lic_lbl.setWordWrap(True)
         lic_lbl.setStyleSheet(label_body(Colors.TEXT_MUTED, Fonts.SIZE_BODY))
         layout.addWidget(lic_lbl)

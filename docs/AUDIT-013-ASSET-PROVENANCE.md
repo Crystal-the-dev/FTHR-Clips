@@ -1,5 +1,10 @@
 # AUDIT-013 — Release asset provenance
 
+> **Project-licence update (2026-08-24):** FTHR application source now uses
+> `GPL-3.0-only`. The generated assets inventoried here retain their explicit
+> MIT grant under `licenses/FTHR-GENERATED-ASSETS.txt` and
+> `licenses/MIT.txt`; Oswald remains OFL-1.1.
+
 Date: **2026-08-14**
 
 Status: **RESOLVED IN SOURCE; ARTIFACT VERIFICATION RECORDED IN

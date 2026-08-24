@@ -15,6 +15,11 @@
 > [AUDIT-013-ASSET-PROVENANCE.md](AUDIT-013-ASSET-PROVENANCE.md). Statements
 > below that call it open are retained as the original audit snapshot.
 
+> **Project-licence update (2026-08-24):** the live source is now declared
+> `GPL-3.0-only`. Earlier MIT statements below remain part of the historical
+> audit snapshot; current terms are in the root `LICENSE` and
+> `THIRD_PARTY_NOTICES.md`.
+
 > **Historical layout note (2026-08-10):** measurements below that name
 > `FTHR_SharedMemory_v3` describe the layout at the time of this audit. The
 > capture-health remediation later extended the contract and moved the live

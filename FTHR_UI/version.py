@@ -35,11 +35,11 @@ PRERELEASE = 'alpha'
 # hardcoded literal in main.py and had drifted four months out of date.
 BUILD_DATE = '2026-08-24'
 
-# A distributed build contains the MIT application plus separately licensed
-# third-party components. PySide6 and the reviewed Qt modules use their LGPLv3
-# option; the complete inventory remains in THIRD_PARTY_NOTICES.md.
-SOURCE_LICENSE = 'MIT'
-DISTRIBUTION_LICENSE = 'MIT + third-party licences'
+# FTHR's application code uses GPLv3. Separately distributed third-party
+# components and project assets retain the licences listed in
+# THIRD_PARTY_NOTICES.md.
+SOURCE_LICENSE = 'GPL-3.0-only'
+DISTRIBUTION_LICENSE = 'GPL-3.0-only + separately licensed components'
 
 APP_NAME = 'FTHR Clips'
 APP_ID = 'FTHRClips'
