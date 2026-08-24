@@ -480,11 +480,12 @@ namespace fthr {
         }
 
         {
-            // Capacity: 2x time-based frame count gives comfortable headroom.
-            // At 1080p/60fps/30s: 3600 slots × ~33KB avg = ~120MB.
-            // (vs ~14GB raw BGRA at same settings)
-            const size_t capacity = static_cast<size_t>(buffer_seconds_)
-                * static_cast<size_t>(fps_) * 2;
+            // Retain requested history plus the encoder's maximum four-second
+            // GOP pre-roll and one second for asynchronous publication jitter.
+            // Unlike the former 2x policy, memory no longer scales with a
+            // second complete copy of long (up to 300-second) replay history.
+            const size_t capacity = CalculateEncodedReplaySlotCapacity(
+                buffer_seconds_, fps_);
 
             LARGE_INTEGER qpc_freq;
             QueryPerformanceFrequency(&qpc_freq);
@@ -1336,19 +1337,11 @@ namespace fthr {
         // ------------------------------------------------------------------
         // Step B2: Trim video start to audio ring coverage.
         //
-        // The video ring stores 2x the frame count (generous capacity), so at
-        // low actual capture rates the video snapshot can cover more wall time
-        // than the audio ring. Example:
-        //
-        //   buffer=32s, configured fps=60, actual fps=49.
-        //   Video ring: 32*60*2=3840 slots. At 49fps, these span ~78s.
-        //   Audio ring: (32+4)*48000=1,728,000 samples = 36s.
-        //
-        //   After 60s of recording, video has 60s of footage (PTS 0-3573).
-        //   Audio ring has wrapped: only 35.5s available, starting at +24s.
-        //
-        // Without this correction, both streams start at "sample 0" but
-        // represent different wall-clock moments → 24s A/V desync.
+        // Older replay generations could retain substantially more video than
+        // audio. Without this correction, both streams started at "sample 0"
+        // while representing different wall-clock moments, causing A/V desync.
+        // Current timestamp-aware snapshots and bounded GOP headroom avoid that
+        // imbalance; keep this branch only for old-style snapshots.
         //
         // Fix: advance keyframe_start to the oldest video frame covered by
         // the audio ring. Uses the same QPC clock as the audio timestamps

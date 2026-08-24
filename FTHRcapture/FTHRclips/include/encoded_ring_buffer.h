@@ -22,6 +22,7 @@
 #define FTHR_ENCODED_RING_BUFFER_H
 
 #include <cstdint>
+#include <cstddef>
 #include <memory>
 #include <vector>
 #include <atomic>
@@ -34,6 +35,21 @@
 
 
 namespace fthr {
+
+    constexpr uint32_t kEncodedReplayKeyframePrerollSeconds = 4;
+    constexpr uint32_t kEncodedReplaySafetySeconds = 1;
+
+    inline size_t CalculateEncodedReplaySlotCapacity(
+        uint32_t buffer_seconds, uint32_t fps) {
+        if (buffer_seconds == 0 || fps == 0) return 0;
+        const uint64_t seconds = static_cast<uint64_t>(buffer_seconds)
+            + kEncodedReplayKeyframePrerollSeconds
+            + kEncodedReplaySafetySeconds;
+        const uint64_t slots = seconds * static_cast<uint64_t>(fps);
+        return slots > std::numeric_limits<size_t>::max()
+            ? std::numeric_limits<size_t>::max()
+            : static_cast<size_t>(slots);
+    }
 
 
     // ---------------------------------------------------------------------------
@@ -103,7 +119,8 @@ namespace fthr {
         // capacity:  number of packet slots to pre-allocate.
         // fps:       capture framerate / encoded packet timebase.
         // qpc_freq:  QueryPerformanceFrequency value, used to convert wall_qpc to seconds.
-        // Recommended capacity = buffer_seconds * fps * 2 (generous headroom).
+        // CalculateEncodedReplaySlotCapacity() retains the requested history,
+        // one maximum four-second GOP of pre-roll, and one second of safety.
         explicit EncodedRingBuffer(size_t capacity, uint32_t fps, int64_t qpc_freq = 0);
 
         // Not copyable or movable - owns large pre-allocated storage.
