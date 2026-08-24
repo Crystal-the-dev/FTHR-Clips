@@ -43,6 +43,20 @@ def test_windows_bundle_is_built_only_after_the_engine() -> None:
     assert "verify_release_licenses.py --windows-dist" in windows_job
 
 
+def test_windows_package_uses_the_solution_playback_mixer_output() -> None:
+    spec = (ROOT / "FTHR.spec").read_text(encoding="utf-8")
+    loader = (ROOT / "FTHR_UI" / "core" / "ffmpeg_playback.py").read_text(
+        encoding="utf-8"
+    )
+
+    stale_path = "'FTHRcapture' / 'FTHRPlaybackMixer' / 'x64'"
+    solution_path = "'FTHRcapture' / 'x64' / 'Release'"
+    assert solution_path in spec
+    assert solution_path in loader
+    assert stale_path not in spec
+    assert stale_path not in loader
+
+
 def test_release_ci_runs_response_and_exception_contracts() -> None:
     workflow = _workflow()
     release_job = workflow[workflow.index("  release-verification:") :]

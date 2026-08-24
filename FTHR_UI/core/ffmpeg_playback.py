@@ -121,7 +121,7 @@ def _bridge_candidates() -> tuple[Path, ...]:
     candidates.extend((executable_dir / 'engine' / suffix, executable_dir / suffix))
     root = Path(__file__).resolve().parents[2]
     candidates.extend((
-        root / 'FTHRcapture' / 'FTHRPlaybackMixer' / 'x64' / 'Release' / suffix,
+        root / 'FTHRcapture' / 'x64' / 'Release' / suffix,
         root / 'FTHRcapture_linux' / 'build' / suffix,
     ))
     return tuple(candidates)

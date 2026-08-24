@@ -47,8 +47,8 @@ VSVersionInfo(
 )
 """, encoding='utf-8')
 ENGINE_EXE = ROOT / 'FTHRcapture' / 'x64' / 'Release' / 'FTHRClips.exe'
-PLAYBACK_MIXER = (ROOT / 'FTHRcapture' / 'FTHRPlaybackMixer' / 'x64'
-                  / 'Release' / 'FTHRPlaybackMixer.dll')
+PLAYBACK_MIXER = (ROOT / 'FTHRcapture' / 'x64' / 'Release'
+                  / 'FTHRPlaybackMixer.dll')
 
 # FFmpeg DLLs the C++ engine links against on Windows
 _FFMPEG_BIN  = ROOT / 'FTHRcapture' / 'FTHRclips' / 'third_party' / 'ffmpeg' / 'bin'
