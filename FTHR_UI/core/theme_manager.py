@@ -1,15 +1,12 @@
-"""
-Theme Manager — lets users repaint the whole app and not have it look like ours.
+"""Theme color, icon, and notification-sound customization.
 
 Handles three kinds of customization: colors (hex tokens that feed the QSS),
 icons (PNG/SVG swaps), and sounds (the little blip when you grab a clip). All of
-it persists under ~/.fthr/theme/, and the whole thing can be zipped up and shared
-so people can trade themes like Pokemon cards.
+it persists under ~/.fthr/theme/, and complete themes can be exported or imported.
 
-Loaded once at startup; QSS is only regenerated when someone hits Apply, because
-restyling the entire widget tree on every color pick is how you get a slideshow.
-The merge-with-defaults dance everywhere is so that adding a new color token in a
-future version doesn't crash on someone's old theme.json. forward-compat or bust.
+Themes are loaded once at startup and QSS is regenerated only when the user
+applies changes, avoiding repeated whole-tree restyling during color selection.
+Merging with defaults keeps older theme files compatible with new color tokens.
 """
 from __future__ import annotations
 

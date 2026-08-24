@@ -118,8 +118,8 @@ class HotkeyManager(QObject):
                 )
                 return False
 
-        # Tear down the old binding first, otherwise both keys fire the action
-        # and you get two clips. (ask me how I know)
+        # Tear down the old binding first so changing a shortcut cannot leave
+        # both keys registered and trigger the action twice.
         old_key = self.hotkeys.get(action)
         if old_key and old_key in self._registered_hotkeys:
             try:

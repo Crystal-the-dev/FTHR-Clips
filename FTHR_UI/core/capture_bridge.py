@@ -5,15 +5,14 @@
 #
 # How they talk: a single fixed-layout struct mapped into shared memory. The UI
 # writes a command into the "ui_*" fields, the engine reads it, does the thing,
-# and writes back into the "engine_*" fields. No sockets, no pipes, no JSON
-# serialization tax on the hot path. Galaxy brain moment: just use shared memory.
+# and writes back into the "engine_*" fields. No frame payload crosses this IPC
+# boundary, which keeps command and status traffic small.
 #
 # The catch is that Windows and Linux do shared memory completely differently:
 #   - Windows: OpenFileMapping + MapViewOfFile via kernel32, wide (utf-16) strings
 #   - Linux:   plain mmap of /dev/shm/<name>, plus narrow (utf-8) byte strings
-# So basically every method has a "if win32 / else" fork. It's not pretty but
-# the struct layout is the contract and both sides agree on it. don't touch the
-# field order unless you also change the C++ side or everything reads garbage.
+# Platform-specific mapping code is required, but the structure layout is a
+# shared contract. Changing field order requires a matching native-engine change.
 
 import sys
 import ctypes
@@ -273,9 +272,8 @@ class CaptureBridge:
 
     def shutdown(self):
         if sys.platform != 'win32':
-            # Must release the ctypes from_buffer reference BEFORE closing the
-            # mmap — otherwise Python raises BufferError: cannot close exported
-            # pointers exist. Order matters here, ask me how I know.
+            # Release the ctypes from_buffer reference before closing the mmap;
+            # otherwise Python raises BufferError for the exported pointer.
             self._layout = None
             if self._linux_mmap is not None:
                 self._linux_mmap.close()

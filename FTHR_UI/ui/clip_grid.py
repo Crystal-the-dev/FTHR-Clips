@@ -1,18 +1,17 @@
-# clip_grid.py - the clip + screenshot library grid (yes, the layout is very
-# "inspired by" Medal/Outplayed — imitation, flattery, etc.)
+# clip_grid.py - responsive clip and screenshot library grid.
 #
 # Big picture: this scans a few folders for video/image files, groups them into
 # "TUE, APR 28" style date sections, and lays each section out as a responsive
 # grid of cards. The number of columns recalculates from the window width.
 #
-# The whole design goal here is DON'T BLOCK THE MAIN THREAD. Decoding a video
+# The primary constraint is to avoid blocking the main thread. Decoding a video
 # frame for a thumbnail with cv2 is slow (20-100ms each), and statting hundreds
 # of files isn't free either. So:
 #   - file scanning + sorting happens on a worker thread (_FileCollectWorker)
 #   - thumbnail generation happens on a worker thread (_ThumbnailWorker)
 #   - thumbnails + duration are cached to disk so we only pay that cost once
-# If the UI ever janks while scrolling this grid, something slow leaked back
-# onto the main thread. go find it. it's always cv2.
+# Unexpected scroll stalls should be checked for decoding or filesystem work
+# that has moved back onto the main thread.
 import os
 import sys
 import subprocess
@@ -113,9 +112,8 @@ _CARD_H      = _THUMB_H + _CARD_BODY_H
 def _get_cached_thumb_path(file_path: str) -> str:
     """Return a cache path based on file path + mtime so stale caches auto-invalidate.
 
-    Baking the mtime into the hash means if a file is overwritten (same name,
-    new content) the cache key changes and we regenerate. Free invalidation,
-    no bookkeeping. galaxy brain moment, smaller scale.
+    Including mtime in the hash invalidates the cache automatically when a file
+    is overwritten without requiring a separate cache index.
     """
     mtime = os.path.getmtime(file_path)
     key = f'{file_path}|{mtime}'.encode('utf-8', errors='surrogateescape')
@@ -937,10 +935,7 @@ class ClipGrid(QWidget):
         """Best-guess column count before the parent viewport has been laid out.
 
         Used at __init__ time so the first grid build matches the maximized
-        window — avoids the ugly visible 3→N-column reflow on app startup where
-        you watch the grid snap wider half a second after launch. small detail,
-        but it's the kind of jank that makes an app feel cheap. narrator: it
-        was not, in fact, fine without this."""
+        window and avoids a visible 3-to-N-column reflow during startup."""
         screen = QApplication.primaryScreen()
         if screen is None:
             return 3

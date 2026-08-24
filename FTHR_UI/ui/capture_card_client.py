@@ -1,18 +1,9 @@
-"""
-CaptureCardClient — looks like a CaptureCard, walks like a CaptureCard, but it's
-actually a puppet that pokes a whole separate process running the real card.
+"""Client proxy for the capture-card notification process.
 
-Yeah this looks cursed but hear me out: the capture card is that little animated
-"CLIP SAVED" toast. It needs to slide in and play a smooth animation EXACTLY at
-the moment you hit the hotkey — which is also the moment the main process is
-busy doing slow blocking junk (spin-waiting on the engine, muxing mic audio with
-ffmpeg, refreshing the clip grid). If the card shared the main Qt event loop, the
-animation would stutter or freeze right when you want it buttery. Plus on Wayland
-you can't cleanly drive a separate top-level animated window from a busy loop.
-
-So the card lives in its own subprocess with its own event loop, and this class
-just shoots it one-line text commands over stdin. Nothing the main process does
-can stall the animation. don't @ me.
+The animated notification has its own process and Qt event loop so clip
+finalization and library refresh work in the main process cannot stall it. This
+class sends small, line-delimited commands over stdin and exposes the same public
+methods as the in-process CaptureCard widget.
 
 Public API is identical to the real CaptureCard so callers don't know the diff:
     client.show_clip(duration_s, fps, resolution)
@@ -27,13 +18,9 @@ import sys
 import subprocess
 from pathlib import Path
 
-# Here's the frozen-build sentinel trick. In dev we just run the helper script
-# with the same python. But once PyInstaller freezes us into an .exe/AppImage,
-# there IS no python.exe to call and no loose .py scripts to point at — it's all
-# baked into one binary. So instead we relaunch OURSELVES (sys.executable) with a
-# magic '--card-process' flag, and main.py sees that flag on startup and says
-# "ah, I'm the card today" and boots the card event loop instead of the full app.
-# Same binary, two personalities. classic "it works on my machine" averted.
+# Development launches the helper script with the current Python interpreter.
+# Frozen builds relaunch the packaged executable with ``--card-process`` because
+# no standalone interpreter or source script is available in the package.
 _FROZEN = getattr(sys, 'frozen', False)
 if _FROZEN:
     _LAUNCH_CMD = [sys.executable, '--card-process']
@@ -41,8 +28,8 @@ else:
     _PROCESS_SCRIPT = Path(__file__).parent / 'capture_card_process.py'
     _LAUNCH_CMD = [sys.executable, str(_PROCESS_SCRIPT)]
 
-# Stops Windows from flashing a black console window every time the card spawns.
-# Looks unprofessional as hell otherwise. No-op on Linux.
+# Prevent a console window from flashing when the helper starts on Windows.
+# This flag is not used on Linux.
 _CREATE_NO_WINDOW = 0x08000000
 _NO_WINDOW = {'creationflags': _CREATE_NO_WINDOW} if sys.platform == 'win32' else {}
 
@@ -93,9 +80,7 @@ class CaptureCardClient:
     def _send(self, cmd: str) -> None:
         if self._proc is None:
             return
-        # If the card process died (crashed, got OOM-killed, whatever), poll()
-        # returns non-None. Just respawn it lazily before sending. Self-healing
-        # on a budget — narrator: it was not, in fact, fine without this check.
+        # Relaunch a terminated helper before sending the next notification.
         if self._proc.poll() is not None:
             self._launch()
             if self._proc is None:

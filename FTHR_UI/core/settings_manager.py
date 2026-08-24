@@ -1,13 +1,9 @@
 """
 Settings Manager - load/save user preferences.
 
-Everything the user can tweak lives here and gets dumped to a single JSON file
-at ~/.fthr/settings.json. One file, human-readable, easy to nuke when someone
-inevitably corrupts it and asks for help in Discord.
-
-Why JSON and not SQLite? Because I'm not writing schema migrations at 3am for
-a config file with twenty keys, that's why. If this ever grows into something
-that needs joins and indexes, future-me can suffer. present-me has clips to ship.
+User preferences are stored in a single human-readable JSON file at
+~/.fthr/settings.json. JSON keeps this small configuration portable and easy to
+recover; a database would add unnecessary schema and migration overhead.
 """
 import json
 import os
