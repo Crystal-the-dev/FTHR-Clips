@@ -429,24 +429,49 @@ class FFmpegPlaybackController(QObject):
 
     def play(self, position_ms: int) -> None:
         self._queue.clear()
+        self._discard_output_buffer()
         self._worker.play(position_ms)
         self._sink_timer.start()
 
     def pause(self) -> None:
         self._worker.pause()
         self._queue.clear()
-        if self._sink is not None:
-            self._sink.suspend()
+        self._discard_output_buffer()
 
     def seek(self, position_ms: int) -> None:
         self._queue.clear()
+        self._discard_output_buffer()
         self._worker.seek(position_ms)
 
     def sync_to_video_position(self, position_ms: int) -> None:
-        # QMediaPlayer is the sole master. Queue latency is subtracted from the
-        # worker estimate, so normal 0.5 s prebuffering does not look like drift.
-        if abs(self._worker.estimated_position_ms - position_ms) > 120:
+        # QMediaPlayer is the sole master.  The worker estimate already removes
+        # the Python queue, but QAudioSink owns another device buffer after it
+        # pulls those bytes.  Treating that buffered audio as already played
+        # made the controller seek unnecessarily and left stale pre-seek audio
+        # queued in the device, which was audible as short clicks under load.
+        if abs(self._estimated_output_position_ms() - position_ms) > 120:
             self.seek(position_ms)
+
+    def _estimated_output_position_ms(self) -> int:
+        buffered_frames = 0
+        if self._sink is not None:
+            try:
+                capacity = max(0, int(self._sink.bufferSize()))
+                free = max(0, min(capacity, int(self._sink.bytesFree())))
+                bytes_per_frame = max(1, self._output_format.bytesPerFrame())
+                buffered_frames = (capacity - free) // bytes_per_frame
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                # A device can disappear between the state check and these Qt
+                # calls.  Error reporting remains owned by _on_sink_state().
+                buffered_frames = 0
+        buffered_ms = round(buffered_frames * 1000 / CANONICAL_SAMPLE_RATE)
+        return max(0, self._worker.estimated_position_ms - buffered_ms)
+
+    def _discard_output_buffer(self) -> None:
+        if self._sink is not None:
+            # reset(), unlike suspend(), discards bytes already accepted by the
+            # platform backend.  The sink is restarted after fresh PCM arrives.
+            self._sink.reset()
 
     def _keep_sink_running(self) -> None:
         if self._queue.frames == 0:
@@ -461,6 +486,10 @@ class FFmpegPlaybackController(QObject):
             # An empty pull queue is an underrun, not a device-loss error.
             # Resume only after a worker-filled block exists; no decode runs in
             # the audio callback and no timing sleep is used for recovery.
+            self._sink.start(self._device)
+        elif (self._sink.state() == QAudio.State.StoppedState
+              and self._sink.error() == QAudio.Error.NoError):
+            # Play/pause/seek use reset() to discard stale device-buffered PCM.
             self._sink.start(self._device)
 
     def _on_sink_state(self, state: QAudio.State) -> None:

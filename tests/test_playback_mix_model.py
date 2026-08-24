@@ -169,6 +169,103 @@ def test_audio_output_fatal_error_is_reported_without_crashing_qt(qtbot):
     assert received == ['Audio output device stopped unexpectedly.']
 
 
+def test_video_sync_accounts_for_qaudio_device_buffer(qtbot):
+    """Queued device audio is pending, not part of the audible position yet."""
+    from PySide6.QtCore import QObject
+
+    class Worker:
+        estimated_position_ms = 1_250
+
+    class OutputFormat:
+        @staticmethod
+        def bytesPerFrame():
+            return 8
+
+    class Sink:
+        @staticmethod
+        def bufferSize():
+            return 96_000  # 12,000 float-stereo frames = 250 ms
+
+        @staticmethod
+        def bytesFree():
+            return 0
+
+    controller = FFmpegPlaybackController.__new__(FFmpegPlaybackController)
+    QObject.__init__(controller)
+    controller._worker = Worker()
+    controller._output_format = OutputFormat()
+    controller._sink = Sink()
+    sought = []
+    controller.seek = sought.append
+
+    assert controller._estimated_output_position_ms() == 1_000
+    controller.sync_to_video_position(1_000)
+    assert sought == []
+    controller.sync_to_video_position(700)
+    assert sought == [700]
+
+
+def test_seek_discards_python_and_qaudio_buffers_before_decoder_seek(qtbot):
+    from PySide6.QtCore import QObject
+
+    events = []
+
+    class Queue:
+        def clear(self):
+            events.append('python-clear')
+
+    class Sink:
+        def reset(self):
+            events.append('sink-reset')
+
+    class Worker:
+        def seek(self, position_ms):
+            events.append(('decoder-seek', position_ms))
+
+    controller = FFmpegPlaybackController.__new__(FFmpegPlaybackController)
+    QObject.__init__(controller)
+    controller._queue = Queue()
+    controller._sink = Sink()
+    controller._worker = Worker()
+
+    controller.seek(1_750)
+
+    assert events == ['python-clear', 'sink-reset', ('decoder-seek', 1_750)]
+
+
+def test_reset_sink_restarts_after_fresh_pcm_arrives(qtbot):
+    from PySide6.QtCore import QObject
+    from PySide6.QtMultimedia import QAudio
+
+    class Queue:
+        frames = 1_024
+
+    class Sink:
+        def __init__(self):
+            self.starts = 0
+
+        @staticmethod
+        def state():
+            return QAudio.State.StoppedState
+
+        @staticmethod
+        def error():
+            return QAudio.Error.NoError
+
+        def start(self, _device):
+            self.starts += 1
+
+    controller = FFmpegPlaybackController.__new__(FFmpegPlaybackController)
+    QObject.__init__(controller)
+    controller._queue = Queue()
+    controller._sink = Sink()
+    controller._device = object()
+
+    controller._keep_sink_running()
+
+    assert controller._sink.starts == 1
+
+
 def test_probe_uses_actual_container_indexes_and_titles(monkeypatch):
     class Result:
         returncode = 0
