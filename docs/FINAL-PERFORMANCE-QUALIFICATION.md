@@ -7,7 +7,7 @@ Host: Windows 10 Pro 19045, NVIDIA GeForce RTX 4060 Ti, driver 610.88, two displ
 
 Measurements used the source-built Release x64 engine, isolated UI profiles, `psutil`, NVIDIA device-wide counters, FFprobe, and full FFmpeg decode. Results under `build/performance_baseline/` are intentionally ignored build evidence. Device-wide GPU figures include the desktop and wallpaper workload. Shared Memory v4 does not expose `frames_dropped`; that value remains unmeasured rather than inferred.
 
-The baseline was captured at cleanup commit `fc6364e`. Performance changes were retained only where a physical or deterministic result supported them. A proposed background-only prewarm deferral was reverted because it produced no measurable benefit.
+The baseline was captured at cleanup commit `fc6364e`. Performance changes were retained only where a physical or deterministic result supported them. A proposed background-only prewarm deferral was reverted because it produced no measurable benefit. The final completion pass re-ran playback, a 30-second pre-UI background save, tray restore, shutdown, and selected-monitor screenshots after the audio and startup fixes.
 
 ## Before and after
 
@@ -67,16 +67,47 @@ Each monitor was captured five times through its stable Windows device identity.
 
 ### Audio and playback
 
-No audio hot path was changed. The baseline production mixer decoded and mixed five seconds with one decoder worker:
+The final completion pass corrected viewer output-buffer resynchronization and
+signed AAC timeline conversion. It did not add per-sample Python processing or
+another frame copy. The current production mixer decoded and mixed the same
+five-second, eight-stream MP4 through one native decoder worker:
 
 | Tracks | Mix wall time | CPU time | Working set | Seek latency range |
 |---:|---:|---:|---:|---:|
-| 1 | 6.2 ms | 0.0 ms | 56.1 MB | 0.09–0.16 ms |
-| 2 | 11.7 ms | 15.6 ms | 56.6 MB | 0.12–0.25 ms |
-| 4 | 13.4 ms | 15.6 ms | 58.4 MB | 0.14–0.38 ms |
-| 8 | 25.3 ms | 31.3 ms | 61.4 MB | 0.18–0.70 ms |
+| 1 | 6.0 ms | 0.0 ms | 54.0 MB | 0.09–0.15 ms |
+| 2 | 8.6 ms | 15.6 ms | 54.0 MB | 0.10–0.22 ms |
+| 4 | 13.1 ms | 15.6 ms | 55.7 MB | 0.13–0.37 ms |
+| 8 | 23.3 ms | 15.6 ms | 58.4 MB | 0.18–0.72 ms |
 
-The final playback smoke recompiled its probe outside the repository and passed FFmpeg 1/4/8-stem mix, QMediaPlayer nine-track discovery, and QAudioSink start/stop with no device error. The existing bounded queue, synchronization model, and multi-audio architecture were unchanged.
+The playback smoke recompiled its probe outside the repository and passed FFmpeg
+1/4/8-stem mix, QMediaPlayer nine-track discovery, and QAudioSink start/stop
+with no device error. A physical viewer run stayed within 24 ms of the media
+clock under normal load and recovered from a 108 ms CPU-load excursion without
+an underrun or stale-buffer replay. Controlled 440/880 Hz captures, a real
+system-plus-microphone clip, and five rapid saves decoded without clipping,
+duplicate AAC payloads, timestamp gaps, or `.partial` residue.
+
+The early system-plus-microphone save also exposed a signedness defect: negative
+AAC encoder-delay timestamps were cast to `uint64_t`, invalidating the manifest
+timeline. Saturating signed conversion fixed it. The rerun produced an 8.0-second
+video with 7.977-second Default Mix and 7.935-second microphone tracks at
+48 kHz stereo, published in 51 ms.
+
+### Final lifecycle and screenshot spot checks
+
+- Background replay ran for more than 30 seconds without constructing or
+  showing the main UI. Tray Save Clip published a fully decodable 30.0-second
+  clip with two audio streams in 191 ms while capture generation 1 continued.
+- First tray restore took 1.60 seconds. Profiling attributed 1.33 seconds to
+  one-time Qt widget/layout/style construction and found no synchronous FFmpeg,
+  device, network, or media decode operation on that path. A risky QWidget
+  threading redesign was therefore not introduced.
+- Closing to tray took 3 ms and did not reset capture. Final Exit completed in
+  470 ms, the engine returned code 0, and no child process remained.
+- Five captures on each of two physical monitors produced ten valid PNGs with
+  the requested 1920×1080 and 2560×1080 dimensions. Capture took 29–64 ms;
+  background PNG publication took 94–964 ms depending on image content, with no
+  `.partial` residue.
 
 ## Retained optimizations and risks
 
@@ -96,13 +127,13 @@ No extra frame copy, CPU readback, Shared Memory change, audio queue change, or 
 - Full Python suite: pass.
 - Ruff and compileall: pass.
 - Windows Release x64 build: pass.
-- Native Windows suite: 389 checks pass.
+- Native Windows suite: 391 checks pass after the signed-audio-timeline regression.
 - Shared Memory v4: Windows 29 fields/2,736 bytes; Linux 29 fields/4,272 bytes; pass.
 - Engine response, exception, version, generated asset, repository hygiene, and license gates: pass.
 - License gate: 160 checks, no failures, one expected Windows-host warning because the Linux FFmpeg bundle is not present.
 - Existing Windows artifact lifecycle contract: pass with release-blocking unsigned-artifact warnings. The checked `dist/` and installer are pre-change artifacts and were not represented as the final candidate package.
 
-Not physically verified in this phase: Windows 11 per-app stems, Windows 11 border suppression, AMD/Intel hardware, Linux runtime, audio-device recovery, viewer open/close soak, and installed-package upgrade/uninstall. `frames_dropped` remains unavailable without changing frozen Shared Memory v4. These belong to final physical qualification, not to a new source architecture.
+Not physically verified in this phase: Windows 11 per-app stems, Windows 11 border suppression, AMD/Intel hardware, Linux runtime, audio-device recovery, the two-hour/50-save soak, and final installed-package GUI/capture smoke. `frames_dropped` remains unavailable without changing frozen Shared Memory v4. These belong to final physical qualification, not to a new source architecture.
 
 ## Decision
 

@@ -41,21 +41,27 @@ Without it most reports are not actionable.
   alpha build because x11grab is now disabled.
 - **No Linux hotkey has ever fired.** The Hyprland auto-config path
   (`~/.config/hypr/fthr-hotkeys.conf` + `hyprctl reload`) is untested.
-- **No visible desktop GUI walkthrough was performed** this cycle. The real
-  MainWindow widget tree and packaged capture-card entrypoint were exercised
-  offscreen with PySide6 on Windows and Linux, but nobody manually inspected a
-  rendered window, tray integration, dialogs, or media playback.
-- **Windows duration was re-verified only for WGC/NVENC video-only saves.** Five
-  real 30/60-second clips were exact and fully decoded. Audio devices, raw
-  fallback, games/fullscreen, and soak remain unverified this cycle.
-- **The installer** has not been tested for install / update / uninstall. A
-  206 MiB PySide6 AppImage was produced and its extracted contents passed the
-  licence gate, but it was not run on a bare-metal desktop.
+- **The packaged Windows GUI still needs a final installed-app walkthrough.**
+  Source-mode Windows tests exercised the visible main window, tray restore,
+  background replay, clip notification, screenshots, and graceful exit. The
+  same complete workflow has not yet been repeated through the final installer.
+- **Windows duration, audio, and background replay are physically verified only
+  on the current NVIDIA qualification host.** Current clips with system audio
+  and microphone fully decode and preserve duration; raw fallback,
+  games/fullscreen, device-loss recovery, AMD, Intel, and Windows 11 app stems
+  remain unverified where stated in the support matrix.
+- **The Windows installer lifecycle is only partially qualified.** Real update,
+  uninstall, reinstall, autostart preservation, and user-data preservation
+  passed. Final installed GUI/capture smoke, custom-path coverage, optional
+  settings removal, code signing, and SmartScreen reputation remain open. The
+  Linux AppImage has not run on a representative bare-metal desktop.
 - Untested on Linux: multi-monitor, monitor switching, resolution changes,
   fractional scaling, fullscreen games, lock/unlock, suspend/resume, device
   removal during capture.
-- **Only replay snapshot/save latency was measured; no soak test was done.**
-  AUDIT-042 records the scoped measurements. Broader performance remains unknown.
+- **No two-hour / 50-save release soak has been run.** Bounded 30-, 60-, and
+  300-second replay measurements and shorter save/screenshot/lifecycle stress
+  runs passed, but long-duration gaming and repeated viewer/device recovery
+  remain release qualification work.
 - **The C++ engines now have focused native tests**, but not comprehensive engine
   coverage. AUDIT-042 adds ten CTest targets around replay timing, audio,
   transactional save, recovery and actual MP4 output.
@@ -123,6 +129,6 @@ relying on any of these:
 
 - Community / Get Invite / Account buttons are visual only.
 - Auto-clipping is not enabled.
-- Multiband/per-source controls are hidden and forcibly disabled for alpha.
-  Legacy Linux implementation code remains for the clean-sheet audio rework,
-  but cannot be activated by old settings or presets.
+- Windows 11 per-app audio controls are code-integrated but remain hidden when
+  the operating system cannot provide official process-loopback sources.
+  Windows 10 intentionally exposes only Master, System Audio, and Microphone.

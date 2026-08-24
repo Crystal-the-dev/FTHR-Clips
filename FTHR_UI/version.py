@@ -33,7 +33,7 @@ PRERELEASE = 'alpha'
 # Date the current source state was cut for release, ISO 8601. Shown in the
 # About page. Bump it together with __version__ — it used to be a separate
 # hardcoded literal in main.py and had drifted four months out of date.
-BUILD_DATE = '2026-08-06'
+BUILD_DATE = '2026-08-24'
 
 # A distributed build contains the MIT application plus separately licensed
 # third-party components. PySide6 and the reviewed Qt modules use their LGPLv3

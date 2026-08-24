@@ -2,10 +2,10 @@
 
 # FTHR Clips
 
-**Local instant replay for Windows, with an experimental Wayland build. Hit a hotkey, save the last 30 seconds.**
+**Local instant replay for Windows. Hit a hotkey and save the moment that just happened.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey)](https://github.com/FTHR-Community/FTHR-Clips/releases)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20experimental-lightgrey)](docs/SUPPORTED_PLATFORMS.md)
 [![Release](https://img.shields.io/github/v/release/FTHR-Community/FTHR-Clips?include_prereleases&label=latest)](https://github.com/FTHR-Community/FTHR-Clips/releases)
 [![CI](https://github.com/FTHR-Community/FTHR-Clips/actions/workflows/ci.yml/badge.svg)](https://github.com/FTHR-Community/FTHR-Clips/actions/workflows/ci.yml)
 
@@ -35,7 +35,7 @@ It runs as a tray icon. You forget it's there until you need it.
 | **Capture** | Monitor selection and scaling modes |
 | **Hotkeys** | Global hotkeys via Hyprland binds (Linux) or system hooks (Windows) |
 | **Hotkeys** | Save clip · Extended clip · Start/stop · Dismiss notification |
-| **Audio** | One system-output mix with an optional microphone mix |
+| **Audio** | System-output and microphone tracks; Windows 11 per-app stems are code-ready but still require hardware qualification |
 | **Post-processing** | Watermark overlay |
 | **Post-processing** | Auto-crop (removes black bars) |
 | **Post-processing** | Webcam overlay (picture-in-picture) |
@@ -43,18 +43,20 @@ It runs as a tray icon. You forget it's there until you need it.
 | **Settings** | Presets — save/load/delete full configuration snapshots |
 | **Clip browser** | Thumbnail grid, linked-folder protection, trim editor and transactional export |
 | **Upload** | Optional background upload to your own endpoint |
-| **Installer** | One-click installer on Windows, AppImage on Linux |
+| **Packaging** | Windows installer and experimental Linux AppImage build paths |
 
 ---
 
 ## Download
 
-Grab the latest build from the [Releases](https://github.com/FTHR-Community/FTHR-Clips/releases) page.
+There is currently **no public-release-qualified build**. Local pre-alpha
+qualification artifacts use the names below; do not publish them until the
+remaining signing and physical gates in `docs/RELEASE_CHECKLIST.md` pass.
 
 | Platform | File |
 |----------|------|
 | Linux (experimental Wayland) | `FTHRClips-1.0.0-alpha-x86_64.AppImage` |
-| Windows 10/11 (qualified NVIDIA cohort) | `FTHRClips-Setup-<version>-x64.exe` |
+| Windows 10/11 (NVIDIA-qualified source) | `FTHRClips-Setup-<version>-x64.exe` |
 
 ---
 
@@ -96,7 +98,7 @@ one of the protocols above are therefore unsupported in this alpha.
 
 ## Windows Setup
 
-Run `FTHRClips-Setup-<version>-x64.exe` and follow the setup steps. FTHR Clips
+Run a locally qualified `FTHRClips-Setup-<version>-x64.exe` and follow the setup steps. FTHR Clips
 installs for all users under Program Files and subsequent downloads of the same
 product update or repair that installation rather than creating a second entry.
 The uninstaller keeps clips, screenshots and exports. It keeps FTHR settings by
@@ -147,8 +149,9 @@ Visual Studio 2022 + Python 3.14. See [`BUILDING.md`](BUILDING.md) for the full 
 
 The native capture engine runs as a separate process and communicates with the
 Python UI via shared memory. Windows uses WGC/DXGI capture with the selected
-NVENC, AMF, or QSV encoder and WASAPI audio. Linux uses its Wayland or X11
-capture path with FFmpeg and PulseAudio/PipeWire. Platform hotkey activation is
+NVENC, AMF, or QSV encoder and WASAPI audio. Linux uses supported Wayland
+capture protocols with FFmpeg and PulseAudio-compatible audio; X11 capture is
+disabled in the alpha because bounded cancellation is unresolved. Platform hotkey activation is
 forwarded by the UI through the same shared-memory command contract; Linux also
 uses an owner-only Unix socket for compositor key bindings.
 
@@ -199,6 +202,7 @@ Licence texts: [`licenses/`](licenses/), also installed alongside the app.
 | [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | Every bundled component and its licence |
 | [`docs/SUPPORTED_PLATFORMS.md`](docs/SUPPORTED_PLATFORMS.md) | The real support matrix — what was actually tested, and where |
 | [`docs/TESTING.md`](docs/TESTING.md) | How to verify a build; build vs headless vs desktop tests |
+| [`docs/WINDOWS-11-QUALIFICATION.md`](docs/WINDOWS-11-QUALIFICATION.md) | Required physical app-stem and border qualification on Windows 11 |
 | [`docs/AUDIT_REPORT.md`](docs/AUDIT_REPORT.md) | Consolidated audit — all findings, all three passes |
 | [`docs/AUDIT-014-LINUX-FFMPEG.md`](docs/AUDIT-014-LINUX-FFMPEG.md) | How the Linux LGPL FFmpeg is pinned, built against and verified |
 | [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md) | The gates a release must pass before it may be tagged |
