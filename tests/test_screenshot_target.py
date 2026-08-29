@@ -108,3 +108,10 @@ def test_grim_command_names_selected_output():
     cmd = build_grim_command('/usr/bin/grim', '/clips/shot.png', 'DP-3')
 
     assert cmd == ['/usr/bin/grim', '-o', 'DP-3', '/clips/shot.png']
+
+
+def test_grim_command_rejects_implicit_all_output_capture():
+    import pytest
+
+    with pytest.raises(ValueError, match='explicit selected output'):
+        build_grim_command('/usr/bin/grim', '/clips/shot.png', '')

@@ -138,7 +138,7 @@ def test_report_lists_every_known_tool():
     if sys.platform == 'win32':
         assert 'not applicable on Windows' in rep
         return
-    for name in ('hyprctl', 'xdotool', 'xprop', 'grim', 'nc', 'xdg-open'):
+    for name in ('hyprctl', 'xdotool', 'xprop', 'xrandr', 'grim', 'nc', 'xdg-open'):
         assert name in rep
 
 

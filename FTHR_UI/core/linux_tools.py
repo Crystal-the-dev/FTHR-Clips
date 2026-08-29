@@ -2,7 +2,7 @@
 
 Why this exists
 ---------------
-The code used to invoke `hyprctl`, `xdotool`, `xprop`, `grim`, `nc` and
+The code used to invoke `hyprctl`, `xdotool`, `xprop`, `xrandr`, `grim`, `nc` and
 `xdg-open` by bare name, scattered across six modules. Three problems with
 that:
 
@@ -49,6 +49,7 @@ _TOOLS: dict[str, tuple[bool, str]] = {
     'hyprctl':  (True,  'Hyprland hotkey binds and window/game detection'),
     'xdotool':  (True,  'window focus and game detection on X11/XWayland'),
     'xprop':    (False, 'fullscreen detection on X11 (falls back to geometry)'),
+    'xrandr':   (True,  'selected-monitor geometry for native X11 capture'),
     'grim':     (True,  'Wayland screenshots'),
     'nc':       (True,  'the hotkey socket client used by compositor binds'),
     'xdg-open': (False, 'opening the clips folder in a file manager'),

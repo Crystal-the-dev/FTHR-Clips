@@ -1,6 +1,7 @@
 #pragma once
 #include "capture_backend.h"
-#include <vector>
+#include "x11_frame_converter.h"
+#include <atomic>
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -11,7 +12,7 @@ namespace fthr {
 
 class X11Backend final : public ICaptureBackend {
 public:
-    X11Backend() = default;
+    explicit X11Backend(const std::atomic<bool>* running) : running_(running) {}
     ~X11Backend() override { Shutdown(); }
 
     bool Initialize(const CaptureConfig& cfg) override;
@@ -23,17 +24,18 @@ public:
     uint32_t NativeHeight() const override { return native_h_; }
 
 private:
+    static int InterruptCallback(void* opaque);
+
+    const std::atomic<bool>* running_ = nullptr;
     AVFormatContext* fmt_ctx_      = nullptr;
     AVCodecContext*  dec_ctx_      = nullptr;
     AVPacket*        pkt_          = nullptr;
     AVFrame*         frame_        = nullptr;
-    struct SwsContext* sws_        = nullptr;
     int              video_stream_ = -1;
 
     uint32_t native_w_ = 0;
     uint32_t native_h_ = 0;
-
-    std::vector<uint8_t> buf_;  // BGR0 output buffer, reused per frame
+    X11FrameConverter converter_;
 };
 
 } // namespace fthr

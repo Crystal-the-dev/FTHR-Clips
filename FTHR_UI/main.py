@@ -112,7 +112,7 @@ from PySide6.QtWidgets import (
     QLayout, QDialog,
 )
 from PySide6.QtCore import (
-    QTimer, Signal, Qt, QPoint, QPointF, QSize, QRect,
+    QTimer, QProcess, Signal, Qt, QPoint, QPointF, QSize, QRect,
     QPropertyAnimation, QEasingCurve,
     QParallelAnimationGroup,
 )
@@ -185,11 +185,20 @@ from core.windows_monitor import (
     enumerate_windows_monitors,
     normalize_monitor_device_path,
 )
-from core.screenshot_target import build_grim_command, select_qt_screen
+from core.screenshot_target import (
+    build_grim_command,
+    qt_screen_name,
+    select_qt_screen,
+)
 from core.screenshot_save import (
     ScreenshotPngSaveWorker,
     ScreenshotSaveError,
     reserve_screenshot_paths,
+)
+from core.x11_monitor import (
+    X11MonitorError,
+    is_native_x11_session,
+    resolve_x11_capture_target,
 )
 from core.library_ownership import add_import_root, remove_import_root
 from core.mic_recorder import MicRecorder, write_wav
@@ -3087,6 +3096,9 @@ class MainWindow(QMainWindow):
         self._tray_icon = None
         self._capture_settings_applying = False
         self._screenshot_inflight = False
+        self._screenshot_pending_requests = 0
+        self._screenshot_capture_process = None
+        self._screenshot_capture_paths = None
         self._screenshot_save_worker = None
         self._lifecycle_log = get_logger('lifecycle')
 
@@ -4098,8 +4110,20 @@ class MainWindow(QMainWindow):
 
     def _on_hotkey_save_screenshot(self):
         if self._screenshot_inflight:
-            print('[Screenshot] Ignored duplicate request while a screenshot is saving.')
+            # One active plus nine pending requests covers a rapid ten-shot
+            # sequence without spawning unbounded capture/PNG workers.
+            if self._screenshot_pending_requests < 9:
+                self._screenshot_pending_requests += 1
+                print('[Screenshot] Queued request while a screenshot is saving '
+                      f'({self._screenshot_pending_requests}/9 pending).')
+            else:
+                print('[Screenshot] Queue full; ignored request beyond ten shots.')
             return
+
+        if self._shutdown_requested:
+            return
+
+        self._screenshot_inflight = True
 
         config = self._capture_config.active
         selected_monitor = (
@@ -4109,34 +4133,37 @@ class MainWindow(QMainWindow):
             paths = reserve_screenshot_paths(
                 clips_directory_from(self.settings_manager) / 'Screenshots')
         except ScreenshotSaveError as error:
+            self._finish_screenshot_request()
             self._show_screenshot_error(error.code, error.detail)
             return
 
-        if sys.platform != 'win32':
-            # Preserve the established Wayland capture backend.  Its explicit
-            # -o output is the same selected monitor identity, and it writes
-            # only to the non-library staging path before the editor publishes.
-            grim = linux_tools.path('grim')
-            if grim:
-                result = subprocess.run(
-                    build_grim_command(grim, str(paths.staged), selected_monitor),
-                    capture_output=True,
-                    **_NO_WINDOW,
-                )
-                if result.returncode == 0 and paths.staged.is_file():
-                    self._screenshot_inflight = True
-                    self._open_screenshot_editor(paths)
-                    return
-                paths.staged.unlink(missing_ok=True)
-                detail = result.stderr.decode(errors='replace').strip()
-                print(
-                    '[Screenshot] grim capture failed; trying the selected Qt '
-                    f'screen instead: {detail or "no diagnostic"}')
+        screen = self._resolve_screenshot_screen(selected_monitor)
+        if screen is None:
+            self._fail_screenshot_request(
+                paths,
+                'MONITOR_NOT_FOUND',
+                'The configured capture monitor is unavailable. FTHR did not '
+                'fall back to another display.',
+            )
+            return
 
-        # Resolve the configured monitor afresh for every screenshot.  Windows
-        # receives the same stable DISPLAYCONFIG device path that starts replay;
-        # no QScreen/DXGI enumeration index is persisted or reused.
-        screen = select_qt_screen(
+        if sys.platform != 'win32' and os.environ.get('WAYLAND_DISPLAY'):
+            # grim is a Wayland backend, not an X11 probe. Run it asynchronously
+            # and always name the exact selected output; plain `grim` would
+            # combine all outputs into one image.
+            grim = linux_tools.path('grim')
+            output_name = qt_screen_name(screen)
+            if grim and output_name:
+                self._start_grim_screenshot(
+                    paths, selected_monitor, grim, output_name)
+                return
+
+        self._capture_selected_qt_screen(paths, selected_monitor)
+
+    def _resolve_screenshot_screen(self, selected_monitor: str):
+        """Resolve the current selected screen without cross-monitor fallback."""
+
+        return select_qt_screen(
             selected_monitor,
             QApplication.screens(),
             platform=sys.platform,
@@ -4144,9 +4171,82 @@ class MainWindow(QMainWindow):
                 enumerate_windows_monitors() if sys.platform == 'win32' else ()),
             primary=QApplication.primaryScreen(),
         )
-        if screen is None:
+
+    def _start_grim_screenshot(
+            self, paths, selected_monitor: str,
+            grim_path: str, output_name: str) -> None:
+        command = build_grim_command(
+            grim_path, str(paths.staged), output_name)
+        process = QProcess(self)
+        process.setProgram(command[0])
+        process.setArguments(command[1:])
+        process.setProcessChannelMode(
+            QProcess.ProcessChannelMode.SeparateChannels)
+        process.finished.connect(
+            lambda exit_code, exit_status, proc=process, target=paths,
+                   monitor=selected_monitor: self._on_grim_finished(
+                       proc, target, monitor, exit_code, exit_status))
+        process.errorOccurred.connect(
+            lambda error, proc=process, target=paths,
+                   monitor=selected_monitor: self._on_grim_error(
+                       proc, target, monitor, error))
+        self._screenshot_capture_process = process
+        self._screenshot_capture_paths = paths
+        process.start()
+        QTimer.singleShot(
+            5000, lambda proc=process: self._on_grim_timeout(proc))
+
+    def _on_grim_error(self, process, paths, selected_monitor, error) -> None:
+        if (self._screenshot_capture_process is process
+                and error == QProcess.ProcessError.FailedToStart):
+            self._on_grim_finished(
+                process, paths, selected_monitor, -1,
+                QProcess.ExitStatus.CrashExit)
+
+    def _on_grim_timeout(self, process) -> None:
+        if (self._screenshot_capture_process is process
+                and process.state() != QProcess.ProcessState.NotRunning):
+            process.setProperty('fthrTimedOut', True)
+            process.kill()
+
+    def _on_grim_finished(
+            self, process, paths, selected_monitor: str,
+            exit_code: int, _exit_status) -> None:
+        if self._screenshot_capture_process is not process:
+            return
+        self._screenshot_capture_process = None
+        self._screenshot_capture_paths = None
+        timed_out = bool(process.property('fthrTimedOut'))
+        detail = bytes(process.readAllStandardError()).decode(
+            errors='replace').strip()
+        process.deleteLater()
+        try:
+            staged_size = paths.staged.stat().st_size
+        except OSError:
+            staged_size = 0
+        if exit_code == 0 and staged_size > 0 and not timed_out:
+            self._open_screenshot_editor(paths)
+            return
+        if self._shutdown_requested:
             paths.staged.unlink(missing_ok=True)
-            self._show_screenshot_error(
+            self._finish_screenshot_request()
+            return
+
+        if timed_out:
+            detail = 'grim exceeded the 5-second capture deadline'
+        print(
+            '[Screenshot] grim capture failed; trying the selected Qt '
+            f'screen instead: {detail or f"exit code {exit_code}"}')
+        self._capture_selected_qt_screen(paths, selected_monitor)
+
+    def _capture_selected_qt_screen(self, paths, selected_monitor: str) -> None:
+        # Resolve again after an asynchronous Wayland attempt. Windows receives
+        # the same stable DISPLAYCONFIG device path that starts replay; X11 and
+        # Wayland use the connector name. No QScreen list index is persisted.
+        screen = self._resolve_screenshot_screen(selected_monitor)
+        if screen is None:
+            self._fail_screenshot_request(
+                paths,
                 'MONITOR_NOT_FOUND',
                 'The configured capture monitor is unavailable. FTHR did not '
                 'fall back to another display.',
@@ -4156,15 +4256,15 @@ class MainWindow(QMainWindow):
         try:
             pixmap = screen.grabWindow(0)
         except Exception as error:
-            paths.staged.unlink(missing_ok=True)
-            self._show_screenshot_error(
+            self._fail_screenshot_request(
+                paths,
                 'CAPTURE_UNAVAILABLE',
                 f'Could not capture the configured monitor: {error}',
             )
             return
         if pixmap.isNull():
-            paths.staged.unlink(missing_ok=True)
-            self._show_screenshot_error(
+            self._fail_screenshot_request(
+                paths,
                 'CAPTURE_UNAVAILABLE',
                 'The configured monitor returned an empty screenshot.',
             )
@@ -4172,14 +4272,13 @@ class MainWindow(QMainWindow):
 
         image = pixmap.toImage()
         if image.isNull():
-            paths.staged.unlink(missing_ok=True)
-            self._show_screenshot_error(
+            self._fail_screenshot_request(
+                paths,
                 'CAPTURE_UNAVAILABLE',
                 'The configured monitor could not provide an image.',
             )
             return
 
-        self._screenshot_inflight = True
         worker = ScreenshotPngSaveWorker(image, paths.staged, self)
         self._screenshot_save_worker = worker
         worker.succeeded.connect(
@@ -4199,7 +4298,7 @@ class MainWindow(QMainWindow):
 
         if QPixmap(str(paths.staged)).isNull():
             paths.staged.unlink(missing_ok=True)
-            self._screenshot_inflight = False
+            self._finish_screenshot_request()
             self._show_screenshot_error(
                 'IMAGE_ENCODE_FAILED',
                 'The screenshot backend returned an unreadable PNG.',
@@ -4222,13 +4321,46 @@ class MainWindow(QMainWindow):
             else:
                 paths.staged.unlink(missing_ok=True)
         finally:
-            self._screenshot_inflight = False
+            self._finish_screenshot_request()
 
     def _on_screenshot_save_failed(self, paths, code: str, detail: str) -> None:
         paths.staged.unlink(missing_ok=True)
         self._screenshot_save_worker = None
-        self._screenshot_inflight = False
+        self._finish_screenshot_request()
         self._show_screenshot_error(code, detail)
+
+    def _fail_screenshot_request(
+            self, paths, code: str, detail: str) -> None:
+        paths.staged.unlink(missing_ok=True)
+        self._finish_screenshot_request()
+        self._show_screenshot_error(code, detail)
+
+    def _finish_screenshot_request(self) -> None:
+        self._screenshot_inflight = False
+        if (self._screenshot_pending_requests > 0
+                and not self._shutdown_requested):
+            self._screenshot_pending_requests -= 1
+            QTimer.singleShot(0, self._on_hotkey_save_screenshot)
+
+    def _stop_screenshot_jobs(self) -> None:
+        """Bound screenshot-worker cleanup during full application shutdown."""
+
+        self._screenshot_pending_requests = 0
+        process = self._screenshot_capture_process
+        paths = self._screenshot_capture_paths
+        self._screenshot_capture_process = None
+        self._screenshot_capture_paths = None
+        if process is not None:
+            process.kill()
+            process.waitForFinished(250)
+            process.deleteLater()
+            if paths is not None:
+                paths.staged.unlink(missing_ok=True)
+        worker = self._screenshot_save_worker
+        if worker is not None and worker.isRunning():
+            if not worker.wait(1500):
+                print('[Lifecycle] Screenshot worker exceeded shutdown grace')
+        self._screenshot_inflight = False
 
     def _show_screenshot_error(self, code: str, detail: str) -> None:
         """Keep screenshot failures actionable when the main window is hidden."""
@@ -4772,6 +4904,30 @@ class MainWindow(QMainWindow):
         capture_mode    = self.settings_manager.get('capture_mode',    'desktop')
         target_hwnd     = self.settings_manager.get('target_hwnd',     0)
         capture_monitor = launch_config.monitor
+        engine_monitor_arg = capture_monitor
+        if sys.platform != 'win32' and is_native_x11_session():
+            xrandr = linux_tools.path('xrandr')
+            if not xrandr:
+                detail = linux_tools.missing_message('xrandr')
+                self._capture_config.fail(detail)
+                self._restart_pending = False
+                self._set_capture_apply_state(False)
+                self._set_status('MONITOR UNAVAILABLE', status_warning_qss())
+                self.push_error('X11 MONITOR UNAVAILABLE', detail, level='error')
+                return False
+            try:
+                x11_target = resolve_x11_capture_target(
+                    capture_monitor, xrandr)
+            except X11MonitorError as error:
+                detail = str(error)
+                self._capture_config.fail(detail)
+                self._restart_pending = False
+                self._set_capture_apply_state(False)
+                self._set_status('MONITOR UNAVAILABLE', status_warning_qss())
+                self.push_error('X11 MONITOR UNAVAILABLE', detail, level='error')
+                return False
+            engine_monitor_arg = x11_target.engine_argument
+            capture_monitor = x11_target.output.name
         # target_hwnd comes from user-editable settings.json — never trust it.
         try:
             target_hwnd = int(target_hwnd)
@@ -4822,7 +4978,7 @@ class MainWindow(QMainWindow):
                  str(launch_config.fps), str(launch_config.buffer_seconds),
                  str(launch_config.width), str(launch_config.height),
                  str(launch_config.bitrate_kbps), str(max_buffer_mb),
-                 mode_arg, hwnd_arg, scale_arg, capture_monitor,
+                 mode_arg, hwnd_arg, scale_arg, engine_monitor_arg,
                  str(codec_pref_int), str(encoder_preset),
                  multiband_arg, audio_arg,
                  microphone_id_arg, microphone_gain_arg,
@@ -4956,7 +5112,7 @@ class MainWindow(QMainWindow):
         process = self.engine_process
         graceful_requested = False
         request_shutdown = getattr(self.bridge, 'request_engine_shutdown', None)
-        if sys.platform == 'win32' and callable(request_shutdown):
+        if callable(request_shutdown):
             graceful_requested = request_shutdown()
         if process:
             try:
@@ -7123,6 +7279,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_save_state'):
             self._save_state.cancel_active(time.monotonic(), reason='shutdown')
         self._prepare_manual_recording_shutdown()
+        self._stop_screenshot_jobs()
         self._shutdown_mark('SaveCommandsStopped')
 
         self._fallback_watch_timer.stop()

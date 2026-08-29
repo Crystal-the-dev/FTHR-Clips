@@ -1,6 +1,8 @@
 #include "backend_x11.h"
+#include "x11_capture_target.h"
 #include <iostream>
 #include <cstdlib>
+#include <string>
 #include <time.h>
 extern "C" {
 #include <libavformat/avformat.h>
@@ -11,6 +13,11 @@ extern "C" {
 }
 
 namespace fthr {
+
+int X11Backend::InterruptCallback(void* opaque) {
+    const auto* backend = static_cast<const X11Backend*>(opaque);
+    return backend && backend->running_ && !backend->running_->load() ? 1 : 0;
+}
 
 bool X11Backend::Initialize(const CaptureConfig& cfg) {
     const char* display_env = std::getenv("DISPLAY");
@@ -31,7 +38,30 @@ bool X11Backend::Initialize(const CaptureConfig& cfg) {
     av_dict_set(&opts, "framerate", std::to_string(cfg.fps).c_str(), 0);
     av_dict_set(&opts, "draw_mouse", "0", 0);
 
-    fmt_ctx_ = nullptr;
+    X11CaptureTarget target{};
+    if (!ParseX11CaptureTarget(cfg.target_output, target)) {
+        std::cerr << "[X11Backend] Invalid or unresolved selected-monitor "
+                     "geometry; refusing whole-desktop fallback" << std::endl;
+        av_dict_free(&opts);
+        return false;
+    }
+    const std::string video_size =
+        std::to_string(target.width) + "x" + std::to_string(target.height);
+    av_dict_set(&opts, "video_size", video_size.c_str(), 0);
+    av_dict_set(&opts, "x", std::to_string(target.x).c_str(), 0);
+    av_dict_set(&opts, "y", std::to_string(target.y).c_str(), 0);
+    std::cerr << "[X11Backend] Selected root rect "
+              << target.width << "x" << target.height
+              << "+" << target.x << "+" << target.y << std::endl;
+
+    fmt_ctx_ = avformat_alloc_context();
+    if (!fmt_ctx_) {
+        av_dict_free(&opts);
+        std::cerr << "[X11Backend] Could not allocate format context" << std::endl;
+        return false;
+    }
+    fmt_ctx_->interrupt_callback.callback = &X11Backend::InterruptCallback;
+    fmt_ctx_->interrupt_callback.opaque = this;
     int ret = avformat_open_input(&fmt_ctx_, display_env, ifmt, &opts);
     av_dict_free(&opts);
     if (ret < 0) {
@@ -65,7 +95,11 @@ bool X11Backend::Initialize(const CaptureConfig& cfg) {
         return false;
     }
     dec_ctx_ = avcodec_alloc_context3(dec);
-    avcodec_parameters_to_context(dec_ctx_, cp);
+    if (!dec_ctx_ || avcodec_parameters_to_context(dec_ctx_, cp) < 0) {
+        avcodec_free_context(&dec_ctx_);
+        avformat_close_input(&fmt_ctx_);
+        return false;
+    }
     if (avcodec_open2(dec_ctx_, dec, nullptr) < 0) {
         avformat_close_input(&fmt_ctx_);
         return false;
@@ -74,21 +108,14 @@ bool X11Backend::Initialize(const CaptureConfig& cfg) {
     native_w_ = static_cast<uint32_t>(dec_ctx_->width);
     native_h_ = static_cast<uint32_t>(dec_ctx_->height);
 
-    // Pre-create sws context for BGR0 conversion
-    sws_ = sws_getContext(
-        static_cast<int>(native_w_), static_cast<int>(native_h_), dec_ctx_->pix_fmt,
-        static_cast<int>(native_w_), static_cast<int>(native_h_), AV_PIX_FMT_BGR0,
-        SWS_BILINEAR, nullptr, nullptr, nullptr);
-    if (!sws_) {
-        avcodec_free_context(&dec_ctx_);
-        avformat_close_input(&fmt_ctx_);
-        return false;
-    }
-
     pkt_   = av_packet_alloc();
     frame_ = av_frame_alloc();
-    buf_.resize(static_cast<size_t>(native_w_) * native_h_ * 4, 0);
-
+    if (!pkt_ || !frame_ || native_w_ == 0 || native_h_ == 0) {
+        Shutdown();
+        std::cerr << "[X11Backend] Invalid stream dimensions or allocation failure"
+                  << std::endl;
+        return false;
+    }
     std::cerr << "[X11Backend] Ready: " << native_w_ << "x" << native_h_ << std::endl;
     return true;
 }
@@ -96,7 +123,10 @@ bool X11Backend::Initialize(const CaptureConfig& cfg) {
 bool X11Backend::CaptureFrame(RawFrame& out) {
     while (true) {
         int ret = av_read_frame(fmt_ctx_, pkt_);
-        if (ret < 0) return false;
+        if (ret < 0) {
+            av_packet_unref(pkt_);
+            return false;
+        }
         if (pkt_->stream_index != video_stream_) {
             av_packet_unref(pkt_);
             continue;
@@ -110,31 +140,21 @@ bool X11Backend::CaptureFrame(RawFrame& out) {
         break;
     }
 
-    // If resolution changed (e.g. screen resize), recreate sws context
-    if (static_cast<uint32_t>(frame_->width)  != native_w_ ||
-        static_cast<uint32_t>(frame_->height) != native_h_) {
-        native_w_ = static_cast<uint32_t>(frame_->width);
-        native_h_ = static_cast<uint32_t>(frame_->height);
-        sws_freeContext(sws_);
-        sws_ = sws_getContext(
-            frame_->width, frame_->height,
-            static_cast<AVPixelFormat>(frame_->format),
-            frame_->width, frame_->height, AV_PIX_FMT_BGR0,
-            SWS_BILINEAR, nullptr, nullptr, nullptr);
-        buf_.resize(static_cast<size_t>(native_w_) * native_h_ * 4, 0);
-        if (!sws_) { av_frame_unref(frame_); return false; }
+    // swscale consumes FFmpeg's real per-plane linesizes. Never assume the
+    // source row pitch equals width * bytes-per-pixel, and never assume BGRA.
+    if (!converter_.Convert(*frame_)) {
+        av_frame_unref(frame_);
+        return false;
     }
+    native_w_ = converter_.Width();
+    native_h_ = converter_.Height();
 
-    uint8_t* dst[1]  = { buf_.data() };
-    int      lns[1]  = { static_cast<int>(native_w_ * 4) };
-    sws_scale(sws_, frame_->data, frame_->linesize,
-              0, static_cast<int>(native_h_), dst, lns);
     av_frame_unref(frame_);
 
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    out.data         = buf_.data();
-    out.stride       = native_w_ * 4;
+    out.data         = converter_.Data();
+    out.stride       = converter_.Stride();
     out.width        = native_w_;
     out.height       = native_h_;
     out.av_pix_fmt   = AV_PIX_FMT_BGR0;
@@ -143,12 +163,11 @@ bool X11Backend::CaptureFrame(RawFrame& out) {
 }
 
 void X11Backend::Shutdown() {
-    if (sws_)     { sws_freeContext(sws_);        sws_     = nullptr; }
+    converter_.Reset();
     if (frame_)   { av_frame_free(&frame_);        frame_   = nullptr; }
     if (pkt_)     { av_packet_free(&pkt_);         pkt_     = nullptr; }
     if (dec_ctx_) { avcodec_free_context(&dec_ctx_); dec_ctx_ = nullptr; }
     if (fmt_ctx_) { avformat_close_input(&fmt_ctx_); fmt_ctx_ = nullptr; }
-    buf_.clear();
 }
 
 } // namespace fthr

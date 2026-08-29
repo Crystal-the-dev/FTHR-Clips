@@ -51,7 +51,7 @@ def test_backend_auto_detects():
         proc.wait()
 
 
-def test_pure_x11_is_disabled_and_exits_bounded():
+def test_unreachable_pure_x11_display_exits_bounded():
     if not BINARY.exists():
         pytest.skip('Binary not built')
     env = dict(os.environ)
@@ -59,19 +59,20 @@ def test_pure_x11_is_disabled_and_exits_bounded():
     env['DISPLAY'] = ':9876'
     proc = subprocess.Popen(
         [str(BINARY), '30', '5', '0', '0', '4000', '0',
-         '', '0', '', '0', '4', '0', '0'],
+         '0', '0', '0', '@x11:0,0,640,480', '0', '4', '0', '0'],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, env=env,
     )
     try:
         stdout, stderr = proc.communicate(timeout=8)
         combined = stdout + stderr
-        assert 'x11grab disabled for alpha' in combined
+        assert ('avformat_open_input failed' in combined or
+                'No capture backend available' in combined)
         assert 'Using x11grab' not in combined
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
-        pytest.fail('Alpha engine hung in a pure X11 environment')
+        pytest.fail('Engine hung while opening an unreachable X11 display')
 
 
 def test_no_backend_exits_cleanly():

@@ -96,7 +96,7 @@ Expected on a machine exposing neither supported Wayland protocol:
 [SHM] Created: /dev/shm/FTHR_SharedMemory_v4
 [WlrBackend] zwlr_screencopy_manager_v1 not available — compositor must support wlr-screencopy
 [ExtBackend] ext-image-copy-capture not available
-[Backend] x11grab disabled for alpha: AUDIT-044 bounded cancellation unresolved
+[Backend] No Wayland capture backend available; refusing XWayland/x11grab fallback
 [Backend] No capture backend available on this system
 [Capture] Recovery exhausted after 3 attempts
 [FTHR] Capture backend stopped; exiting engine

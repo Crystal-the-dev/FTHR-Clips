@@ -73,17 +73,23 @@ Settings → Hotkeys. Root access and the `input` group are not required.
 
 **Requirements:**
 - A Wayland compositor exposing `wlr-screencopy` or
-  `ext-image-copy-capture`
+  `ext-image-copy-capture`, or a native X11 session
 - `nc` (netcat) for hotkeys — install via `sudo pacman -S openbsd-netcat` (Arch) or `sudo apt install netcat-openbsd` (Debian/Ubuntu)
 - `grim` for screenshot capture — install via `sudo pacman -S grim` (Arch) or `sudo apt install grim` (Debian/Ubuntu)
 - PulseAudio or PipeWire's PulseAudio compatibility layer; FTHR records the
   default output sink's monitor source
 - NVIDIA GPU recommended. AMD/Intel Linux runtime support is not qualified.
 - `xdotool` required on KDE/GNOME for game detection — `sudo pacman -S xdotool`
+- `xrandr` is required for exact selected-monitor geometry on native X11 —
+  install `xorg-xrandr` (Arch) or `x11-xserver-utils` (Debian/Ubuntu)
 
-The public alpha build disables FFmpeg `x11grab`: AUDIT-044 has no proven
-bounded-cancellation path. X11-only sessions and Wayland compositors without
-one of the protocols above are therefore unsupported in this alpha.
+Native X11 capture is source-integrated but remains experimental until a real
+X11 desktop passes the 30/60-second visual, monitor, performance and shutdown
+qualification. FTHR resolves the chosen connector through RandR and runs
+FFmpeg/XCB only in the already-isolated native engine process; the UI applies a
+fixed terminate/kill/reap deadline if an XCB reply ignores the normal interrupt
+callback. XWayland is deliberately not used as a fallback for unsupported
+Wayland compositors because it can expose a black root window.
 
 **Hotkeys (default):**
 
@@ -156,8 +162,9 @@ Visual Studio 2022 + Python 3.14. See [`BUILDING.md`](BUILDING.md) for the full 
 The native capture engine runs as a separate process and communicates with the
 Python UI via shared memory. Windows uses WGC/DXGI capture with the selected
 NVENC, AMF, or QSV encoder and WASAPI audio. Linux uses supported Wayland
-capture protocols with FFmpeg and PulseAudio-compatible audio; X11 capture is
-disabled in the alpha because bounded cancellation is unresolved. Platform hotkey activation is
+capture protocols or native X11/RandR with FFmpeg and PulseAudio-compatible
+audio. Native X11 remains physically unqualified and XWayland fallback is
+refused. Platform hotkey activation is
 forwarded by the UI through the same shared-memory command contract; Linux also
 uses an owner-only Unix socket for compositor key bindings.
 

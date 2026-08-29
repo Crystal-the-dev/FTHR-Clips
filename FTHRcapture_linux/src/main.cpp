@@ -39,7 +39,8 @@ int main(int argc, char* argv[]) {
     //   [7]  capture_mode   (0=desktop, 1=window — Linux always desktop)
     //   [8]  target_hwnd    (ignored on Linux)
     //   [9]  scaling_mode   (0=stretch, 1=fit)
-    //   [10] target_output  (wl_output name, e.g. "DP-3" — empty = first output)
+    //   [10] target_output  (Wayland output name, or UI-resolved
+    //                        "@x11:x,y,width,height" on native X11)
     //   [11] codec_pref     (0=auto, 1=h264, 2=hevc, 3=av1)
     //   [12] encoder_preset (1-7, default 4)
     //   [13] multiband      (retired; ignored)
@@ -226,6 +227,15 @@ int main(int argc, char* argv[]) {
                 engine.SetPaused(false);
                 layout->engine_response =
                     static_cast<uint32_t>(fthr::ResponseType::RECORDING_STARTED);
+                break;
+
+            case fthr::CommandType::SHUTDOWN:
+                // Normal X11 shutdown first uses AVIOInterruptCB through
+                // CaptureEngine::Shutdown(). If an XCB reply ignores that
+                // callback, the UI's existing fixed process deadline still
+                // terminates, kills and reaps this isolated engine process.
+                std::cout << "[FTHR] SHUTDOWN requested" << std::endl;
+                g_quit = 1;
                 break;
 
             default:

@@ -134,21 +134,37 @@ def write_png_to_staged(image: _PngWritable, staged_path: str | Path) -> None:
 def publish_staged_png(staged_path: str | Path, final_path: str | Path) -> None:
     """Atomically expose a fully-written staged PNG at its final path.
 
-    The single-instance application allocates names before the write.  The
-    existence check is retained as a final guard against external changes; a
-    screenshot never deliberately replaces an existing user file.
+    Windows rename is atomic and refuses an existing destination, including on
+    external filesystems that do not support hard links. POSIX rename replaces
+    by definition, so there a same-directory hard link publishes the fully
+    closed staging inode only when the final name does not already exist. Both
+    remain no-overwrite if another process races the reservation.
     """
 
     staged = Path(staged_path)
     final = Path(final_path)
-    if final.exists() or final.is_symlink():
-        raise ScreenshotSaveError(
-            'OUTPUT_COLLISION', f'Refusing to overwrite an existing file: {final.name}')
     try:
-        os.replace(staged, final)
+        if os.name == 'nt':
+            os.rename(staged, final)
+            return
+        os.link(staged, final)
+    except FileExistsError as error:
+        raise ScreenshotSaveError(
+            'OUTPUT_COLLISION',
+            f'Refusing to overwrite an existing file: {final.name}',
+        ) from error
     except OSError as error:
         raise ScreenshotSaveError(
             'WRITE_FAILED', f'Could not publish the screenshot: {error}') from error
+    try:
+        staged.unlink()
+    except OSError as error:
+        # Roll back the exact link created above. A failure never leaves a
+        # final-looking name while reporting that publication failed.
+        final.unlink(missing_ok=True)
+        raise ScreenshotSaveError(
+            'WRITE_FAILED', f'Could not remove screenshot staging file: {error}'
+        ) from error
 
 
 class ScreenshotPngSaveWorker(QThread):

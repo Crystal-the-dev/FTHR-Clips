@@ -4,10 +4,12 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # FFmpeg x11grab can block in XCB replies that do not consult the public
-# interrupt callback. Keep the source available for AUDIT-044 design work,
-# but do not ship an unbounded shutdown path in the public alpha.
-option(FTHR_EXPERIMENTAL_X11GRAB
-    "Enable unbounded experimental FFmpeg x11grab backend" OFF)
+# interrupt callback. FTHR therefore never uses it as an in-process UI path:
+# the already-existing native engine process owns FFmpeg/XCB, the UI requests
+# graceful shutdown, then terminates/kills/reaps that process on fixed bounds.
+# No full-resolution frame crosses an additional IPC boundary.
+option(FTHR_X11_CAPTURE
+    "Enable process-isolated native X11 capture backend" ON)
 
 include(CTest)
 if(BUILD_TESTING)
@@ -69,6 +71,14 @@ if(BUILD_TESTING)
     target_compile_options(fthr_capture_recovery_test PRIVATE
         -Wall -Wextra -Wpedantic -UNDEBUG)
     add_test(NAME capture_recovery_policy COMMAND fthr_capture_recovery_test)
+
+    add_executable(fthr_x11_capture_target_test
+        tests/x11_capture_target_test.cpp
+        src/x11_capture_target.cpp)
+    target_include_directories(fthr_x11_capture_target_test PRIVATE src)
+    target_compile_options(fthr_x11_capture_target_test PRIVATE
+        -Wall -Wextra -Wpedantic -UNDEBUG)
+    add_test(NAME x11_capture_target COMMAND fthr_x11_capture_target_test)
 
     add_executable(fthr_transactional_save_test tests/transactional_save_test.cpp)
     target_include_directories(fthr_transactional_save_test PRIVATE
@@ -286,8 +296,11 @@ set(FTHR_ENGINE_SOURCES
     ${PROTO_GEN_DIR}/ext-foreign-toplevel-list-protocol.c
 )
 
-if(FTHR_EXPERIMENTAL_X11GRAB)
-    list(APPEND FTHR_ENGINE_SOURCES src/backend_x11.cpp)
+if(FTHR_X11_CAPTURE)
+    list(APPEND FTHR_ENGINE_SOURCES
+        src/backend_x11.cpp
+        src/x11_capture_target.cpp
+        src/x11_frame_converter.cpp)
 endif()
 
 add_executable(FTHRclips ${FTHR_ENGINE_SOURCES})
@@ -316,7 +329,7 @@ target_link_libraries(FTHRclips PRIVATE
 
 target_compile_options(FTHRclips PRIVATE -Wall -Wextra)
 target_compile_definitions(FTHRclips PRIVATE
-    FTHR_EXPERIMENTAL_X11GRAB=$<BOOL:${FTHR_EXPERIMENTAL_X11GRAB}>)
+    FTHR_X11_CAPTURE=$<BOOL:${FTHR_X11_CAPTURE}>)
 
 target_include_directories(FTHRPlaybackMixer PRIVATE
     ${CMAKE_SOURCE_DIR}/../FTHRcapture_common)
@@ -374,6 +387,22 @@ if(FTHR_FFMPEG_BUNDLED)
 endif()
 
 if(BUILD_TESTING)
+    if(FTHR_X11_CAPTURE)
+        add_executable(fthr_x11_frame_converter_test
+            tests/x11_frame_converter_test.cpp
+            src/x11_frame_converter.cpp)
+        target_include_directories(fthr_x11_frame_converter_test PRIVATE src)
+        target_include_directories(fthr_x11_frame_converter_test SYSTEM PRIVATE
+            ${FFMPEG_INCLUDE_DIRS})
+        target_link_libraries(fthr_x11_frame_converter_test PRIVATE
+            $<$<BOOL:${FTHR_FFMPEG_BUNDLED}>:${FTHR_FFMPEG_LINK_LIBRARIES}>
+            $<$<NOT:$<BOOL:${FTHR_FFMPEG_BUNDLED}>>:PkgConfig::FFMPEG>)
+        target_compile_options(fthr_x11_frame_converter_test PRIVATE
+            -Wall -Wextra -Wpedantic -UNDEBUG)
+        add_test(NAME x11_frame_conversion
+            COMMAND fthr_x11_frame_converter_test)
+    endif()
+
     add_executable(fthr_linux_encoder_timestamp_test
         tests/linux_encoder_timestamp_test.cpp
         src/encoder.cpp)

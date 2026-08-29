@@ -35,11 +35,13 @@ desktop/capture and installer lifecycle gates below are still `NOT RUN` or
 
 ### Linux release recommendation: 🚫 EXPERIMENTAL / DO NOT INCLUDE IN PUBLIC ALPHA
 
-The alpha-safe build now disables X11/x11grab while AUDIT-044 remains open. A
-future Linux cohort requires at least one real supported Wayland session to
-record visible content and desktop audio, fire a hotkey, shut down cleanly and
-pass the current AppImage lifecycle. WSL proves the build and bounded failure,
-not representative desktop capture.
+Native X11 is now source-integrated with an exact RandR-selected rectangle and
+the existing engine-process terminate/kill/reap boundary, but no real native
+X11 session has qualified its pixels, pacing, performance or shutdown. A future
+Linux cohort still requires at least one real supported Wayland or native-X11
+session to record visible content and desktop audio, fire a hotkey, shut down
+cleanly and pass the current AppImage lifecycle. WSL proves the build and
+bounded failure, not representative desktop capture.
 
 Everything else below is either already green or is honest, tracked work.
 
@@ -110,7 +112,7 @@ Everything else below is either already green or is honest, tracked work.
 | 6.2a | Windows installer input/lifecycle contract | **PASS (source contract)** — stable AppId, update/repair/downgrade policy, safe data boundary, autostart ownership, VC++ guard, legacy opt-in and package metadata are verified by `tools/verify_windows_installer_lifecycle.py`; this is not a physical install claim. |
 | 6.2b | Windows Authenticode signing | **DECISION REQUIRED** — build support accepts an external operator-owned signing command, but no release signing identity is configured in the repository or this checkout. Unsigned artifacts are local-qualification only. |
 | 6.3 | Linux engine builds clean (CMake, Release) | **PARTIAL** — current source built and passed tests in a WSL development build using system FFmpeg. The required pinned-FFmpeg Release rebuild was not run. |
-| 6.4 | Linux AppImage builds | **NOT RUN for current source** — historical artifact evidence does not qualify the X11-disabled/audio-corrected build. |
+| 6.4 | Linux AppImage builds | **NOT RUN for current source** — historical artifact evidence does not qualify the current X11-corrected/audio-corrected build. |
 | 6.5 | CI green on all jobs | **NOT RUN** — the workflow has never executed; there is no remote yet |
 
 ## 7. Runtime verification — the part no CI can do for you
@@ -121,8 +123,8 @@ Everything else below is either already green or is honest, tracked work.
 | 7.2 | Windows: a real clip is captured via the hotkey and plays back | **PARTIAL** — current qualification captured and fully decoded H.264/HEVC/AV1 files, controlled system audio, system-plus-microphone audio, rapid saves, and a 30-second pre-UI tray save. Final packaged hotkey/player listening remains `NOT RUN`. |
 | 7.3 | Windows: installer install → launch → update → uninstall | **PARTIAL (2026-08-24)** — a real existing-install update, default uninstall, fresh reinstall and checked legacy cleanup ran successfully against the generated Setup executable. Installed-app identity, Start Menu, exact autostart ownership and clip/settings snapshots were checked. Installed GUI/tray/capture launch remains `NOT RUN`; see `WINDOWS-INSTALLER-LIFECYCLE-QUALIFICATION-2026-08-24.md`. |
 | 7.4 | Windows: uninstall removes what it claims to | **PARTIAL (2026-08-24)** — default uninstall removed product registration, Program Files payload, common shortcuts and the exact Run value while preserving the recorded clip and `.fthr` state snapshots. The optional interactive settings/cache-removal choice and a custom install location remain `NOT RUN`. |
-| 7.5 | Linux: engine starts and captures on a real compositor | **NOT RUN** — WSLg exposes neither supported Wayland protocol; current alpha source refuses x11grab and exits after bounded recovery. Hyprland/KDE/GNOME remain `NOT RUN`. |
-| 7.5b | Linux: a clip is saved, decodes, and contains a picture | **NOT RUN for current source** — older black-frame x11grab clips are historical and do not qualify the alpha-safe build. |
+| 7.5 | Linux: engine starts and captures on a real compositor | **NOT RUN** — WSLg exposes neither supported Wayland protocol and is not a native X11 session. The source refuses XWayland fallback and exits after bounded recovery. Hyprland/KDE/GNOME/native X11 remain `NOT RUN`. |
+| 7.5b | Linux: a clip is saved, decodes, and contains a picture | **NOT RUN for current source** — older black-frame XWayland clips are historical and do not qualify the current native-X11 path. |
 | 7.6 | Linux: AppImage launches and captures | **NOT RUN for current source** |
 | 7.7 | Linux: the Linux-only fixes are exercised | **PASS** — single-instance `flock` verified with real processes (acquire → second refused → SIGKILL holder → third acquires; lock `~/.fthr/fthr.lock` uid=you mode=600). Hotkey socket verified at `$XDG_RUNTIME_DIR/fthr/hotkey.sock`, dir 0700, socket 0600, 16 new tests. |
 | 7.7b | Linux: hotkeys actually fire from a compositor bind | **NOT RUN** — no compositor available |

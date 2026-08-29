@@ -57,9 +57,12 @@ fi
 # Which capture backend the engine will pick, by the same rule it uses.
 if [ -n "${WAYLAND_DISPLAY:-}" ]; then
     _kv 'engine will try'  'wlr-screencopy, then ext-image-copy-capture'
-    _kv 'x11grab'          'disabled for alpha (AUDIT-044 bounded cancellation unresolved)'
+    _kv 'x11grab'          'XWayland fallback is refused'
+elif [ -n "${DISPLAY:-}" ]; then
+    _kv 'engine will try'  'native X11 x11grab with RandR-selected geometry'
+    _kv 'cancellation'     'interrupt callback plus bounded engine-process kill/reap'
 else
-    _kv 'engine will try'  'no alpha-safe backend (X11/x11grab disabled)'
+    _kv 'engine will try'  'no display backend (headless session)'
 fi
 
 # ---------------------------------------------------------------------------
@@ -162,7 +165,7 @@ PY
 
 # ---------------------------------------------------------------------------
 _h 'FTHR external helper tools'
-for t in hyprctl xdotool xprop grim nc xdg-open wmctrl; do
+for t in hyprctl xdotool xprop xrandr grim nc xdg-open wmctrl; do
     p=$(command -v "$t" 2>/dev/null) && _kv "$t" "$p" || _kv "$t" 'NOT FOUND'
 done
 

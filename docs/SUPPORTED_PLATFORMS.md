@@ -4,7 +4,7 @@
 executed by anyone on this project. It is not a prediction that it will fail —
 it is a statement that nobody knows.
 
-Last updated: 2026-08-24.
+Last updated: 2026-08-29.
 
 ## Summary
 
@@ -15,7 +15,7 @@ Last updated: 2026-08-24.
 | Windows hybrid/cross-adapter | Unsupported for alpha; no CPU full-frame fallback |
 | Linux — engine, IPC and bounded failure | **Verified** on Ubuntu 24.04 / WSL2 |
 | Linux — real Wayland desktop capture (visible pixels) | **NOT VERIFIED** |
-| Linux — X11 | Disabled for alpha while AUDIT-044 remains open |
+| Linux — native X11 | Source-integrated with RandR-selected geometry; physical qualification `NOT RUN` |
 
 FTHR Clips must not be advertised as broadly Linux-supported. The current Linux
 build is experimental and requires a compositor that exposes one of the two
@@ -32,7 +32,7 @@ implemented Wayland capture protocols.
 | Display server | WSLg Weston (Wayland) + XWayland (`WAYLAND_DISPLAY=wayland-0`, `DISPLAY=:0`) |
 | Desktop environment | none (`XDG_CURRENT_DESKTOP` unset) |
 | Compositor | Weston (RDP backend) |
-| Capture backend used | No current safe video backend: WSLg exposes neither supported Wayland protocol; x11grab is disabled |
+| Capture backend used | None: WSLg exposes neither supported Wayland protocol and XWayland fallback is deliberately refused |
 | Audio | PulseAudio 17.0 via `/mnt/wslg/PulseServer`; current smoke resolved `RDPSink.monitor` |
 | GPU | NVIDIA GeForce RTX 4060 Ti, driver 610.62 (WSL passthrough) |
 | Encoder used | `av1_nvenc` (hardware) |
@@ -61,18 +61,19 @@ first frame luma: min 0, max 0, mean 0.0, distinct values 1
 
 XWayland under WSLg had no real root-window content for `x11grab` to read. That
 historical result proved plumbing, not a picture, and does not apply to the
-current alpha build because x11grab is disabled. Nobody has yet confirmed that
-the current Wayland build records visible content on a representative desktop.
+current build because it refuses XWayland fallback. Nobody has yet confirmed
+that the current Wayland or native-X11 build records visible content on a
+representative desktop.
 
 ## Support matrix
 
 | Distro | Desktop | Display server | Compositor | Capture backend | Audio | Hotkey method | Tested | Notes |
 |---|---|---|---|---|---|---|---|---|
-| Ubuntu 24.04 | none | Wayland + XWayland | Weston (WSLg) | none in alpha | Pulse monitor opens | socket only (no compositor binds) | **YES** — build, IPC, audio-open and bounded failure only | No supported Wayland protocol; x11grab disabled |
+| Ubuntu 24.04 | none | Wayland + XWayland | Weston (WSLg) | none | Pulse monitor opens | socket only (no compositor binds) | **YES** — build, IPC, audio-open and bounded failure only | No supported Wayland protocol; XWayland fallback refused |
 | Arch / any | Hyprland | Wayland | Hyprland | wlr-screencopy | PipeWire | auto-written binds + socket | `NOT RUN` | The primary intended target; auto-config code is untested |
 | Any | KDE Plasma | Wayland | KWin | ext-image-copy-capture if compositor exposes it | PipeWire | **manual** — see below | `NOT RUN` | Unsupported when the protocol is absent |
 | Any | GNOME | Wayland | Mutter | ext-image-copy-capture if compositor exposes it | PipeWire | **manual** | `NOT RUN` | Unsupported when the protocol is absent |
-| Any | any | X11 | any | disabled | PulseAudio/PipeWire | **manual** | bounded-rejection smoke only | AUDIT-044 open; experimental compile opt-in is not an alpha build |
+| Any | any | native X11 | any | FFmpeg x11grab with UI-resolved RandR rectangle | PulseAudio/PipeWire | **manual** | source/build/invalid-display tests only; physical `NOT RUN` | Process-isolated cancellation boundary; requires `xrandr`; experimental until real 30/60-second qualification |
 | Any | any | Wayland | anything else | none available | — | — | `NOT RUN` | Engine reports this clearly and exits the Wayland path |
 
 ### Wayland backend availability
@@ -83,16 +84,17 @@ The alpha engine tries, in order: `wlr-screencopy` →
 ```
 [WlrBackend] zwlr_screencopy_manager_v1 not available — compositor must support wlr-screencopy
 [ExtBackend] ext-image-copy-capture not available
-[Backend] x11grab disabled for alpha: AUDIT-044 bounded cancellation unresolved
+[Backend] No Wayland capture backend available; refusing XWayland/x11grab fallback
 [Backend] No capture backend available on this system
 [Capture] Recovery exhausted after 3 attempts
 [FTHR] Capture backend stopped; exiting engine
 ```
 
-That is the intended, bounded failure path for an unsupported compositor. A
-developer may compile the known-unbounded historical backend with
-`FTHR_EXPERIMENTAL_X11GRAB=ON`, but that binary is not eligible for alpha
-packaging or support claims.
+That is the intended, bounded failure path for an unsupported compositor.
+Native X11 uses the dedicated x11grab path only in an actual X11 session; the
+UI-owned engine process remains the hard cancellation boundary if XCB itself
+stops responding. Physical native-X11 qualification is still required before
+making an alpha support claim.
 
 ## Hotkeys
 
@@ -142,7 +144,8 @@ libraries that pip cannot supply:
 | Fedora | `gcc-c++ cmake pkgconf ffmpeg-devel wayland-devel wayland-protocols-devel pulseaudio-libs-devel portaudio` |
 
 Optional helpers: `hyprctl` (Hyprland), `xdotool` + `xprop` (X11 window/game
-detection), `grim` (Wayland screenshots), `openbsd-netcat` (hotkeys),
+detection), `xrandr` (required by native-X11 selected-monitor capture),
+`grim` (Wayland screenshots), `openbsd-netcat` (hotkeys),
 `xdg-utils` (open clips folder). `bash tools/linux_system_report.sh` lists which
 of these it found.
 

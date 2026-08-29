@@ -1,7 +1,7 @@
 #include "capture_backend.h"
 #include "backend_wlr.h"
 #include "backend_ext.h"
-#if FTHR_EXPERIMENTAL_X11GRAB
+#if FTHR_X11_CAPTURE
 #include "backend_x11.h"
 #endif
 #include <cstdlib>
@@ -36,21 +36,23 @@ std::unique_ptr<ICaptureBackend> CreateBestBackend(
         }
         if (cancelled()) return nullptr;
 
-        std::cerr << "[Backend] No Wayland capture backend available" << std::endl;
+        std::cerr << "[Backend] No Wayland capture backend available; "
+                     "refusing XWayland/x11grab fallback" << std::endl;
+        return nullptr;
     }
 
-    // x11grab remains opt-in until AUDIT-044 has a proven bounded-cancellation
-    // architecture. Never silently fall back to it in an alpha build.
+    // Native X11 only. The UI resolves the selected connector through RandR
+    // and passes a physical root-window rectangle. The engine process itself
+    // is the cancellation boundary for XCB calls that ignore AVIOInterruptCB.
     if (cancelled()) return nullptr;
-#if FTHR_EXPERIMENTAL_X11GRAB
-    auto x11 = std::make_unique<X11Backend>();
+#if FTHR_X11_CAPTURE
+    auto x11 = std::make_unique<X11Backend>(running);
     if (x11->Initialize(cfg)) {
         std::cerr << "[Backend] Using x11grab" << std::endl;
         return x11;
     }
 #else
-    std::cerr << "[Backend] x11grab disabled for alpha: AUDIT-044 bounded "
-                 "cancellation unresolved" << std::endl;
+    std::cerr << "[Backend] Native X11 capture disabled at build time" << std::endl;
 #endif
 
     std::cerr << "[Backend] No capture backend available on this system" << std::endl;

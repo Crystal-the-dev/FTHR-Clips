@@ -11,6 +11,12 @@ def _screen_name(screen: object) -> str:
     return str(name() if callable(name) else name or '')
 
 
+def qt_screen_name(screen: object) -> str:
+    """Return the stable Qt output name used by the platform backend."""
+
+    return _screen_name(screen)
+
+
 def _screen_geometry(screen: object) -> tuple[int, int, int, int] | None:
     geometry_getter = getattr(screen, 'geometry', None)
     if not callable(geometry_getter):
@@ -73,8 +79,7 @@ def select_qt_screen(
 def build_grim_command(
     grim_path: str, output_path: str, selected_output: str = ''
 ) -> list[str]:
-    command = [grim_path]
-    if selected_output:
-        command.extend(['-o', selected_output])
-    command.append(output_path)
-    return command
+    output = selected_output.strip()
+    if not output:
+        raise ValueError('grim requires an explicit selected output')
+    return [grim_path, '-o', output, output_path]
