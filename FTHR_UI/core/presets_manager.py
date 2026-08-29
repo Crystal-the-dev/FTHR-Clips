@@ -6,8 +6,8 @@ from pathlib import Path
 
 PRESET_KEYS = [
     'clip_length', 'extended_clip_length', 'framerate',
-    'resolution', 'bitrate_level', 'codec_pref', 'encoder_preset',
-    'audio_capture_enabled',
+    'resolution', 'bitrate_level', 'encoder_pref', 'codec_pref',
+    'encoder_preset', 'audio_capture_enabled',
 ]
 
 

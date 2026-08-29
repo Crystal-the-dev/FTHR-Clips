@@ -21,6 +21,15 @@ class _CaptureCardStub:
     def restart(self) -> None:
         self.restarted = True
 
+    def play_startup(self) -> None:
+        pass
+
+    def show_background_capture(self, _source: str) -> None:
+        pass
+
+    def hide_background_capture(self) -> None:
+        pass
+
     def close(self) -> None:
         self.closed = True
 
@@ -67,6 +76,23 @@ def test_main_window_constructs_with_side_effect_boundaries(
     assert window.windowTitle().startswith('FTHR Clips')
     assert window.styleSheet()
     assert window.settings_manager.config_file.parent == tmp_path / '.fthr'
+    assert window.close_btn is not window.power_btn
+    assert window.power_btn.toolTip() == 'Shut down FTHR Clips and stop capture'
+    window._on_close_to_tray_changed(False)
+    assert window.power_btn.isHidden()
+    window._on_close_to_tray_changed(True)
+    assert not window.power_btn.isHidden()
+
+    # Exercise the actual title-bar control through the shared cleanup path.
+    # Run the deferred callback inline and keep pytest's QApplication alive.
+    monkeypatch.setattr(main.QApplication, 'instance', staticmethod(lambda: None))
+    monkeypatch.setattr(
+        main.QTimer, 'singleShot', staticmethod(lambda _delay, callback: callback()))
+    window.power_btn.click()
+
+    assert window._shutdown_requested
+    assert window._shutdown_complete
+    assert window.capture_card.closed
 
 
 def test_background_start_defers_main_ui_but_keeps_core_services(

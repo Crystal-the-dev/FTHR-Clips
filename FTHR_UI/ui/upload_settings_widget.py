@@ -1,345 +1,756 @@
-"""
-upload_settings_widget.py — Upload tab in the Settings page.
-
-Layout
-------
-    ── UPLOAD ──────────────────────────────────────
-      [☐] Enable clip uploads
-
-    ── SERVER ──────────────────────────────────────
-      Server URL    [_______________________________]
-      Auth header   [_______________________________]  (optional)
-                                    [ TEST CONNECTION ]
-      Status:  "Not tested"  /  "OK (200)"  /  "Failed: ..."
-
-    ── AUTO UPLOAD ─────────────────────────────────
-      (•) Upload immediately after capture
-      ( ) Upload on an interval:  [5 ▼] [minutes ▼]
-      ( ) Manual only (right-click → Upload)
-
-    ── POST-UPLOAD ─────────────────────────────────
-      [☐] Auto-delete local clip after successful upload
-"""
+"""Consent-first settings UI for the optional upload packages."""
 
 from __future__ import annotations
 
+import secrets
 import threading
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QUrl, Qt, QTimer, Signal
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, QLineEdit,
-    QPushButton, QRadioButton, QButtonGroup, QComboBox, QScrollArea,
+    QButtonGroup,
+    QCheckBox,
+    QDialog,
     QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QRadioButton,
+    QScrollArea,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
 )
 
+from core.upload_manager import (
+    CATBOX_LEGAL_VERSION,
+    LUSTFUL_LEGAL_VERSION,
+)
+from core.export_profiles import provider_limit_mb
+from core.uploader_bundle_manifest import (
+    HARDWARE_POLICY_VERSION,
+    UPLOADER_PRIVACY_VERSION,
+    UPLOADER_TERMS_VERSION,
+)
 from ui.style import (
-    Colors, Fonts, label_body,
-    button_primary_qss, button_outline_qss,
-    checkbox_qss, lineedit_qss, radiobutton_qss, combo_qss,
+    Colors,
+    Fonts,
+    button_outline_qss,
+    button_primary_qss,
+    checkbox_qss,
+    combo_qss,
+    label_body,
+    label_uppercase,
+    lineedit_qss,
+    radiobutton_qss,
     scrollbar_qss,
+    WheelSafeComboBox,
 )
+from ui.dialogs import FthrMessageDialog
+from ui.dialogs import FthrDialog
 
 
-# ─── Section-header helper (matches settings-page style in main.py) ───────────
+CATBOX_API_URL = 'https://catbox.moe/user/api.php'
+CATBOX_LEGAL_URL = 'https://catbox.moe/legal.php'
+CATBOX_SUPPORT_URL = 'https://catbox.moe/support.php'
+LUSTFUL_HOME_URL = 'https://fthr.lustful.wtf/'
+LUSTFUL_TERMS_URL = 'https://fthr.lustful.wtf/tos'
+LUSTFUL_PRIVACY_URL = 'https://fthr.lustful.wtf/privacy'
+LUSTFUL_DONATE_URL = 'https://fthr.lustful.wtf/donate'
+
 
 def _section_header(title: str) -> QWidget:
     row = QWidget()
     row.setStyleSheet('background: transparent;')
-    hl = QHBoxLayout(row)
-    hl.setContentsMargins(0, 0, 0, 0)
-    hl.setSpacing(10)
-    lbl = QLabel(title.upper())
-    lbl.setStyleSheet(
+    layout = QHBoxLayout(row)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(10)
+    label = QLabel(title.upper())
+    label.setStyleSheet(
         f'color: {Colors.ACCENT}; font-size: {Fonts.SIZE_BODY_L}px; font-weight: 700;'
         f' letter-spacing: 2px; background: transparent; border: none;'
-        f' font-family: {Fonts.DISPLAY};'
-    )
-    hl.addWidget(lbl)
+        f' font-family: {Fonts.DISPLAY};')
+    layout.addWidget(label)
     line = QFrame()
     line.setFrameShape(QFrame.Shape.HLine)
     line.setFixedHeight(1)
     line.setStyleSheet(f'background: {Colors.SHELL_DIVIDER}; border: none;')
-    hl.addWidget(line, 1)
+    layout.addWidget(line, 1)
     return row
 
 
 def _field_label(text: str) -> QLabel:
-    lbl = QLabel(text)
-    lbl.setStyleSheet(label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
-    lbl.setMinimumWidth(90)
-    return lbl
+    label = QLabel(text)
+    label.setStyleSheet(label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
+    label.setMinimumWidth(90)
+    return label
 
 
-# ─── Main widget ─────────────────────────────────────────────────────────────
+def _legal_install_dialog(
+        parent: QWidget,
+        *,
+        title: str,
+        explanation: str,
+        terms: str,
+        privacy: str,
+        install_label: str) -> bool:
+    dialog = FthrDialog(title, parent, width=740)
+    dialog.resize(740, 660)
+    layout = dialog.body_layout
+    layout.setContentsMargins(24, 22, 24, 12)
+    layout.setSpacing(12)
+
+    heading = QLabel(title.upper())
+    heading.setStyleSheet(label_uppercase(Colors.ACCENT, Fonts.SIZE_H3, 2))
+    layout.addWidget(heading)
+    summary = QLabel(explanation)
+    summary.setWordWrap(True)
+    summary.setStyleSheet(label_body(Colors.TEXT, Fonts.SIZE_BODY_L))
+    layout.addWidget(summary)
+
+    terms_title = QLabel('TERMS OF SERVICE')
+    terms_title.setStyleSheet(label_uppercase(Colors.TEXT_DIM, Fonts.SIZE_LABEL, 1))
+    layout.addWidget(terms_title)
+    terms_view = QTextEdit()
+    terms_view.setReadOnly(True)
+    terms_view.setPlainText(terms)
+    terms_view.setMinimumHeight(150)
+    terms_view.setStyleSheet(
+        f'background: {Colors.SURFACE_1}; color: {Colors.TEXT}; '
+        f'border: 1px solid {Colors.BORDER}; padding: 8px;')
+    layout.addWidget(terms_view, 1)
+
+    privacy_title = QLabel('PRIVACY POLICY')
+    privacy_title.setStyleSheet(label_uppercase(Colors.TEXT_DIM, Fonts.SIZE_LABEL, 1))
+    layout.addWidget(privacy_title)
+    privacy_view = QTextEdit()
+    privacy_view.setReadOnly(True)
+    privacy_view.setPlainText(privacy)
+    privacy_view.setMinimumHeight(150)
+    privacy_view.setStyleSheet(terms_view.styleSheet())
+    layout.addWidget(privacy_view, 1)
+
+    accept_terms = QCheckBox('I have read and accept the Terms of Service.')
+    accept_privacy = QCheckBox('I have read and accept the Privacy Policy.')
+    accept_terms.setStyleSheet(checkbox_qss())
+    accept_privacy.setStyleSheet(checkbox_qss())
+    layout.addWidget(accept_terms)
+    layout.addWidget(accept_privacy)
+
+    buttons = QHBoxLayout()
+    buttons.addStretch()
+    cancel = QPushButton('CANCEL')
+    cancel.setStyleSheet(button_outline_qss())
+    cancel.clicked.connect(dialog.reject)
+    buttons.addWidget(cancel)
+    install = QPushButton(install_label)
+    install.setStyleSheet(button_primary_qss())
+    install.setEnabled(False)
+
+    def _update_install() -> None:
+        install.setEnabled(accept_terms.isChecked() and accept_privacy.isChecked())
+
+    accept_terms.toggled.connect(_update_install)
+    accept_privacy.toggled.connect(_update_install)
+    install.clicked.connect(dialog.accept)
+    buttons.addWidget(install)
+    dialog.action_layout.addLayout(buttons)
+    return dialog.exec() == QDialog.DialogCode.Accepted
+
+
+def _provider_consent_dialog(parent: QWidget, provider: str) -> bool:
+    name = 'Catbox' if provider == 'catbox' else 'Lustful'
+    dialog = FthrDialog(f'Connect {name}', parent, width=560)
+    layout = dialog.body_layout
+    layout.setContentsMargins(28, 24, 28, 12)
+    layout.setSpacing(14)
+    title = QLabel(f'CONNECT {name.upper()}')
+    title.setStyleSheet(label_uppercase(Colors.ACCENT, Fonts.SIZE_H3, 2))
+    layout.addWidget(title)
+
+    if provider == 'catbox':
+        copy = (
+            'Catbox stores the clip, filename, file size, upload time, and your IP '
+            'address. Files are publicly accessible to anyone with the link and may '
+            'remain available until deleted. Review Catbox’s Terms, Privacy Policy, '
+            'and Acceptable Use Policy before continuing.')
+        links = QLabel(
+            '<a href="catbox">OPEN CATBOX TERMS, PRIVACY & ACCEPTABLE USE</a>')
+        links.linkActivated.connect(
+            lambda _target: QDesktopServices.openUrl(QUrl(CATBOX_LEGAL_URL)))
+        accept_copy = 'I accept Catbox’s Terms, Privacy Policy, and Acceptable Use Policy.'
+    else:
+        copy = (
+            'Lustful binds one account to one physical device. It receives your '
+            'account ID, uploaded files, file metadata, and a UUID derived locally '
+            'from this PC’s hardware identity. Normal files expire after seven days.')
+        links = QLabel(
+            '<a href="terms">OPEN LUSTFUL TERMS</a>  ·  '
+            '<a href="privacy">OPEN LUSTFUL PRIVACY POLICY</a>')
+
+        def _open_lustful(target: str) -> None:
+            QDesktopServices.openUrl(QUrl(
+                LUSTFUL_TERMS_URL if target == 'terms' else LUSTFUL_PRIVACY_URL))
+
+        links.linkActivated.connect(_open_lustful)
+        accept_copy = 'I accept Lustful’s Terms of Service and Privacy Policy.'
+
+    description = QLabel(copy)
+    description.setWordWrap(True)
+    description.setStyleSheet(label_body(Colors.TEXT, Fonts.SIZE_BODY_L))
+    layout.addWidget(description)
+    links.setTextFormat(Qt.TextFormat.RichText)
+    links.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+    links.setOpenExternalLinks(False)
+    links.setStyleSheet(label_body(Colors.ACCENT, Fonts.SIZE_BODY))
+    layout.addWidget(links)
+    acceptance = QCheckBox(accept_copy)
+    acceptance.setWordWrap(True) if hasattr(acceptance, 'setWordWrap') else None
+    acceptance.setStyleSheet(checkbox_qss())
+    layout.addWidget(acceptance)
+    buttons = QHBoxLayout()
+    buttons.addStretch()
+    cancel = QPushButton('CANCEL')
+    cancel.setStyleSheet(button_outline_qss())
+    cancel.clicked.connect(dialog.reject)
+    buttons.addWidget(cancel)
+    accept = QPushButton('ACCEPT & CONTINUE')
+    accept.setStyleSheet(button_primary_qss())
+    accept.setEnabled(False)
+    acceptance.toggled.connect(accept.setEnabled)
+    accept.clicked.connect(dialog.accept)
+    buttons.addWidget(accept)
+    dialog.action_layout.addLayout(buttons)
+    return dialog.exec() == QDialog.DialogCode.Accepted
+
 
 class UploadSettingsWidget(QWidget):
-    """Drop-in page widget for the Upload settings tab."""
+    """Settings surface backed by :class:`core.upload_manager.UploadManager`."""
 
-    # Worker thread → main thread. QTimer.singleShot from a plain
-    # threading.Thread never fires (no event loop there) — the test button
-    # would stay disabled on 'Testing…' forever.
     _test_finished = Signal(bool, str)
+    _account_finished = Signal(bool, object, str)
+    connection_failed = Signal(str)
 
-    def __init__(self, settings_manager, parent=None, no_scroll=False):
+    def __init__(self, upload_manager, parent=None, no_scroll=False):
         super().__init__(parent)
-        self._sm = settings_manager
+        if hasattr(upload_manager, 'is_enabled'):
+            self._sm = upload_manager
+        else:
+            # Lightweight settings-page tests construct the page without the
+            # MainWindow-owned coordinator. Production always passes the
+            # existing instance through ``_upload_manager_ref``.
+            from core.upload_manager import UploadManager
+            self._sm = UploadManager(upload_manager)
         self._no_scroll = no_scroll
+        self._loading = True
+        self._selected_provider = 'catbox'
         self._test_thread: threading.Thread | None = None
+        self._account_thread: threading.Thread | None = None
         self._test_finished.connect(self._on_test_done)
+        self._account_finished.connect(self._on_account_done)
         self._setup_ui()
         self._load_settings()
+        self._loading = False
 
-    # ── Build UI ─────────────────────────────────────────────────────────
-
-    def _setup_ui(self):
+    def _setup_ui(self) -> None:
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-
         page = QWidget()
         page.setStyleSheet('background: transparent;')
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 16, 32)
         layout.setSpacing(0)
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-
         if not self._no_scroll:
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QFrame.Shape.NoFrame)
             scroll.setStyleSheet(scrollbar_qss())
+            scroll.setWidget(page)
             outer.addWidget(scroll)
+        else:
+            outer.addWidget(page)
 
-        # ── Enable toggle ────────────────────────────────────────────────
         layout.addWidget(_section_header('Upload'))
         layout.addSpacing(12)
-
-        self.enable_check = QCheckBox('Enable clip uploads')
+        self.enable_check = QCheckBox('Enable optional clip uploader')
         self.enable_check.setStyleSheet(checkbox_qss())
         self.enable_check.stateChanged.connect(self._on_enabled_changed)
         layout.addWidget(self.enable_check)
+        install_note = QLabel(
+            'The uploader is a separate package. It is installed only after you '
+            'enable it and accept its Terms of Service and Privacy Policy.')
+        install_note.setWordWrap(True)
+        install_note.setStyleSheet(label_body(Colors.TEXT_MUTED, Fonts.SIZE_BODY))
+        layout.addWidget(install_note)
 
-        # ── Collapsible body (hidden when uploads disabled) ──────────────
+        support_row = QHBoxLayout()
+        support_row.setContentsMargins(0, 16, 0, 0)
+        support_row.setSpacing(0)
+        support_qss = f'''
+            QPushButton {{
+                background: #f4d43a;
+                border: 1px solid #ffe66b;
+                color: #0a0a0a;
+                font-family: {Fonts.DISPLAY};
+                font-size: {Fonts.SIZE_BODY_L}px;
+                font-weight: bold;
+                letter-spacing: 2px;
+                min-height: 42px;
+                padding: 0 18px;
+                text-align: left;
+            }}
+            QPushButton:hover {{ background: #ffe66b; border-color: #ffffff; }}
+            QPushButton:pressed {{ background: #d9b900; }}
+        '''
+        self.catbox_donate_btn = QPushButton(
+            'HELP COVER CATBOX HOSTING  ·  DONATE >')
+        self.catbox_donate_btn.setStyleSheet(support_qss)
+        self.catbox_donate_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(CATBOX_SUPPORT_URL)))
+        support_row.addWidget(self.catbox_donate_btn, 1)
+        self.lustful_donate_btn = QPushButton(
+            'HELP COVER LUSTFUL HOSTING  ·  DONATE >')
+        self.lustful_donate_btn.setStyleSheet(support_qss)
+        self.lustful_donate_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(LUSTFUL_DONATE_URL)))
+        support_row.addWidget(self.lustful_donate_btn, 1)
+        layout.addLayout(support_row)
+
         self._body = QWidget()
         self._body.setStyleSheet('background: transparent;')
-        body_layout = QVBoxLayout(self._body)
-        body_layout.setContentsMargins(0, 0, 0, 0)
-        body_layout.setSpacing(0)
+        body = QVBoxLayout(self._body)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        layout.addWidget(self._body)
 
-        # ── Server ───────────────────────────────────────────────────────
-        body_layout.addSpacing(16)  # gap between enable checkbox and SERVER section
-        body_layout.addWidget(_section_header('Server'))
-        body_layout.addSpacing(12)
+        body.addSpacing(20)
+        body.addWidget(_section_header('Host'))
+        body.addSpacing(12)
+        provider_row = QHBoxLayout()
+        provider_row.addWidget(_field_label('Provider'))
+        self.provider_combo = WheelSafeComboBox()
+        self.provider_combo.addItem('Catbox', 'catbox')
+        self.provider_combo.addItem('Lustful', 'lustful')
+        self.provider_combo.setStyleSheet(combo_qss())
+        self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
+        provider_row.addWidget(self.provider_combo, 1)
+        self.website_btn = QPushButton('OPEN CATBOX')
+        self.website_btn.setStyleSheet(button_outline_qss())
+        self.website_btn.clicked.connect(self._open_provider)
+        provider_row.addWidget(self.website_btn)
+        body.addLayout(provider_row)
 
-        url_row = QHBoxLayout()
-        url_row.setSpacing(10)
-        url_row.addWidget(_field_label('Server URL'))
-        self.url_edit = QLineEdit()
-        self.url_edit.setPlaceholderText('https://your-server.example.com/upload')
-        self.url_edit.setStyleSheet(lineedit_qss())
-        url_row.addWidget(self.url_edit, 1)
-        body_layout.addLayout(url_row)
-        body_layout.addSpacing(8)
+        self.provider_note = QLabel()
+        self.provider_note.setWordWrap(True)
+        self.provider_note.setStyleSheet(label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
+        body.addSpacing(8)
+        body.addWidget(self.provider_note)
 
-        auth_row = QHBoxLayout()
-        auth_row.setSpacing(10)
-        auth_row.addWidget(_field_label('Auth header'))
-        self.auth_edit = QLineEdit()
-        self.auth_edit.setPlaceholderText('Bearer token123   (optional)')
-        self.auth_edit.setStyleSheet(lineedit_qss())
-        auth_row.addWidget(self.auth_edit, 1)
-        body_layout.addLayout(auth_row)
-        body_layout.addSpacing(12)
+        self.catbox_panel = QWidget()
+        catbox_row = QHBoxLayout(self.catbox_panel)
+        catbox_row.setContentsMargins(0, 8, 0, 0)
+        catbox_row.addWidget(_field_label('User hash'))
+        self.catbox_userhash = QLineEdit()
+        self.catbox_userhash.setPlaceholderText('Optional Catbox account userhash')
+        self.catbox_userhash.setStyleSheet(lineedit_qss())
+        catbox_row.addWidget(self.catbox_userhash, 1)
+        body.addWidget(self.catbox_panel)
+
+        self.lustful_panel = QFrame()
+        self.lustful_panel.setStyleSheet(
+            f'background: {Colors.SURFACE_1}; border: 1px solid {Colors.BORDER}; '
+            f'border-left: 3px solid {Colors.ACCENT};')
+        account = QVBoxLayout(self.lustful_panel)
+        account.setContentsMargins(16, 14, 16, 14)
+        self.account_state = QLabel('NOT CONNECTED')
+        self.account_state.setStyleSheet(
+            label_uppercase(Colors.TEXT_MUTED, Fonts.SIZE_LABEL, 1))
+        account.addWidget(self.account_state)
+        self.account_edit = QLineEdit()
+        self.account_edit.setPlaceholderText('Existing Lustful account ID for log in')
+        self.account_edit.setStyleSheet(lineedit_qss())
+        account_row = QHBoxLayout()
+        account_row.addWidget(self.account_edit, 1)
+        self.login_btn = QPushButton('LOG IN')
+        self.login_btn.setStyleSheet(button_outline_qss())
+        self.login_btn.clicked.connect(lambda: self._start_account_action('login'))
+        account_row.addWidget(self.login_btn)
+        self.register_btn = QPushButton('CREATE ACCOUNT')
+        self.register_btn.setStyleSheet(button_primary_qss())
+        self.register_btn.clicked.connect(lambda: self._start_account_action('register'))
+        account_row.addWidget(self.register_btn)
+        account.addLayout(account_row)
+        self.account_status = QLabel(
+            'Hardware Identity is installed separately only after Lustful consent.')
+        self.account_status.setWordWrap(True)
+        self.account_status.setStyleSheet(label_body(Colors.TEXT_MUTED, Fonts.SIZE_BODY))
+        account.addWidget(self.account_status)
+        self.logout_btn = QPushButton('LOG OUT LOCALLY')
+        self.logout_btn.setStyleSheet(button_outline_qss())
+        self.logout_btn.clicked.connect(self._logout)
+        account.addWidget(self.logout_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+        body.addSpacing(10)
+        body.addWidget(self.lustful_panel)
 
         test_row = QHBoxLayout()
         test_row.setSpacing(12)
         self.test_btn = QPushButton('TEST CONNECTION')
         self.test_btn.setStyleSheet(button_outline_qss())
-        self.test_btn.setFixedWidth(180)
         self.test_btn.clicked.connect(self._on_test_connection)
         test_row.addWidget(self.test_btn)
         self._test_status = QLabel('Not tested')
         self._test_status.setStyleSheet(label_body(Colors.TEXT_MUTED, Fonts.SIZE_BODY))
         test_row.addWidget(self._test_status)
         test_row.addStretch()
-        body_layout.addLayout(test_row)
+        body.addSpacing(12)
+        body.addLayout(test_row)
 
-        # ── Auto upload ──────────────────────────────────────────────────
-        body_layout.addSpacing(24)
-        body_layout.addWidget(_section_header('Auto Upload'))
-        body_layout.addSpacing(12)
-
+        body.addSpacing(24)
+        body.addWidget(_section_header('Auto Upload'))
+        body.addSpacing(12)
         self._mode_group = QButtonGroup(self)
-        self._mode_group.setExclusive(True)
-
         self.mode_immediate = QRadioButton('Upload immediately after capture')
-        self.mode_immediate.setStyleSheet(radiobutton_qss())
-        self._mode_group.addButton(self.mode_immediate, 0)
-        body_layout.addWidget(self.mode_immediate)
-        body_layout.addSpacing(8)
-
+        self.mode_interval = QRadioButton('Upload on an interval')
+        self.mode_manual = QRadioButton('Manual only  (right-click a clip → Upload)')
+        for index, radio in enumerate(
+                (self.mode_immediate, self.mode_interval, self.mode_manual)):
+            radio.setStyleSheet(radiobutton_qss())
+            self._mode_group.addButton(radio, index)
+        body.addWidget(self.mode_immediate)
+        body.addSpacing(8)
+        body.addWidget(self.mode_interval)
         interval_row = QHBoxLayout()
-        interval_row.setSpacing(8)
-        self.mode_interval = QRadioButton('Upload on an interval:')
-        self.mode_interval.setStyleSheet(radiobutton_qss())
-        self._mode_group.addButton(self.mode_interval, 1)
-        interval_row.addWidget(self.mode_interval)
-
-        self.interval_value = QComboBox()
+        interval_row.setContentsMargins(28, 4, 0, 0)
+        interval_row.setSpacing(10)
+        every_label = QLabel('EVERY')
+        every_label.setStyleSheet(
+            label_uppercase(Colors.TEXT_DIM, Fonts.SIZE_MICRO, 1))
+        interval_row.addWidget(every_label)
+        self.interval_value = WheelSafeComboBox()
         self.interval_value.addItems(['1', '2', '5', '10', '15', '30', '60'])
-        self.interval_value.setCurrentText('5')
         self.interval_value.setStyleSheet(combo_qss())
-        self.interval_value.setFixedWidth(64)
-        interval_row.addWidget(self.interval_value)
-
-        self.interval_unit = QComboBox()
+        self.interval_value.setFixedWidth(96)
+        self.interval_unit = WheelSafeComboBox()
         self.interval_unit.addItems(['minutes', 'hours', 'days'])
         self.interval_unit.setStyleSheet(combo_qss())
-        self.interval_unit.setFixedWidth(90)
+        self.interval_unit.setFixedWidth(150)
+        interval_row.addWidget(self.interval_value)
         interval_row.addWidget(self.interval_unit)
         interval_row.addStretch()
-        body_layout.addLayout(interval_row)
-        body_layout.addSpacing(8)
+        body.addLayout(interval_row)
+        body.addSpacing(8)
+        body.addWidget(self.mode_manual)
+        self._mode_group.idClicked.connect(lambda _index: self._update_interval_controls())
 
-        self.mode_manual = QRadioButton('Manual only  (right-click a clip → Upload)')
-        self.mode_manual.setStyleSheet(radiobutton_qss())
-        self._mode_group.addButton(self.mode_manual, 2)
-        body_layout.addWidget(self.mode_manual)
+        body.addSpacing(24)
+        body.addWidget(_section_header('Upload Processing'))
+        body.addSpacing(12)
+        self.auto_compress_check = QCheckBox(
+            'Automatically compress oversized clips before upload')
+        self.auto_compress_check.setStyleSheet(checkbox_qss())
+        body.addWidget(self.auto_compress_check)
+        compress_note = QLabel(
+            f'Uses a provider-safe target: Catbox {provider_limit_mb("catbox")} MB · '
+            f'Lustful {provider_limit_mb("lustful")} MB. The original clip stays unchanged.')
+        compress_note.setWordWrap(True)
+        compress_note.setStyleSheet(label_body(Colors.TEXT_MUTED, Fonts.SIZE_BODY))
+        body.addWidget(compress_note)
 
-        # Enable/disable interval combos based on selection
-        self._mode_group.idClicked.connect(self._on_mode_changed)
-
-        # ── Post-upload ──────────────────────────────────────────────────
-        body_layout.addSpacing(24)
-        body_layout.addWidget(_section_header('Post-Upload'))
-        body_layout.addSpacing(12)
-
-        self.auto_delete_check = QCheckBox('Auto-delete local clip after successful upload')
+        body.addSpacing(24)
+        body.addWidget(_section_header('Post-Upload'))
+        body.addSpacing(12)
+        self.auto_delete_check = QCheckBox(
+            'Auto-delete local clip after a confirmed successful upload')
         self.auto_delete_check.setStyleSheet(checkbox_qss())
-        body_layout.addWidget(self.auto_delete_check)
+        body.addWidget(self.auto_delete_check)
+        body.addSpacing(24)
+        self.save_btn = QPushButton('SAVE UPLOAD SETTINGS')
+        self.save_btn.setStyleSheet(button_primary_qss())
+        self.save_btn.clicked.connect(self._on_save)
+        body.addWidget(self.save_btn, alignment=Qt.AlignmentFlag.AlignLeft)
 
-        # ── Save button ──────────────────────────────────────────────────
-        body_layout.addSpacing(28)
-        save_row = QHBoxLayout()
-        save_row.setContentsMargins(0, 0, 0, 0)
-        save_btn = QPushButton('SAVE UPLOAD SETTINGS')
-        save_btn.setStyleSheet(button_primary_qss())
-        save_btn.clicked.connect(self._on_save)
-        save_row.addWidget(save_btn)
-        save_row.addStretch()
-        body_layout.addLayout(save_row)
-        body_layout.addStretch()
-
-        layout.addWidget(self._body)
-
-        if self._no_scroll:
-            outer.addWidget(page)
-        else:
-            scroll.setWidget(page)
-
-    # ── Load / save ───────────────────────────────────────────────────────
-
-    def _load_settings(self):
-        enabled = self._sm.get('upload_enabled', False)
+    def _load_settings(self) -> None:
+        enabled = self._sm.is_enabled()
         self.enable_check.setChecked(enabled)
         self._body.setVisible(enabled)
-
-        self.url_edit.setText(self._sm.get('upload_server_url', ''))
-        self.auth_edit.setText(self._sm.get('upload_auth_header', ''))
-
+        provider = self._sm.get('upload_provider', 'catbox')
+        if provider == 'fthr':
+            provider = 'lustful'
+        index = self.provider_combo.findData(provider)
+        self.provider_combo.setCurrentIndex(index if index >= 0 else 0)
+        self._selected_provider = provider
+        self.catbox_userhash.setText(self._sm.get('catbox_userhash', ''))
         mode = self._sm.get('upload_mode', 'manual')
         self.mode_immediate.setChecked(mode == 'immediate')
         self.mode_interval.setChecked(mode == 'interval')
         self.mode_manual.setChecked(mode == 'manual')
-
-        val  = str(self._sm.get('upload_interval_value', 5))
-        unit = self._sm.get('upload_interval_unit', 'minutes')
-        idx  = self.interval_value.findText(val)
-        self.interval_value.setCurrentIndex(idx if idx >= 0 else 2)
-        self.interval_unit.setCurrentText(unit)
-
+        value = str(self._sm.get('upload_interval_value', 5))
+        index = self.interval_value.findText(value)
+        self.interval_value.setCurrentIndex(index if index >= 0 else 2)
+        self.interval_unit.setCurrentText(self._sm.get('upload_interval_unit', 'minutes'))
+        self.auto_compress_check.setChecked(
+            self._sm.get('upload_auto_compress', False))
         self.auto_delete_check.setChecked(self._sm.get('upload_auto_delete', False))
+        self._apply_provider(provider)
+        self._load_account()
         self._update_interval_controls()
 
-    def _on_save(self):
-        self._sm.set('upload_enabled', self.enable_check.isChecked())
-        url = self.url_edit.text().strip()
-        # A bare host ('myserver.de/upload') gives urlparse an empty netloc
-        # and the upload worker dies with a cryptic connection error.
-        if url and not url.lower().startswith(('http://', 'https://')):
-            url = 'https://' + url
-            self.url_edit.setText(url)
-        self._sm.set('upload_server_url', url)
-        self._sm.set('upload_auth_header', self.auth_edit.text().strip())
-
-        mode_map = {0: 'immediate', 1: 'interval', 2: 'manual'}
-        self._sm.set('upload_mode', mode_map.get(self._mode_group.checkedId(), 'manual'))
-
-        try:
-            val = int(self.interval_value.currentText())
-        except ValueError:
-            val = 5
-        self._sm.set('upload_interval_value', val)
-        self._sm.set('upload_interval_unit', self.interval_unit.currentText())
-        self._sm.set('upload_auto_delete', self.auto_delete_check.isChecked())
-        self._sm.save_settings()
-
-        # Notify UploadManager to re-apply interval timer
-        if hasattr(self._sm, '_upload_manager_ref'):
-            try:
-                self._sm._upload_manager_ref.refresh_settings()
-            except Exception:
-                pass
-
-        self._test_status.setText('Settings saved')
-        self._test_status.setStyleSheet(
-            label_body(Colors.SUCCESS, Fonts.SIZE_BODY))
-        QTimer.singleShot(3000, lambda: (
-            self._test_status.setText('Not tested'),
-            self._test_status.setStyleSheet(label_body(Colors.TEXT_MUTED, Fonts.SIZE_BODY)),
-        ))
-
-    # ── Connection test ───────────────────────────────────────────────────
-
-    def _on_test_connection(self):
-        url  = self.url_edit.text().strip()
-        auth = self.auth_edit.text().strip()
-        if not url:
-            self._test_status.setText('Enter a server URL first')
-            self._test_status.setStyleSheet(label_body(Colors.ERROR, Fonts.SIZE_BODY))
+    def _on_enabled_changed(self, state: int) -> None:
+        requested = bool(state)
+        if self._loading:
+            self._body.setVisible(requested)
             return
+        if requested and not self._sm.is_plugin_installed():
+            try:
+                terms, privacy = self._sm.uploader_legal_text()
+            except Exception as exc:
+                self._reject_enable('Upload Extension Unavailable', str(exc))
+                return
+            accepted = _legal_install_dialog(
+                self,
+                title='Install FTHR Upload Extension',
+                explanation=(
+                    'This separately packaged component contains all provider network '
+                    'code. FTHR Clips Core remains upload-free.'),
+                terms=terms,
+                privacy=privacy,
+                install_label='ACCEPT & INSTALL UPLOADER',
+            )
+            if not accepted:
+                self._reject_enable('', '')
+                return
+            ok, message = self._sm.activate_plugin(
+                UPLOADER_TERMS_VERSION, UPLOADER_PRIVACY_VERSION)
+            if not ok:
+                self._reject_enable('Upload Extension Installation Failed', message)
+                return
+        else:
+            ok, message = self._sm.set_plugin_enabled(requested)
+            if not ok:
+                FthrMessageDialog.warning(self, 'Upload Extension', message)
+                self.enable_check.blockSignals(True)
+                self.enable_check.setChecked(not requested)
+                self.enable_check.blockSignals(False)
+                self._body.setVisible(not requested)
+                return
+        if requested and not self._ensure_provider_ready(
+                self.provider_combo.currentData() or 'catbox'):
+            self._sm.set_plugin_enabled(False)
+            self._reject_enable('', '')
+            return
+        self._body.setVisible(requested)
 
+    def _reject_enable(self, title: str, message: str) -> None:
+        if title and message:
+            FthrMessageDialog.warning(self, title, message)
+        self.enable_check.blockSignals(True)
+        self.enable_check.setChecked(False)
+        self.enable_check.blockSignals(False)
+        self._body.setVisible(False)
+
+    def _ensure_provider_ready(self, provider: str) -> bool:
+        if not self._sm.provider_consent_current(provider):
+            if not _provider_consent_dialog(self, provider):
+                return False
+            version = (
+                CATBOX_LEGAL_VERSION if provider == 'catbox' else LUSTFUL_LEGAL_VERSION)
+            if not self._sm.record_provider_consent(provider, version):
+                FthrMessageDialog.warning(
+                    self, 'Uploader', 'Provider consent could not be saved.')
+                return False
+        if provider != 'lustful' or self._sm.is_hardware_identity_installed():
+            return True
+        try:
+            terms, privacy = self._sm.hardware_legal_text()
+        except Exception as exc:
+            FthrMessageDialog.warning(
+                self, 'Hardware Identity Unavailable', str(exc))
+            return False
+        if not _legal_install_dialog(
+                self,
+                title='Install Lustful Hardware Identity',
+                explanation=(
+                    'Lustful requires a device-bound account. This separate local '
+                    'capability reads the OS machine identity and returns only a '
+                    'derived UUID to the uploader.'),
+                terms=terms,
+                privacy=privacy,
+                install_label='ACCEPT & INSTALL HARDWARE IDENTITY'):
+            return False
+        ok, message = self._sm.activate_hardware_identity(HARDWARE_POLICY_VERSION)
+        if not ok:
+            FthrMessageDialog.warning(
+                self, 'Hardware Identity Installation Failed', message)
+            return False
+        return True
+
+    def _on_provider_changed(self, _index: int) -> None:
+        provider = self.provider_combo.currentData() or 'catbox'
+        previous = self._selected_provider
+        if (not self._loading and self.enable_check.isChecked()
+                and not self._ensure_provider_ready(provider)):
+            old_index = self.provider_combo.findData(previous)
+            self.provider_combo.blockSignals(True)
+            self.provider_combo.setCurrentIndex(old_index if old_index >= 0 else 0)
+            self.provider_combo.blockSignals(False)
+            self._apply_provider(previous)
+            return
+        self._selected_provider = provider
+        self._apply_provider(provider)
+
+    def _apply_provider(self, provider: str) -> None:
+        catbox = provider == 'catbox'
+        self.catbox_panel.setVisible(catbox)
+        self.lustful_panel.setVisible(not catbox)
+        self.website_btn.setText('OPEN CATBOX' if catbox else 'OPEN LUSTFUL')
+        self.provider_note.setText(
+            'Public file hosting through Catbox. Anonymous uploads work without a userhash.'
+            if catbox else
+            'Seven-day clip hosting with a hardware-bound account. Hardware Identity '
+            'is a second optional install and is never needed by Catbox.')
+        self.catbox_donate_btn.setVisible(catbox)
+        self.lustful_donate_btn.setVisible(not catbox)
+
+    def _open_provider(self) -> None:
+        provider = self.provider_combo.currentData() or 'catbox'
+        QDesktopServices.openUrl(QUrl(
+            'https://catbox.moe/' if provider == 'catbox' else LUSTFUL_HOME_URL))
+
+    def _on_save(self) -> None:
+        provider = self.provider_combo.currentData() or 'catbox'
+        if self.enable_check.isChecked() and not self._ensure_provider_ready(provider):
+            return
+        if provider == 'lustful' and self.enable_check.isChecked() and not self._sm.local_account():
+            self._set_account_status('Create or log in to a Lustful account first.', False)
+            return
+        self._sm.set('upload_provider', provider)
+        self._sm.set('catbox_userhash', self.catbox_userhash.text().strip())
+        mode = {0: 'immediate', 1: 'interval', 2: 'manual'}.get(
+            self._mode_group.checkedId(), 'manual')
+        self._sm.set('upload_mode', mode)
+        try:
+            value = int(self.interval_value.currentText())
+        except ValueError:
+            value = 5
+        self._sm.set('upload_interval_value', value)
+        self._sm.set('upload_interval_unit', self.interval_unit.currentText())
+        self._sm.set('upload_auto_compress', self.auto_compress_check.isChecked())
+        self._sm.set('upload_auto_delete', self.auto_delete_check.isChecked())
+        ok, message = self._sm.set_plugin_enabled(self.enable_check.isChecked())
+        if not ok:
+            FthrMessageDialog.warning(self, 'Uploader Settings', message)
+            return
+        self._test_status.setText('Settings saved')
+        self._test_status.setStyleSheet(label_body(Colors.SUCCESS, Fonts.SIZE_BODY))
+        QTimer.singleShot(3000, lambda: self._test_status.setText('Not tested'))
+
+    def _on_test_connection(self) -> None:
+        provider = self.provider_combo.currentData() or 'catbox'
+        if not self._ensure_provider_ready(provider):
+            return
         self.test_btn.setEnabled(False)
         self._test_status.setText('Testing…')
-        self._test_status.setStyleSheet(label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
 
-        def _run():
-            from core.upload_manager import test_server_connection
+        def _run() -> None:
             try:
-                ok, msg = test_server_connection(url, auth)
-            except Exception as e:
-                ok, msg = False, str(e)
-            # Cross-thread signal — queued to the main thread by Qt.
-            self._test_finished.emit(ok, msg)
+                ok, message = self._sm.test_connection({
+                    'upload_provider': provider,
+                    'catbox_userhash': self.catbox_userhash.text().strip(),
+                })
+            except Exception as exc:
+                ok, message = False, str(exc)
+            self._test_finished.emit(ok, message)
 
         self._test_thread = threading.Thread(target=_run, daemon=True)
         self._test_thread.start()
 
-    def _on_test_done(self, ok: bool, msg: str):
+    def _on_test_done(self, ok: bool, message: str) -> None:
         self.test_btn.setEnabled(True)
-        color = Colors.SUCCESS if ok else Colors.ERROR
-        self._test_status.setText(msg)
-        self._test_status.setStyleSheet(label_body(color, Fonts.SIZE_BODY))
+        message = str(message or '').strip()
+        if not ok and not message:
+            message = 'The upload provider did not return a reason.'
+        self._test_status.setText(message)
+        self._test_status.setStyleSheet(label_body(
+            Colors.SUCCESS if ok else Colors.ERROR, Fonts.SIZE_BODY))
+        if not ok:
+            self.connection_failed.emit(message)
 
-    # ── Control state handlers ────────────────────────────────────────────
+    def _start_account_action(self, mode: str) -> None:
+        if not self._ensure_provider_ready('lustful'):
+            return
+        account_id = (
+            secrets.token_hex(8)
+            if mode == 'register'
+            else self.account_edit.text().strip())
+        if not account_id:
+            self._set_account_status('Enter an account ID first.', False)
+            return
+        self.login_btn.setEnabled(False)
+        self.register_btn.setEnabled(False)
+        self._set_account_status(
+            'Creating a new Lustful account…' if mode == 'register'
+            else 'Logging in to Lustful…',
+            None)
 
-    def _on_enabled_changed(self, state):
-        self._body.setVisible(bool(state))
+        def _run() -> None:
+            try:
+                ok, data, message = self._sm.account_action(mode, account_id)
+            except Exception as exc:
+                ok, data, message = False, {}, str(exc)
+            self._account_finished.emit(ok, data, message)
 
-    def _on_mode_changed(self, btn_id: int):
-        self._update_interval_controls()
+        self._account_thread = threading.Thread(target=_run, daemon=True)
+        self._account_thread.start()
 
-    def _update_interval_controls(self):
-        interval_on = self.mode_interval.isChecked()
-        self.interval_value.setEnabled(interval_on)
-        self.interval_unit.setEnabled(interval_on)
+    def _on_account_done(self, ok: bool, data: object, message: str) -> None:
+        self.login_btn.setEnabled(True)
+        self.register_btn.setEnabled(True)
+        if not ok:
+            self._set_account_status(message or 'Could not connect.', False)
+            return
+        result = data if isinstance(data, dict) else {}
+        self.account_edit.setText(str(result.get('account_id', '')))
+        self._load_account()
+        self._set_account_status(message or 'Lustful account connected.', True)
+
+    def _load_account(self) -> None:
+        account = self._sm.local_account()
+        if account:
+            self.account_edit.setText(str(account.get('account_id', '')))
+            self.account_state.setText('CONNECTED')
+            self.account_state.setStyleSheet(
+                label_uppercase(Colors.SUCCESS, Fonts.SIZE_LABEL, 1))
+            self.logout_btn.setVisible(True)
+        else:
+            self.account_state.setText('NOT CONNECTED')
+            self.account_state.setStyleSheet(
+                label_uppercase(Colors.TEXT_MUTED, Fonts.SIZE_LABEL, 1))
+            self.logout_btn.setVisible(False)
+
+    def _logout(self) -> None:
+        try:
+            ok, message = self._sm.logout_account()
+        except Exception as exc:
+            ok, message = False, str(exc)
+        if not ok:
+            self._set_account_status(message or 'Could not log out.', False)
+            return
+        self.account_edit.clear()
+        self._load_account()
+        self._set_account_status('Local Lustful account removed.', True)
+
+    def _set_account_status(self, message: str, ok: bool | None) -> None:
+        color = Colors.TEXT_DIM
+        if ok is True:
+            color = Colors.SUCCESS
+        elif ok is False:
+            color = Colors.ERROR
+        self.account_status.setText(message)
+        self.account_status.setStyleSheet(label_body(color, Fonts.SIZE_BODY))
+
+    def _update_interval_controls(self) -> None:
+        enabled = self.mode_interval.isChecked()
+        self.interval_value.setEnabled(enabled)
+        self.interval_unit.setEnabled(enabled)

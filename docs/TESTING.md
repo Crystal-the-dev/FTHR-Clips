@@ -172,8 +172,7 @@ None of these are covered by CI, and none have been performed:
 - Install → update → uninstall of the AppImage
 - Soak: 2 hours, 50+ clips, watching RSS, fds, threads and zombies
 
-Record these separately from automated results; `KNOWN_ISSUES.md` identifies
-which product paths remain unverified.
+See `RELEASE_CHECKLIST.md` for which of these block a tag.
 
 ## Reporting a bug
 

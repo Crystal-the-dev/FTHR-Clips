@@ -52,7 +52,11 @@ def mix_multiband_clip(
         + f';{mix_inputs}amix=inputs={n}:duration=first:dropout_transition=0[aout]'
     )
 
-    with tempfile.TemporaryDirectory(dir=os.path.dirname(clip_path)) as td:
+    # Keep the transient MP4 in an app-owned hidden directory.  The clip grid
+    # scans one level below the library root, so a generic TemporaryDirectory
+    # would otherwise briefly appear as a second clip during the mix.
+    with tempfile.TemporaryDirectory(
+            prefix='.fthr-audio-', dir=os.path.dirname(clip_path)) as td:
         out_path = os.path.join(td, 'mixed.mp4')
         cmd = (
             [ffmpeg_exe, '-y', '-i', clip_path]

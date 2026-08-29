@@ -17,7 +17,9 @@ sys.path.insert(0, str(ROOT / 'FTHR_UI'))
 
 from core import ffmpeg_tools  # noqa: E402
 from core.ffmpeg_tools import (  # noqa: E402
-    FFmpegUnavailable, software_video_args, get_ffmpeg_exe, reset_cache,
+    FFmpegUnavailable, get_ffmpeg_exe, reset_cache,
+    maximum_quality_video_args,
+    size_constrained_video_args, software_video_args,
 )
 
 
@@ -58,10 +60,55 @@ def test_openh264_disables_frame_skipping(monkeypatch):
     assert args[i + 1] == '0'
 
 
+def test_maximum_quality_openh264_uses_the_highest_bounded_bitrate(monkeypatch):
+    monkeypatch.setattr(ffmpeg_tools, '_probe_encoders', lambda _ff: 'libopenh264')
+
+    args = maximum_quality_video_args(ffmpeg='dummy')
+
+    assert args[args.index('-b:v') + 1] == '200000k'
+    assert args[args.index('-allow_skip_frames') + 1] == '0'
+    assert '-crf' not in args
+
+
+def test_maximum_quality_uses_true_lossless_x264_when_available(monkeypatch):
+    monkeypatch.setattr(ffmpeg_tools, '_probe_encoders', lambda _ff: 'libx264')
+
+    args = maximum_quality_video_args(ffmpeg='dummy')
+
+    assert args[args.index('-crf') + 1] == '0'
+    assert args[args.index('-preset') + 1] == 'veryslow'
+    assert '-b:v' not in args
+
+
 def test_bitrate_is_honoured(monkeypatch):
     monkeypatch.setattr(ffmpeg_tools, '_probe_encoders', lambda _ff: 'libopenh264')
     args = software_video_args(bitrate_kbps=4500, ffmpeg='dummy')
     assert '4500k' in args
+
+
+def test_software_transcodes_preserve_sdr_bt709_range(monkeypatch):
+    monkeypatch.setattr(ffmpeg_tools, '_probe_encoders', lambda _ff: 'libopenh264')
+    args = software_video_args(ffmpeg='dummy')
+
+    assert args[args.index('-color_range') + 1] == 'tv'
+    assert args[args.index('-colorspace') + 1] == 'bt709'
+    assert args[args.index('-color_primaries') + 1] == 'bt709'
+    assert args[args.index('-color_trc') + 1] == 'bt709'
+    assert args[args.index('-bsf:v') + 1].startswith(
+        'h264_metadata=video_full_range_flag=0')
+
+
+def test_size_constrained_args_replace_quality_only_rate_control(monkeypatch):
+    monkeypatch.setattr(
+        ffmpeg_tools, 'software_video_args',
+        lambda _bitrate, _ffmpeg: [
+            '-c:v', 'test-h264', '-preset', 'fast', '-crf', '18'],
+    )
+
+    args = size_constrained_video_args(3200, 'dummy')
+
+    assert '-crf' not in args
+    assert args[args.index('-b:v') + 1] == '3200k'
 
 
 def test_probe_prefers_openh264_over_x264():

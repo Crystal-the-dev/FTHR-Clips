@@ -53,6 +53,14 @@ void ActivityGatingAndIntervalSelectionAreDeterministic() {
         "source outside saved interval is excluded");
     CheckAudio(registry.SourcesForInterval(0, 400).front().identity.display_name == "VALORANT",
         "silent discovered browser is not fabricated into a clip");
+
+    const auto quiet_music = Source(
+        "23232323-2323-4232-8232-232323232323", "Quiet Music");
+    CheckAudio(registry.Discover(quiet_music), "quiet music source is discovered");
+    registry.ObserveActivity(quiet_music.identity.id, 0.0006f, 300);
+    CheckAudio(registry.ObserveActivity(quiet_music.identity.id, 0.0006f, 400)
+                   == fthr::AudioSourceAdmission::Accepted,
+        "quiet background music is admitted above the digital-silence floor");
 }
 
 void EndedHistorySurvivesAndGenerationDoesNotMix() {
@@ -88,6 +96,8 @@ void SourceLimitAndSanitizationStaySafe() {
     CheckAudio(fthr::SanitizeAudioSourceText("C:/Users/Tom/Discord?token=x", 128)
                    == "CUsersTomDiscordtokenx",
         "manifest text removes path separators and sensitive punctuation");
+    CheckAudio(fthr::SanitizeAudioSourceText("KovaaK's", 128) == "KovaaK's",
+        "friendly application names can preserve an ASCII apostrophe");
 }
 
 void EncodedPacketRingIsBoundedAndSnapshotsOverlap() {

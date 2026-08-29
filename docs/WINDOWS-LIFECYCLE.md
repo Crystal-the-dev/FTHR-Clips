@@ -2,14 +2,21 @@
 
 ## Product rule
 
-On Windows, closing the main FTHR window hides it to the system tray when the
-native tray is available. Capture, replay history, hotkeys, upload scheduling
-and the single capture-engine process continue running. Normal minimize keeps
-its existing taskbar behaviour. `Exit FTHR` in the tray menu is the deliberate
-full-exit action.
+On Windows, **Minimize to system tray when closing FTHR** controls the window
+lifecycle and is enabled by default. With it enabled, X hides the main FTHR
+window to the system tray when the native tray is available. Capture, replay
+history, hotkeys, upload scheduling and the single capture-engine process
+continue running. Normal minimize keeps its existing taskbar behaviour. The
+title-bar power icon and `Exit FTHR` in the tray menu are deliberate full-exit
+actions. With the setting disabled, the power icon is hidden and X performs
+that same full exit.
 
 If Windows reports no tray support, FTHR does not hide the only window. A close
 instead starts the bounded full-exit path.
+
+Hiding to tray also sends one compact top-right capture card that identifies
+the active source and states that capture continues in the background. Restoring
+the main window dismisses that card without restarting capture.
 
 ## Startup and single instance
 

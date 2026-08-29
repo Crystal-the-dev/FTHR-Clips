@@ -18,7 +18,7 @@ bool IsUuidCharacter(char value) {
 
 bool IsManifestCharacter(unsigned char value) {
     return std::isalnum(value) || value == ' ' || value == '.' || value == '_'
-        || value == '-' || value == '+' || value == '(' || value == ')';
+        || value == '-' || value == '+' || value == '(' || value == ')' || value == '\'';
 }
 
 }  // namespace
@@ -139,6 +139,25 @@ void AudioSourceRegistry::MarkFailed(const AudioSourceId& id) {
     it->second.state.health = AudioSourceHealth::Failed;
     it->second.state.active_in_generation = false;
     ++it->second.state.failure_count;
+}
+
+uint32_t AudioSourceRegistry::ReleaseAdmissionsOlderThan(int64_t cutoff_100ns) {
+    uint32_t released = 0;
+    for (auto& [id, source] : sources_) {
+        auto& state = source.state;
+        if (!state.admitted || state.active_in_generation
+                || state.last_active_100ns < 0
+                || state.last_active_100ns >= cutoff_100ns) {
+            continue;
+        }
+        state.admitted = false;
+        state.health = AudioSourceHealth::Ended;
+        const auto gate = gates_.find(id);
+        if (gate != gates_.end()) gate->second.Reset();
+        if (admitted_count_ > 0) --admitted_count_;
+        ++released;
+    }
+    return released;
 }
 
 std::vector<AudioSourceMetadata> AudioSourceRegistry::SourcesForInterval(

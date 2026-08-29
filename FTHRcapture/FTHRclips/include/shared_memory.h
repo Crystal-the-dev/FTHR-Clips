@@ -94,6 +94,7 @@ namespace fthr {
         STATUS_UPDATE = 4,
         ERROR_OCCURRED = 5,
         SAVE_STARTED = 6,   // Phase 3: async SaveClip queued successfully
+        MANUAL_RECORDING_ERROR = 7,
     };
 
     // v4 capture-health status bits.  These are continuous status, not command

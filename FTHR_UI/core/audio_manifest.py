@@ -23,7 +23,7 @@ MANIFEST_SUFFIX = '.fthr-audio.json'
 # native muxer; otherwise a valid rich clip would silently fall back to wrong
 # generic playback labels.
 MAX_SOURCES = 10
-_SAFE_TEXT = re.compile(r'^[A-Za-z0-9 ._+()\-]{1,128}$')
+_SAFE_TEXT = re.compile(r"^[A-Za-z0-9 ._+()'\-]{1,128}$")
 _SOURCE_TYPES = frozenset({'application', 'microphone', 'system'})
 
 
@@ -123,6 +123,36 @@ def write_manifest_atomic(manifest: dict[str, Any], media_path: str | Path) -> P
             pass
         raise AudioManifestError(f'could not publish manifest: {error}') from error
     return destination
+
+
+def rebind_manifest_after_media_replace(media_path: str | Path) -> bool:
+    """Re-bind an existing native sidecar after a lossless media rewrite.
+
+    Video post-processing can replace the MP4 while stream-copying all of its
+    audio tracks. The source identities are still valid in that case, but the
+    media SHA-256 necessarily changes. Read and validate the old sidecar
+    *without* accepting it for playback, update only its exact-media binding,
+    and publish it atomically.
+
+    Returns ``False`` for legacy/imported clips and for an invalid sidecar. A
+    caller must only invoke this after a command which explicitly maps every
+    original audio stream in its original order.
+    """
+
+    media = Path(media_path)
+    sidecar = manifest_path_for(media)
+    if not sidecar.is_file() or not media.is_file():
+        return False
+    try:
+        manifest = json.loads(sidecar.read_text(encoding='utf-8'))
+        validate_manifest(manifest)
+        if manifest.get('media_file') != media.name:
+            return False
+        manifest['media_sha256'] = media_sha256(media)
+        write_manifest_atomic(manifest, media)
+        return True
+    except (OSError, json.JSONDecodeError, AudioManifestError):
+        return False
 
 
 def read_manifest_for_media(media_path: str | Path) -> dict[str, Any] | None:

@@ -104,14 +104,15 @@ exists.
 
 ## Future package identity decision
 
-Do not convert the alpha to MSIX now. The existing border policy correctly
-reports no border removal for this unpackaged Inno build. When Windows 11
-borderless WGC qualification is scheduled, evaluate an identity-only sparse
-package (MSIX with external location) alongside this installer. It can grant
-package identity while retaining the EXE location and Inno update path, but it
-requires its own manifest, matching signed package identity, registration and
-unregistration, and Windows 11 physical qualification. No current installer
-claims that capability.
+Do not convert the alpha to MSIX now. The unpackaged Inno build follows the old
+FTHR capture behavior: it directly applies `IsBorderRequired(false)` to each
+WGC session without prompting for package capability access, then verifies the
+result. If Windows refuses the opt-out, the engine closes WGC before capture
+starts and falls back to DXGI so active capture remains free of the Windows
+indicator. Any future package-identity work must preserve this no-prompt,
+no-visible-border contract and requires its own manifest and Windows physical
+qualification. See `WINDOWS-CAPTURE-BORDER-CHANGE.md` for the implementation
+record.
 
 ## Build and gates
 

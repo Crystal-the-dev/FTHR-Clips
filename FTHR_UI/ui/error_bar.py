@@ -5,12 +5,6 @@ from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton
 
 from ui.style import Colors, Fonts, Sizes
 
-_LEVEL_COLOR: dict[str, str] = {
-    'error':   Colors.ERROR,
-    'warning': Colors.WARNING,
-}
-
-
 class ErrorBar(QFrame):
     """Persistent error bar at the bottom of the main window.
 
@@ -39,6 +33,7 @@ class ErrorBar(QFrame):
 
         sep = QLabel('—')
         sep.setStyleSheet(f'background: transparent; color: {Colors.TEXT};')
+        self._separator = sep
         self._layout.addWidget(sep)
 
         self._detail = QLabel()
@@ -53,7 +48,7 @@ class ErrorBar(QFrame):
         self._more_lbl = QLabel()
         self._more_lbl.setStyleSheet(
             f'font-size: {Fonts.SIZE_LABEL}px; font-family: {Fonts.DISPLAY};'
-            f' letter-spacing: 1px; background: transparent; color: #888;'
+            f' letter-spacing: 1px; background: transparent; color: {Colors.TEXT_DIM};'
         )
         self._more_lbl.setVisible(False)
         self._layout.addWidget(self._more_lbl)
@@ -63,11 +58,28 @@ class ErrorBar(QFrame):
         self._dismiss_btn.setFixedWidth(28)
         self._dismiss_btn.setStyleSheet(
             'QPushButton { background: transparent; border: none;'
-            ' color: #888; font-size: 14px; }'
-            'QPushButton:hover { color: white; }'
+            f' color: {Colors.TEXT_DIM}; font-size: 14px; }}'
+            f'QPushButton:hover {{ color: {Colors.TEXT}; }}'
         )
         self._dismiss_btn.clicked.connect(self.dismiss_current)
         self._layout.addWidget(self._dismiss_btn)
+
+    def refresh_theme(self) -> None:
+        """Refresh both idle chrome and any currently displayed error."""
+        self._separator.setStyleSheet(
+            f'background: transparent; color: {Colors.TEXT};')
+        self._detail.setStyleSheet(
+            f'font-size: {Fonts.SIZE_BODY}px; font-family: {Fonts.BODY};'
+            f' background: transparent; color: {Colors.TEXT};')
+        self._more_lbl.setStyleSheet(
+            f'font-size: {Fonts.SIZE_LABEL}px; font-family: {Fonts.DISPLAY};'
+            f' letter-spacing: 1px; background: transparent; color: {Colors.TEXT_DIM};')
+        self._dismiss_btn.setStyleSheet(
+            'QPushButton { background: transparent; border: none;'
+            f' color: {Colors.TEXT_DIM}; font-size: 14px; }}'
+            f'QPushButton:hover {{ color: {Colors.TEXT}; }}')
+        if self._current is not None:
+            self._show(self._current)
 
     # ------------------------------------------------------------------
     # Public API
@@ -117,7 +129,12 @@ class ErrorBar(QFrame):
 
     def _show(self, entry: dict) -> None:
         self._current = entry
-        color = _LEVEL_COLOR.get(entry['level'], Colors.ERROR)
+        # Resolve the token at display time so an applied theme also affects
+        # errors that arrive after the settings page was left open.
+        color = {
+            'error': Colors.ERROR,
+            'warning': Colors.WARNING,
+        }.get(entry['level'], Colors.ERROR)
 
         self.setStyleSheet(f'''
             QFrame {{

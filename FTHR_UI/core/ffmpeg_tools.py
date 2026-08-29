@@ -15,7 +15,7 @@ Two separate problems collapsed into one fix (AUDIT-005):
 
 2. **It was already broken on Windows.** ``imageio_ffmpeg`` is not actually
    present in the frozen Windows bundle (no package directory, no binary), so
-   every ``get_ffmpeg_exe()`` call raised and the watermark, auto-crop, webcam
+   every ``get_ffmpeg_exe()`` call raised and the watermark, webcam
    overlay and clip-export paths silently degraded in the shipped build.
 
 Both are solved by using the **same LGPL FFmpeg that already ships next to the
@@ -42,6 +42,13 @@ _NO_WINDOW = {'creationflags': 0x08000000} if sys.platform == 'win32' else {}
 
 _EXE_NAME = 'ffmpeg.exe' if sys.platform == 'win32' else 'ffmpeg'
 _PROBE_NAME = 'ffprobe.exe' if sys.platform == 'win32' else 'ffprobe'
+
+# The editor's normal transcode is intentionally bounded for optional
+# post-processing. Export and full-quality Share have a different contract:
+# when an edit makes a transcode unavoidable, they should preserve as much of
+# the source as the reviewed encoder can carry. OpenH264 has no CRF/lossless
+# mode, so this uses the largest bitrate accepted by the capture settings.
+MAXIMUM_QUALITY_VIDEO_BITRATE_KBPS = 200_000
 
 # Resolved lazily, then cached — resolution touches the filesystem and the
 # encoder probe spawns a process; neither should happen per clip.
@@ -130,7 +137,7 @@ def get_ffmpeg_exe() -> str:
     raise FFmpegUnavailable(
         'No ffmpeg binary found. FTHR Clips ships one next to the capture '
         'engine; if this is a source checkout, run the build script or install '
-        'ffmpeg and make sure it is on your PATH. Watermark, auto-crop, webcam '
+        'ffmpeg and make sure it is on your PATH. Watermark, webcam '
         'overlay and clip export need it.'
     )
 
@@ -198,6 +205,25 @@ def software_h264_encoder(ffmpeg: Optional[str] = None) -> str:
     return _cached_encoder
 
 
+def _sdr_color_args() -> list[str]:
+    """Return the color metadata shared by every editor video transcode."""
+    # Editor/share transcodes must retain the capture engine's SDR range. If
+    # this metadata is omitted, Windows players can guess full-range YUV and
+    # expand studio-range samples a second time, making the saved clip brighter.
+    return [
+        '-color_range', 'tv',
+        '-colorspace', 'bt709',
+        '-color_primaries', 'bt709',
+        '-color_trc', 'bt709',
+        # OpenH264 retains range/matrix on AVCodecContext but does not copy
+        # primaries/transfer into its SPS. Patch the H.264 VUI in the reviewed
+        # post-encode bitstream stage so exports carry the complete contract.
+        '-bsf:v',
+        ('h264_metadata=video_full_range_flag=0:colour_primaries=1:'
+         'transfer_characteristics=1:matrix_coefficients=1'),
+    ]
+
+
 def software_video_args(bitrate_kbps: int = 16000,
                         ffmpeg: Optional[str] = None) -> list[str]:
     """ffmpeg arguments selecting the software H.264 encoder and its quality.
@@ -211,6 +237,7 @@ def software_video_args(bitrate_kbps: int = 16000,
     short, high-motion clips this tool produces.
     """
     enc = software_h264_encoder(ffmpeg)
+    color_args = _sdr_color_args()
 
     if enc == 'libopenh264':
         return [
@@ -220,13 +247,80 @@ def software_video_args(bitrate_kbps: int = 16000,
             # against the audio track muxed in afterwards.
             '-allow_skip_frames', '0',
             '-profile:v', 'high',
+            *color_args,
         ]
     if enc == 'libx264':
         # Only reachable via a third-party/system FFmpeg that still has x264.
         # FTHR does not ship this path.
-        return ['-c:v', 'libx264', '-preset', 'superfast', '-crf', '18']
+        return [
+            '-c:v', 'libx264', '-preset', 'superfast', '-crf', '18',
+            *color_args,
+        ]
     # h264_mf (Windows MediaFoundation) and anything else: bitrate only.
-    return ['-c:v', enc, '-b:v', f'{bitrate_kbps}k']
+    return ['-c:v', enc, '-b:v', f'{bitrate_kbps}k', *color_args]
+
+
+def maximum_quality_video_args(ffmpeg: Optional[str] = None) -> list[str]:
+    """Return the highest-quality video arguments for editor exports.
+
+    Untouched clips are stream-copied by the editor, which is the only way to
+    preserve every source bit. Once a crop, effect, stretch, watermark, or
+    timeline edit requires decoding and re-encoding, use a quality mode suited
+    to the encoder that is actually available:
+
+    * x264 can produce mathematically lossless H.264 with CRF 0;
+    * the shipped OpenH264 build has no constant-quality/lossless option, so
+      its 200 Mbps ceiling is used with frame skipping disabled;
+    * other H.264 encoders receive the same high bitrate fallback.
+
+    This helper is deliberately separate from :func:`software_video_args` so
+    bounded post-processing and size-constrained upload paths keep their
+    existing behavior.
+    """
+    enc = software_h264_encoder(ffmpeg)
+    color_args = _sdr_color_args()
+    if enc == 'libx264':
+        return [
+            '-c:v', 'libx264',
+            '-preset', 'veryslow',
+            '-crf', '0',
+            *color_args,
+        ]
+    if enc == 'libopenh264':
+        return [
+            '-c:v', 'libopenh264',
+            '-b:v', f'{MAXIMUM_QUALITY_VIDEO_BITRATE_KBPS}k',
+            '-allow_skip_frames', '0',
+            '-profile:v', 'high',
+            *color_args,
+        ]
+    return [
+        '-c:v', enc,
+        '-b:v', f'{MAXIMUM_QUALITY_VIDEO_BITRATE_KBPS}k',
+        *color_args,
+    ]
+
+
+def size_constrained_video_args(
+        bitrate_kbps: int, ffmpeg: Optional[str] = None) -> list[str]:
+    """Return H.264 arguments whose bitrate is a real file-size constraint.
+
+    The normal third-party libx264 path uses CRF for quality exports. A target
+    file size cannot rely on CRF, so this variant replaces it with ABR while
+    retaining the reviewed encoder and preset selection.
+    """
+    args = software_video_args(bitrate_kbps, ffmpeg)
+    constrained: list[str] = []
+    index = 0
+    while index < len(args):
+        if args[index] == '-crf' and index + 1 < len(args):
+            index += 2
+            continue
+        constrained.append(args[index])
+        index += 1
+    if '-b:v' not in constrained:
+        constrained += ['-b:v', f'{int(bitrate_kbps)}k']
+    return constrained
 
 
 def reset_cache() -> None:

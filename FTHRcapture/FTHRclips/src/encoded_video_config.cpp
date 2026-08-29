@@ -55,4 +55,13 @@ AVCodecID ToAvCodecId(VideoCodec codec) noexcept {
     return AV_CODEC_ID_NONE;
 }
 
+void ApplySdrBt709ColorMetadata(AVCodecParameters* parameters) noexcept {
+    if (!parameters) return;
+    parameters->color_range = AVCOL_RANGE_MPEG;
+    parameters->color_primaries = AVCOL_PRI_BT709;
+    parameters->color_trc = AVCOL_TRC_BT709;
+    parameters->color_space = AVCOL_SPC_BT709;
+    parameters->chroma_location = AVCHROMA_LOC_LEFT;
+}
+
 } // namespace fthr

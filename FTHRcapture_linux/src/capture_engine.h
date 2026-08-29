@@ -29,6 +29,7 @@ struct CaptureConfig {
     bool      audio_enabled    = true;
     std::vector<AudioCategoryConfig> audio_categories;
     CodecPref codec_pref = CodecPref::Auto;
+    EncoderPref encoder_pref = EncoderPref::Auto;
     int       preset     = 4;
 };
 

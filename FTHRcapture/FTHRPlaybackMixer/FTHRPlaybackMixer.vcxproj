@@ -35,11 +35,11 @@
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile><WarningLevel>Level4</WarningLevel><SDLCheck>true</SDLCheck><ConformanceMode>true</ConformanceMode><LanguageStandard>stdcpp17</LanguageStandard><AdditionalIncludeDirectories>$(ProjectDir)..\FTHRclips\third_party\ffmpeg\include;$(ProjectDir)..\..\FTHRcapture_common;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories></ClCompile>
-    <Link><GenerateDebugInformation>true</GenerateDebugInformation><AdditionalLibraryDirectories>$(ProjectDir)..\FTHRclips\third_party\ffmpeg\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories><AdditionalDependencies>avcodec.lib;avformat.lib;avutil.lib;swresample.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
+    <Link><GenerateDebugInformation>true</GenerateDebugInformation><AdditionalLibraryDirectories>$(ProjectDir)..\FTHRclips\third_party\ffmpeg\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories><AdditionalDependencies>avcodec.lib;avfilter.lib;avformat.lib;avutil.lib;swresample.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile><WarningLevel>Level4</WarningLevel><FunctionLevelLinking>true</FunctionLevelLinking><IntrinsicFunctions>true</IntrinsicFunctions><SDLCheck>true</SDLCheck><ConformanceMode>true</ConformanceMode><LanguageStandard>stdcpp17</LanguageStandard><AdditionalIncludeDirectories>$(ProjectDir)..\FTHRclips\third_party\ffmpeg\include;$(ProjectDir)..\..\FTHRcapture_common;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories></ClCompile>
-    <Link><GenerateDebugInformation>true</GenerateDebugInformation><AdditionalLibraryDirectories>$(ProjectDir)..\FTHRclips\third_party\ffmpeg\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories><AdditionalDependencies>avcodec.lib;avformat.lib;avutil.lib;swresample.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
+    <Link><GenerateDebugInformation>true</GenerateDebugInformation><AdditionalLibraryDirectories>$(ProjectDir)..\FTHRclips\third_party\ffmpeg\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories><AdditionalDependencies>avcodec.lib;avfilter.lib;avformat.lib;avutil.lib;swresample.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
   </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

@@ -314,6 +314,11 @@ public:
         codec_context_->width = static_cast<int>(output_width);
         codec_context_->height = static_cast<int>(output_height);
         codec_context_->pix_fmt = AV_PIX_FMT_D3D11;
+        codec_context_->color_range = AVCOL_RANGE_MPEG;
+        codec_context_->color_primaries = AVCOL_PRI_BT709;
+        codec_context_->color_trc = AVCOL_TRC_BT709;
+        codec_context_->colorspace = AVCOL_SPC_BT709;
+        codec_context_->chroma_sample_location = AVCHROMA_LOC_LEFT;
         codec_context_->time_base = AVRational{1, static_cast<int>(config.fps)};
         codec_context_->framerate = AVRational{static_cast<int>(config.fps), 1};
         codec_context_->bit_rate = static_cast<int64_t>(config.bitrate_kbps) * 1000;

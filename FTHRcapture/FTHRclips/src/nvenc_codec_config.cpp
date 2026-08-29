@@ -89,6 +89,17 @@ bool ConfigureNvencCodec(
         h264.outputPictureTimingSEI = 0;
         h264.outputBufferingPeriodSEI = 0;
         h264.h264VUIParameters.timingInfoPresentFlag = 0;
+        h264.h264VUIParameters.videoSignalTypePresentFlag = 1;
+        h264.h264VUIParameters.videoFormat =
+            NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
+        h264.h264VUIParameters.videoFullRangeFlag = 0;
+        h264.h264VUIParameters.colourDescriptionPresentFlag = 1;
+        h264.h264VUIParameters.colourPrimaries =
+            NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+        h264.h264VUIParameters.transferCharacteristics =
+            NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+        h264.h264VUIParameters.colourMatrix =
+            NV_ENC_VUI_MATRIX_COEFFS_BT709;
         h264.inputBitDepth = NV_ENC_BIT_DEPTH_8;
         h264.outputBitDepth = NV_ENC_BIT_DEPTH_8;
         return true;
@@ -101,6 +112,17 @@ bool ConfigureNvencCodec(
         hevc.outputPictureTimingSEI = 0;
         hevc.outputBufferingPeriodSEI = 0;
         hevc.hevcVUIParameters.timingInfoPresentFlag = 0;
+        hevc.hevcVUIParameters.videoSignalTypePresentFlag = 1;
+        hevc.hevcVUIParameters.videoFormat =
+            NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
+        hevc.hevcVUIParameters.videoFullRangeFlag = 0;
+        hevc.hevcVUIParameters.colourDescriptionPresentFlag = 1;
+        hevc.hevcVUIParameters.colourPrimaries =
+            NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+        hevc.hevcVUIParameters.transferCharacteristics =
+            NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+        hevc.hevcVUIParameters.colourMatrix =
+            NV_ENC_VUI_MATRIX_COEFFS_BT709;
         hevc.disableSPSPPS = 1;
         hevc.repeatSPSPPS = 0;
         hevc.inputBitDepth = NV_ENC_BIT_DEPTH_8;
@@ -122,6 +144,12 @@ bool ConfigureNvencCodec(
         av1.repeatSeqHdr = 1;
         av1.inputBitDepth = NV_ENC_BIT_DEPTH_8;
         av1.outputBitDepth = NV_ENC_BIT_DEPTH_8;
+        av1.colorPrimaries = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+        av1.transferCharacteristics =
+            NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+        av1.matrixCoefficients = NV_ENC_VUI_MATRIX_COEFFS_BT709;
+        av1.colorRange = 0;
+        av1.chromaSamplePosition = 1;
         return true;
     }
     }

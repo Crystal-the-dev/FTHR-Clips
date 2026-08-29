@@ -27,9 +27,15 @@
 //            aspect ratio from the captured source.
 //   argv[10] monitor_path   Stable normalized Windows monitor device path.
 //   argv[11] codec_pref     0 = auto/H.264, 1 = H.264, 2 = HEVC, 3 = AV1.
+//   argv[12] encoder_preset NVIDIA NVENC preset P1-P7. Default: P4.
+//   argv[13] multiband      Retired; retained as a zero-only ABI slot.
+//   argv[14] audio_enabled  0 = disable all audio capture.
 //   argv[15] microphone_endpoint_id  Empty = Default microphone; otherwise a
 //            stable native eCapture endpoint ID selected by the settings page.
 //   argv[16] microphone_gain_percent Capture-input gain, clamped to 0-200.
+//   argv[17] encoder_pref   0=Auto, 1=NVIDIA, 2=AMD, 3=Intel, 4=Software.
+//   argv[18] crop_enabled   1 applies argv[19..22] before encoder input.
+//   argv[19..22] crop_x, crop_y, crop_width, crop_height normalized to source.
 //
 // Threading:
 //   This file runs entirely on the main thread.
@@ -40,6 +46,9 @@
 #include "hardware_encoder.h"  // DetectNVENC() for pre-init logging
 #include "windows_microphone_audio_provider.h"
 #include <algorithm>
+#include <cerrno>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <Windows.h>
@@ -54,6 +63,17 @@ static uint32_t ParseArgU32(int argc, char* argv[], int index, uint32_t default_
     int val = std::atoi(argv[index]);
     if (val < 0) return default_val;
     return static_cast<uint32_t>(val);
+}
+
+static double ParseArgDouble(
+    int argc, char* argv[], int index, double default_val) {
+    if (index >= argc || !argv[index]) return default_val;
+    errno = 0;
+    char* end = nullptr;
+    const double value = std::strtod(argv[index], &end);
+    if (errno != 0 || end == argv[index] || (end && *end != '\0')
+        || !std::isfinite(value)) return default_val;
+    return value;
 }
 
 // Parse a 64-bit unsigned integer from argv (used for HWND on 64-bit Windows).
@@ -85,6 +105,21 @@ static std::string Utf8FromWide(const std::wstring& value) {
     std::string result(static_cast<size_t>(length), '\0');
     if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.c_str(), -1,
             result.data(), length, nullptr, nullptr) != length) {
+        return {};
+    }
+    result.pop_back();
+    return result;
+}
+
+static std::wstring WideFromUtf8(const std::string& value) {
+    if (value.empty()) return {};
+    const int length = MultiByteToWideChar(
+        CP_UTF8, MB_ERR_INVALID_CHARS, value.c_str(), -1, nullptr, 0);
+    if (length <= 1) return {};
+    std::wstring result(static_cast<size_t>(length), L'\0');
+    if (MultiByteToWideChar(
+            CP_UTF8, MB_ERR_INVALID_CHARS, value.c_str(), -1,
+            result.data(), length) != length) {
         return {};
     }
     result.pop_back();
@@ -142,6 +177,9 @@ static void PrintConfig(const fthr::CaptureConfig& cfg) {
     std::cout << "  Bitrate      : " << cfg.bitrate_kbps << " kbps" << std::endl;
     std::cout << "  Video codec  : " << fthr::VideoCodecName(cfg.video_codec)
               << std::endl;
+    std::cout << "  Encoder pref : "
+              << static_cast<uint32_t>(cfg.encoder_preference) << std::endl;
+    std::cout << "  NVENC preset : P" << cfg.encoder_preset << std::endl;
     std::cout << "  Raw budget   : " << cfg.max_buffer_mb
               << " MB (diagnostic only; automatic fallback disabled)" << std::endl;
 
@@ -160,6 +198,7 @@ static void PrintConfig(const fthr::CaptureConfig& cfg) {
     std::cout << "  Audio        : "
               << (cfg.audio_enabled ? "Enabled" : "Disabled (user setting)")
               << std::endl;
+    std::cout << "  Audio tracks : System mix + microphone" << std::endl;
     if (cfg.audio_enabled) {
         std::cout << "  Microphone   : "
                   << (cfg.microphone_endpoint_id.empty() ? "Default microphone"
@@ -215,10 +254,11 @@ int main(int argc, char* argv[]) {
     // argv[10] = capture_monitor  (stable Windows monitor device path)
     // argv[11] = codec_pref       (0=auto/H.264, 1=H.264, 2=HEVC, 3=AV1)
     // argv[12] = encoder_preset   (same)
-    // argv[13] = multiband_arg    (Windows uses per-app WASAPI; multiband handled in engine)
+    // argv[13] = retired multiband slot (ignored)
     // argv[14] = audio_enabled    (0 = disable WASAPI loopback capture)
     config.monitor_device_path = ParseArgUtf8(argc, argv, 10);
-    switch (ParseArgU32(argc, argv, 11, 0)) {
+    const uint32_t codec_preference_arg = ParseArgU32(argc, argv, 11, 0);
+    switch (codec_preference_arg) {
     case 0:
     case 1:
         config.video_codec = fthr::VideoCodec::H264;
@@ -235,10 +275,25 @@ int main(int argc, char* argv[]) {
         config.video_codec = fthr::VideoCodec::H264;
         break;
     }
+    config.encoder_preset = std::clamp<uint32_t>(
+        ParseArgU32(argc, argv, 12, 4), 1, 7);
+    config.multiband_enabled = false;
     config.audio_enabled = (ParseArgU32(argc, argv, 14, 1) != 0);
     config.microphone_endpoint_id = ParseArgUtf8(argc, argv, 15);
     config.microphone_gain_percent = std::min<uint32_t>(
         ParseArgU32(argc, argv, 16, 100), 200);
+    switch (ParseArgU32(argc, argv, 17, 0)) {
+    case 1: config.encoder_preference = fthr::EncoderPreference::Nvidia; break;
+    case 2: config.encoder_preference = fthr::EncoderPreference::Amd; break;
+    case 3: config.encoder_preference = fthr::EncoderPreference::Intel; break;
+    case 4: config.encoder_preference = fthr::EncoderPreference::Software; break;
+    default: config.encoder_preference = fthr::EncoderPreference::Auto; break;
+    }
+    config.crop_enabled = (ParseArgU32(argc, argv, 18, 0) != 0);
+    config.crop_x = ParseArgDouble(argc, argv, 19, 0.0);
+    config.crop_y = ParseArgDouble(argc, argv, 20, 0.0);
+    config.crop_width = ParseArgDouble(argc, argv, 21, 1.0);
+    config.crop_height = ParseArgDouble(argc, argv, 22, 1.0);
 
     // ------------------------------------------------------------------
     // 2. Validate all parameters - clamp to safe ranges
@@ -349,6 +404,12 @@ int main(int argc, char* argv[]) {
     layout->content_suspicious_streak = 0;
     layout->content_luma_mean = 0.0f;
     layout->content_luma_variance = 0.0f;
+    layout->cfg_bitrate_kbps = config.bitrate_kbps;
+    layout->cfg_target_width = config.target_width;
+    layout->cfg_target_height = config.target_height;
+    layout->cfg_codec_pref = std::min<uint32_t>(codec_preference_arg, 3);
+    layout->cfg_preset = config.encoder_preset;
+    layout->multiband_enabled = false;
 
     std::cout << "Shared memory ready (is_initialized = false until engine starts)." << std::endl;
 
@@ -391,15 +452,17 @@ int main(int argc, char* argv[]) {
                   codec_name.c_str(), _TRUNCATE);
     }
 
-    // v3 fields are zeroed by SharedMemory::Initialize() and written by the
-    // capture engine as multiband audio state changes. Nothing extra needed here.
+    // The retired v3 multiband field remains false for ABI compatibility.
 
     std::cout << "=== FTHR Capture Engine RUNNING ===" << std::endl;
     std::cout << "  is_initialized = true" << std::endl;
     std::cout << "  nvenc_active   = " << (layout->nvenc_active ? "true" : "false") << std::endl;
     std::cout << "  active_codec   = " << layout->active_codec << std::endl;
     const auto& capability = engine.GetActiveReplayCapability();
-    std::cout << "  replay_policy  = same-adapter" << std::endl;
+    std::cout << "  replay_policy  = "
+              << (capability.same_adapter ? "same-adapter"
+                                          : "explicit-cross-adapter")
+              << std::endl;
     std::cout << "  capture_vendor = "
               << fthr::EncoderVendorName(capability.capture_vendor) << std::endl;
     std::cout << "  encoder_vendor = "
@@ -433,17 +496,35 @@ int main(int argc, char* argv[]) {
                     layout->engine_response = fthr::ResponseType::RECORDING_STARTED;
                 }
                 else {
-                    // Payload first, response last (AUDIT-018/019).
-                    fthr::SetEngineError(layout,
-                        L"Could not start capturing. The selected capture "
-                        L"source may be unavailable or in use.");
+                    // Continuous-recording failures use their own response so
+                    // the replay-save state machine cannot consume them.
+                    std::wstring error = WideFromUtf8(
+                        engine.GetLastRecordingError());
+                    if (error.empty()) {
+                        error = L"Could not start the recoverable recording.";
+                    }
+                    fthr::SetEngineString(layout, error.c_str());
+                    layout->engine_response =
+                        fthr::ResponseType::MANUAL_RECORDING_ERROR;
                 }
                 break;
 
             case fthr::CommandType::STOP_RECORDING:
                 std::cout << "[Cmd] STOP_RECORDING" << std::endl;
-                engine.StopRecording();
-                layout->engine_response = fthr::ResponseType::RECORDING_STOPPED;
+                if (engine.StopRecording()) {
+                    fthr::SetEngineString(layout, L"");
+                    layout->engine_response =
+                        fthr::ResponseType::RECORDING_STOPPED;
+                } else {
+                    std::wstring error = WideFromUtf8(
+                        engine.GetLastRecordingError());
+                    if (error.empty()) {
+                        error = L"The recording closed with a recoverable error.";
+                    }
+                    fthr::SetEngineString(layout, error.c_str());
+                    layout->engine_response =
+                        fthr::ResponseType::MANUAL_RECORDING_ERROR;
+                }
                 break;
 
             case fthr::CommandType::SAVE_CLIP:
@@ -457,10 +538,15 @@ int main(int argc, char* argv[]) {
                     std::wcout << L"[Cmd] SAVE_CLIP queued" << std::endl;
                 }
                 else {
-                    // Payload first, response last (AUDIT-018/019).
-                    fthr::SetEngineError(layout,
-                        L"The capture engine could not queue the save. The "
-                        L"replay buffer may be empty or still starting up.");
+                    // SaveClip publishes a specific health/ring error. Preserve
+                    // it instead of replacing every failure with a generic
+                    // message, which hid the startup/focus-gate root cause.
+                    if (layout->engine_response
+                            != fthr::ResponseType::ERROR_OCCURRED) {
+                        fthr::SetEngineError(layout,
+                            L"The capture engine could not queue the save. The "
+                            L"replay buffer may be empty or still starting up.");
+                    }
                     std::cerr << "[Cmd] SAVE_CLIP failed to queue" << std::endl;
                 }
                 break;

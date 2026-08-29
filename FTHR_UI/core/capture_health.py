@@ -54,7 +54,10 @@ class CaptureHealthSnapshot:
     def save_allowed(self) -> bool:
         """Whether replay data is recent enough to permit a save."""
 
-        if self.state is CaptureHealthState.DEGRADED:
+        if self.state in {
+            CaptureHealthState.DEGRADED,
+            CaptureHealthState.STALLED,
+        }:
             return self.fresh_buffer_seconds > 0.0
         return self.state in {
             CaptureHealthState.HEALTHY,
@@ -182,8 +185,12 @@ class CaptureHealthMonitor:
         if flags & CaptureHealthFlag.PAUSED:
             self.state = CaptureHealthState.DEGRADED
             self._last_progress_at = timestamp
-            self._fresh_since = None
-            self._fresh_duration_s = 0.0
+            # Focus-gated capture intentionally pauses while the user opens the
+            # clip UI or another window.  The native replay ring is retained, so
+            # preserve the amount of replay already known to be fresh.  Clearing
+            # it here made the first hotkey after returning to a game fail with
+            # "0 seconds of fresh replay" until another five seconds elapsed.
+            # poll_delta is deliberately not accumulated while paused.
             self._healthy_since = None
             return self._snapshot("capture is intentionally paused", old_state, False, timestamp)
 
@@ -226,9 +233,10 @@ class CaptureHealthMonitor:
 
         if elapsed >= self.stalled_after_s:
             self.state = CaptureHealthState.STALLED
-            if old_state is not CaptureHealthState.STALLED:
-                self._fresh_since = None
-                self._fresh_duration_s = 0.0
+            # WGC is damage/event driven and legitimately stops producing new
+            # frames on a static desktop.  Keep the last verified replay age so
+            # a valid native ring remains saveable.  Explicit BACKEND_FAILED and
+            # RECOVERING flags still clear it and reject saves above.
             self._healthy_since = None
             if old_state is not CaptureHealthState.STALLED and self._auto_recoveries < 1:
                 self._auto_recoveries += 1

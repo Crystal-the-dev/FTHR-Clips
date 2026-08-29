@@ -192,6 +192,26 @@ def test_peek_ignores_unrelated_responses():
         assert layout.engine_response == resp
 
 
+def test_manual_recording_responses_have_an_independent_consumer():
+    layout, buf = _make_fake_layout()
+    bridge = _FakeBridge(layout)
+    layout.engine_response = ResponseType.RECORDING_STARTED
+
+    assert bridge.peek_save_response() is None
+    assert bridge.peek_manual_recording_response() == ('started', '')
+    assert bridge.consume_manual_recording_response()
+    assert layout.engine_response == ResponseType.NONE
+
+
+def test_manual_recording_error_is_not_misread_as_save_failure():
+    layout, buf = _make_fake_layout()
+    bridge = _FakeBridge(layout)
+    layout.engine_response = ResponseType.MANUAL_RECORDING_ERROR
+
+    assert bridge.peek_save_response() is None
+    assert bridge.peek_manual_recording_response()[0] == 'error'
+
+
 def test_consume_clears_exactly_once():
     layout, buf = _make_fake_layout()
     bridge = _FakeBridge(layout)

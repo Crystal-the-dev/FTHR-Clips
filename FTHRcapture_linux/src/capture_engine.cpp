@@ -149,6 +149,7 @@ bool CaptureEngine::RunCaptureGeneration() {
     enc_cfg.fps          = cfg_.fps;
     enc_cfg.bitrate_kbps = cfg_.bitrate_kbps;
     enc_cfg.codec_pref   = cfg_.codec_pref;
+    enc_cfg.encoder_pref = cfg_.encoder_pref;
     enc_cfg.preset       = cfg_.preset;
 
     std::string codec_used;

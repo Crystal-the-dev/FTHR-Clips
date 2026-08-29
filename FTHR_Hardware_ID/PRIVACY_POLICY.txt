@@ -1,0 +1,20 @@
+FTHR LUSTFUL HARDWARE IDENTITY — PRIVACY NOTICE
+Version: lustful-2026-07-27-hwid-v1
+
+What this separately installed capability reads
+
+- Windows: the operating-system MachineGuid value.
+- Linux: the operating-system machine-id value.
+
+What it produces
+
+The raw value is transformed locally into a namespaced UUID. The raw value is
+not written to disk, returned to FTHR Clips Core, or sent over the network. Only
+the derived UUID is returned to the separately installed uploader. The uploader
+sends that derived UUID to Lustful when registering or verifying an account.
+
+The capability contains no networking code and does not run in the background.
+It starts for a single authorized request, returns one derived UUID, and exits.
+
+Lustful's current privacy policy, including its retention and device-ban rules,
+is published at https://fthr.lustful.wtf/privacy.

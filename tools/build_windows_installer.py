@@ -36,10 +36,14 @@ def run(command: list[str], *, label: str) -> None:
 
 def find_iscc(value: str | None) -> Path:
     candidates = [Path(value)] if value else []
+    local_app_data = os.environ.get('LOCALAPPDATA')
     candidates.extend([
-        Path(os.environ.get('INNO_SETUP_COMPILER', '')),
+        Path(os.environ['INNO_SETUP_COMPILER'])
+        if os.environ.get('INNO_SETUP_COMPILER') else Path(),
         Path(r'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'),
         Path(r'C:\Program Files\Inno Setup 6\ISCC.exe'),
+        Path(local_app_data) / 'Programs' / 'Inno Setup 6' / 'ISCC.exe'
+        if local_app_data else Path(),
     ])
     for candidate in candidates:
         if str(candidate) and candidate.is_file():
@@ -94,6 +98,11 @@ def main() -> int:
         if not REDIST.is_file():
             raise FileNotFoundError(f'missing prerequisite: {REDIST}')
         if not args.skip_pyinstaller:
+            optional_command = [
+                sys.executable, 'tools/build_optional_uploaders.py']
+            if sign_command:
+                optional_command.extend(['--sign-command', sign_command])
+            run(optional_command, label='Build sealed optional upload packages')
             run([sys.executable, '-m', 'PyInstaller', 'FTHR.spec', '--clean', '--noconfirm'],
                 label='PyInstaller Windows onedir bundle')
         if not DIST.is_dir():

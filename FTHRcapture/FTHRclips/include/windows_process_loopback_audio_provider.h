@@ -62,6 +62,7 @@ public:
     bool Start();
     void Stop();
     bool IsRunning() const;
+    bool HasCapturedAudio() const;
     const std::string& last_error() const;
 
     // Returns a contract track only when this provider actually encoded packets
@@ -92,7 +93,8 @@ public:
     WindowsApplicationSourceCoordinator(uint64_t generation,
                                         WindowsProcessLoopbackCapability capability,
                                         SourceIdGenerator source_id_generator,
-                                        uint32_t source_limit = kMaxRetainedAudioSources);
+                                        uint32_t source_limit = kMaxRetainedAudioSources,
+                                        uint32_t retention_seconds = 30);
 
     bool available() const { return capability_.api_build_supported; }
     const WindowsProcessLoopbackCapability& capability() const { return capability_; }
@@ -119,6 +121,7 @@ private:
     WindowsProcessLoopbackCapability capability_;
     SourceIdGenerator source_id_generator_;
     AudioSourceRegistry registry_;
+    int64_t retention_100ns_;
     std::map<std::string, AudioSourceId> runtime_groups_;
 };
 

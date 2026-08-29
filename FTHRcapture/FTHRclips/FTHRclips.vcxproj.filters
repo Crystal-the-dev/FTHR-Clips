@@ -15,6 +15,9 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="include\continuous_recording_writer.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="include\shared_memory.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -86,6 +89,9 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="src\continuous_recording_writer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\shared_memory.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>

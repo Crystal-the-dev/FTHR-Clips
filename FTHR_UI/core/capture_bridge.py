@@ -49,6 +49,7 @@ class ResponseType(IntEnum):
     STATUS_UPDATE = 4
     ERROR_OCCURRED = 5
     SAVE_STARTED = 6       # Phase 3: async SaveClip queued
+    MANUAL_RECORDING_ERROR = 7
 
 
 # THE struct. This binary layout is the entire API contract with the engine.
@@ -360,6 +361,23 @@ class CaptureBridge:
         self._layout.ui_command = CommandType.START_RECORDING
         return True
 
+    def start_manual_recording(self, output_path: str) -> bool:
+        """Start the native Windows continuous recorder asynchronously."""
+        if sys.platform != 'win32' or not self.is_connected():
+            return False
+        if not output_path or len(output_path) > 255:
+            print('[CaptureBridge] Manual-recording path is empty or too long')
+            return False
+        self._layout.ui_string = output_path
+        self._layout.ui_command = CommandType.START_RECORDING
+        return True
+
+    def stop_manual_recording(self) -> bool:
+        if sys.platform != 'win32' or not self.is_connected():
+            return False
+        self._layout.ui_command = CommandType.STOP_RECORDING
+        return True
+
     def request_engine_shutdown(self) -> bool:
         """Ask the native engine to leave its command loop cleanly.
 
@@ -438,6 +456,38 @@ class CaptureBridge:
             return True
         except Exception as e:
             self._log_read_error_once('consume_save_response', e)
+            return False
+
+    _MANUAL_RECORDING_RESPONSES = {
+        ResponseType.RECORDING_STARTED: 'started',
+        ResponseType.RECORDING_STOPPED: 'stopped',
+        ResponseType.MANUAL_RECORDING_ERROR: 'error',
+    }
+
+    def peek_manual_recording_response(self) -> tuple[str, str] | None:
+        """Read a continuous-recording response without stealing save events."""
+        if not self.is_connected():
+            return None
+        try:
+            response = self._layout.engine_response
+            kind = self._MANUAL_RECORDING_RESPONSES.get(response)
+            if kind is None:
+                return None
+            return kind, self._read_engine_string()
+        except Exception as exc:
+            self._log_read_error_once('peek_manual_recording_response', exc)
+            return None
+
+    def consume_manual_recording_response(self) -> bool:
+        if not self.is_connected():
+            return False
+        try:
+            if self._layout.engine_response not in self._MANUAL_RECORDING_RESPONSES:
+                return False
+            self._layout.engine_response = ResponseType.NONE
+            return True
+        except Exception as exc:
+            self._log_read_error_once('consume_manual_recording_response', exc)
             return False
 
     def _read_engine_string(self) -> str:

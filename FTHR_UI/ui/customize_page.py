@@ -4,7 +4,7 @@ Customize settings page — accordion-based UI for colors, icons, and sounds.
 Performance notes:
 - Color preview uses a small static mockup, not the live app.
 - Icons are loaded lazily via QPixmap with size caching.
-- Sounds store paths only; playback is on-demand via QMediaPlayer.
+- Sounds store paths only; short cues are preloaded for reliable preview.
 - Theme is applied to the main app only on explicit "Apply" click (batch QSS regen).
 """
 from __future__ import annotations
@@ -13,28 +13,56 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import (
-    Qt, QPropertyAnimation, QEasingCurve, Signal, QUrl, QRect,
-    QPoint,
+    Qt, Signal, QRect, QPoint,
 )
 from PySide6.QtGui import (
     QPixmap, QColor, QPainter, QPen, QBrush, QFont, QCursor,
-    QMouseEvent, QPaintEvent,
+    QMouseEvent, QPaintEvent, QFontDatabase, QTransform,
 )
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea,
     QFrame, QColorDialog, QFileDialog, QSizePolicy, QGridLayout,
+    QSlider,
 )
-from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
-
 from ui.style import (
     Colors, Fonts, label_uppercase, label_body,
     button_primary_qss, button_outline_qss, button_secondary_qss,
+    combo_qss, slider_qss, ThemedDropdownArrow, WheelSafeComboBox,
 )
 from core.theme_manager import (
     ThemeManager, DEFAULT_COLORS, CUSTOMIZABLE_ICONS,
     CUSTOMIZABLE_SOUNDS, SUPPORTED_IMAGE_FORMATS, SUPPORTED_SOUND_FORMATS,
-    DEFAULT_CAPTURE_CARD_COLORS,
+    SUPPORTED_FONT_FORMATS, DEFAULT_CAPTURE_CARD_COLORS, DEFAULT_FONTS,
+    CUSTOMIZABLE_COLOR_GROUPS,
 )
+from ui.sound_playback import SoundPlayback
+
+
+def _default_icon_path(filename: str) -> Path:
+    """Return the bundled source used by the live app for an icon key."""
+    assets = Path(__file__).parent.parent / 'assets'
+    if filename == 'favicon.ico':
+        return assets / 'favicon.ico'
+    # The Performance tab is an inverted Updates arrow; it has no separate
+    # bundled file, but it is still a real, customizable icon in the app.
+    if filename == 'performance.png':
+        return assets / 'icons' / 'updates.png'
+    return assets / 'icons' / filename
+
+
+def _default_icon_pixmap(filename: str, size: int) -> QPixmap:
+    """Load the visual used for an icon preview, including derived icons."""
+    path = _default_icon_path(filename)
+    pix = QPixmap(str(path)) if path.exists() else QPixmap()
+    if filename == 'performance.png' and not pix.isNull():
+        pix = pix.transformed(QTransform().scale(1, -1))
+    if pix.isNull():
+        return pix
+    return pix.scaled(
+        size, size,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
 
 
 # Dark-themed stylesheet for the non-native QColorDialog
@@ -333,17 +361,13 @@ def _fthr_message_box(parent, title: str, message: str,
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class _AccordionSection(QFrame):
-    """Collapsible section with animated expand/collapse.
-
-    Matches the fthrclips.com accordion: 350ms material-design ease,
-    overflow hidden, no re-toggle while animating.
-    """
+    """Collapsible section with an immediate, stable expand/collapse."""
 
     def __init__(self, title: str, number: str = '', parent=None):
         super().__init__(parent)
         self.setObjectName('accordionSection')
+        self._title = title
         self._expanded = False
-        self._animating = False
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
 
         layout = QVBoxLayout(self)
@@ -380,62 +404,96 @@ class _AccordionSection(QFrame):
         h_layout.addWidget(title_lbl)
         h_layout.addStretch()
 
-        self._indicator = QLabel('+')
-        self._indicator.setStyleSheet(
-            f'color: {Colors.TEXT_DIM}; font-size: 18px;'
-            f' font-family: {Fonts.DISPLAY}; font-weight: bold;'
-            f' background: transparent;'
-        )
+        self._indicator = ThemedDropdownArrow()
         h_layout.addWidget(self._indicator)
 
         layout.addWidget(self._header)
 
-        # ── Body (animated content area) ──────────────────────────────────
+        # ── Body ──────────────────────────────────────────────────────────
         self._body = QWidget()
         self._body.setObjectName('accordionBody')
-        self._body.setMaximumHeight(0)
+        self._body.setVisible(False)
         self._body_layout = QVBoxLayout(self._body)
-        self._body_layout.setContentsMargins(16, 12, 16, 16)
+        # Give controls a full spacing step around every edge.  The wrappers
+        # inside the body used to paint the global pure-black canvas and made
+        # right-aligned actions appear to touch the section border.
+        self._body_layout.setContentsMargins(24, 16, 24, 20)
         self._body_layout.setSpacing(8)
         layout.addWidget(self._body)
-
-        self._anim = QPropertyAnimation(self._body, b'maximumHeight')
-        self._anim.setDuration(350)
-        self._anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
-        self._anim.finished.connect(self._on_anim_finished)
+        self.refresh_theme()
 
     def add_content(self, widget: QWidget):
+        # The application-wide QWidget rule paints the page canvas black.
+        # Name each direct content wrapper so the accordion can explicitly
+        # keep its expanded content on the raised gray surface instead.
+        widget.setObjectName('accordionContent')
         self._body_layout.addWidget(widget)
 
     def add_layout(self, layout):
         self._body_layout.addLayout(layout)
 
+    def clear_content(self):
+        """Remove the current body widgets so theme styles can be rebuilt."""
+        while self._body_layout.count():
+            item = self._body_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+            elif item.layout() is not None:
+                child_layout = item.layout()
+                while child_layout.count():
+                    child_item = child_layout.takeAt(0)
+                    child_widget = child_item.widget()
+                    if child_widget is not None:
+                        child_widget.deleteLater()
+
+    def refresh_theme(self):
+        """Refresh the section shell and header after a theme change."""
+        self.setStyleSheet(f'''
+            QFrame#accordionSection {{
+                background-color: {Colors.SURFACE_3};
+                border: 1px solid {Colors.BORDER};
+            }}
+            QPushButton#accordionHeader {{
+                background-color: {Colors.SURFACE_3};
+                border: none;
+                border-bottom: 1px solid {Colors.BORDER};
+                text-align: left;
+            }}
+            QPushButton#accordionHeader:hover {{
+                background-color: {Colors.BORDER_HI};
+            }}
+            QWidget#accordionBody,
+            QWidget#accordionBody > QWidget#accordionContent {{
+                background-color: {Colors.SURFACE_3};
+            }}
+            QWidget#accordionBody QFrame#iconRow,
+            QWidget#accordionBody QFrame#iconTintRow,
+            QWidget#accordionBody QFrame#soundRow {{
+                background-color: transparent;
+                border: none;
+            }}
+        ''')
+        for label in self._header.findChildren(QLabel):
+            if label.text() == self._title.upper():
+                label.setStyleSheet(
+                    f'color: {Colors.TEXT}; font-size: {Fonts.SIZE_BODY_L}px;'
+                    f' font-family: {Fonts.DISPLAY}; font-weight: bold;'
+                    f' letter-spacing: {Fonts.TRACK_LABEL}px;'
+                    f' background: transparent;'
+                )
+            else:
+                label.setStyleSheet(
+                    f'color: {Colors.ACCENT}; font-size: {Fonts.SIZE_BODY_L}px;'
+                    f' font-family: {Fonts.DISPLAY}; font-weight: bold;'
+                    f' background: transparent;'
+                )
+        self._indicator.refresh_theme()
+
     def toggle(self):
-        if self._animating:
-            return
         self._expanded = not self._expanded
-        self._animating = True
-        self._indicator.setText('−' if self._expanded else '+')
-
-        current = self._body.height()
-
-        if self._expanded:
-            # Expanding — measure content height without visual flash
-            self._body.setMaximumHeight(16777215)
-            end_height = self._body_layout.sizeHint().height() + 28
-            self._body.setMaximumHeight(current)
-        else:
-            end_height = 0
-
-        self._anim.stop()
-        self._anim.setStartValue(current)
-        self._anim.setEndValue(end_height)
-        self._anim.start()
-
-    def _on_anim_finished(self):
-        self._animating = False
-        if self._expanded:
-            self._body.setMaximumHeight(16777215)
+        self._indicator.setExpanded(self._expanded)
+        self._body.setVisible(self._expanded)
 
     def expand(self):
         if not self._expanded:
@@ -487,7 +545,7 @@ class _ColorSwatch(QWidget):
 
         # Label text below
         p.setPen(QPen(QColor(Colors.TEXT_DIM)))
-        p.setFont(QFont('Segoe UI', 7))
+        p.setFont(QFont(Fonts.BODY_FAMILY, 7))
         text_rect = QRect(0, 33, self.width(), 16)
         p.drawText(text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, self._label)
         p.end()
@@ -567,12 +625,38 @@ class _ColorPreviewMockup(QFrame):
         tb_layout.addStretch()
         status = QLabel('CAPTURING')
         status.setStyleSheet(
-            f'color: {c["BG"]}; background: {c["ACCENT"]};'
-            f' font-size: 8px; font-weight: bold; padding: 2px 6px;'
-            f' font-family: {Fonts.DISPLAY};'
+            f'color: {c["ACCENT"]}; background: transparent; border: none;'
+            f' font-size: 8px; font-weight: bold; padding: 0 2px;'
+            f' font-family: {Fonts.DISPLAY}; letter-spacing: 1px;'
         )
         tb_layout.addWidget(status)
         layout.addWidget(top_bar)
+
+        # The secondary shell surface is used by the app's status strips and
+        # settings chrome. Keep it visible in the preview so it is obvious
+        # that changing the token affects more than the main canvas.
+        status_bar = QFrame()
+        status_bar.setFixedHeight(20)
+        status_bar.setStyleSheet(
+            f'background-color: {c["SHELL_BG_2"]};'
+            f' border-bottom: 1px solid {c["SHELL_DIVIDER"]};'
+        )
+        sb_layout = QHBoxLayout(status_bar)
+        sb_layout.setContentsMargins(10, 0, 10, 0)
+        ready = QLabel('READY')
+        ready.setStyleSheet(
+            f'color: {c["SUCCESS"]}; font-size: 8px; font-weight: bold;'
+            f' font-family: {Fonts.DISPLAY}; background: transparent;'
+        )
+        sb_layout.addWidget(ready)
+        sb_layout.addStretch()
+        sb_hint = QLabel('STATUS STRIP')
+        sb_hint.setStyleSheet(
+            f'color: {c["TEXT_MUTED"]}; font-size: 7px;'
+            f' font-family: {Fonts.BODY}; background: transparent;'
+        )
+        sb_layout.addWidget(sb_hint)
+        layout.addWidget(status_bar)
 
         # Content area with cards
         content = QFrame()
@@ -636,9 +720,12 @@ class _ColorPreviewMockup(QFrame):
         t2.setStyleSheet(f'color: {c["TEXT_DIM"]}; font-size: 9px; background: transparent;')
         t3 = QLabel('Muted text sample')
         t3.setStyleSheet(f'color: {c["TEXT_MUTED"]}; font-size: 9px; background: transparent;')
+        t4 = QLabel('Ghost text sample')
+        t4.setStyleSheet(f'color: {c["TEXT_GHOST"]}; font-size: 9px; background: transparent;')
         text_row.addWidget(t1)
         text_row.addWidget(t2)
         text_row.addWidget(t3)
+        text_row.addWidget(t4)
         cl.addLayout(text_row)
 
         # Error / delete samples
@@ -651,6 +738,20 @@ class _ColorPreviewMockup(QFrame):
             f' background: transparent; font-family: {Fonts.DISPLAY};'
         )
         state_row.addWidget(err)
+        warning = QLabel('WARNING')
+        warning.setStyleSheet(
+            f'color: {c["WARNING"]}; font-size: 8px; font-weight: bold;'
+            f' border: 1px solid {c["WARNING"]}; padding: 2px 6px;'
+            f' background: transparent; font-family: {Fonts.DISPLAY};'
+        )
+        state_row.addWidget(warning)
+        success = QLabel('SUCCESS')
+        success.setStyleSheet(
+            f'color: {c["SUCCESS"]}; font-size: 8px; font-weight: bold;'
+            f' border: 1px solid {c["SUCCESS"]}; padding: 2px 6px;'
+            f' background: transparent; font-family: {Fonts.DISPLAY};'
+        )
+        state_row.addWidget(success)
         delete_color = c.get("DELETE", c["ERROR"])
         delbtn = QLabel('DELETE')
         delbtn.setStyleSheet(
@@ -735,7 +836,8 @@ class _IconCropWidget(QWidget):
         p.drawPixmap(self._offset_x, self._offset_y, scaled)
 
         # Dim overlay outside crop
-        overlay = QColor(0, 0, 0, 140)
+        overlay = QColor(Colors.BG)
+        overlay.setAlpha(140)
         p.setBrush(QBrush(overlay))
         p.setPen(Qt.PenStyle.NoPen)
         cr = self._crop_to_display()
@@ -965,16 +1067,8 @@ class _IconRow(QFrame):
         layout.addWidget(reset_btn)
 
     def _load_reference_icon(self):
-        # Load from default assets
-        if self._filename == 'fthr_logo.png':
-            path = Path(__file__).parent.parent / 'assets' / 'fthr_logo.png'
-        else:
-            path = Path(__file__).parent.parent / 'assets' / 'icons' / self._filename
-        if path.exists():
-            pix = QPixmap(str(path)).scaled(
-                28, 28, Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
+        pix = _default_icon_pixmap(self._filename, 28)
+        if not pix.isNull():
             self._ref_icon.setPixmap(pix)
 
     def _load_current_icon(self):
@@ -989,15 +1083,8 @@ class _IconRow(QFrame):
             self._load_reference_as_current()
 
     def _load_reference_as_current(self):
-        if self._filename == 'fthr_logo.png':
-            path = Path(__file__).parent.parent / 'assets' / 'fthr_logo.png'
-        else:
-            path = Path(__file__).parent.parent / 'assets' / 'icons' / self._filename
-        if path.exists():
-            pix = QPixmap(str(path)).scaled(
-                28, 28, Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
+        pix = _default_icon_pixmap(self._filename, 28)
+        if not pix.isNull():
             self._cur_icon.setPixmap(pix)
 
     def _on_import(self):
@@ -1013,10 +1100,7 @@ class _IconRow(QFrame):
         file_size_kb = source.stat().st_size / 1024
 
         # Get original icon dimensions for crop target
-        if self._filename == 'fthr_logo.png':
-            ref_path = Path(__file__).parent.parent / 'assets' / 'fthr_logo.png'
-        else:
-            ref_path = Path(__file__).parent.parent / 'assets' / 'icons' / self._filename
+        ref_path = _default_icon_path(self._filename)
         ref_pix = QPixmap(str(ref_path)) if ref_path.exists() else QPixmap(32, 32)
         target_size = max(ref_pix.width(), ref_pix.height(), 32)
 
@@ -1062,7 +1146,7 @@ class _IconRow(QFrame):
         )
         dlg.setMinimumSize(500, 400)
         dlg.setStyleSheet(
-            f'QDialog {{ background: {Colors.BG};'
+            f'QDialog {{ background: {Colors.SURFACE_1};'
             f' border: 1px solid {Colors.BORDER_HI}; }}'
             f' QLabel {{ color: {Colors.TEXT}; background: transparent; }}'
         )
@@ -1070,13 +1154,6 @@ class _IconRow(QFrame):
 
         dl = QVBoxLayout(dlg)
         dl.setSpacing(12)
-
-        info = QLabel(
-            f'Drag to move, drag corners to resize, scroll to zoom.\n'
-            f'The selected area will be scaled to {target_size}×{target_size}px.'
-        )
-        info.setStyleSheet(label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
-        dl.addWidget(info)
 
         # Side by side: crop widget + reference
         row = QHBoxLayout()
@@ -1092,15 +1169,9 @@ class _IconRow(QFrame):
         ref_display = QLabel()
         ref_display.setFixedSize(64, 64)
         ref_display.setStyleSheet(f'background: {Colors.SURFACE_2}; border: 1px solid {Colors.BORDER};')
-        if self._filename == 'fthr_logo.png':
-            ref_path = Path(__file__).parent.parent / 'assets' / 'fthr_logo.png'
-        else:
-            ref_path = Path(__file__).parent.parent / 'assets' / 'icons' / self._filename
-        if ref_path.exists():
-            ref_display.setPixmap(QPixmap(str(ref_path)).scaled(
-                60, 60, Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            ))
+        ref_pix = _default_icon_pixmap(self._filename, 60)
+        if not ref_pix.isNull():
+            ref_display.setPixmap(ref_pix)
         ref_col.addWidget(ref_display)
         ref_col.addStretch()
         row.addLayout(ref_col, stretch=1)
@@ -1216,16 +1287,9 @@ class _IconTintRow(QFrame):
         )
 
     def _refresh_preview(self):
-        if self._filename == 'fthr_logo.png':
-            path = Path(__file__).parent.parent / 'assets' / 'fthr_logo.png'
-        else:
-            path = Path(__file__).parent.parent / 'assets' / 'icons' / self._filename
-        if not path.exists():
+        pix = _default_icon_pixmap(self._filename, 28)
+        if pix.isNull():
             return
-        pix = QPixmap(str(path)).scaled(
-            28, 28, Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
         pix = _tint_pixmap(pix, QColor(self._current_tint()))
         self._preview.setPixmap(pix)
 
@@ -1272,14 +1336,24 @@ class _SoundRow(QFrame):
 
     sound_changed = Signal(str)  # key
 
-    def __init__(self, key: str, label: str, theme_mgr: ThemeManager, parent=None):
+    _VOLUME_KEYS = {
+        'clip_captured': 'clip',
+        'screenshot_captured': 'screenshot',
+        'error': 'error',
+        'startup': 'startup',
+        'upload_successful': 'upload_successful',
+        'upload_failed': 'upload_failed',
+    }
+
+    def __init__(self, key: str, label: str, theme_mgr: ThemeManager,
+                 settings_manager=None, parent=None):
         super().__init__(parent)
         self._key = key
         self._label = label
         self._theme = theme_mgr
-        self._player: Optional[QMediaPlayer] = None
-        self._audio_output: Optional[QAudioOutput] = None
-        self.setFixedHeight(48)
+        self._settings = settings_manager
+        self._sound_playback = SoundPlayback(parent=self)
+        self.setFixedHeight(52)
         self.setObjectName('soundRow')
 
         layout = QHBoxLayout(self)
@@ -1294,10 +1368,34 @@ class _SoundRow(QFrame):
 
         # Current file indicator
         self._file_lbl = QLabel()
-        self._file_lbl.setFixedWidth(180)
+        self._file_lbl.setFixedWidth(150)
         self._file_lbl.setStyleSheet(label_body(Colors.TEXT_DIM, Fonts.SIZE_LABEL))
         self._update_file_label()
         layout.addWidget(self._file_lbl)
+
+        volume_key = self._VOLUME_KEYS.get(key, key)
+        self._volume_setting = f'sound_volume_{volume_key}'
+        volume_label = QLabel('VOLUME')
+        volume_label.setStyleSheet(
+            label_uppercase(Colors.TEXT_MUTED, Fonts.SIZE_MICRO, 1))
+        layout.addWidget(volume_label)
+        self._volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self._volume_slider.setRange(0, 100)
+        self._volume_slider.setFixedWidth(120)
+        self._volume_slider.setStyleSheet(slider_qss())
+        current_volume = int(
+            self._settings.get(self._volume_setting, 100)
+            if self._settings is not None else 100)
+        self._volume_slider.setValue(max(0, min(100, current_volume)))
+        self._volume_slider.valueChanged.connect(self._on_volume_changed)
+        layout.addWidget(self._volume_slider)
+        self._volume_value = QLabel(f'{self._volume_slider.value()}%')
+        self._volume_value.setFixedWidth(34)
+        self._volume_value.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._volume_value.setStyleSheet(
+            label_body(Colors.TEXT_DIM, Fonts.SIZE_LABEL))
+        layout.addWidget(self._volume_value)
 
         layout.addStretch()
 
@@ -1342,6 +1440,12 @@ class _SoundRow(QFrame):
         reset_btn.clicked.connect(self._on_reset)
         layout.addWidget(reset_btn)
 
+        current_sound = self._theme.get_custom_sound_path(self._key)
+        if current_sound is None:
+            current_sound = self._find_default_sound()
+        if current_sound is not None:
+            self._sound_playback.prepare(current_sound)
+
     def _update_file_label(self):
         custom = self._theme.get_custom_sound_path(self._key)
         if custom and custom.exists():
@@ -1360,16 +1464,15 @@ class _SoundRow(QFrame):
             if not sound_path:
                 return
 
-        # Lazy-init player
-        if self._player is None:
-            self._audio_output = QAudioOutput()
-            self._player = QMediaPlayer()
-            self._player.setAudioOutput(self._audio_output)
+        self._sound_playback.play(sound_path, self._volume_slider.value())
 
-        self._player.stop()
-        self._player.setSource(QUrl.fromLocalFile(str(sound_path)))
-        self._audio_output.setVolume(0.8)
-        self._player.play()
+    def _on_volume_changed(self, value: int):
+        self._volume_value.setText(f'{int(value)}%')
+        self._sound_playback.set_volume(int(value))
+        if self._settings is None:
+            return
+        self._settings.set(self._volume_setting, int(value))
+        self._settings.save_settings()
 
     def _find_default_sound(self) -> Optional[Path]:
         sounds_dir = Path(__file__).parent.parent / 'assets' / 'sounds'
@@ -1378,7 +1481,9 @@ class _SoundRow(QFrame):
             'error': 'error.wav',
             'screenshot_captured': 'screenshot_saved.wav',
             'screenshot_saved': 'screenshot_saved.wav',
-            'startup': None,
+            'startup': 'startup.wav',
+            'upload_successful': 'upload_successful.wav',
+            'upload_failed': 'upload_failed.wav',
         }
         filename = mapping.get(self._key)
         if filename:
@@ -1397,18 +1502,18 @@ class _SoundRow(QFrame):
             return
 
         source = Path(file_path)
-        self._theme.set_custom_sound(self._key, source)
+        self._sound_playback.stop()
+        stored = self._theme.set_custom_sound(self._key, source)
         self._theme.save()
         self._update_file_label()
+        self._sound_playback.prepare(stored)
         self.sound_changed.emit(self._key)
 
     def _on_reset(self):
         self._theme.remove_custom_sound(self._key)
         self._theme.save()
         self._update_file_label()
-        # Stop playback if active
-        if self._player:
-            self._player.stop()
+        self._sound_playback.stop()
         self.sound_changed.emit(self._key)
 
 
@@ -1421,9 +1526,13 @@ class CustomizePage(QWidget):
 
     theme_applied = Signal()  # Emitted when user clicks Apply
 
-    def __init__(self, parent=None):
+    def __init__(self, settings_manager=None, parent=None):
         super().__init__(parent)
+        self.setObjectName('customizePage')
+        self.setStyleSheet(
+            f'QWidget#customizePage {{ background: {Colors.BG}; }}')
         self._theme = ThemeManager()
+        self._settings = settings_manager
         self._swatches: list[_ColorSwatch] = []
         self._setup_ui()
 
@@ -1438,9 +1547,20 @@ class CustomizePage(QWidget):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setStyleSheet('QScrollArea { border: none; background: transparent; }')
+        scroll.setObjectName('customizeScroll')
+        scroll.setStyleSheet(
+            f'QScrollArea#customizeScroll {{ border: none;'
+            f' background: {Colors.BG}; }}'
+            f' QScrollArea#customizeScroll QWidget#qt_scrollarea_viewport {{'
+            f' background: {Colors.BG}; }}'
+        )
+        self._scroll = scroll
 
         container = QWidget()
+        container.setObjectName('customizeContainer')
+        container.setStyleSheet(
+            f'QWidget#customizeContainer {{ background: {Colors.BG}; }}')
+        self._container = container
         self._layout = QVBoxLayout(container)
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(12)
@@ -1448,40 +1568,47 @@ class CustomizePage(QWidget):
 
         # ── Format info bar ───────────────────────────────────────────────
         info_bar = QLabel(
-            'Supported formats  —  '
+            'Themes include typography, colors, icons, capture-card styling, and sounds  —  '
+            f'Fonts: {", ".join(SUPPORTED_FONT_FORMATS)}  |  '
             f'Icons: {", ".join(SUPPORTED_IMAGE_FORMATS)}  |  '
             f'Sounds: {", ".join(SUPPORTED_SOUND_FORMATS)}'
         )
         info_bar.setStyleSheet(
             f'color: {Colors.TEXT_MUTED}; font-size: {Fonts.SIZE_LABEL}px;'
-            f' font-family: {Fonts.BODY}; background: {Colors.SURFACE_1};'
+            f' font-family: {Fonts.BODY}; background: {Colors.SURFACE_2};'
             f' padding: 8px 16px; border: 1px solid {Colors.BORDER};'
         )
         info_bar.setWordWrap(True)
+        self._info_bar = info_bar
         self._layout.addWidget(info_bar)
 
-        # ── Section 1: Colors ─────────────────────────────────────────────
-        self._colors_section = _AccordionSection('Colors', '01')
+        # ── Section 1: Typography ─────────────────────────────────────────
+        self._typography_section = _AccordionSection('Typography', '01')
+        self._build_typography_section()
+        self._layout.addWidget(self._typography_section)
+
+        # ── Section 2: Colors ─────────────────────────────────────────────
+        self._colors_section = _AccordionSection('Colors', '02')
         self._build_colors_section()
         self._layout.addWidget(self._colors_section)
 
-        # ── Section 2: Icon Colors ────────────────────────────────────────
-        self._icon_colors_section = _AccordionSection('Icon Colors', '02')
+        # ── Section 3: Icon Colors ────────────────────────────────────────
+        self._icon_colors_section = _AccordionSection('Icon Colors', '03')
         self._build_icon_colors_section()
         self._layout.addWidget(self._icon_colors_section)
 
-        # ── Section 3: Icons ──────────────────────────────────────────────
-        self._icons_section = _AccordionSection('Icons', '03')
+        # ── Section 4: Icons ──────────────────────────────────────────────
+        self._icons_section = _AccordionSection('Icons', '04')
         self._build_icons_section()
         self._layout.addWidget(self._icons_section)
 
-        # ── Section 4: Capture Card ───────────────────────────────────────
-        self._capture_card_section = _AccordionSection('Capture Card', '04')
+        # ── Section 5: Capture Card ───────────────────────────────────────
+        self._capture_card_section = _AccordionSection('Capture Card', '05')
         self._build_capture_card_section()
         self._layout.addWidget(self._capture_card_section)
 
-        # ── Section 5: Sounds ─────────────────────────────────────────────
-        self._sounds_section = _AccordionSection('Sounds', '05')
+        # ── Section 6: Sounds ─────────────────────────────────────────────
+        self._sounds_section = _AccordionSection('Sounds & Volumes', '06')
         self._build_sounds_section()
         self._layout.addWidget(self._sounds_section)
 
@@ -1494,12 +1621,14 @@ class CustomizePage(QWidget):
         export_btn.setStyleSheet(button_secondary_qss())
         export_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         export_btn.clicked.connect(self._on_export)
+        self._export_btn = export_btn
         action_bar.addWidget(export_btn)
 
         import_btn = QPushButton('IMPORT THEME')
         import_btn.setStyleSheet(button_outline_qss())
         import_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         import_btn.clicked.connect(self._on_import)
+        self._import_btn = import_btn
         action_bar.addWidget(import_btn)
 
         action_bar.addStretch()
@@ -1508,6 +1637,7 @@ class CustomizePage(QWidget):
         apply_btn.setStyleSheet(button_primary_qss())
         apply_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         apply_btn.clicked.connect(self._on_apply)
+        self._apply_btn = apply_btn
         action_bar.addWidget(apply_btn)
 
         self._layout.addLayout(action_bar)
@@ -1515,6 +1645,145 @@ class CustomizePage(QWidget):
 
         scroll.setWidget(container)
         outer.addWidget(scroll)
+
+    # ── Typography section ────────────────────────────────────────────────
+
+    def _build_typography_section(self):
+        wrapper = QWidget()
+        layout = QVBoxLayout(wrapper)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        note = QLabel('Fonts: .ttf and .otf files are supported.')
+        note.setWordWrap(True)
+        note.setStyleSheet(label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
+        layout.addWidget(note)
+
+        families = ['Oswald', *sorted(
+            (family for family in self._theme.get_custom_font_paths()
+             if family != 'Oswald'),
+            key=str.casefold,
+        )]
+        self._font_combos = {}
+        for role, title in (('display', 'DISPLAY FONT'), ('body', 'INTERFACE FONT')):
+            row = QHBoxLayout()
+            row.setSpacing(12)
+            label = QLabel(title)
+            label.setFixedWidth(140)
+            label.setStyleSheet(
+                label_uppercase(Colors.TEXT, Fonts.SIZE_LABEL, 1))
+            row.addWidget(label)
+            combo = WheelSafeComboBox()
+            # Keep the typography selectors lifted from the pure-black canvas;
+            # the color preview below intentionally remains a true black sample.
+            combo.setStyleSheet(combo_qss(background=Colors.SURFACE_3))
+            current = self._theme.get_font(role)
+            for family in families:
+                combo.addItem(family, family)
+            if current not in families:
+                current = 'Oswald'
+                self._theme.set_font(role, current)
+                self._theme.save()
+            index = combo.findData(current)
+            combo.setCurrentIndex(max(0, index))
+            combo.currentIndexChanged.connect(
+                lambda _index, selected_role=role: self._on_font_changed(
+                    selected_role))
+            row.addWidget(combo, 1)
+            self._font_combos[role] = combo
+
+            import_btn = QPushButton('IMPORT FONT')
+            import_btn.setStyleSheet(button_outline_qss())
+            import_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            import_btn.clicked.connect(
+                lambda _checked=False, selected_role=role:
+                self._on_import_font(selected_role))
+            row.addWidget(import_btn)
+            layout.addLayout(row)
+
+        self._font_preview = QLabel(
+            "YOUR PRIVACY ISN'T CURRENCY  ·  Your privacy isn't currency.")
+        self._font_preview.setMinimumHeight(52)
+        self._font_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._font_preview.setStyleSheet(
+            f'background: {Colors.SURFACE_2}; border: 1px solid {Colors.BORDER}; '
+            f'color: {Colors.TEXT}; padding: 10px;')
+        layout.addWidget(self._font_preview)
+
+        reset_row = QHBoxLayout()
+        reset_row.addStretch()
+        reset = QPushButton('RESET TYPOGRAPHY')
+        reset.setStyleSheet(button_outline_qss())
+        reset.clicked.connect(self._on_reset_fonts)
+        reset_row.addWidget(reset)
+        layout.addLayout(reset_row)
+
+        self._update_font_preview()
+        self._typography_section.add_content(wrapper)
+
+    def _on_font_changed(self, role: str):
+        combo = self._font_combos.get(role)
+        if combo is None:
+            return
+        self._theme.set_font(role, combo.currentData() or combo.currentText())
+        self._theme.save()
+        self._update_font_preview()
+
+    def _on_import_font(self, role: str):
+        formats = ' '.join(f'*{ext}' for ext in SUPPORTED_FONT_FORMATS)
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, 'Import font', '', f'Font files ({formats})')
+        if not file_path:
+            return
+
+        font_id = QFontDatabase.addApplicationFont(file_path)
+        families = (QFontDatabase.applicationFontFamilies(font_id)
+                    if font_id >= 0 else [])
+        if not families:
+            _fthr_message_box(
+                self, 'Font not supported',
+                'Choose a valid OpenType (.otf) or TrueType (.ttf) font file.',
+                ok_cancel=False,
+            )
+            return
+
+        try:
+            self._theme.set_custom_font(list(families), Path(file_path))
+            self._theme.save()
+        except (OSError, ValueError) as exc:
+            _fthr_message_box(
+                self, 'Font import failed', str(exc), ok_cancel=False)
+            return
+
+        for combo in self._font_combos.values():
+            for family in families:
+                if combo.findData(family) < 0:
+                    combo.addItem(family, family)
+
+        selected = families[0]
+        combo = self._font_combos[role]
+        combo.setCurrentIndex(combo.findData(selected))
+
+    def _on_reset_fonts(self):
+        self._theme.reset_fonts()
+        self._theme.save()
+        for role, family in DEFAULT_FONTS.items():
+            combo = self._font_combos.get(role)
+            if combo is None:
+                continue
+            index = combo.findData(family)
+            combo.blockSignals(True)
+            combo.setCurrentIndex(max(0, index))
+            combo.blockSignals(False)
+        self._update_font_preview()
+
+    def _update_font_preview(self):
+        display = self._theme.get_font('display').replace('"', '')
+        body = self._theme.get_font('body').replace('"', '')
+        self._font_preview.setStyleSheet(
+            f'background: {Colors.SURFACE_2}; border: 1px solid {Colors.BORDER}; '
+            f'color: {Colors.TEXT}; padding: 10px; '
+            f'font-family: "{display}", "{body}"; font-size: {Fonts.SIZE_BODY_L}px;')
 
     # ── Colors section ────────────────────────────────────────────────────
 
@@ -1530,46 +1799,11 @@ class CustomizePage(QWidget):
         wl.addSpacing(8)
 
         # Group colors by category — label + description on the left, swatches right
-        groups = [
-            ('Surfaces', 'App backgrounds, panels, popups', [
-                ('BG', 'Background'),
-                ('SURFACE_1', 'Surface 1'),
-                ('SURFACE_2', 'Surface 2'),
-                ('SURFACE_3', 'Surface 3'),
-                ('SHELL_BG', 'Shell BG'),
-                ('SHELL_DIVIDER', 'Shell Line'),
-            ]),
-            ('Accent', 'Highlights, buttons, progress bars, active states', [
-                ('ACCENT', 'Accent'),
-                ('ACCENT_DIM', 'Accent Dim'),
-                ('ACCENT_SOFT', 'Accent Soft'),
-            ]),
-            ('Text', 'All text throughout the app', [
-                ('TEXT', 'Primary'),
-                ('TEXT_DIM', 'Secondary'),
-                ('TEXT_MUTED', 'Muted'),
-            ]),
-            ('Borders', 'Dividers, outlines, separators', [
-                ('BORDER', 'Border'),
-                ('BORDER_HI', 'Border Light'),
-                ('HAIRLINE', 'Hairline'),
-            ]),
-            ('Cards', 'Clip cards in the grid', [
-                ('CARD_BG', 'Card BG'),
-                ('CARD_BG_HI', 'Card Hover'),
-                ('CARD_BORDER', 'Card Border'),
-            ]),
-            ('Status', 'Error and functional indicators', [
-                ('ERROR', 'Error'),
-                ('DELETE', 'Delete Button'),
-            ]),
-        ]
-
-        for group_name, description, tokens in groups:
+        for group_name, tokens in CUSTOMIZABLE_COLOR_GROUPS:
             row = QHBoxLayout()
             row.setSpacing(16)
 
-            # Category label + description on the left
+            # Category label on the left
             cat_col = QVBoxLayout()
             cat_col.setSpacing(2)
             cat_lbl = QLabel(group_name.upper())
@@ -1582,15 +1816,6 @@ class CustomizePage(QWidget):
             )
             cat_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
             cat_col.addWidget(cat_lbl)
-            desc_lbl = QLabel(description)
-            desc_lbl.setFixedWidth(90)
-            desc_lbl.setWordWrap(True)
-            desc_lbl.setStyleSheet(
-                f'color: {Colors.TEXT_MUTED}; font-size: {Fonts.SIZE_MICRO}px;'
-                f' font-family: {Fonts.BODY}; background: transparent;'
-            )
-            desc_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
-            cat_col.addWidget(desc_lbl)
             cat_col.addStretch()
             row.addLayout(cat_col)
 
@@ -1651,16 +1876,6 @@ class CustomizePage(QWidget):
         wl.setContentsMargins(0, 0, 0, 0)
         wl.setSpacing(4)
 
-        note = QLabel(
-            'Replace any app icon with your own image. '
-            'Images will be cropped to match the original dimensions. '
-            'Smaller files (<100 KB) load faster at startup.'
-        )
-        note.setStyleSheet(label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
-        note.setWordWrap(True)
-        wl.addWidget(note)
-        wl.addSpacing(8)
-
         for filename, label in CUSTOMIZABLE_ICONS.items():
             row = _IconRow(filename, label, self._theme)
             row.icon_changed.connect(self._on_icon_changed)
@@ -1678,16 +1893,6 @@ class CustomizePage(QWidget):
         wl = QVBoxLayout(wrapper)
         wl.setContentsMargins(0, 0, 0, 0)
         wl.setSpacing(4)
-
-        note = QLabel(
-            'Default icons are tinted with a color (signature teal by default). '
-            'Change the global tint or set a unique color per icon. '
-            'Imported custom icons are not affected.'
-        )
-        note.setStyleSheet(label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
-        note.setWordWrap(True)
-        wl.addWidget(note)
-        wl.addSpacing(8)
 
         # Global tint row
         global_row = QHBoxLayout()
@@ -1783,15 +1988,6 @@ class CustomizePage(QWidget):
         wl.setContentsMargins(0, 0, 0, 0)
         wl.setSpacing(12)
 
-        note = QLabel(
-            'Customize the colors of the capture notification card '
-            'that appears when a clip is saved.'
-        )
-        note.setStyleSheet(label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
-        note.setWordWrap(True)
-        wl.addWidget(note)
-        wl.addSpacing(4)
-
         tokens = [
             ('CAPTURE_CARD_BG',             'Background'),
             ('CAPTURE_CARD_ACCENT',         'Left Accent'),
@@ -1851,18 +2047,14 @@ class CustomizePage(QWidget):
         wl.setContentsMargins(0, 0, 0, 0)
         wl.setSpacing(4)
 
-        note = QLabel(
-            'Replace notification sounds with your own audio files. '
-            'Any format the system can play is supported. '
-            'Click PREVIEW to hear the current sound.'
-        )
+        note = QLabel('Any format the system can play is supported.')
         note.setStyleSheet(label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
         note.setWordWrap(True)
         wl.addWidget(note)
         wl.addSpacing(8)
 
         for key, label in CUSTOMIZABLE_SOUNDS.items():
-            row = _SoundRow(key, label, self._theme)
+            row = _SoundRow(key, label, self._theme, self._settings)
             row.sound_changed.connect(self._on_sound_changed)
             wl.addWidget(row)
 
@@ -1899,7 +2091,7 @@ class CustomizePage(QWidget):
         if not _fthr_message_box(
             self, 'Import Theme',
             'This will fully replace your current theme '
-            '(colors, icons, sounds).\n\nContinue?',
+            '(typography, colors, icons, and sounds).\n\nContinue?',
         ):
             return
 
@@ -1913,12 +2105,95 @@ class CustomizePage(QWidget):
                 ok_cancel=False,
             )
 
+    def refresh_theme(self):
+        """Rebuild inline QSS after the shared theme tokens are updated.
+
+        Customize controls intentionally use local styles for their dense,
+        preview-like layout. Rebuilding the section bodies keeps those styles
+        in sync with the same Apply action that refreshes the rest of the app,
+        while preserving which accordions were open and the scroll position.
+        """
+        scroll_value = self._scroll.verticalScrollBar().value()
+        expanded = {
+            section: section.expanded
+            for section in (
+                self._typography_section,
+                self._colors_section,
+                self._icon_colors_section,
+                self._icons_section,
+                self._capture_card_section,
+                self._sounds_section,
+            )
+        }
+
+        self.setStyleSheet(
+            f'QWidget#customizePage {{ background: {Colors.BG}; }}')
+        self._scroll.setStyleSheet(
+            f'QScrollArea#customizeScroll {{ border: none;'
+            f' background: {Colors.BG}; }}'
+            f' QScrollArea#customizeScroll QWidget#qt_scrollarea_viewport {{'
+            f' background: {Colors.BG}; }}'
+        )
+        self._container.setStyleSheet(
+            f'QWidget#customizeContainer {{ background: {Colors.BG}; }}')
+        self._info_bar.setStyleSheet(
+            f'color: {Colors.TEXT_MUTED}; font-size: {Fonts.SIZE_LABEL}px;'
+            f' font-family: {Fonts.BODY}; background: {Colors.SURFACE_2};'
+            f' padding: 8px 16px; border: 1px solid {Colors.BORDER};'
+        )
+        self._export_btn.setStyleSheet(button_secondary_qss())
+        self._import_btn.setStyleSheet(button_outline_qss())
+        self._apply_btn.setStyleSheet(button_primary_qss())
+
+        self._swatches = []
+        sections = (
+            (self._typography_section, self._build_typography_section),
+            (self._colors_section, self._build_colors_section),
+            (self._icon_colors_section, self._build_icon_colors_section),
+            (self._icons_section, self._build_icons_section),
+            (self._capture_card_section, self._build_capture_card_section),
+            (self._sounds_section, self._build_sounds_section),
+        )
+        for section, builder in sections:
+            section.clear_content()
+            section.refresh_theme()
+            builder()
+        for section, was_expanded in expanded.items():
+            if was_expanded:
+                section.expand()
+
+        self._scroll.verticalScrollBar().setValue(scroll_value)
+
     def _on_apply(self):
         self.theme_applied.emit()
 
     def _refresh_all(self):
         """Reload all UI elements from current theme state."""
         colors = self._theme.get_all_colors()
+        # Update typography selectors and preview.
+        if hasattr(self, '_font_combos'):
+            for configured_family, font_path in (
+                    self._theme.get_custom_font_paths().items()):
+                font_id = QFontDatabase.addApplicationFont(str(font_path))
+                registered = (QFontDatabase.applicationFontFamilies(font_id)
+                              if font_id >= 0 else [])
+                names = set(registered) | {configured_family}
+                for combo in self._font_combos.values():
+                    for family in sorted(names, key=str.casefold):
+                        if combo.findData(family) < 0:
+                            combo.addItem(family, family)
+            for role, combo in self._font_combos.items():
+                family = self._theme.get_font(role)
+                index = combo.findData(family)
+                if index < 0:
+                    family = 'Oswald'
+                    self._theme.set_font(role, family)
+                    index = combo.findData(family)
+                combo.blockSignals(True)
+                combo.setCurrentIndex(index)
+                combo.blockSignals(False)
+                combo.setStyleSheet(combo_qss(background=Colors.SURFACE_3))
+            self._update_font_preview()
         # Update color swatches
         for swatch in self._swatches:
             swatch.set_color(colors.get(swatch.token, '#000000'))

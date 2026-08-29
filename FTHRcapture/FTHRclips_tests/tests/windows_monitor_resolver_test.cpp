@@ -22,6 +22,7 @@ int RunWindowsAudioSessionRegistryTests();
 int RunWindowsProcessLoopbackAudioProviderTests();
 int RunWindowsMicrophoneAudioProviderTests();
 int RunWindowsCaptureBorderPolicyTests();
+int RunContinuousRecordingWriterTests();
 
 namespace {
 
@@ -283,6 +284,32 @@ void NativeNvencLowLatencyConfigurationIsCodecSpecific() {
     Check(av1.encodeCodecConfig.av1Config.disableSeqHdr == 0
               && av1.encodeCodecConfig.av1Config.repeatSeqHdr == 1,
           "AV1 repeats its sequence header on MP4 keyframes");
+    const auto& h264_vui = h264.encodeCodecConfig.h264Config.h264VUIParameters;
+    Check(h264_vui.videoSignalTypePresentFlag == 1
+              && h264_vui.videoFullRangeFlag == 0
+              && h264_vui.colourDescriptionPresentFlag == 1
+              && h264_vui.colourPrimaries == NV_ENC_VUI_COLOR_PRIMARIES_BT709
+              && h264_vui.transferCharacteristics
+                  == NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709
+              && h264_vui.colourMatrix == NV_ENC_VUI_MATRIX_COEFFS_BT709,
+          "H.264 explicitly signals studio-range BT.709 SDR");
+    const auto& hevc_vui = hevc.encodeCodecConfig.hevcConfig.hevcVUIParameters;
+    Check(hevc_vui.videoSignalTypePresentFlag == 1
+              && hevc_vui.videoFullRangeFlag == 0
+              && hevc_vui.colourDescriptionPresentFlag == 1
+              && hevc_vui.colourPrimaries == NV_ENC_VUI_COLOR_PRIMARIES_BT709
+              && hevc_vui.transferCharacteristics
+                  == NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709
+              && hevc_vui.colourMatrix == NV_ENC_VUI_MATRIX_COEFFS_BT709,
+          "HEVC explicitly signals studio-range BT.709 SDR");
+    Check(av1.encodeCodecConfig.av1Config.colorRange == 0
+              && av1.encodeCodecConfig.av1Config.colorPrimaries
+                  == NV_ENC_VUI_COLOR_PRIMARIES_BT709
+              && av1.encodeCodecConfig.av1Config.transferCharacteristics
+                  == NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709
+              && av1.encodeCodecConfig.av1Config.matrixCoefficients
+                  == NV_ENC_VUI_MATRIX_COEFFS_BT709,
+          "AV1 explicitly signals studio-range BT.709 SDR");
 }
 
 void NativeNvencVideoConfigsPropagateCodecData() {
@@ -453,10 +480,12 @@ int main() {
     const int windows_process_loopback_checks = RunWindowsProcessLoopbackAudioProviderTests();
     const int windows_microphone_checks = RunWindowsMicrophoneAudioProviderTests();
     const int capture_border_checks = RunWindowsCaptureBorderPolicyTests();
+    const int recording_checks = RunContinuousRecordingWriterTests();
     std::cout << "FTHRclips_tests: native suites completed ("
               << (checks + amf_checks + qsv_checks + policy_checks + audio_source_checks
                   + windows_audio_checks + windows_process_loopback_checks)
                   + windows_microphone_checks + capture_border_checks
+                  + recording_checks
               << " checks total)" << std::endl;
     return 0;
 }

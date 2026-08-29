@@ -55,7 +55,7 @@ media and the separately licensed Oswald font are documented under
 | **SHA-256 (zip)** | `27bcaf58b5140171…` — full value recorded in [`tools/ffmpeg_manifest.json`](tools/ffmpeg_manifest.json) |
 | **Licence** | **LGPL v3 or later** — self-reported by the binary as `libavcodec license: LGPL version 3 or later` |
 | **Linkage** | Dynamic. The C++ engine links the import libraries; the DLLs ship beside it. The Python UI shells out to `ffmpeg.exe`. |
-| **Used for** | Video/audio encoding and muxing in the capture engine; mic mux, multiband audio mix, watermark, auto-crop, webcam overlay, clip export/share in the UI. |
+| **Used for** | Video/audio encoding and muxing in the capture engine; mic mux, multiband audio mix, watermark, webcam overlay, clip export/share in the UI. |
 | **Licence text** | [`licenses/FFmpeg-LICENSE.txt`](licenses/FFmpeg-LICENSE.txt) |
 | **Shipped files** | `avcodec-62.dll`, `avdevice-62.dll`, `avfilter-11.dll`, `avformat-62.dll`, `avutil-60.dll`, `swresample-6.dll`, `swscale-9.dll`, `ffmpeg.exe`, `ffprobe.exe` |
 

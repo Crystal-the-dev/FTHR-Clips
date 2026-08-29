@@ -27,6 +27,14 @@ enum class EncoderVendor : uint32_t {
     Software,
 };
 
+enum class EncoderPreference : uint32_t {
+    Auto = 0,
+    Nvidia = 1,
+    Amd = 2,
+    Intel = 3,
+    Software = 4,
+};
+
 enum class ReplayEncoderBackend : uint32_t {
     NativeNvenc,
     FfmpegAmf,
@@ -131,25 +139,68 @@ constexpr bool IsAutomaticRawReplayFallbackAllowed() noexcept {
 
 constexpr WindowsReplaySelection SelectWindowsReplayPolicy(
     EncoderVendor capture_vendor,
+    EncoderPreference preference,
     VideoCodec requested_codec) noexcept {
     WindowsReplaySelection result;
     result.capture_vendor = capture_vendor;
-    result.encoder_vendor = capture_vendor;
     result.requested_codec = requested_codec;
-    result.backend = SelectProductionReplayBackend(
-        capture_vendor, requested_codec);
-    result.same_adapter = capture_vendor != EncoderVendor::Software;
 
     if (!IsProductionReplayCodecEnabled(requested_codec)) {
         result.error = ReplayStartupError::RequestedCodecUnsupported;
         return result;
     }
-    if (capture_vendor == EncoderVendor::Software
+
+    switch (preference) {
+    case EncoderPreference::Auto:
+        result.encoder_vendor = capture_vendor;
+        break;
+    case EncoderPreference::Nvidia:
+        result.encoder_vendor = EncoderVendor::Nvidia;
+        break;
+    case EncoderPreference::Amd:
+        result.encoder_vendor = EncoderVendor::Amd;
+        break;
+    case EncoderPreference::Intel:
+        result.encoder_vendor = EncoderVendor::Intel;
+        break;
+    case EncoderPreference::Software:
+        result.encoder_vendor = EncoderVendor::Software;
+        break;
+    }
+    result.backend = SelectProductionReplayBackend(
+        result.encoder_vendor, requested_codec);
+    result.same_adapter = result.encoder_vendor == capture_vendor
+        && capture_vendor != EncoderVendor::Software;
+
+    if (result.encoder_vendor == EncoderVendor::Software
         || result.backend == ReplayEncoderBackend::Software) {
-        result.error = ReplayStartupError::CaptureAdapterUnsupported;
+        result.error = ReplayStartupError::HardwareEncoderUnavailable;
+        return result;
+    }
+    if (!result.same_adapter
+        && result.encoder_vendor != EncoderVendor::Nvidia) {
+        result.error = ReplayStartupError::CrossAdapterPathUnavailable;
+        return result;
+    }
+    // An explicit NVIDIA choice may use the already-supported CPU-input path
+    // on hybrid systems. Automatic mode remains strictly same-adapter.
+    if (!result.same_adapter && preference == EncoderPreference::Auto) {
+        result.error = ReplayStartupError::CrossAdapterPathUnavailable;
         return result;
     }
     result.allowed = true;
+    return result;
+}
+
+constexpr WindowsReplaySelection SelectWindowsReplayPolicy(
+    EncoderVendor capture_vendor,
+    VideoCodec requested_codec) noexcept {
+    auto result = SelectWindowsReplayPolicy(
+        capture_vendor, EncoderPreference::Auto, requested_codec);
+    if (capture_vendor == EncoderVendor::Software
+        && result.error == ReplayStartupError::HardwareEncoderUnavailable) {
+        result.error = ReplayStartupError::CaptureAdapterUnsupported;
+    }
     return result;
 }
 

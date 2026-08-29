@@ -8,6 +8,15 @@ import sys as _sys
 ROOT       = Path(SPECPATH)
 UI_DIR     = ROOT / 'FTHR_UI'
 ASSETS_DIR = UI_DIR / 'assets'
+PLUGIN_DIR = ROOT / 'plugin-packages'
+OPTIONAL_PLUGIN_BUNDLES = [
+    PLUGIN_DIR / 'FTHR-Uploader.fthrplugin',
+    PLUGIN_DIR / 'FTHR-Hardware-Identity.fthrplugin',
+]
+for _plugin_bundle in OPTIONAL_PLUGIN_BUNDLES:
+    if not _plugin_bundle.is_file():
+        raise FileNotFoundError(
+            f'Missing {_plugin_bundle}. Run tools/build_optional_uploaders.py first.')
 
 # Product version comes from FTHR_UI/version.py — never retype it here.
 _sys.path.insert(0, str(UI_DIR))
@@ -46,15 +55,24 @@ VSVersionInfo(
   ]
 )
 """, encoding='utf-8')
-ENGINE_EXE = ROOT / 'FTHRcapture' / 'x64' / 'Release' / 'FTHRClips.exe'
-PLAYBACK_MIXER = (ROOT / 'FTHRcapture' / 'x64' / 'Release'
-                  / 'FTHRPlaybackMixer.dll')
+# The supported solution build emits into FTHRcapture/x64. Keep project-local
+# output as a compatibility fallback and select the newest mixer artifact so
+# an independently rebuilt playback bridge is never silently packaged as an
+# older DLL from the solution output directory.
+_ENGINE_CANDIDATES = [
+    ROOT / 'FTHRcapture' / 'x64' / 'Release' / 'FTHRClips.exe',
+    ROOT / 'FTHRcapture' / 'FTHRclips' / 'x64' / 'Release' / 'FTHRclips.exe',
+]
+ENGINE_EXE = next((path for path in _ENGINE_CANDIDATES if path.exists()),
+                  _ENGINE_CANDIDATES[0])
+PLAYBACK_MIXER = (
+    ROOT / 'FTHRcapture' / 'x64' / 'Release' / 'FTHRPlaybackMixer.dll')
 
 # FFmpeg DLLs the C++ engine links against on Windows
 _FFMPEG_BIN  = ROOT / 'FTHRcapture' / 'FTHRclips' / 'third_party' / 'ffmpeg' / 'bin'
 _FFMPEG_DLLS = _glob.glob(str(_FFMPEG_BIN / '*.dll'))
 # ffmpeg.exe / ffprobe.exe from the SAME LGPL build. The Python side shells
-# out to these for mic mux, watermark, auto-crop, webcam overlay and export.
+# out to these for mic mux, watermark, webcam overlay and export.
 # They were previously taken from imageio-ffmpeg, which (a) is GPL and
 # (b) was never actually bundled — so all of the above silently no-opped.
 _FFMPEG_TOOLS = [str(_FFMPEG_BIN / n) for n in ('ffmpeg.exe', 'ffprobe.exe')]
@@ -72,7 +90,10 @@ a = Analysis(
         *[(exe, 'engine') for exe in _FFMPEG_TOOLS],
     ],
     datas=[
+        (str(ASSETS_DIR / 'favicon.ico'),     'assets'),
         (str(ASSETS_DIR / 'fthr_logo.png'),   'assets'),
+        (str(ASSETS_DIR / 'preview_desktop.png'), 'assets'),
+        *[(str(bundle), 'plugin-packages') for bundle in OPTIONAL_PLUGIN_BUNDLES],
         # Licence paperwork must travel INSIDE the bundle (AUDIT-005), so a
         # portable copy is as complete as an installed one.
         (str(ROOT / 'LICENSE'), '.'),
@@ -100,6 +121,8 @@ a = Analysis(
         'numpy',
         'cv2',
         'keyboard',
+        'keyboard.mouse',
+        'keyboard._mouse_event',
         # UI submodules
         'ui.capture_card',
         'ui.capture_card_client',
@@ -121,6 +144,7 @@ a = Analysis(
         'core.ffmpeg_playback',
         'core.game_detector',
         'core.hotkey_manager',
+        'core.input_overlay',
         'core.instance_activation',
         'core.mic_recorder',
         'core.presets_manager',
@@ -194,7 +218,7 @@ exe = EXE(
     strip=False,      # strip doesn't work reliably on Windows DLLs
     upx=True,
     console=False,
-    icon=str(ASSETS_DIR / 'fthr_logo.ico'),
+    icon=str(ASSETS_DIR / 'favicon.ico'),
     version=str(_VER_FILE),
 )
 

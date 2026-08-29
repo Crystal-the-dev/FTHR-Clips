@@ -10,6 +10,9 @@ Public API is identical to the real CaptureCard so callers don't know the diff:
     client.show_screenshot()
     client.show_error(detail='')
     client.show_upload(filename='')
+    client.show_upload_failed(detail='')
+    client.show_recording_saved(filename='')
+    client.show_background_capture(source)
     client.close()
 """
 
@@ -39,6 +42,9 @@ class CaptureCardClient:
 
     def __init__(self, settings_manager=None):
         self._sm = settings_manager
+        self._visuals_enabled = bool(
+            settings_manager.get('capture_card_enabled', True)
+            if settings_manager is not None else True)
         self._proc: subprocess.Popen | None = None
         self._launch()
 
@@ -52,6 +58,8 @@ class CaptureCardClient:
                 env['DISPLAY'] = os.environ.get('DISPLAY', ':0')
             monitor = self._sm.get('notification_monitor', 'auto') if self._sm else 'auto'
             env['FTHR_CARD_SCREEN_NAME'] = monitor
+            env['FTHR_CARD_VISUALS_ENABLED'] = (
+                '1' if self._visuals_enabled else '0')
             self._proc = subprocess.Popen(
                 _LAUNCH_CMD,
                 stdin=subprocess.PIPE,
@@ -77,34 +85,107 @@ class CaptureCardClient:
         self._proc = None
         self._launch()
 
+    def set_visuals_enabled(self, enabled: bool) -> None:
+        """Enable or disable the card visuals without muting notification sounds."""
+        self._visuals_enabled = bool(enabled)
+        self._send(f'visuals|{1 if self._visuals_enabled else 0}')
+
     def _send(self, cmd: str) -> None:
-        if self._proc is None:
-            return
-        # Relaunch a terminated helper before sending the next notification.
-        if self._proc.poll() is not None:
-            self._launch()
+        # A broken helper must not permanently disable notifications. Retry
+        # the exact event once on a fresh process; later events can also
+        # relaunch after a previous launch failure.
+        for attempt in range(2):
+            if self._proc is None or self._proc.poll() is not None:
+                self._proc = None
+                self._launch()
             if self._proc is None:
                 return
+            try:
+                self._proc.stdin.write(cmd + '\n')
+                self._proc.stdin.flush()
+                return
+            except Exception:
+                failed = self._proc
+                self._proc = None
+                if failed.poll() is None:
+                    try:
+                        failed.terminate()
+                    except Exception:
+                        pass
+                if attempt == 1:
+                    return
+
+    @staticmethod
+    def _field(value: str) -> str:
+        """Keep the small line protocol unambiguous for window/file names."""
+        return str(value).replace('|', '/').replace('\r', ' ').replace('\n', ' ')
+
+    @staticmethod
+    def _hold_suffix(hold_duration_ms: int | None) -> str:
+        if hold_duration_ms is None:
+            return ''
         try:
-            self._proc.stdin.write(cmd + '\n')
-            self._proc.stdin.flush()
-        except Exception:
-            self._proc = None
+            value = max(1, int(hold_duration_ms))
+        except (TypeError, ValueError, OverflowError):
+            return ''
+        return f'|{value}'
 
-    def show_clip(self, duration_s: int, fps: int, resolution: str) -> None:
-        self._send(f'clip|{duration_s}|{fps}|{resolution}')
+    def show_clip(self, duration_s: int, fps: int, resolution: str,
+                  hold_duration_ms: int | None = None) -> None:
+        self._send(
+            f'clip|{duration_s}|{fps}|{self._field(resolution)}'
+            f'{self._hold_suffix(hold_duration_ms)}')
 
-    def show_screenshot(self) -> None:
-        self._send('screenshot')
+    def show_screenshot(self, hold_duration_ms: int | None = None) -> None:
+        self._send(f'screenshot{self._hold_suffix(hold_duration_ms)}')
 
-    def show_error(self, detail: str = '') -> None:
-        self._send(f'error|{detail}')
+    def show_error(self, detail: str = '',
+                   hold_duration_ms: int | None = None) -> None:
+        self._send(
+            f'error|{self._field(detail)}'
+            f'{self._hold_suffix(hold_duration_ms)}')
 
-    def show_upload(self, filename: str = '') -> None:
-        self._send(f'upload|{filename}')
+    def show_upload(self, filename: str = '',
+                    hold_duration_ms: int | None = None) -> None:
+        self._send(
+            f'upload|{self._field(filename)}'
+            f'{self._hold_suffix(hold_duration_ms)}')
 
-    def show_prompt(self, text: str) -> None:
-        self._send(f'prompt|{text}')
+    def show_upload_failed(self, detail: str = '',
+                           hold_duration_ms: int | None = None) -> None:
+        self._send(
+            f'upload_failed|{self._field(detail)}'
+            f'{self._hold_suffix(hold_duration_ms)}')
+
+    def show_recording_saved(self, filename: str = '',
+                             hold_duration_ms: int | None = None) -> None:
+        self._send(
+            f'recording_saved|{self._field(filename)}'
+            f'{self._hold_suffix(hold_duration_ms)}')
+
+    def play_startup(self) -> None:
+        self._send('startup')
+
+    def show_prompt(self, text: str,
+                    hold_duration_ms: int | None = None) -> None:
+        self._send(
+            f'prompt|{self._field(text)}'
+            f'{self._hold_suffix(hold_duration_ms)}')
+
+    def show_capturing(self, source: str,
+                       hold_duration_ms: int | None = None) -> None:
+        self._send(
+            f'capturing|{self._field(source)}'
+            f'{self._hold_suffix(hold_duration_ms)}')
+
+    def show_background_capture(
+            self, source: str, hold_duration_ms: int | None = None) -> None:
+        self._send(
+            f'background|{self._field(source)}'
+            f'{self._hold_suffix(hold_duration_ms)}')
+
+    def hide_background_capture(self) -> None:
+        self._send('background_hide')
 
     def close(self) -> None:
         proc = self._proc

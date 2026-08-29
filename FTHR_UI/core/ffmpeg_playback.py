@@ -32,13 +32,54 @@ from core.playback_mix_model import (
     ProbedAudioStream,
     SourceMixState,
     build_playback_sources,
+    source_gain,
 )
 
 
 _NO_WINDOW = {'creationflags': subprocess.CREATE_NO_WINDOW} if sys.platform == 'win32' else {}
 _FRAMES_PER_BLOCK = 1024
-_MAX_QUEUED_FRAMES = CANONICAL_SAMPLE_RATE // 2
+# Keep gain changes perceptually immediate. A half-second pre-render queue made
+# every slider appear stale because it continued playing PCM mixed with the old
+# values. 150 ms is still ample protection from ordinary decoder jitter.
+_MAX_QUEUED_FRAMES = CANONICAL_SAMPLE_RATE * 3 // 20
 _SYNC_RECOVERY_SECONDS = 0.75
+_SYNC_DRIFT_LIMIT_MS = 120
+_SYNC_RESUME_MARGIN_MS = 40
+_OUTPUT_BUFFER_MS = 40
+
+
+def _resample_pcm(pcm: bytes, playback_rate: float) -> tuple[bytes, int]:
+    """Time-scale interleaved float32 stereo PCM for the fixed-rate sink.
+
+    The native bridge decodes source-time frames. The Qt audio device always
+    consumes 48 kHz frames, so a fast clip needs more source frames per output
+    block while a slow clip needs fewer. Linear interpolation keeps the bridge
+    independent of an additional FFmpeg audio filter and preserves the same
+    mix/gain path at every speed.
+    """
+
+    rate = max(0.25, min(2.0, float(playback_rate)))
+    usable_bytes = len(pcm) - (len(pcm) % (CANONICAL_CHANNELS * 4))
+    if usable_bytes <= 0:
+        return b'', 0
+    source = np.frombuffer(pcm[:usable_bytes], dtype='<f4')
+    source_frames = source.size // CANONICAL_CHANNELS
+    if source_frames <= 0:
+        return b'', 0
+    if abs(rate - 1.0) < 1e-6:
+        return pcm[:usable_bytes], source_frames
+
+    output_frames = max(1, round(source_frames / rate))
+    if output_frames == source_frames:
+        return pcm[:usable_bytes], source_frames
+    source = source.reshape(source_frames, CANONICAL_CHANNELS)
+    positions = np.linspace(0.0, source_frames - 1, output_frames)
+    output = np.empty((output_frames, CANONICAL_CHANNELS), dtype=np.float32)
+    source_x = np.arange(source_frames, dtype=np.float32)
+    for channel in range(CANONICAL_CHANNELS):
+        output[:, channel] = np.interp(
+            positions, source_x, source[:, channel]).astype(np.float32)
+    return output.astype('<f4', copy=False).tobytes(), output_frames
 
 
 class PlaybackError(RuntimeError):
@@ -91,14 +132,26 @@ class BoundedPCMQueue:
 
 
 class _AudioPullDevice(QIODevice):
-    """Qt pull device whose callback touches only ``BoundedPCMQueue``."""
+    """Qt pull device whose callback touches only ``BoundedPCMQueue``.
+
+    A pull device belongs to one QAudioSink generation.  Windows can perform
+    one late pull after ``QAudioSink.stop()`` returns; invalidating that old
+    device makes the late pull silent instead of letting two endpoint
+    generations consume fresh PCM at once.
+    """
 
     def __init__(self, queue: BoundedPCMQueue, parent: QObject):
         super().__init__(parent)
         self._queue = queue
+        self._active = True
         self.open(QIODevice.OpenModeFlag.ReadOnly)
 
+    def invalidate(self) -> None:
+        self._active = False
+
     def readData(self, maxlen: int) -> bytes:  # noqa: N802 - Qt virtual name
+        if not self._active:
+            return b''
         return self._queue.read(maxlen)
 
     def writeData(self, _data: bytes, _maxlen: int) -> int:  # noqa: N802
@@ -108,6 +161,8 @@ class _AudioPullDevice(QIODevice):
         return True
 
     def bytesAvailable(self) -> int:  # noqa: N802
+        if not self._active:
+            return super().bytesAvailable()
         return self._queue.byte_count + super().bytesAvailable()
 
 
@@ -120,10 +175,24 @@ def _bridge_candidates() -> tuple[Path, ...]:
     executable_dir = Path(sys.executable).resolve().parent
     candidates.extend((executable_dir / 'engine' / suffix, executable_dir / suffix))
     root = Path(__file__).resolve().parents[2]
-    candidates.extend((
+    development_candidates = (
+        # A locked DLL cannot be replaced while the editor is open, so builds
+        # can land in any of these source-checkout outputs. Choose the newest
+        # existing artifact on the next launch instead of permanently preferring
+        # an older, still-locked Upgrade copy.
+        root / 'FTHRcapture' / 'FTHRPlaybackMixer' / 'x64' / 'Upgrade' / suffix,
+        root / 'FTHRcapture' / 'FTHRPlaybackMixer' / 'x64' / 'Release' / suffix,
         root / 'FTHRcapture' / 'x64' / 'Release' / suffix,
         root / 'FTHRcapture_linux' / 'build' / suffix,
-    ))
+    )
+
+    def _modified(path: Path) -> int:
+        try:
+            return path.stat().st_mtime_ns
+        except OSError:
+            return -1
+
+    candidates.extend(sorted(development_candidates, key=_modified, reverse=True))
     return tuple(candidates)
 
 
@@ -168,6 +237,8 @@ class InProcessFFmpegMixer:
             os.fsencode(media_path), indexes, len(self.sources), error, len(error))
         if not self._handle:
             raise PlaybackError(error.value.decode(errors='replace') or 'could not open clip audio')
+        self._pitch_compensation_available = hasattr(
+            self._library, 'fthr_playback_set_playback_rate')
 
     def _configure_signatures(self) -> None:
         library = self._library
@@ -185,6 +256,32 @@ class InProcessFFmpegMixer:
         library.fthr_playback_source_failed.restype = ctypes.c_int
         library.fthr_playback_close.argtypes = [ctypes.c_void_p]
         library.fthr_playback_close.restype = None
+        set_rate = getattr(library, 'fthr_playback_set_playback_rate', None)
+        if set_rate is not None:
+            set_rate.argtypes = [ctypes.c_void_p, ctypes.c_float, ctypes.c_int,
+                                 ctypes.c_char_p, ctypes.c_size_t]
+            set_rate.restype = ctypes.c_int
+
+    def set_playback_rate(self, rate: float, preserve_pitch: bool) -> bool:
+        """Configure native pitch preservation and report whether it is live.
+
+        Older bundled bridges do not expose this entry point.  They remain
+        usable with the historical resampling fallback, but cannot claim to
+        preserve pitch on a backend that lacks the capability.
+        """
+
+        active = bool(preserve_pitch and abs(float(rate) - 1.0) > 1e-6)
+        if not self._pitch_compensation_available:
+            return False
+        error = ctypes.create_string_buffer(512)
+        configured = self._library.fthr_playback_set_playback_rate(
+            self._handle, ctypes.c_float(rate), int(bool(preserve_pitch)),
+            error, len(error))
+        if not configured:
+            raise PlaybackError(
+                error.value.decode(errors='replace')
+                or 'could not configure pitch-preserving playback')
+        return active
 
     def pull(self, frames: int, gains: Sequence[float], master_gain: float) -> bytes | None:
         output = (ctypes.c_float * (frames * CANONICAL_CHANNELS))()
@@ -262,7 +359,7 @@ class _DecodeWorker(threading.Thread):
                  mix_values: Callable[[], tuple[list[float], float]],
                  ready: Callable[[str | None], None],
                  failed: Callable[[str], None], source_failed: Callable[[str], None],
-                 eof: Callable[[], None]):
+                 eof: Callable[[], None], pcm_ready: Callable[[], None] = lambda: None):
         super().__init__(name='FTHR-audio-decode', daemon=True)
         self._media_path = media_path
         self._sources = tuple(sources)
@@ -273,46 +370,80 @@ class _DecodeWorker(threading.Thread):
         self._failed = failed
         self._source_failed = source_failed
         self._eof = eof
+        self._pcm_ready = pcm_ready
         self._condition = threading.Condition()
         self._playing = False
         self._stopping = False
         self._seek_ms: int | None = 0
         self._decoded_frames = 0
+        self._playback_rate = 1.0
+        self._preserve_pitch = True
+        # Invalidates a pull that was already inside native FFmpeg when a new
+        # seek/pause arrived.  Without this token, one old 1024-frame block
+        # could be appended after the UI cleared the queue and become the first
+        # audible audio at the new playhead position.
+        self._command_generation = 0
         self._reported_failed_sources: set[int] = set()
 
     def play(self, position_ms: int) -> None:
         with self._condition:
+            self._command_generation += 1
             self._seek_ms = max(0, position_ms)
             self._playing = True
+            self._queue.clear()
             self._condition.notify_all()
 
     def pause(self) -> None:
         with self._condition:
+            self._command_generation += 1
             self._playing = False
+            self._queue.clear()
             self._condition.notify_all()
 
     def seek(self, position_ms: int) -> None:
         with self._condition:
+            self._command_generation += 1
             self._seek_ms = max(0, position_ms)
+            self._queue.clear()
             self._condition.notify_all()
+
+    def set_playback_rate(self, rate: float, position_ms: int | None = None,
+                          preserve_pitch: bool = True) -> None:
+        rate = max(0.25, min(2.0, float(rate)))
+        with self._condition:
+            self._playback_rate = rate
+            self._preserve_pitch = bool(preserve_pitch)
+            if position_ms is not None:
+                self._command_generation += 1
+                self._seek_ms = max(0, int(position_ms))
+                self._queue.clear()
+                self._condition.notify_all()
 
     def stop(self) -> None:
         with self._condition:
+            self._command_generation += 1
             self._stopping = True
             self._playing = False
+            self._queue.clear()
             self._condition.notify_all()
 
     @property
     def estimated_position_ms(self) -> int:
         with self._condition:
             queued = self._queue.frames
-            return max(0, round((self._decoded_frames - queued) * 1000 / CANONICAL_SAMPLE_RATE))
+            queued_source_frames = round(queued * self._playback_rate)
+            return max(0, round(
+                (self._decoded_frames - queued_source_frames)
+                * 1000 / CANONICAL_SAMPLE_RATE))
 
     def run(self) -> None:
         mixer: InProcessFFmpegMixer | None = None
         try:
             mixer = InProcessFFmpegMixer(self._media_path, self._sources)
             self._ready(None)
+            configured_rate: float | None = None
+            configured_preserve_pitch: bool | None = None
+            native_pitch_compensation = False
             while True:
                 with self._condition:
                     while not self._stopping and not self._playing:
@@ -321,28 +452,73 @@ class _DecodeWorker(threading.Thread):
                         return
                     seek_ms = self._seek_ms
                     self._seek_ms = None
+                    generation = self._command_generation
+                    playback_rate = self._playback_rate
+                    preserve_pitch = self._preserve_pitch
+                if (configured_rate != playback_rate
+                        or configured_preserve_pitch != preserve_pitch):
+                    configure = getattr(mixer, 'set_playback_rate', None)
+                    native_pitch_compensation = bool(
+                        configure(playback_rate, preserve_pitch)
+                        if callable(configure) else False)
+                    configured_rate = playback_rate
+                    configured_preserve_pitch = preserve_pitch
                 if seek_ms is not None:
-                    self._queue.clear()
                     mixer.seek(seek_ms)
                     with self._condition:
+                        if generation != self._command_generation:
+                            continue
                         self._decoded_frames = round(seek_ms * CANONICAL_SAMPLE_RATE / 1000)
                 if self._queue.frames >= _MAX_QUEUED_FRAMES - _FRAMES_PER_BLOCK:
                     time.sleep(0.005)
                     continue
                 gains, master = self._mix_values()
-                block = mixer.pull(_FRAMES_PER_BLOCK, gains, master)
+                # The native bridge's atempo pipeline returns sink-rate PCM
+                # when pitch is preserved.  The old resampling path instead
+                # needs source-rate PCM and deliberately shifts pitch.
+                requested_frames = (_FRAMES_PER_BLOCK if native_pitch_compensation
+                                    else max(1, round(
+                                        _FRAMES_PER_BLOCK * playback_rate)))
+                block = mixer.pull(requested_frames, gains, master)
+                with self._condition:
+                    stale = (generation != self._command_generation
+                             or not self._playing or self._stopping)
+                if stale:
+                    continue
                 for index in mixer.failed_source_indexes():
                     if index not in self._reported_failed_sources:
                         self._reported_failed_sources.add(index)
                         self._source_failed(self._sources[index].source_id)
                 if block is None:
                     with self._condition:
+                        if generation != self._command_generation:
+                            continue
                         self._playing = False
                     self._eof()
                     continue
-                if self._queue.append(self._encode_for_device(block)):
-                    with self._condition:
-                        self._decoded_frames += _FRAMES_PER_BLOCK
+                output_frames = len(block) // (CANONICAL_CHANNELS * 4)
+                source_frames = (round(output_frames * playback_rate)
+                                 if native_pitch_compensation else output_frames)
+                encoded = (block if native_pitch_compensation
+                           else _resample_pcm(block, playback_rate)[0])
+                encoded = self._encode_for_device(encoded)
+                wake_output = False
+                with self._condition:
+                    # Re-check under the command lock and append while holding
+                    # it. seek()/pause() clear the queue under this same lock,
+                    # so an obsolete block can never race in just afterwards.
+                    if (generation != self._command_generation
+                            or not self._playing or self._stopping):
+                        continue
+                    was_empty = self._queue.frames == 0
+                    if self._queue.append(encoded):
+                        self._decoded_frames += source_frames
+                        wake_output = was_empty
+                if wake_output:
+                    # Cross-thread Qt signal: starts/restarts the endpoint on
+                    # the GUI thread as soon as replacement PCM exists instead
+                    # of waiting up to one 20 ms maintenance-timer interval.
+                    self._pcm_ready()
         except PlaybackError as error:
             self._ready(str(error))
             self._failed(str(error))
@@ -361,6 +537,7 @@ class FFmpegPlaybackController(QObject):
     audio_failed = Signal(str)
     source_failed = Signal(str)
     reached_eof = Signal()
+    pcm_available = Signal()
 
     def __init__(self, media_path: str, sources: Sequence[PlaybackSource], parent: QObject):
         super().__init__(parent)
@@ -369,16 +546,32 @@ class FFmpegPlaybackController(QObject):
         self._master_gain = 1.0
         self._mix_lock = threading.Lock()
         self._sync_guard_until = 0.0
+        # A clock correction may briefly hold an early audio endpoint while
+        # the video catches up.  Automatic sync must never seek audio
+        # backwards: doing so replays the just-heard syllable/sample and is
+        # perceived as a deterministic double hit after a timeline seek.
+        self._sync_holding = False
         self._output_device, self._output_format, self._encode_for_device = self._select_output_format()
         self._queue = BoundedPCMQueue(self._output_format.bytesPerFrame())
-        self._device = _AudioPullDevice(self._queue, self)
+        self._device: _AudioPullDevice | None = None
         self._sink: QAudioSink | None = None
         self._sink_timer = QTimer(self)
         self._sink_timer.setInterval(20)
         self._sink_timer.timeout.connect(self._keep_sink_running)
+        self.pcm_available.connect(self._keep_sink_running)
         self._worker = _DecodeWorker(
             media_path, self.sources, self._queue, self._encode_for_device, self._mix_values,
-            self._worker_ready, self._worker_failed, self.source_failed.emit, self.reached_eof.emit)
+            self._worker_ready, self._worker_failed, self.source_failed.emit,
+            self.reached_eof.emit, self.pcm_available.emit)
+        # The owner must connect ready/error signals before this thread starts;
+        # otherwise a fast bridge open can emit readiness before Qt has any
+        # receiver and leave the fallback output permanently muted.
+        self._worker_started = False
+
+    def start(self) -> None:
+        if self._worker_started:
+            return
+        self._worker_started = True
         self._worker.start()
 
     def _select_output_format(
@@ -404,7 +597,12 @@ class FFmpegPlaybackController(QObject):
 
     def _mix_values(self) -> tuple[list[float], float]:
         with self._mix_lock:
-            return ([self._states[source.source_id].gain for source in self.sources],
+            # Application stems are reversible deltas against Default Mix.
+            # Feeding their raw 0..1 UI gain here duplicated every app at 100%
+            # and made 0% merely remove that duplicate. source_gain() converts
+            # them to the required -1..0 delta while leaving mic/import tracks
+            # as ordinary direct gains and the hidden base fixed at 1.
+            return ([source_gain(source, self._states) for source in self.sources],
                     self._master_gain)
 
     def _worker_ready(self, error: str | None) -> None:
@@ -425,26 +623,53 @@ class FFmpegPlaybackController(QObject):
                 gain_percent=current.gain_percent if gain_percent is None else gain_percent,
                 muted=current.muted if muted is None else muted)
 
+    def set_playback_rate(self, rate: float, position_ms: int | None = None,
+                          preserve_pitch: bool = True) -> None:
+        """Match live mixed audio to speed, with optional pitch preservation."""
+
+        normalized = max(0.25, min(2.0, float(rate)))
+        self._worker.set_playback_rate(
+            normalized, position_ms, preserve_pitch=preserve_pitch)
+        if position_ms is not None:
+            self._discard_output_buffer()
+            self._sync_guard_until = time.monotonic() + _SYNC_RECOVERY_SECONDS
+            self._keep_sink_running()
+
+    def refresh_mix(self, position_ms: int) -> None:
+        """Apply current gains at an explicit video-clock position.
+
+        Gain is applied by the decoder worker, so queued/device PCM still has
+        the previous mix. The editor coalesces slider events and calls this at
+        most every 40 ms; clearing every buffer and seeking to QMediaPlayer's
+        exact clock makes mute/unmute and all gains deterministic without a
+        seek storm while a handle is dragged.
+        """
+
+        if not self._worker_started:
+            return
+        self._worker.seek(max(0, position_ms))
+        self._discard_output_buffer()
+        self._sync_guard_until = time.monotonic() + _SYNC_RECOVERY_SECONDS
+        self._keep_sink_running()
+
     def source_state(self, source_id: str) -> SourceMixState:
         with self._mix_lock:
             return self._states.get(source_id, SourceMixState())
 
     def play(self, position_ms: int) -> None:
-        self._queue.clear()
-        self._discard_output_buffer()
+        self.start()
         self._worker.play(position_ms)
+        self._discard_output_buffer()
         self._sync_guard_until = time.monotonic() + _SYNC_RECOVERY_SECONDS
         self._sink_timer.start()
 
     def pause(self) -> None:
         self._worker.pause()
-        self._queue.clear()
         self._discard_output_buffer()
 
     def seek(self, position_ms: int) -> None:
-        self._queue.clear()
-        self._discard_output_buffer()
         self._worker.seek(position_ms)
+        self._discard_output_buffer()
         self._sync_guard_until = time.monotonic() + _SYNC_RECOVERY_SECONDS
 
     def sync_to_video_position(self, position_ms: int) -> None:
@@ -459,7 +684,43 @@ class FFmpegPlaybackController(QObject):
         # create a seek storm while the sink is still restarting.
         if time.monotonic() < getattr(self, '_sync_guard_until', 0.0):
             return
-        if abs(self._estimated_output_position_ms() - position_ms) > 120:
+        drift_ms = self._estimated_output_position_ms() - max(0, position_ms)
+
+        # If audio is early, freeze the endpoint and let the monotonic video
+        # clock catch up.  Seeking it backwards would replay PCM that has
+        # already reached the listener, which was the short double-audio glitch
+        # seen at repeatable timeline positions.  Hysteresis avoids rapidly
+        # toggling suspend/resume around the correction threshold.
+        if getattr(self, '_sync_holding', False):
+            if drift_ms > _SYNC_RESUME_MARGIN_MS:
+                return
+            self._sync_holding = False
+            if drift_ms < -_SYNC_DRIFT_LIMIT_MS:
+                # Video passed the held endpoint: skip forward, never rewind.
+                self.seek(position_ms)
+                return
+            sink = self._sink
+            if sink is not None:
+                try:
+                    if sink.state() == QAudio.State.SuspendedState:
+                        sink.resume()
+                except (AttributeError, RuntimeError, TypeError):
+                    # The endpoint may be deleted asynchronously during stop.
+                    pass
+            return
+
+        if drift_ms > _SYNC_DRIFT_LIMIT_MS:
+            sink = self._sink
+            if sink is not None:
+                try:
+                    sink.suspend()
+                    self._sync_holding = True
+                except (AttributeError, RuntimeError, TypeError):
+                    # A disappearing output endpoint is handled by state polling.
+                    pass
+            return
+        if drift_ms < -_SYNC_DRIFT_LIMIT_MS:
+            # Skipping late audio forward cannot replay anything already heard.
             self.seek(position_ms)
 
     def _estimated_output_position_ms(self) -> int:
@@ -478,29 +739,92 @@ class FFmpegPlaybackController(QObject):
         return max(0, self._worker.estimated_position_ms - buffered_ms)
 
     def _discard_output_buffer(self) -> None:
-        if self._sink is not None:
-            # reset(), unlike suspend(), discards bytes already accepted by the
-            # platform backend.  The sink is restarted after fresh PCM arrives.
-            self._sink.reset()
+        # QAudioSink.reset() is not restartable on the Windows backend used by
+        # Qt 6: the state changes to StoppedState/NoError, but calling start()
+        # on that same sink never resumes device pulls.  A/V sync performs a
+        # corrective seek shortly after playback starts, so reusing the reset
+        # sink produced the characteristic one-to-two seconds of audio followed
+        # by permanent silence (including after seeking backwards).
+        #
+        # Dropping the sink is also the only reliable way to discard PCM that
+        # the platform endpoint already accepted.  Fresh decoded PCM causes
+        # _keep_sink_running() to create a fresh endpoint on the next timer tick.
+        self._release_sink()
+
+    def _release_sink(self) -> None:
+        self._sync_holding = False
+        device = getattr(self, '_device', None)
+        if device is not None:
+            try:
+                device.invalidate()
+            except (AttributeError, RuntimeError, TypeError):
+                # An already-destroyed Qt device needs no further cleanup.
+                pass
+        sink = self._sink
+        if sink is None:
+            return
+        # Clear the field first. stop() emits stateChanged synchronously on
+        # some backends and the old sink must not be mistaken for the active
+        # endpoint by _on_sink_state().
+        self._sink = None
+        try:
+            sink.stop()
+        except (AttributeError, RuntimeError, TypeError):
+            # Stop is best-effort after detaching this sink generation.
+            pass
+        try:
+            sink.deleteLater()
+        except (AttributeError, RuntimeError, TypeError):
+            # Qt may already have destroyed the endpoint during shutdown.
+            pass
+
+    def _new_pull_device(self) -> _AudioPullDevice:
+        """Return a fresh, active device for one sink generation."""
+
+        old_device = getattr(self, '_device', None)
+        if old_device is not None:
+            try:
+                old_device.invalidate()
+                old_device.close()
+                old_device.deleteLater()
+            except (AttributeError, RuntimeError, TypeError):
+                # Replacing an already-invalidated device is safe and expected.
+                pass
+        self._device = _AudioPullDevice(self._queue, self)
+        return self._device
 
     def _keep_sink_running(self) -> None:
         if self._queue.frames == 0:
             return
         if self._sink is None:
+            device = self._new_pull_device()
             self._sink = QAudioSink(self._output_device, self._output_format, self)
+            try:
+                self._sink.setBufferSize(
+                    self._output_format.bytesPerFrame() * CANONICAL_SAMPLE_RATE
+                    * _OUTPUT_BUFFER_MS // 1000)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                # Some Qt audio backends reject advisory buffer sizing; their
+                # safe backend default remains usable.
+                pass
             self._sink.stateChanged.connect(self._on_sink_state)
-            self._sink.start(self._device)
+            self._sink.start(device)
         elif self._sink.state() == QAudio.State.SuspendedState:
-            self._sink.resume()
+            if not getattr(self, '_sync_holding', False):
+                self._sink.resume()
         elif self._sink.state() == QAudio.State.IdleState:
             # An empty pull queue is an underrun, not a device-loss error.
             # Resume only after a worker-filled block exists; no decode runs in
             # the audio callback and no timing sleep is used for recovery.
-            self._sink.start(self._device)
+            if self._device is not None:
+                self._sink.start(self._device)
         elif (self._sink.state() == QAudio.State.StoppedState
               and self._sink.error() == QAudio.Error.NoError):
-            # Play/pause/seek use reset() to discard stale device-buffered PCM.
-            self._sink.start(self._device)
+            # A stopped Windows endpoint cannot be trusted to restart in place.
+            # Recreate it while queued PCM is available so unexpected benign
+            # stops recover through the same proven path as a corrective seek.
+            self._release_sink()
+            self._keep_sink_running()
 
     def _on_sink_state(self, state: QAudio.State) -> None:
         if state != QAudio.State.StoppedState or self._sink is None:
@@ -511,11 +835,16 @@ class FFmpegPlaybackController(QObject):
 
     def stop(self) -> None:
         self._sink_timer.stop()
-        self._queue.clear()
-        self._worker.stop()
-        self._worker.join(timeout=0.5)
-        if self._sink is not None:
-            self._sink.stop()
-            self._sink.deleteLater()
-            self._sink = None
-        self._device.close()
+        if self._worker_started:
+            self._worker.stop()
+            self._worker.join(timeout=0.5)
+        else:
+            self._queue.clear()
+        self._release_sink()
+        device = getattr(self, '_device', None)
+        if device is not None:
+            try:
+                device.close()
+            except (AttributeError, RuntimeError, TypeError):
+                # Process teardown may destroy the Qt device before stop().
+                pass

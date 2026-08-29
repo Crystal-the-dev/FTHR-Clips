@@ -80,8 +80,11 @@ struct AudioSourceMetadata {
 };
 
 struct AudioActivityGateConfig {
-    float activate_rms = 0.010f;
-    float deactivate_rms = 0.003f;
+    // Process loopback returns digital silence for an idle app, so the gate can
+    // safely admit quiet background music without confusing endpoint noise for
+    // a real source. 0.0005 is roughly -66 dBFS.
+    float activate_rms = 0.0005f;
+    float deactivate_rms = 0.0001f;
     uint32_t activate_blocks = 2;
     uint32_t deactivate_blocks = 10;
 };
@@ -128,6 +131,10 @@ public:
                                          int64_t timestamp_100ns);
     void MarkEnded(const AudioSourceId& id, int64_t timestamp_100ns);
     void MarkFailed(const AudioSourceId& id);
+    // Release capacity only after a source is inactive and older than the
+    // caller's replay-window cutoff. Its provider/ring may remain alive, so a
+    // later audible block can safely re-admit the same runtime source.
+    uint32_t ReleaseAdmissionsOlderThan(int64_t cutoff_100ns);
 
     // Only real audible contributors within [start, end] are returned. The
     // result has a stable semantic ordering, never MP4 stream-index ordering.

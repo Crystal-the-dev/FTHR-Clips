@@ -35,7 +35,9 @@ redist/
 # PyInstaller
 /build/
 /dist/
+/dist-uploader-toggle/
 /dist_old_gpl_*/
+/plugin-packages/
 *.spec.bak
 
 # Visual Studio / MSBuild
@@ -105,6 +107,7 @@ qualification/
 audit-output/
 test_output/
 benchmarks/output/
+/_qa_*.png
 
 # ---------------------------------------------------------------------------
 # Runtime / user data — never belongs in the repo

@@ -284,6 +284,11 @@ namespace fthr {
         codec_ctx_->time_base = AVRational{ 1, static_cast<int>(config.fps) };
         codec_ctx_->framerate = AVRational{ static_cast<int>(config.fps), 1 };
         codec_ctx_->pix_fmt = AV_PIX_FMT_YUV420P;
+        codec_ctx_->color_range = AVCOL_RANGE_MPEG;
+        codec_ctx_->color_primaries = AVCOL_PRI_BT709;
+        codec_ctx_->color_trc = AVCOL_TRC_BT709;
+        codec_ctx_->colorspace = AVCOL_SPC_BT709;
+        codec_ctx_->chroma_sample_location = AVCHROMA_LOC_LEFT;
 
         // CBR rate control
         const int64_t bitrate_bps = static_cast<int64_t>(config.bitrate_kbps) * 1000;

@@ -42,11 +42,56 @@ def test_volume_popup_handles_long_names_eight_rows_and_unavailable_source(qtbot
     qtbot.addWidget(popup)
     assert popup._row_order[0] == 'master'
     assert popup._row_order[1:9] == [source.source_id for source in sources]
-    assert popup._labels['app-0'].toolTip() == 'LONG APPLICATION SOURCE NAME 0'
-    assert popup._labels['app-0'].text() != popup._labels['app-0'].toolTip()
+    assert popup.width() >= 520
+    assert popup._labels['app-0'].toolTip() == 'Long Application Source Name 0'
     assert popup._sliders['missing'].isEnabled() is False
     assert popup._mute_buttons['missing'].isEnabled() is False
     assert popup._values['missing'].text() == '—'
+
+
+def test_volume_popup_hides_default_mix_base_when_application_rows_exist(qtbot):
+    base = PlaybackSource(
+        'base', 'Default Mix', 'system', 1, 0,
+        mix_role='base', editable=False)
+    chrome = PlaybackSource(
+        'chrome', 'Google Chrome', 'application', 2, 1,
+        mix_role='delta')
+    discord = PlaybackSource(
+        'discord', 'Discord', 'application', 3, 2,
+        mix_role='delta')
+
+    popup = VolumePopup(100, source_tracks=(base, chrome, discord), live_preview=True)
+    qtbot.addWidget(popup)
+
+    assert popup._row_order == ['master', 'chrome', 'discord']
+    assert 'base' not in popup._sliders
+    assert popup._labels['chrome'].toolTip() == 'Google Chrome'
+
+
+def test_volume_popup_disables_source_controls_when_live_mixer_is_unavailable(qtbot):
+    source = PlaybackSource('mic', 'Microphone', 'microphone', 2, 1)
+    popup = VolumePopup(80, source_tracks=(source,), live_preview=False)
+    qtbot.addWidget(popup)
+
+    assert popup._sliders['mic'].isEnabled() is False
+    assert popup._mute_buttons['mic'].isEnabled() is False
+
+
+def test_volume_popup_uses_real_running_app_icon_when_available(qtbot, monkeypatch):
+    from PySide6.QtGui import QColor, QIcon, QPixmap
+
+    pixmap = QPixmap(18, 18)
+    pixmap.fill(QColor('#00d9c0'))
+    monkeypatch.setattr(
+        'ui.clip_viewer._running_windows_app_icon', lambda identity: QIcon(pixmap))
+    source = PlaybackSource(
+        'kovaak', "KovaaK's", 'application', 2, 1,
+        persistent_identity='fpsaimtrainer-win64-shipping')
+    popup = VolumePopup(100, source_tracks=(source,), live_preview=True)
+    qtbot.addWidget(popup)
+
+    assert popup._icons['kovaak'].pixmap() is not None
+    assert not popup._icons['kovaak'].pixmap().isNull()
 
 
 def test_one_failed_source_is_disabled_without_removing_healthy_source():

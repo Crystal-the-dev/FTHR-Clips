@@ -41,6 +41,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <algorithm>
 #include <iostream>
 #include <sstream>
 #include <utility>
@@ -86,6 +87,19 @@ namespace fthr {
         case NV_ENC_ERR_RESOURCE_NOT_REGISTERED:    return "RESOURCE_NOT_REGISTERED";
         case NV_ENC_ERR_RESOURCE_NOT_MAPPED:        return "RESOURCE_NOT_MAPPED";
         default:                                     return "UNKNOWN_ERROR";
+        }
+    }
+
+    static const GUID& NvencPresetGuid(uint32_t preset) noexcept {
+        switch (preset) {
+        case 1: return NV_ENC_PRESET_P1_GUID;
+        case 2: return NV_ENC_PRESET_P2_GUID;
+        case 3: return NV_ENC_PRESET_P3_GUID;
+        case 5: return NV_ENC_PRESET_P5_GUID;
+        case 6: return NV_ENC_PRESET_P6_GUID;
+        case 7: return NV_ENC_PRESET_P7_GUID;
+        case 4:
+        default: return NV_ENC_PRESET_P4_GUID;
         }
     }
 
@@ -620,10 +634,13 @@ namespace fthr {
         NV_ENC_PRESET_CONFIG preset_config = { NV_ENC_PRESET_CONFIG_VER };
         preset_config.presetCfg.version = NV_ENC_CONFIG_VER;
 
+        const uint32_t selected_preset = std::max<uint32_t>(
+            1, std::min<uint32_t>(7, config.hardware_preset));
+        const GUID& preset_guid = NvencPresetGuid(selected_preset);
         status = nvenc_api->nvEncGetEncodePresetConfigEx(
             nvenc_session_,
             codec_selection->encode_guid,
-            NV_ENC_PRESET_P2_GUID,
+            preset_guid,
             NV_ENC_TUNING_INFO_LOW_LATENCY,
             &preset_config
         );
@@ -631,7 +648,8 @@ namespace fthr {
         NV_ENC_CONFIG encode_config = {};
         if (status == NV_ENC_SUCCESS) {
             memcpy(&encode_config, &preset_config.presetCfg, sizeof(NV_ENC_CONFIG));
-            std::cout << "[HardwareEncoder] Preset P2/LOW_LATENCY loaded" << std::endl;
+            std::cout << "[HardwareEncoder] Preset P" << selected_preset
+                      << "/LOW_LATENCY loaded" << std::endl;
         }
         else {
             std::cout << "[HardwareEncoder] Preset failed (" << NvencStatusToString(status)
@@ -670,7 +688,7 @@ namespace fthr {
         init_params.version = NV_ENC_INITIALIZE_PARAMS_VER;
         init_params.encodeConfig = &encode_config;
         init_params.encodeGUID = codec_selection->encode_guid;
-        init_params.presetGUID = NV_ENC_PRESET_P2_GUID;
+        init_params.presetGUID = preset_guid;
         init_params.encodeWidth = enc_width_;
         init_params.encodeHeight = enc_height_;
         init_params.darWidth = enc_width_;

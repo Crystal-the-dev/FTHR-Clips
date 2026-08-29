@@ -297,7 +297,6 @@ namespace fthr {
         encoder_ = encoder;
     }
 
-
     // ===========================================================================
     // Start
     // ===========================================================================
@@ -645,7 +644,8 @@ namespace fthr {
         }
         if (encoder_) {
             encoder_->EncodeSamples(interleaved_data, frame_count * channels_);
-        } else if (ring_) {
+        }
+        if (ring_) {
             ring_->Push(interleaved_data, frame_count, qpc_100ns);
         }
     }

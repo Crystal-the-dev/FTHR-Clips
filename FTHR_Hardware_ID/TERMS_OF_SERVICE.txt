@@ -1,0 +1,16 @@
+FTHR LUSTFUL HARDWARE IDENTITY — CAPABILITY TERMS
+Version: lustful-2026-07-27-hwid-v1
+
+This optional capability is installed only after you choose Lustful and accept
+Lustful's Terms of Service and Privacy Policy in FTHR Clips.
+
+The capability may be used only to derive the stable device identifier required
+by Lustful for account registration, verification, uploading, and moderation.
+It is not required for Catbox. Cancelling installation prevents FTHR Clips from
+using Lustful but does not affect local capture or Catbox uploads.
+
+Lustful is an independent service. Your use of it is governed by the current
+terms published at https://fthr.lustful.wtf/tos.
+
+You can stop using the capability at any time by disabling uploads. Uninstalling
+FTHR Clips removes the activated capability files.

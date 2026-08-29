@@ -10,6 +10,27 @@ import os
 from pathlib import Path
 
 
+def default_clips_directory() -> Path:
+    """Return the default root used for FTHR's local clip library."""
+    return Path.home() / 'FTHR_Clips'
+
+
+def clips_directory_from(settings_manager=None) -> Path:
+    """Resolve the user-selected clip library root, with a safe fallback."""
+    default = default_clips_directory()
+    if settings_manager is None:
+        return default
+    try:
+        configured = settings_manager.get('clips_directory', default)
+        if not configured:
+            return default
+        return Path(configured).expanduser().resolve(strict=False)
+    except (OSError, TypeError, ValueError):
+        # User-editable settings may contain a malformed path; keep the app on
+        # its known local library root instead of failing during startup.
+        return default
+
+
 class SettingsManager:
     """Manages application settings persistence"""
 
@@ -17,7 +38,10 @@ class SettingsManager:
         # ~/.fthr is the one true home for all user state (settings, hotkeys,
         # themes). Lives outside the install dir so updates never wipe it.
         self.config_file = Path.home() / '.fthr' / 'settings.json'
+        self._retired_settings_removed = False
         self.settings = self._load_settings()
+        if self._retired_settings_removed:
+            self.save_settings()
     
     def _load_settings(self) -> dict:
         """Load settings from config file"""
@@ -26,7 +50,18 @@ class SettingsManager:
             'extended_clip_length': 60,  # seconds — used by F10 / EXT. CLIP hotkey
             'framerate': 60,         # FPS
             'resolution': 'source',  # 480p/720p/1080p/1440p/source
-            'bitrate_level': 'medium',  # low/medium/high
+            'bitrate_level': 'medium',  # low/medium/high/custom
+            # Used only when ``bitrate_level`` is ``custom``. The UI keeps it
+            # within the encoder-safe 500–200,000 kbps range.
+            'custom_bitrate_kbps': 25000,
+            # Manual recordings temporarily switch the native encoder to this
+            # profile, then return to the replay/clip profile above.  Keeping a
+            # second profile is necessary because the crash-resilient recorder
+            # writes the encoder's compressed packets directly.
+            'recording_framerate': 60,
+            'recording_resolution': 'source',
+            'recording_bitrate_level': 'medium',
+            'recording_custom_bitrate_kbps': 25000,
             'hotkeys': {
                 'save_clip': 'F9',
                 'save_extended_clip': 'F10',
@@ -39,6 +74,15 @@ class SettingsManager:
             'mic_device_name': None, # str display name, or None for system default
             'mic_volume': 100,       # 0–200 (scaled in callbacks)
             'mic_loopback': False,   # real-time monitor: hear your own mic
+            # Gary Mode fades a calming image onto the active screen when the
+            # microphone level moves through the configured response range.
+            'gary_mode_enabled': False,
+            'gary_min_level': 55,
+            'gary_max_level': 85,
+            'gary_image_path': None,
+            # Windows only: X hides the main window to the notification area.
+            # The dedicated title-bar power control remains the full-exit path.
+            'close_to_tray': True,
             # 'stretch' = fill the target rect, distort if aspect differs.
             # 'fit'     = preserve aspect, add black bars (letterbox/pillarbox).
             'scaling_mode': 'stretch',
@@ -56,40 +100,68 @@ class SettingsManager:
             'sound_volume_clip':        100,  # 0–100, FTHR notification sounds
             'sound_volume_screenshot':  100,
             'sound_volume_error':       100,
+            'sound_volume_startup':     100,
+            'sound_volume_upload_successful': 100,
+            'sound_volume_upload_failed': 100,
             'notification_monitor': 'auto',  # 'auto' = highest refresh rate, or screen name e.g. 'DP-3'
+            # Bottom-bar notifications are reserved for capture/save/upload
+            # failures. Keep them enabled by default, but let users mute the
+            # bar without disabling capture cards or sound cues.
+            'error_notifications_enabled': True,
             # Windows: stable monitor device path. Linux: wl_output name.
             'capture_monitor': '',
+            'clips_directory': str(default_clips_directory()),
             'imported_clip_folders': [],  # additional folders from other clipping software
-            # ── Upload ────────────────────────────────────────────────────
-            'upload_enabled':          False,
-            'upload_server_url':       '',
-            'upload_auth_header':      '',
-            'upload_mode':             'manual',    # 'immediate' | 'interval' | 'manual'
-            'upload_interval_value':   5,
-            'upload_interval_unit':    'minutes',   # 'minutes' | 'hours' | 'days'
-            'upload_auto_delete':      False,
-            # Encoder codec + preset (v2 settings)
+            'recording_directory': str(default_clips_directory() / 'Recordings'),
+            'selected_export_preset': 'discord',
+            # Encoder backend + codec + preset. ``auto`` keeps platform-native
+            # selection; explicit keys are populated only after a runtime probe.
+            'encoder_pref':   'auto',   # auto | nvenc | amf | qsv | software
             'codec_pref':     'auto',   # 'auto' | 'h264' | 'hevc' | 'av1'
             'encoder_preset': 4,        # 1–7
-            # Multiband audio
-            'multiband_audio_enabled': False,
+            # Clip editor preview. When disabled, visual edits are retained
+            # for export but the editor keeps showing the source frame.
+            'clip_editor_live_preview': True,
             'game_detection_enabled':  False,
+            # Foreground-game handoff. ``auto`` switches capture immediately;
+            # ``prompt`` waits for the configured accept/dismiss hotkeys.
+            'game_detection_mode':     'auto',
+            # Manual rules can also carry legacy per-game crop overrides.
+            'game_detection_custom_games': [],
+            # If enabled, an automatically selected game is replaced by
+            # desktop capture after the game window has actually closed.
+            'game_detection_fallback_desktop': False,
+            'capture_mode':           'desktop',
+            'target_hwnd':            0,
+            'target_window_name':     '',
             'audio_capture_enabled':   True,
+            # Visual notification card. Sound cues remain active when this
+            # is disabled because they are handled by the same sound-only
+            # helper process.
+            'capture_card_enabled':    True,
             'watermark_enabled':  False,
-            'watermark_text':     'FTHR',
-            'auto_crop_enabled':  False,
             'anticheat_detection_enabled': False,
             'camera_enabled':       False,
             'camera_device_index':  0,
             'camera_position':      'bottom-right',
             'camera_size':          'medium',
-            'audio_categories': [
-                {'name': 'Game',     'volume': 100, 'patterns': []},
-                {'name': 'Discord',  'volume': 100, 'patterns': ['discord', 'Discord', 'WebRTC']},
-                {'name': 'Browser',  'volume': 100, 'patterns': ['firefox', 'chrome', 'chromium', 'brave']},
-                {'name': 'Musik',    'volume': 80,  'patterns': ['spotify', 'Spotify', 'vlc', 'mpv']},
-                {'name': 'Sonstige', 'volume': 100, 'patterns': []},
-            ],
+            'camera_overlay_rect': {
+                'x': 0.72, 'y': 0.64, 'w': 0.25, 'h': 0.34,
+            },
+            'image_overlay_enabled': False,
+            'image_overlay_path': '',
+            'image_overlay_opacity': 100,
+            'image_overlay_fit': 'fit',
+            'image_overlay_rect': {
+                'x': 0.76, 'y': 0.04, 'w': 0.20, 'h': 0.24,
+            },
+            # Ordered image layers. The singular keys above remain as a
+            # compatibility mirror for older themes/settings builds.
+            'image_overlays': [],
+            # Empty means the bundled desktop screenshot is used. A user
+            # selected image is stored here so the preview remains portable
+            # and can be reset to the standard background at any time.
+            'input_overlay_preview_background': '',
         }
         
         if not self.config_file.exists():
@@ -108,17 +180,54 @@ class SettingsManager:
                     merged[k] = {**merged[k], **v}
                 else:
                     merged[k] = v
-            # Migrate old source_volumes to audio_categories if present in loaded config
-            if 'source_volumes' in loaded and 'audio_categories' not in loaded:
-                sv = loaded['source_volumes']
-                name_map = {'game': 'Game', 'discord': 'Discord',
-                            'browser': 'Browser', 'music': 'Musik'}
-                cats = merged['audio_categories']
-                for old_key, new_name in name_map.items():
-                    if old_key in sv:
-                        for cat in cats:
-                            if cat['name'] == new_name:
-                                cat['volume'] = sv[old_key]
+            # Existing installations should not change recording quality just
+            # because the profile feature was added.  Seed each missing
+            # recording value from the user's established clip value.
+            for recording_key, clip_key in (
+                    ('recording_framerate', 'framerate'),
+                    ('recording_resolution', 'resolution'),
+                    ('recording_bitrate_level', 'bitrate_level'),
+                    ('recording_custom_bitrate_kbps', 'custom_bitrate_kbps')):
+                if recording_key not in loaded:
+                    merged[recording_key] = merged[clip_key]
+            retired_overlay_keys = [
+                key for key in merged
+                if (key.startswith('keyboard_overlay_')
+                    or key.startswith('mouse_overlay_')
+                    or key == 'input_overlay_preview_clip')
+            ]
+            retired_audio_keys = [
+                key for key in ('multiband_audio_enabled', 'audio_categories')
+                if key in merged
+            ]
+            retired_feature_keys = [
+                key for key in ('auto_crop_enabled',)
+                if key in merged
+            ]
+            for key in (*retired_overlay_keys, *retired_audio_keys,
+                        *retired_feature_keys):
+                merged.pop(key, None)
+            self._retired_settings_removed = bool(
+                retired_overlay_keys or retired_audio_keys or retired_feature_keys)
+            if ('image_overlays' not in loaded
+                    and str(loaded.get('image_overlay_path', '') or '')):
+                from core.camera_overlay import new_image_overlay_layer
+                layer = new_image_overlay_layer(
+                    str(loaded.get('image_overlay_path', '')), 0)
+                layer.update({
+                    'enabled': bool(loaded.get('image_overlay_enabled', False)),
+                    'opacity': loaded.get('image_overlay_opacity', 100),
+                    'fit': loaded.get('image_overlay_fit', 'fit'),
+                    'rect': loaded.get('image_overlay_rect', layer['rect']),
+                })
+                merged['image_overlays'] = [layer]
+                self._retired_settings_removed = True
+            if 'camera_overlay_rect' not in loaded:
+                from core.camera_overlay import legacy_overlay_rect
+                merged['camera_overlay_rect'] = legacy_overlay_rect(
+                    loaded.get('camera_position', 'bottom-right'),
+                    loaded.get('camera_size', 'medium'),
+                )
             return merged
         except Exception as e:
             print(f"Failed to load settings: {e}")

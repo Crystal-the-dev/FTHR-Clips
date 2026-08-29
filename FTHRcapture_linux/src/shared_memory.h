@@ -98,7 +98,8 @@ enum class CommandType : uint32_t {
 
 enum class ResponseType : uint32_t {
     NONE=0, RECORDING_STARTED=1, RECORDING_STOPPED=2, CLIP_SAVED=3,
-    STATUS_UPDATE=4, ERROR_OCCURRED=5, SAVE_STARTED=6
+    STATUS_UPDATE=4, ERROR_OCCURRED=5, SAVE_STARTED=6,
+    MANUAL_RECORDING_ERROR=7
 };
 
 class SharedMemory {

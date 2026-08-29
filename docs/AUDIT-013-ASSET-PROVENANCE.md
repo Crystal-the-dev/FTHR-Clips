@@ -7,7 +7,8 @@
 
 Date: **2026-08-14**
 
-Status: **RESOLVED IN SOURCE AND ENFORCED BY RELEASE GATES**
+Status: **RESOLVED IN SOURCE; ARTIFACT VERIFICATION RECORDED IN
+`AUDIT-013-QT-LICENSING.md`**
 
 This is an engineering evidence record, not legal advice. The canonical,
 machine-readable inventory is `tools/release_asset_manifest.json`; its SHA-256
@@ -42,6 +43,7 @@ installer rather than copied as a standalone artifact file.
 | `FTHR_UI/assets/fonts/Oswald-Bold.ttf` | TTF | Qt font registration in `FTHR_UI/main.py::_load_fonts`; both specs | W, L | OFL-1.1; O1 | APPROVED |
 | `FTHR_UI/assets/fthr_logo.ico` | ICO | `FTHR.spec` executable icon; `installer_windows.iss` setup icon | W Embedded | MIT; G1 | APPROVED |
 | `FTHR_UI/assets/fthr_logo.png` | PNG | main window, splash and theme/customization fallback; both specs | W, L | MIT; G1 | APPROVED |
+| `FTHR_UI/assets/preview_desktop.png` | PNG | standard visual-overlays preview background; both specs | W, L | User-provided; workspace owner | APPROVED |
 | `FTHR_UI/assets/icons/clip.png` | PNG | clip navigation tab; theme manager | W, L | MIT; G1 | APPROVED |
 | `FTHR_UI/assets/icons/close.png` | PNG | window close button; theme manager | W, L | MIT; G1 | APPROVED |
 | `FTHR_UI/assets/icons/dropdown.png` | PNG | combo-box arrow in main UI and clip grid | W, L | MIT; G1 | APPROVED |

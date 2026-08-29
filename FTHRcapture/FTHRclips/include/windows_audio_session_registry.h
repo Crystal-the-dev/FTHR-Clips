@@ -48,6 +48,8 @@ struct WindowsAudioSessionUpdate {
 // process.  They intentionally accept only executable basenames.
 std::string NormalizeWindowsExecutableIdentity(const std::wstring& executable_basename);
 std::string ResolveWindowsAudioSourceName(const std::wstring& executable_basename);
+std::string ResolveWindowsAudioSourceName(const std::wstring& executable_basename,
+                                          const std::wstring& executable_description);
 std::string BuildWindowsRuntimeGroupKey(uint32_t root_process_id,
                                         const std::wstring& executable_basename);
 
@@ -66,20 +68,27 @@ public:
     void Stop();
 
     bool needs_refresh() const { return dirty_.load(std::memory_order_acquire); }
-    // Enumerates only on initial start or a session-created notification; it
-    // is not an aggressive periodic process scan.
+    // Ask the next RefreshIfNeeded call to rescan endpoint topology as well as
+    // live sessions. The production owner uses a slow safety poll in addition
+    // to event notifications so a newly attached/rerouted output device cannot
+    // make an application disappear from multitrack capture.
+    void RequestRefresh() { MarkDirty(); }
     bool RefreshIfNeeded(WindowsAudioSessionUpdate* update);
     const std::string& last_error() const { return last_error_; }
 
 private:
     class SessionNotification;
     class SessionEventNotification;
+    struct EndpointRegistration;
     struct SessionEventRegistration;
+    bool RefreshEndpoints();
     bool Refresh(WindowsAudioSessionUpdate* update);
     void MarkDirty() { dirty_.store(true, std::memory_order_release); }
 
-    void* session_manager_ = nullptr;  // IAudioSessionManager2*
     SessionNotification* notification_ = nullptr;
+    // One IAudioSessionManager2 registration per active render endpoint. An
+    // app routed away from the console default must still receive its own row.
+    std::vector<std::unique_ptr<EndpointRegistration>> endpoint_registrations_;
     // One registration per live WASAPI session instance. Session-created alone
     // is insufficient for replay retention: disconnect/state notifications make
     // an exited source retire while its already-encoded history remains owned by

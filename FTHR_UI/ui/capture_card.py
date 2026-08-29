@@ -15,12 +15,10 @@ Public API:
     card.show_clip(duration_s, fps, resolution_label)
     card.show_screenshot()
     card.show_error(detail='')
+    card.show_recording_saved(filename='')
 """
 
-import ctypes
 import os
-import sys
-import subprocess as _subprocess
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -28,85 +26,106 @@ from PySide6.QtCore import (
     QPauseAnimation, QEasingCurve, QPoint, QRect, QElapsedTimer,
 )
 from PySide6.QtGui import (
-    QColor, QPainter, QPen, QFont, QLinearGradient, QPainterPath,
+    QColor, QPainter, QPen, QFont, QFontDatabase, QFontMetrics,
+    QLinearGradient, QPainterPath,
 )
 from PySide6.QtWidgets import QApplication, QWidget
 
 from core.settings_manager import SettingsManager
 from core.theme_manager import ThemeManager
+from ui.sound_playback import SoundPlayback
 
 
 # ---------------------------------------------------------------------------
 # Layout constants
 # ---------------------------------------------------------------------------
 
-_W, _H     = 340, 116   # card size in pixels
+_FULL_W, _FULL_H       = 340, 116
+_COMPACT_W, _COMPACT_H = 320, 76
 _BORDER    = 3           # left accent border width
 _MARGIN    = 16          # distance from screen edges
 
-# Animation timing (ms)
-_SLIDE_IN  = 450
-_HOLD      = 2400
-_SLIDE_OUT = 350
+# Animation timing. Every value is milliseconds; ``hold_duration_ms`` is the
+# fully-arrived visible hold. Total lifetime also includes slide-in/out.
+_SLIDE_IN_DURATION_MS = 450
+_DEFAULT_HOLD_DURATION_MS = 2400
+_SLIDE_OUT_DURATION_MS = 350
 
 # Sound files live in assets/sounds/ alongside the UI source.
-_SND_DIR        = Path(__file__).parent.parent / 'assets' / 'sounds'
-_SND_CLIP       = _SND_DIR / 'clip_captured.wav'
-_SND_SCREENSHOT = _SND_DIR / 'screenshot_saved.wav'
-_SND_ERROR      = _SND_DIR / 'error.wav'
-
-_SND_VOLUME_KEYS = {
-    _SND_CLIP:       'sound_volume_clip',
-    _SND_SCREENSHOT: 'sound_volume_screenshot',
-    _SND_ERROR:      'sound_volume_error',
+_SND_DIR = Path(__file__).parent.parent / 'assets' / 'sounds'
+_SOUND_FILES = {
+    'clip_captured': _SND_DIR / 'clip_captured.wav',
+    'screenshot_captured': _SND_DIR / 'screenshot_saved.wav',
+    'error': _SND_DIR / 'error.wav',
+    'startup': _SND_DIR / 'startup.wav',
+    'upload_successful': _SND_DIR / 'upload_successful.wav',
+    'upload_failed': _SND_DIR / 'upload_failed.wav',
+}
+_SOUND_VOLUME_KEYS = {
+    'clip_captured': 'sound_volume_clip',
+    'screenshot_captured': 'sound_volume_screenshot',
+    'error': 'sound_volume_error',
+    'startup': 'sound_volume_startup',
+    'upload_successful': 'sound_volume_upload_successful',
+    'upload_failed': 'sound_volume_upload_failed',
 }
 
-_MCI_ALIAS = 'fthr_card'
+_FONT_ASSET = Path(__file__).parent.parent / 'assets' / 'fonts' / 'Oswald-Bold.ttf'
+_NOTIFICATION_FONTS_LOADED = False
+
+_SOUND_PLAYBACK: SoundPlayback | None = None
+
+
+def _load_notification_fonts() -> None:
+    global _NOTIFICATION_FONTS_LOADED
+    if _NOTIFICATION_FONTS_LOADED:
+        return
+    if _FONT_ASSET.exists():
+        QFontDatabase.addApplicationFont(str(_FONT_ASSET))
+    _NOTIFICATION_FONTS_LOADED = True
+
+
+def _body_font(size: int, weight=QFont.Weight.Normal) -> QFont:
+    # Keep the detached notification card on the same display system as the
+    # main app. Its process loads the bundled Oswald asset independently.
+    family = ThemeManager().get_font('body') or 'Oswald'
+    return QFont(family, size, weight)
+
+
+def _resolve_sound(key: str) -> Path:
+    try:
+        custom = ThemeManager().get_custom_sound_path(key)
+        if custom is not None and custom.exists():
+            return custom
+    except (AttributeError, OSError, TypeError, ValueError):
+        # A missing/corrupt custom theme sound must fall back to the bundled cue.
+        return _SOUND_FILES[key]
+    return _SOUND_FILES[key]
 
 
 # ---------------------------------------------------------------------------
 # Sound helper
 # ---------------------------------------------------------------------------
 
-def _play_sound(path: Path, volume: int = 100) -> None:
-    """Fire-and-forget playback for the synthesized project WAV files.
+def _get_sound_playback() -> SoundPlayback:
+    global _SOUND_PLAYBACK
+    if _SOUND_PLAYBACK is None:
+        # The card process is long-lived, so loading the short cues once avoids
+        # a decoder startup race every time a clip is saved or the app starts.
+        preload = [_resolve_sound(key) for key in _SOUND_FILES]
+        _SOUND_PLAYBACK = SoundPlayback(preload_paths=preload)
+    return _SOUND_PLAYBACK
 
-    Creating QMediaPlayer for a short notification adds avoidable startup and
-    lifecycle overhead, and has blocked prewarming on some Linux configurations.
-    Use the lightweight platform path instead:
-      - Windows: play through the MCI API provided by winmm.
-      - Linux: invoke ffplay without a display and with automatic exit.
-    The defaults contain no third-party samples; they are reproducibly
-    generated by ``tools/generate_release_assets.py``.
-    """
-    if not path.exists():
-        return
-    vol = max(0, min(100, volume))
-    if vol == 0:
-        return
-    if sys.platform == 'win32':
+
+def _play_sound(path: Path, volume: int = 100) -> None:
+    """Play a cue after its local source is ready."""
+    if path.exists():
         try:
-            mci = ctypes.windll.winmm.mciSendStringW
-            # Close any previous playback first or MCI gets cranky about the alias
-            # already being in use when you clip twice in a row.
-            mci(f'close {_MCI_ALIAS}', None, 0, None)
-            mci(f'open "{path}" type waveaudio alias {_MCI_ALIAS}', None, 0, None)
-            # MCI volume range is 0–1000
-            mci(f'setaudio {_MCI_ALIAS} volume to {vol * 10}', None, 0, None)
-            mci(f'play {_MCI_ALIAS}', None, 0, None)
+            _get_sound_playback().play(path, volume)
         except Exception:
-            pass
-    else:
-        try:
-            _subprocess.Popen(
-                ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet',
-                 '-volume', str(vol), str(path)],
-                stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL,
-            )
-        except FileNotFoundError:
-            pass  # ffplay not installed — silent fallback
-        except Exception:
-            pass
+            # Audio must never take down the detached notification process.
+            global _SOUND_PLAYBACK
+            _SOUND_PLAYBACK = None
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +138,8 @@ class CaptureCard(QWidget):
     Slide in → hold → slide out, with a draining progress bar and shimmer.
     """
 
-    def __init__(self):
+    def __init__(self, *, visuals_enabled: bool = True):
+        _load_notification_fonts()
         super().__init__(
             None,
             Qt.WindowType.FramelessWindowHint |
@@ -128,14 +148,21 @@ class CaptureCard(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        self.setFixedSize(_W, _H)
+        self.setFixedSize(_FULL_W, _FULL_H)
 
         # Display state
         self._headline: str = 'CLIP CAPTURED'
         self._stats: list[tuple[str, str]] = []   # (value, label) pairs
+        self._detail: str = ''
         self._progress: float = 1.0               # 1.0 → 0.0 during hold
         self._shimmer: float = -1.0               # -1 = off, 0→3 = x position
         self._scale: float = 1.0                  # set per-show from screen height
+        self._base_w = _FULL_W
+        self._base_h = _FULL_H
+        self._compact = False
+        self._display_kind = 'normal'
+        self._visuals_enabled = bool(visuals_enabled)
+        self._hold_duration_ms = _DEFAULT_HOLD_DURATION_MS
 
         # Theme colors — loaded once per show to avoid per-paint overhead
         self._c_bg = QColor('#000000')
@@ -173,44 +200,127 @@ class CaptureCard(QWidget):
         # compete with the new group for control of self.pos during rapid saves.
         self._seq: QSequentialAnimationGroup | None = None
 
+        # Warm the short cues while the detached card is starting. The first
+        # startup/clip event can then play immediately instead of racing a
+        # decoder initialization on the notification path.
+        try:
+            _get_sound_playback()
+        except Exception:
+            # Notification audio is optional; a later event retries initialization.
+            pass
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def show_clip(self, duration_s: int, fps: int, resolution: str) -> None:
+    def show_clip(self, duration_s: int, fps: int, resolution: str,
+                  hold_duration_ms: int = _DEFAULT_HOLD_DURATION_MS) -> None:
         self._headline = 'CLIP CAPTURED'
+        self._detail = ''
         self._stats = [
             (f'{duration_s}s',  'Duration'),
             (f'{fps} FPS',      'Framerate'),
             (resolution,        'Resolution'),
         ]
-        self._show(_SND_CLIP)
+        self._show('clip_captured', hold_duration_ms=hold_duration_ms)
 
-    def show_screenshot(self) -> None:
+    def show_screenshot(
+            self, hold_duration_ms: int = _DEFAULT_HOLD_DURATION_MS) -> None:
         self._headline = 'SCREENSHOT SAVED'
+        self._detail = ''
         self._stats = []
-        self._show(_SND_SCREENSHOT)
+        self._show(
+            'screenshot_captured', compact=True,
+            hold_duration_ms=hold_duration_ms)
 
-    def show_error(self, detail: str = '') -> None:
+    def show_error(self, detail: str = '',
+                   hold_duration_ms: int = _DEFAULT_HOLD_DURATION_MS) -> None:
         self._headline = 'CAPTURE FAILED'
-        self._stats = [(detail, '')] if detail else []
-        self._show(_SND_ERROR)
-
-    def show_upload(self, filename: str = '') -> None:
-        self._headline = 'CLIP UPLOADED'
-        self._stats = [(filename, '')] if filename else []
-        self._show(_SND_CLIP)
-
-    def show_prompt(self, text: str) -> None:
-        self._headline = text
+        self._detail = detail
         self._stats = []
-        self._show(_SND_ERROR)
+        self._show(
+            'error', compact=True, hold_duration_ms=hold_duration_ms)
+
+    def show_upload(self, filename: str = '',
+                    hold_duration_ms: int = _DEFAULT_HOLD_DURATION_MS) -> None:
+        self._headline = 'CLIP UPLOADED'
+        self._detail = filename
+        self._stats = []
+        self._show(
+            'upload_successful', compact=True,
+            hold_duration_ms=hold_duration_ms)
+
+    def show_upload_failed(
+            self, detail: str = '',
+            hold_duration_ms: int = _DEFAULT_HOLD_DURATION_MS) -> None:
+        self._headline = 'UPLOAD FAILED'
+        self._detail = detail
+        self._stats = []
+        self._show(
+            'upload_failed', compact=True,
+            hold_duration_ms=hold_duration_ms)
+
+    def play_startup(self) -> None:
+        key = 'startup'
+        try:
+            volume = int(SettingsManager().get(
+                _SOUND_VOLUME_KEYS[key], 100))
+        except Exception:
+            volume = 100
+        _play_sound(_resolve_sound(key), volume)
+
+    def show_prompt(self, text: str,
+                    hold_duration_ms: int = _DEFAULT_HOLD_DURATION_MS) -> None:
+        self._headline = 'CAPTURE UPDATE'
+        self._detail = text
+        self._stats = []
+        self._show(
+            None, compact=True, hold_duration_ms=hold_duration_ms)
+
+    def show_recording_saved(
+            self, filename: str = '',
+            hold_duration_ms: int = _DEFAULT_HOLD_DURATION_MS) -> None:
+        self._headline = 'MANUAL RECORDING SAVED'
+        self._detail = (
+            f'{filename}  ·  Ready to trim and export.'
+            if filename else 'Ready to trim and export.')
+        self._stats = []
+        self._show(
+            None, compact=True, hold_duration_ms=hold_duration_ms)
+
+    def show_capturing(self, source: str,
+                       hold_duration_ms: int = _DEFAULT_HOLD_DURATION_MS) -> None:
+        self._headline = 'NOW CAPTURING'
+        self._detail = source or 'Desktop'
+        self._stats = []
+        self._show(
+            None, compact=True, hold_duration_ms=hold_duration_ms)
+
+    def show_background_capture(
+            self, source: str,
+            hold_duration_ms: int = _DEFAULT_HOLD_DURATION_MS) -> None:
+        self._headline = 'NOW CAPTURING'
+        self._detail = f'{source or "Desktop"}  ·  Running in the background'
+        self._stats = []
+        self._show(
+            None, compact=True, hold_duration_ms=hold_duration_ms)
+        self._display_kind = 'background'
+
+    def hide_background_capture(self) -> None:
+        if self._display_kind == 'background':
+            self._stop_display()
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
-    def _show(self, sound: Path) -> None:
+    def set_visuals_enabled(self, enabled: bool) -> None:
+        """Toggle the card window while leaving notification sounds enabled."""
+        self._visuals_enabled = bool(enabled)
+        if not self._visuals_enabled:
+            self._stop_display()
+
+    def _stop_display(self) -> None:
         # Cancel any running animation/timers and destroy the old group so it
         # doesn't linger as a Qt child competing with the new animation.
         if self._seq is not None:
@@ -221,6 +331,18 @@ class CaptureCard(QWidget):
         self._shimmer_delay.stop()
         self._progress_delay.stop()
         self.hide()
+        self._display_kind = 'normal'
+
+    def _show(self, sound_key: str | None, *, compact: bool = False,
+              hold_duration_ms: int = _DEFAULT_HOLD_DURATION_MS) -> None:
+        self._stop_display()
+        try:
+            self._hold_duration_ms = max(1, int(hold_duration_ms))
+        except (TypeError, ValueError, OverflowError):
+            self._hold_duration_ms = _DEFAULT_HOLD_DURATION_MS
+        self._compact = compact
+        self._base_w = _COMPACT_W if compact else _FULL_W
+        self._base_h = _COMPACT_H if compact else _FULL_H
 
         # Load theme colors once per show
         try:
@@ -235,12 +357,19 @@ class CaptureCard(QWidget):
         except Exception:
             pass
 
-        try:
-            vol_key = _SND_VOLUME_KEYS.get(sound, 'sound_volume_clip')
-            volume = int(SettingsManager().get(vol_key, 100))
-        except Exception:
-            volume = 100
-        _play_sound(sound, volume)
+        if sound_key is not None:
+            try:
+                volume = int(SettingsManager().get(
+                    _SOUND_VOLUME_KEYS[sound_key], 100))
+            except Exception:
+                volume = 100
+            _play_sound(_resolve_sound(sound_key), volume)
+
+        # The helper process remains alive as a lightweight sound host when
+        # card visuals are disabled. Keep this after sound dispatch so all
+        # notification cues retain their existing behaviour.
+        if not self._visuals_enabled:
+            return
 
         # Determine positions and scale for this screen.
         # FTHR_CARD_SCREEN_NAME is set by CaptureCardClient based on the user's
@@ -259,8 +388,8 @@ class CaptureCard(QWidget):
         # billboard on a 768p laptop or a postage stamp on 4K. Clamp to [0.65, 1.0]
         # — never bigger than the design size, never microscopic.
         self._scale = min(1.0, max(0.65, screen.height() / 1080))
-        w = int(_W * self._scale)
-        h = int(_H * self._scale)
+        w = int(self._base_w * self._scale)
+        h = int(self._base_h * self._scale)
         self.setFixedSize(w, h)
 
         on_x   = screen.right() - w - _MARGIN
@@ -282,15 +411,15 @@ class CaptureCard(QWidget):
         # and the group itself has no Qt parent so Python refcount controls its
         # lifetime. Replacing self._seq destroys everything cleanly.
         sin = QPropertyAnimation(self, b'pos')
-        sin.setDuration(_SLIDE_IN)
+        sin.setDuration(_SLIDE_IN_DURATION_MS)
         sin.setStartValue(off_pt)
         sin.setEndValue(on_pt)
         sin.setEasingCurve(QEasingCurve.Type.OutBack)
 
-        hold = QPauseAnimation(_HOLD)
+        hold = QPauseAnimation(self._hold_duration_ms)
 
         sout = QPropertyAnimation(self, b'pos')
-        sout.setDuration(_SLIDE_OUT)
+        sout.setDuration(_SLIDE_OUT_DURATION_MS)
         sout.setStartValue(on_pt)
         sout.setEndValue(off_pt)
         sout.setEasingCurve(QEasingCurve.Type.InCubic)
@@ -305,7 +434,7 @@ class CaptureCard(QWidget):
         # Start the shimmer during arrival, then drain progress only after the
         # card has landed. These delays are visual timing constants.
         self._shimmer_delay.start(150)
-        self._progress_delay.start(_SLIDE_IN + 30)
+        self._progress_delay.start(_SLIDE_IN_DURATION_MS + 30)
 
     def _start_progress(self) -> None:
         self._prog_clock.start()
@@ -313,8 +442,9 @@ class CaptureCard(QWidget):
 
     def _tick_progress(self) -> None:
         elapsed = self._prog_clock.elapsed()
-        self._progress = max(0.0, 1.0 - elapsed / _HOLD)
-        if elapsed >= _HOLD:
+        self._progress = max(
+            0.0, 1.0 - elapsed / self._hold_duration_ms)
+        if elapsed >= self._hold_duration_ms:
             self._prog_timer.stop()
         self.update()
 
@@ -340,61 +470,101 @@ class CaptureCard(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # Scale all painting to the base 340×116 coordinate space
+        # Scale all painting to the selected full/compact coordinate space.
         if self._scale != 1.0:
             p.scale(self._scale, self._scale)
 
+        w = self._base_w
+        h = self._base_h
+
         # Background (use base dimensions, not widget size)
-        p.fillRect(0, 0, _W, _H, self._c_bg)
+        p.fillRect(0, 0, w, h, self._c_bg)
 
         # Left accent border
-        p.fillRect(0, 0, _BORDER, _H, self._c_accent)
+        p.fillRect(0, 0, _BORDER, h, self._c_accent)
 
         # Clip shimmer to card interior
-        inner = QRect(_BORDER, 0, _W - _BORDER, _H)
+        inner = QRect(_BORDER, 0, w - _BORDER, h)
         p.setClipRect(inner)
 
         # Shimmer overlay sweep
         if self._shimmer >= 0.0:
-            cx = _BORDER + int((_W - _BORDER) * (self._shimmer / 3.0 - 0.3))
+            cx = _BORDER + int((w - _BORDER) * (self._shimmer / 3.0 - 0.3))
             grad = QLinearGradient(cx - 70, 0, cx + 70, 0)
-            grad.setColorAt(0.0, QColor(255, 255, 255, 0))
-            grad.setColorAt(0.5, QColor(255, 255, 255, 14))
-            grad.setColorAt(1.0, QColor(255, 255, 255, 0))
+            shimmer_clear = QColor(self._c_accent)
+            shimmer_clear.setAlpha(0)
+            shimmer_soft = QColor(self._c_accent)
+            shimmer_soft.setAlpha(14)
+            grad.setColorAt(0.0, shimmer_clear)
+            grad.setColorAt(0.5, shimmer_soft)
+            grad.setColorAt(1.0, shimmer_clear)
             p.fillRect(inner, grad)
 
         p.setClipping(False)
 
-        # ── Top row: camera icon + headline ──
-        icon_x, icon_y, icon_size = _BORDER + 17, 17, 26
+        # Compact cards keep punctuation-heavy text in the native body face;
+        # headline tracking is reserved for short all-caps status text.
+        if self._compact:
+            icon_x, icon_y, icon_size = _BORDER + 12, 13, 20
+            headline_x, headline_y, headline_h = _BORDER + 42, 8, 25
+            headline_size = 11
+        else:
+            icon_x, icon_y, icon_size = _BORDER + 17, 17, 26
+            headline_x, headline_y, headline_h = _BORDER + 52, 12, 28
+            headline_size = 15
         self._draw_camera(p, icon_x, icon_y, icon_size)
 
-        hl_font = QFont('Bahnschrift', 15, QFont.Weight.Bold)
-        hl_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.4)
+        hl_font = QFont(
+            ThemeManager().get_font('display') or 'Oswald',
+            headline_size,
+            QFont.Weight.Bold,
+        )
+        hl_font.setLetterSpacing(
+            QFont.SpacingType.AbsoluteSpacing, 1.0 if self._compact else 1.4)
         p.setFont(hl_font)
         p.setPen(self._c_text)
-        p.drawText(
-            _BORDER + 52, 12, _W - _BORDER - 58, 28,
-            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+        headline = QFontMetrics(hl_font).elidedText(
             self._headline,
+            Qt.TextElideMode.ElideRight,
+            w - headline_x - 12,
+        )
+        p.drawText(
+            headline_x, headline_y, w - headline_x - 12, headline_h,
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            headline,
         )
 
-        # ── Divider ──
-        p.setPen(QPen(self._c_divider, 1))
-        p.drawLine(_BORDER + 10, 47, _W - 10, 47)
-
-        # ── Stats ──
-        if self._stats:
-            self._draw_stats(p, 54)
+        if self._compact:
+            if self._detail:
+                detail_font = _body_font(9, QFont.Weight.Normal)
+                p.setFont(detail_font)
+                detail_color = QColor(self._c_text)
+                detail_color.setAlpha(180)
+                p.setPen(detail_color)
+                detail = QFontMetrics(detail_font).elidedText(
+                    self._detail,
+                    Qt.TextElideMode.ElideRight,
+                    w - headline_x - 12,
+                )
+                p.drawText(
+                    headline_x, 33, w - headline_x - 12, 27,
+                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                    detail,
+                )
+        else:
+            p.setPen(QPen(self._c_divider, 1))
+            p.drawLine(_BORDER + 10, 47, w - 10, 47)
+            if self._stats:
+                self._draw_stats(p, 54)
 
         # ── Progress track ──
         p.setPen(Qt.PenStyle.NoPen)
-        p.fillRect(0, _H - 2, _W, 2, self._c_prog_track)
+        p.fillRect(0, h - 2, w, 2, self._c_prog_track)
 
         # ── Progress fill ──
-        fill_w = int(_W * self._progress)
+        fill_w = int(w * self._progress)
         if fill_w > 0:
-            p.fillRect(0, _H - 2, fill_w, 2, self._c_prog_fill)
+            p.fillRect(0, h - 2, fill_w, 2, self._c_prog_fill)
 
         p.end()
 
@@ -430,25 +600,25 @@ class CaptureCard(QWidget):
         if n == 0:
             return
 
-        usable = _W - _BORDER - 20
+        usable = self._base_w - _BORDER - 20
         col_w  = usable // n
         base_x = _BORDER + 10
 
-        val_font = QFont('Bahnschrift', 12, QFont.Weight.DemiBold)
-        val_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.5)
+        val_font = _body_font(11, QFont.Weight.DemiBold)
 
-        lbl_font = QFont('Bahnschrift', 8)
+        lbl_font = _body_font(8)
         lbl_font.setWeight(QFont.Weight.Light)
-        lbl_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.2)
 
         for i, (val, lbl) in enumerate(self._stats):
             cx = base_x + i * col_w
 
             p.setFont(val_font)
             p.setPen(self._c_text)
+            value = QFontMetrics(val_font).elidedText(
+                str(val), Qt.TextElideMode.ElideRight, col_w - 6)
             p.drawText(cx, top, col_w - 6, 22,
                        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                       val)
+                       value)
 
             if lbl:
                 p.setFont(lbl_font)

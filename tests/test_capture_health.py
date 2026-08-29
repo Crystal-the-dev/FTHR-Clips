@@ -108,6 +108,42 @@ def test_recovering_and_paused_capture_reject_saves() -> None:
     assert not paused.save_allowed  # no fresh buffer exists after an intentional pause
 
 
+def test_intentional_pause_preserves_an_already_warm_replay_ring() -> None:
+    clock = FakeClock()
+    monitor = CaptureHealthMonitor(clock=clock)
+    _observe(monitor, 1)
+    clock.advance(6)
+    warm = _observe(monitor, 2)
+    assert warm.fresh_buffer_seconds == 6
+
+    clock.advance(2)
+    paused = _observe(
+        monitor, 2, int(CaptureHealthFlag.ACTIVE | CaptureHealthFlag.PAUSED))
+    clock.advance(1)
+    resumed = _observe(monitor, 3)
+
+    assert paused.save_allowed
+    assert resumed.fresh_buffer_seconds == 7
+    admitted = evaluate_save_admission(resumed, 30)
+    assert admitted.allowed
+    assert admitted.duration_seconds == 7
+
+
+def test_static_wgc_source_keeps_verified_replay_saveable() -> None:
+    clock = FakeClock()
+    monitor = CaptureHealthMonitor(clock=clock)
+    _observe(monitor, 1)
+    clock.advance(10)
+    _observe(monitor, 2)
+    clock.advance(9)
+
+    stalled = _observe(monitor, 2)
+
+    assert stalled.state is CaptureHealthState.STALLED
+    assert stalled.fresh_buffer_seconds == 10
+    assert evaluate_save_admission(stalled, 30).allowed
+
+
 def _solid_frame(width: int, height: int, bgr: tuple[int, int, int]) -> bytes:
     blue, green, red = bgr
     return bytes((blue, green, red, 255)) * (width * height)

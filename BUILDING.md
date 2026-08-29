@@ -65,9 +65,9 @@ python -m pytest tests/
 python -m ruff check .
 ```
 
-All must pass. [`docs/TESTING.md`](docs/TESTING.md) explains which additional
-checks require real hardware or a desktop session. The release asset manifest
-hash-locks every bundled asset. Before packaging, also
+All must pass. See [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md) for
+the full gate list. AUDIT-013 selected PySide6/LGPLv3 and hash-locks every
+release asset in `tools/release_asset_manifest.json`. Before packaging, also
 verify that the committed generated media matches its reviewed source:
 
 ```bash
@@ -116,12 +116,18 @@ Output: `FTHRcapture\x64\Release\FTHRclips.exe`.
 ### 2. Bundle with PyInstaller
 
 ```powershell
+python tools/build_optional_uploaders.py
 python -m PyInstaller FTHR.spec --clean
 ```
 
 Output: `dist\FTHRClips\`. The spec generates the Windows VERSIONINFO resource
 from `FTHR_UI/version.py`, so the `.exe` reports its version in Explorer →
 Properties → Details.
+
+The first command independently freezes and seals the optional uploader and
+Lustful Hardware Identity packages, then binds both archive hashes into Core.
+`FTHR.spec` refuses to build if either dormant package is missing. The normal
+installer build entrypoint runs this command automatically.
 
 Optional size reduction:
 
@@ -160,8 +166,9 @@ python tools/build_windows_installer.py `
 ### What the installer contains
 
 Windows DXGI capture engine · Python runtime and dependencies · Qt6 Widgets (no
-Wayland/QML) · Microsoft Visual C++ redistributable · Start Menu and optional
-desktop shortcut · versioned Inno uninstaller. Clips, screenshots, exports and
+Wayland/QML) · two dormant consent-gated optional upload packages · Microsoft
+Visual C++ redistributable · Start Menu and optional desktop shortcut ·
+versioned Inno uninstaller. Clips, screenshots, exports and
 sidecars under `%USERPROFILE%\FTHR_Clips` are never uninstaller targets;
 settings/cache in `%USERPROFILE%\.fthr` are retained unless the user explicitly
 chooses their removal.
@@ -342,5 +349,5 @@ Ubuntu 24.04 / WSL2, 2026-08-06:
 | Licence gate | **PASS** — 83 checks, 0 failed, 0 warnings |
 | AppImage produced | **YES** — 219 MB, starts (offscreen), engine loads all 7 bundled FFmpeg libraries |
 
-Full platform detail is in
-[`docs/SUPPORTED_PLATFORMS.md`](docs/SUPPORTED_PLATFORMS.md).
+Full detail in [`docs/SUPPORTED_PLATFORMS.md`](docs/SUPPORTED_PLATFORMS.md) and
+[`docs/AUDIT_REPORT.md`](docs/AUDIT_REPORT.md).

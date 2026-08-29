@@ -7,6 +7,79 @@ import time
 from unittest.mock import patch, MagicMock
 
 
+def test_oversized_catbox_upload_requires_compression_confirmation(
+    qapp, tmp_path,
+):
+    from core.upload_manager import UploadManager
+
+    sm = MagicMock()
+    sm.get.side_effect = lambda key, default=None: {
+        'upload_provider': 'catbox',
+    }.get(key, default)
+    manager = UploadManager(sm)
+    manager.is_enabled = lambda: True
+    clip = tmp_path / 'large.mp4'
+    with clip.open('wb') as stream:
+        stream.truncate(201 * 1024 * 1024)
+    requested = []
+    manager.compression_required.connect(
+        lambda path, provider, limit: requested.append(
+            (path, provider, limit)))
+
+    manager.enqueue_upload(str(clip))
+
+    assert requested == [(str(clip), 'catbox', 200)]
+    assert manager._queue.empty()
+
+
+def test_oversized_upload_auto_compresses_without_confirmation(qapp, tmp_path):
+    from core.upload_manager import UploadManager
+
+    sm = MagicMock()
+    manager = UploadManager(sm)
+    manager.set('upload_provider', 'lustful')
+    manager.set('upload_auto_compress', True)
+    manager.is_enabled = lambda: True
+    clip = tmp_path / 'large.mp4'
+    with clip.open('wb') as stream:
+        stream.truncate(101 * 1024 * 1024)
+    requested = []
+    manager.compression_required.connect(
+        lambda path, provider, limit: requested.append(
+            (path, provider, limit)))
+
+    manager.enqueue_upload(str(clip))
+
+    assert requested == []
+    task_kind, queued_path, _event = manager._queue.get_nowait()
+    assert task_kind == 'compress_upload'
+    assert queued_path == str(clip)
+
+
+def test_compressed_upload_history_marks_original_and_preserves_provenance(
+    qapp, tmp_path, monkeypatch,
+):
+    import json
+    from core import upload_manager as upload_module
+
+    history_path = tmp_path / 'history.json'
+    compressed = str(tmp_path / 'compressed.mp4')
+    original = str(tmp_path / 'original.mp4')
+    history_path.write_text(json.dumps({
+        compressed: {'status': 'ok', 'url': 'https://example.test/clip'},
+    }), encoding='utf-8')
+    monkeypatch.setattr(upload_module, '_HISTORY_FILE', history_path)
+    manager = upload_module.UploadManager(MagicMock())
+
+    manager._alias_compressed_upload_history(
+        original, compressed, 42 * 1024 * 1024)
+
+    history = json.loads(history_path.read_text(encoding='utf-8'))
+    assert history[original]['uploaded_copy'] == 'compressed'
+    assert history[original]['original_preserved'] is True
+    assert history[original]['uploaded_path'] == compressed
+
+
 def test_upload_error_signal_has_four_args(qapp):
     """upload_error must carry (title, detail, level, clip_path)."""
     from core.upload_manager import UploadManager
@@ -19,8 +92,6 @@ def test_upload_error_signal_has_four_args(qapp):
 
     # Simulate UPLOAD NOT CONFIGURED (no path)
     assert um._do_single_upload.__func__ is not None  # the method exists
-    with patch.object(um, '_http_post', return_value=200):
-        pass  # we test signal shape via direct emit
     um.upload_error.emit('TEST', 'detail', 'warning', '')
     assert received == [('TEST', 'detail', 'warning', '')]
 
@@ -36,6 +107,7 @@ def test_upload_failed_emits_path(qapp, tmp_path):
         'upload_auto_delete': False,
     }.get(key, default)
     um = UploadManager(sm)
+    um.is_enabled = lambda: True
 
     clip = tmp_path / 'test_clip.mp4'
     clip.write_bytes(b'\x00' * 64)
@@ -43,9 +115,9 @@ def test_upload_failed_emits_path(qapp, tmp_path):
     received = []
     um.upload_error.connect(lambda t, d, l, p: received.append((t, d, l, p)))
 
-    # _RETRY_DELAYS is (5, 15, 45) — patch time.sleep + _http_post to fail fast
-    with patch('core.upload_manager.time.sleep'), \
-         patch.object(um, '_http_post', side_effect=OSError('refused')):
+    with patch.object(
+            um, '_invoke_plugin',
+            return_value={'ok': False, 'message': 'refused'}):
         um._do_single_upload(str(clip))
 
     failed = [r for r in received if r[0] == 'UPLOAD FAILED']
@@ -103,6 +175,8 @@ def test_upload_waits_for_real_final_ready_state(qapp, tmp_path):
     }.get(key, default)
     registry = ClipReadinessRegistry()
     um = UploadManager(sm, registry)
+    um.is_enabled = lambda: True
+    um.is_uploaded = lambda _path: False
     clip = tmp_path / 'clip.mp4'
     clip.write_bytes(b'base')
     registry.engine_committed(str(clip), needs_finalization=True)
@@ -134,6 +208,8 @@ def test_failed_finalization_never_uploads(qapp, tmp_path):
     }.get(key, default)
     registry = ClipReadinessRegistry()
     um = UploadManager(sm, registry)
+    um.is_enabled = lambda: True
+    um.is_uploaded = lambda _path: False
     clip = tmp_path / 'clip.mp4'
     registry.engine_committed(str(clip), needs_finalization=True)
     uploaded = []

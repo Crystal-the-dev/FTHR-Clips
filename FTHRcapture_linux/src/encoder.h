@@ -16,6 +16,9 @@ extern "C" {
 namespace fthr {
 
 enum class CodecPref : uint32_t { Auto = 0, H264 = 1, HEVC = 2, AV1 = 3 };
+enum class EncoderPref : uint32_t {
+    Auto = 0, Nvidia = 1, Amd = 2, Intel = 3, Software = 4
+};
 
 struct EncoderConfig {
     uint32_t  src_width;
@@ -25,6 +28,7 @@ struct EncoderConfig {
     uint32_t  fps;
     uint32_t  bitrate_kbps;
     CodecPref codec_pref = CodecPref::Auto;
+    EncoderPref encoder_pref = EncoderPref::Auto;
     int       preset     = 4;   // 1=fastest … 7=best quality
 };
 

@@ -119,7 +119,9 @@ a = Analysis(
         *_so('imageformats'),
     ],
     datas=[
+        (str(ASSETS_DIR / 'favicon.ico'),    'assets'),
         (str(ASSETS_DIR / 'fthr_logo.png'),  'assets'),
+        (str(ASSETS_DIR / 'preview_desktop.png'), 'assets'),
         # Licence paperwork must travel INSIDE the bundle (AUDIT-005), so a
         # portable copy is as complete as an installed one.
         (str(ROOT / 'LICENSE'), '.'),
@@ -142,6 +144,8 @@ a = Analysis(
         'numpy',
         'cv2',
         'keyboard',
+        'keyboard.mouse',
+        'keyboard._mouse_event',
         # UI submodules
         'ui.capture_card',
         'ui.capture_card_client',
@@ -163,6 +167,7 @@ a = Analysis(
         'core.ffmpeg_playback',
         'core.game_detector',
         'core.hotkey_manager',
+        'core.input_overlay',
         'core.mic_recorder',
         'core.presets_manager',
         'core.settings_manager',

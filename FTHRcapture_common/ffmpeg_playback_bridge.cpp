@@ -10,9 +10,13 @@
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/error.h>
+#include <libavutil/opt.h>
 #include <libavutil/samplefmt.h>
 #include <libavutil/mathematics.h>
 #include <libswresample/swresample.h>
@@ -35,6 +39,10 @@ namespace {
 constexpr int kSampleRate = 48'000;
 constexpr int kChannels = 2;
 constexpr float kLimiterCeiling = 0.98f;
+// A seek cuts the old endpoint at an arbitrary waveform value.  Ramp only the
+// first 2.7 ms of replacement PCM so the discontinuity cannot become a click;
+// this is far below an AAC frame and does not create perceptible seek lag.
+constexpr int kSeekFadeFrames = 128;
 // Keep every demux pass bounded.  This permits normal interleaved streams to
 // fill a mixer block while avoiding a large decoded-audio runway when a
 // selected stream is missing or malformed.
@@ -98,6 +106,7 @@ struct DecoderState {
 class Mixer {
 public:
     ~Mixer() {
+        ResetTempo();
         av_frame_free(&frame_);
         av_packet_free(&packet_);
         avformat_close_input(&format_);
@@ -134,6 +143,15 @@ public:
             }
             auto decoder = std::make_unique<DecoderState>();
             if (!ConfigureDecoder(*decoder, stream_index, *stream, error)) continue;
+            if (seek_stream_index_ < 0
+                    || (stream->start_time != AV_NOPTS_VALUE
+                        && (seek_start_time_ == AV_NOPTS_VALUE
+                            || av_compare_ts(stream->start_time, stream->time_base,
+                                             seek_start_time_, seek_time_base_) < 0))) {
+                seek_stream_index_ = stream_index;
+                seek_time_base_ = stream->time_base;
+                seek_start_time_ = stream->start_time;
+            }
             decoders_.push_back(std::move(decoder));
         }
         if (decoders_.empty()) {
@@ -149,8 +167,36 @@ public:
         return true;
     }
 
+    bool SetPlaybackRate(const float requested_rate, const bool preserve_pitch,
+                         std::string& error) {
+        const float rate = std::clamp(requested_rate, 0.25f, 2.0f);
+        const bool enabled = preserve_pitch && std::abs(rate - 1.0f) > 1e-6f;
+        if (!enabled) {
+            ResetTempo();
+            tempo_rate_ = rate;
+            tempo_preserve_pitch_ = preserve_pitch;
+            return true;
+        }
+        if (tempo_active_ && tempo_preserve_pitch_
+                && std::abs(tempo_rate_ - rate) <= 1e-6f) {
+            return true;
+        }
+        ResetTempo();
+        tempo_rate_ = rate;
+        tempo_preserve_pitch_ = true;
+        return ConfigureTempo(rate, error);
+    }
+
     int Pull(float* output, const int requested_frames,
              const float* gains, const int gain_count, const float master_gain) {
+        if (!tempo_active_) {
+            return PullSource(output, requested_frames, gains, gain_count, master_gain);
+        }
+        return PullPitchPreserved(output, requested_frames, gains, gain_count, master_gain);
+    }
+
+    int PullSource(float* output, const int requested_frames,
+                   const float* gains, const int gain_count, const float master_gain) {
         if (!output || requested_frames <= 0 || gain_count != static_cast<int>(decoders_.size())) {
             return -1;
         }
@@ -173,21 +219,30 @@ public:
         std::fill(output, output + static_cast<size_t>(requested_frames) * kChannels, 0.0f);
         int active_sources = 0;
         for (int index = 0; index < gain_count; ++index) {
-            active_sources += gains[index] > 0.0f && !decoders_[index]->failed;
+            active_sources += std::abs(gains[index]) > 1e-6f && !decoders_[index]->failed;
         }
         const float headroom = 1.0f / std::sqrt(static_cast<float>(std::max(1, active_sources)));
 
         for (int index = 0; index < gain_count; ++index) {
-            const float gain = std::max(0.0f, gains[index]);
+            // Application stems use a reversible delta against the hidden
+            // desktop base, so their gain legitimately ranges from -1 to 0.
+            const float gain = std::clamp(gains[index], -2.0f, 2.0f);
             if (gain == 0.0f) continue;
             MixDecoder(*decoders_[index], first, end, gain, output);
         }
         const float master = std::clamp(master_gain, 0.0f, 1.0f);
         for (int frame = 0; frame < requested_frames; ++frame) {
+            float seek_gain = 1.0f;
+            if (seek_fade_remaining_ > 0) {
+                seek_gain = static_cast<float>(
+                    kSeekFadeFrames - seek_fade_remaining_) / kSeekFadeFrames;
+                --seek_fade_remaining_;
+            }
             for (int channel = 0; channel < kChannels; ++channel) {
                 const size_t sample = static_cast<size_t>(frame) * kChannels + channel;
                 output[sample] = std::clamp(output[sample] * headroom,
-                                            -kLimiterCeiling, kLimiterCeiling) * master;
+                                            -kLimiterCeiling, kLimiterCeiling)
+                    * master * seek_gain;
             }
         }
         cursor_sample_ = end;
@@ -196,9 +251,16 @@ public:
 
     bool Seek(const int64_t position_ms, std::string& error) {
         const int64_t clamped_ms = std::max<int64_t>(0, position_ms);
+        const int64_t target = av_rescale_q(
+            clamped_ms, AVRational{1, 1000}, seek_time_base_);
+        // Seek on an audio stream, not the global/video timeline. Global seeks
+        // snap to a potentially distant video keyframe; Pull() then emitted
+        // silence while every AAC decoder caught up. AAC packets are valid
+        // seek points, and AVSEEK_FLAG_ANY keeps the first post-seek block near
+        // the requested editor position.
         const int result = av_seek_frame(
-            format_, -1, av_rescale_q(clamped_ms, AVRational{1, 1000}, AV_TIME_BASE_Q),
-            AVSEEK_FLAG_BACKWARD);
+            format_, seek_stream_index_, target,
+            AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_ANY);
         if (result < 0) {
             error = "could not seek clip audio: " + ErrorText(result);
             return false;
@@ -206,6 +268,7 @@ public:
         avformat_flush(format_);
         cursor_sample_ = av_rescale_q(clamped_ms, AVRational{1, 1000},
                                       AVRational{1, kSampleRate});
+        seek_fade_remaining_ = kSeekFadeFrames;
         input_eof_ = false;
         for (const auto& decoder : decoders_) {
             avcodec_flush_buffers(decoder->codec);
@@ -221,6 +284,7 @@ public:
             decoder->flushed = false;
             decoder->failed = false;
         }
+        if (tempo_active_ && !ConfigureTempo(tempo_rate_, error)) return false;
         return true;
     }
 
@@ -231,6 +295,211 @@ public:
     }
 
 private:
+    void ResetTempo() {
+        avfilter_graph_free(&tempo_graph_);
+        tempo_source_ = nullptr;
+        tempo_sink_ = nullptr;
+        tempo_pending_.clear();
+        tempo_pending_offset_frames_ = 0;
+        tempo_input_pts_ = 0;
+        tempo_input_eof_ = false;
+        tempo_eof_sent_ = false;
+        tempo_filter_eof_ = false;
+        tempo_active_ = false;
+    }
+
+    bool ConfigureTempo(const float rate, std::string& error) {
+        ResetTempo();
+        tempo_graph_ = avfilter_graph_alloc();
+        if (!tempo_graph_) {
+            error = "could not allocate pitch-preserving audio filter";
+            return false;
+        }
+        const AVFilter* buffer = avfilter_get_by_name("abuffer");
+        const AVFilter* atempo = avfilter_get_by_name("atempo");
+        const AVFilter* sink = avfilter_get_by_name("abuffersink");
+        if (!buffer || !atempo || !sink) {
+            error = "FFmpeg build does not provide the atempo audio filter";
+            ResetTempo();
+            return false;
+        }
+
+        const char* source_args =
+            "time_base=1/48000:sample_rate=48000:sample_fmt=flt:channel_layout=0x3";
+        int result = avfilter_graph_create_filter(
+            &tempo_source_, buffer, "fthr_tempo_source", source_args, nullptr, tempo_graph_);
+        if (result < 0) {
+            error = "could not create pitch-preserving audio source: " + ErrorText(result);
+            ResetTempo();
+            return false;
+        }
+
+        std::vector<float> stages;
+        float remaining = rate;
+        while (remaining < 0.5f - 1e-6f) {
+            stages.push_back(0.5f);
+            remaining /= 0.5f;
+        }
+        while (remaining > 2.0f + 1e-6f) {
+            stages.push_back(2.0f);
+            remaining /= 2.0f;
+        }
+        if (std::abs(remaining - 1.0f) > 1e-6f) stages.push_back(remaining);
+        if (stages.empty()) {
+            error = "pitch-preserving filter received an invalid playback rate";
+            ResetTempo();
+            return false;
+        }
+
+        AVFilterContext* previous = tempo_source_;
+        for (size_t index = 0; index < stages.size(); ++index) {
+            char name[48]{};
+            char args[64]{};
+            std::snprintf(name, sizeof(name), "fthr_atempo_%zu", index);
+            std::snprintf(args, sizeof(args), "tempo=%.9g", stages[index]);
+            AVFilterContext* stage = nullptr;
+            result = avfilter_graph_create_filter(
+                &stage, atempo, name, args, nullptr, tempo_graph_);
+            if (result < 0) {
+                error = "could not configure pitch-preserving audio: " + ErrorText(result);
+                ResetTempo();
+                return false;
+            }
+            result = avfilter_link(previous, 0, stage, 0);
+            if (result < 0) {
+                error = "could not configure pitch-preserving audio: " + ErrorText(result);
+                ResetTempo();
+                return false;
+            }
+            previous = stage;
+        }
+        result = avfilter_graph_create_filter(
+            &tempo_sink_, sink, "fthr_tempo_sink", nullptr, nullptr, tempo_graph_);
+        if (result >= 0) result = avfilter_link(previous, 0, tempo_sink_, 0);
+        if (result >= 0) result = avfilter_graph_config(tempo_graph_, nullptr);
+        if (result < 0) {
+            error = "could not finalize pitch-preserving audio: " + ErrorText(result);
+            ResetTempo();
+            return false;
+        }
+        tempo_active_ = true;
+        return true;
+    }
+
+    int CopyTempoPending(float* output, const int output_offset,
+                         const int requested_frames) {
+        const int available = static_cast<int>(tempo_pending_.size() / kChannels)
+            - tempo_pending_offset_frames_;
+        const int copied = std::max(0, std::min(requested_frames, available));
+        if (copied > 0) {
+            const size_t source = static_cast<size_t>(tempo_pending_offset_frames_) * kChannels;
+            std::memcpy(output + static_cast<size_t>(output_offset) * kChannels,
+                        tempo_pending_.data() + source,
+                        static_cast<size_t>(copied) * kChannels * sizeof(float));
+            tempo_pending_offset_frames_ += copied;
+        }
+        if (tempo_pending_offset_frames_ >= static_cast<int>(tempo_pending_.size() / kChannels)) {
+            tempo_pending_.clear();
+            tempo_pending_offset_frames_ = 0;
+        }
+        return copied;
+    }
+
+    bool DrainTempo(std::string& error) {
+        while (true) {
+            AVFrame* frame = av_frame_alloc();
+            if (!frame) {
+                error = "could not allocate pitch-preserving output frame";
+                return false;
+            }
+            const int result = av_buffersink_get_frame(tempo_sink_, frame);
+            if (result == AVERROR(EAGAIN)) {
+                av_frame_free(&frame);
+                return true;
+            }
+            if (result == AVERROR_EOF) {
+                tempo_filter_eof_ = true;
+                av_frame_free(&frame);
+                return true;
+            }
+            if (result < 0) {
+                error = "could not read pitch-preserving audio: " + ErrorText(result);
+                av_frame_free(&frame);
+                return false;
+            }
+            if (frame->nb_samples > 0 && frame->data[0]) {
+                const size_t samples = static_cast<size_t>(frame->nb_samples) * kChannels;
+                const size_t old_size = tempo_pending_.size();
+                tempo_pending_.resize(old_size + samples);
+                std::memcpy(tempo_pending_.data() + old_size, frame->data[0],
+                            samples * sizeof(float));
+            }
+            av_frame_free(&frame);
+        }
+    }
+
+    bool FeedTempo(const float* samples, const int frames, std::string& error) {
+        AVFrame* frame = av_frame_alloc();
+        if (!frame) {
+            error = "could not allocate pitch-preserving input frame";
+            return false;
+        }
+        frame->format = AV_SAMPLE_FMT_FLT;
+        frame->sample_rate = kSampleRate;
+        frame->nb_samples = frames;
+        frame->pts = tempo_input_pts_;
+        av_channel_layout_default(&frame->ch_layout, kChannels);
+        int result = av_frame_get_buffer(frame, 0);
+        if (result >= 0) {
+            std::memcpy(frame->data[0], samples,
+                        static_cast<size_t>(frames) * kChannels * sizeof(float));
+            result = av_buffersrc_add_frame_flags(
+                tempo_source_, frame, AV_BUFFERSRC_FLAG_KEEP_REF);
+        }
+        av_frame_free(&frame);
+        if (result < 0) {
+            error = "could not feed pitch-preserving audio: " + ErrorText(result);
+            return false;
+        }
+        tempo_input_pts_ += frames;
+        return true;
+    }
+
+    int PullPitchPreserved(float* output, const int requested_frames,
+                           const float* gains, const int gain_count,
+                           const float master_gain) {
+        int produced = CopyTempoPending(output, 0, requested_frames);
+        while (produced < requested_frames) {
+            std::string error;
+            if (!DrainTempo(error)) return -1;
+            produced += CopyTempoPending(output, produced, requested_frames - produced);
+            if (produced >= requested_frames) break;
+            if (tempo_filter_eof_) return produced;
+
+            if (tempo_input_eof_) {
+                if (tempo_eof_sent_) return produced;
+                const int result = av_buffersrc_add_frame_flags(tempo_source_, nullptr, 0);
+                if (result < 0 && result != AVERROR_EOF) return -1;
+                tempo_eof_sent_ = true;
+                continue;
+            }
+
+            // Feed a little more than one endpoint block. The atempo filter
+            // has an internal overlap window, so this keeps a fast seek
+            // responsive without creating a long stale-audio runway.
+            std::vector<float> source(static_cast<size_t>(2048) * kChannels);
+            const int source_frames = PullSource(
+                source.data(), 2048, gains, gain_count, master_gain);
+            if (source_frames < 0) return -1;
+            if (source_frames == 0) {
+                tempo_input_eof_ = true;
+                continue;
+            }
+            if (!FeedTempo(source.data(), source_frames, error)) return -1;
+        }
+        return produced;
+    }
+
     bool ConfigureDecoder(DecoderState& decoder, const int stream_index,
                           AVStream& stream, std::string& error) {
         const AVCodec* codec = avcodec_find_decoder(stream.codecpar->codec_id);
@@ -392,8 +661,24 @@ private:
     AVPacket* packet_ = nullptr;
     AVFrame* frame_ = nullptr;
     std::vector<std::unique_ptr<DecoderState>> decoders_;
+    int seek_stream_index_ = -1;
+    AVRational seek_time_base_{1, kSampleRate};
+    int64_t seek_start_time_ = AV_NOPTS_VALUE;
     int64_t cursor_sample_ = 0;
+    int seek_fade_remaining_ = 0;
     bool input_eof_ = false;
+    AVFilterGraph* tempo_graph_ = nullptr;
+    AVFilterContext* tempo_source_ = nullptr;
+    AVFilterContext* tempo_sink_ = nullptr;
+    std::vector<float> tempo_pending_;
+    int tempo_pending_offset_frames_ = 0;
+    int64_t tempo_input_pts_ = 0;
+    float tempo_rate_ = 1.0f;
+    bool tempo_preserve_pitch_ = false;
+    bool tempo_active_ = false;
+    bool tempo_input_eof_ = false;
+    bool tempo_eof_sent_ = false;
+    bool tempo_filter_eof_ = false;
 };
 
 } // namespace
@@ -419,6 +704,21 @@ extern "C" int fthr_playback_pull(
     const float* gains, const int gain_count, const float master_gain) {
     if (!mixer) return -1;
     return mixer->mixer.Pull(interleaved_float_stereo, frame_count, gains, gain_count, master_gain);
+}
+
+extern "C" int fthr_playback_set_playback_rate(
+    FTHRPlaybackMixer* mixer, const float playback_rate, const int preserve_pitch,
+    char* error_text, const size_t error_text_capacity) {
+    if (!mixer) {
+        WriteError(error_text, error_text_capacity, "playback mixer is not open");
+        return 0;
+    }
+    std::string error;
+    if (!mixer->mixer.SetPlaybackRate(playback_rate, preserve_pitch != 0, error)) {
+        WriteError(error_text, error_text_capacity, error);
+        return 0;
+    }
+    return 1;
 }
 
 extern "C" int fthr_playback_seek(

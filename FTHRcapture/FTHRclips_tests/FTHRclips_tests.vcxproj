@@ -11,6 +11,7 @@
     </ProjectConfiguration>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="tests\continuous_recording_writer_test.cpp" />
     <ClCompile Include="tests\audio_source_model_test.cpp" />
     <ClCompile Include="tests\windows_audio_session_registry_test.cpp" />
     <ClCompile Include="tests\windows_process_loopback_audio_provider_test.cpp" />
@@ -21,6 +22,7 @@
     <ClCompile Include="tests\windows_monitor_resolver_test.cpp" />
     <ClCompile Include="tests\windows_capture_border_policy_test.cpp" />
     <ClCompile Include="..\FTHRclips\src\encoded_ring_buffer.cpp" />
+    <ClCompile Include="..\FTHRclips\src\continuous_recording_writer.cpp" />
     <ClCompile Include="..\FTHRclips\src\audio_packet_ring.cpp" />
     <ClCompile Include="..\FTHRclips\src\audio_timeline.cpp" />
     <ClCompile Include="..\FTHRclips\src\audio_source_model.cpp" />
@@ -80,7 +82,7 @@
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>$(ProjectDir)..\FTHRclips\third_party\ffmpeg\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>avcodec.lib;avutil.lib;swresample.lib;d3d11.lib;dxgi.lib;User32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>avcodec.lib;avformat.lib;avutil.lib;swresample.lib;d3d11.lib;dxgi.lib;User32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -97,7 +99,7 @@
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>$(ProjectDir)..\FTHRclips\third_party\ffmpeg\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>avcodec.lib;avutil.lib;swresample.lib;d3d11.lib;dxgi.lib;User32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>avcodec.lib;avformat.lib;avutil.lib;swresample.lib;d3d11.lib;dxgi.lib;User32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

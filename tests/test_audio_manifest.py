@@ -12,6 +12,7 @@ from core.audio_manifest import (
     AudioSourceManifestEntry,
     build_manifest,
     manifest_path_for,
+    rebind_manifest_after_media_replace,
     read_manifest_for_media,
     validate_manifest,
     verified_audio_tracks_for_export,
@@ -62,6 +63,35 @@ def test_manifest_detects_media_replacement_and_falls_back_cleanly(tmp_path):
 
     media.write_bytes(b'replaced version')
     assert read_manifest_for_media(media) is None
+
+
+def test_lossless_media_replace_can_rebind_the_existing_source_manifest(tmp_path):
+    media = tmp_path / 'clip.mp4'
+    media.write_bytes(b'original multitrack media')
+    manifest = build_manifest(
+        media_path=media, transaction_id=str(uuid4()),
+        sources=[_entry(stream_index=1), _entry(stream_index=2, name='Discord')])
+    write_manifest_atomic(manifest, media)
+
+    media.write_bytes(b'post-processed media with the same ordered audio streams')
+    assert read_manifest_for_media(media) is None
+    assert rebind_manifest_after_media_replace(media) is True
+
+    rebound = read_manifest_for_media(media)
+    assert rebound is not None
+    assert [source['display_name'] for source in rebound['sources']] == [
+        'VALORANT', 'Discord']
+    assert rebound['media_sha256'] != manifest['media_sha256']
+
+
+def test_rebind_refuses_invalid_sidecar(tmp_path):
+    media = tmp_path / 'clip.mp4'
+    media.write_bytes(b'media')
+    sidecar = manifest_path_for(media)
+    sidecar.write_text('{"not":"a manifest"}', encoding='utf-8')
+
+    assert rebind_manifest_after_media_replace(media) is False
+    assert sidecar.read_text(encoding='utf-8') == '{"not":"a manifest"}'
 
 
 def test_manifest_rejects_duplicate_streams_and_more_than_ten_sources(tmp_path):

@@ -41,6 +41,15 @@ class PlaybackSource:
     audio_index: int | None
     icon_reference: str | None = None
     available: bool = True
+    # ``base`` is the hidden recorded desktop mix. ``delta`` is an isolated
+    # application stem applied as (user_gain - 1) against that base. ``direct``
+    # sources such as microphones and imported tracks use their slider gain.
+    mix_role: str = 'direct'
+    editable: bool = True
+    # Privacy-safe executable identity from a verified native manifest. This
+    # is a basename-like key (never a path) and lets the editor resolve a
+    # friendly legacy label and, while the app is running, its real icon.
+    persistent_identity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +98,9 @@ def source_display_name(source: PlaybackSource) -> str:
     container-provided name unchanged.
     """
 
+    identity = (source.persistent_identity or '').casefold()
+    if identity in {'fpsaimtrainer', 'fpsaimtrainer-win64-shipping'}:
+        return "KovaaK's"
     if source.source_type == 'system' and source.display_name.casefold() == 'default mix':
         return 'System Audio'
     return source.display_name
@@ -125,9 +137,10 @@ def build_playback_sources(
     Imported and legacy media use real stream titles, or generic track names.
     A current Windows 10 FTHR clip has ``Default Mix`` plus ``Microphone`` and
     both remain editable because the manifest describes Default Mix as system
-    loopback only.  Once application stems exist, a source explicitly named
-    ``Default Mix`` is compatibility-only and is excluded to avoid duplicate
-    audio; the app stems and microphone remain editable.
+    loopback only. Once application stems exist, ``Default Mix`` becomes the
+    hidden base of a reversible delta mix. An app slider then applies
+    ``base + (gain - 1) * app_stem`` so changing one application cannot change
+    another and unattributed system sounds remain intact.
     """
 
     by_container = {stream.container_index: stream for stream in streams}
@@ -139,10 +152,13 @@ def build_playback_sources(
         sources: list[PlaybackSource] = []
         for entry in entries:
             name = str(entry.get('display_name', 'Audio Track'))
-            if (has_application_stem
-                    and entry.get('source_type') == 'system'
-                    and name.casefold() == 'default mix'):
-                continue
+            compatibility_base = bool(
+                has_application_stem
+                and entry.get('source_type') == 'system'
+                and name.casefold() == 'default mix')
+            application_delta = bool(
+                has_application_stem
+                and entry.get('source_type') == 'application')
             container_index = entry.get('stream_index')
             stream = by_container.get(container_index)
             sources.append(PlaybackSource(
@@ -153,6 +169,11 @@ def build_playback_sources(
                 audio_index=stream.audio_index if stream else None,
                 icon_reference=entry.get('icon_reference'),
                 available=stream is not None,
+                mix_role=('base' if compatibility_base else
+                          'delta' if application_delta else 'direct'),
+                editable=not compatibility_base,
+                persistent_identity=(str(entry.get('persistent_identity'))
+                                     if entry.get('persistent_identity') else None),
             ))
         return order_playback_sources(sources)
 
@@ -174,14 +195,19 @@ def source_gain(source: PlaybackSource, states: dict[str, SourceMixState]) -> fl
 
     if not source.available:
         return 0.0
-    return states.get(source.source_id, SourceMixState()).gain
+    if source.mix_role == 'base':
+        return 1.0
+    gain = states.get(source.source_id, SourceMixState()).gain
+    if source.mix_role == 'delta':
+        return gain - 1.0
+    return gain
 
 
 def active_source_count(sources: Iterable[PlaybackSource],
                         states: dict[str, SourceMixState]) -> int:
     """Count non-muted, decodable source rows for deterministic headroom."""
 
-    return sum(source_gain(source, states) > 0.0 for source in sources)
+    return sum(abs(source_gain(source, states)) > 1e-6 for source in sources)
 
 
 def headroom_for_active_sources(active_sources: int) -> float:

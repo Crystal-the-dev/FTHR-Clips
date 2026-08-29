@@ -10,6 +10,7 @@ import pytest
 from core.clip_files import (
     cleanup_stale_partial_clips,
     is_completed_video_path,
+    is_fthr_temporary_dir,
     is_fthr_owned_orphan_audio_manifest_path,
     is_fthr_owned_partial_path,
     is_library_media_path,
@@ -24,7 +25,13 @@ def test_completed_video_names_are_accepted(path: str) -> None:
 
 @pytest.mark.parametrize(
     'path',
-    ['foo.mp4.partial', 'foo.MP4.PARTIAL', 'foo.partial', 'foo.mp4.tmp'],
+    [
+        'foo.mp4.partial',
+        'foo.MP4.PARTIAL',
+        'foo.partial',
+        'foo.mp4.tmp',
+        '.clip.partial.token.mp4',
+    ],
 )
 def test_partial_or_incomplete_names_are_rejected(path: str) -> None:
     assert not is_completed_video_path(path)
@@ -41,6 +48,11 @@ def test_partial_check_is_explicit_not_an_extension_accident() -> None:
 def test_library_accepts_completed_video_and_image_names() -> None:
     assert is_library_media_path('clip.mp4')
     assert is_library_media_path('screenshot.png')
+
+
+def test_fthr_post_processing_directories_are_identifiable() -> None:
+    assert is_fthr_temporary_dir('.fthr-finalize-123')
+    assert not is_fthr_temporary_dir('recordings')
 
 
 def test_startup_cleanup_removes_only_old_fthr_partials(tmp_path: Path) -> None:

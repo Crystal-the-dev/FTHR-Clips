@@ -8,8 +8,9 @@ from PySide6.QtWidgets import (
     QSplashScreen, QVBoxLayout, QLabel, QProgressBar, QWidget,
 )
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QPixmap, QColor
+from PySide6.QtGui import QPixmap, QColor, QPainter
 
+from core.theme_manager import ThemeManager
 from ui.style import Colors, Fonts, Sizes
 
 
@@ -39,8 +40,8 @@ class SplashScreen(QSplashScreen):
         container = QWidget(self)
         container.setGeometry(0, 0, _W, _H)
         container.setStyleSheet(
-            f'background-color: {Colors.BAR_BG};'
-            f' border: {Sizes.BORDER_W}px solid {Colors.BAR_FG};'
+            f'background-color: {Colors.SHELL_BG};'
+            f' border: {Sizes.BORDER_W}px solid {Colors.TEXT};'
         )
 
         layout = QVBoxLayout(container)
@@ -51,9 +52,22 @@ class SplashScreen(QSplashScreen):
 
         # ── Logo ──
         logo_label = QLabel()
-        logo_path = Path(__file__).parent.parent / 'assets' / 'fthr_logo.png'
+        theme = ThemeManager()
+        custom_logo = theme.get_custom_icon_path('favicon.ico')
+        logo_path = custom_logo or Path(__file__).parent.parent / 'assets' / 'favicon.ico'
         if logo_path.exists():
             logo_pixmap = QPixmap(str(logo_path))
+            if custom_logo is None and not logo_pixmap.isNull():
+                tinted = QPixmap(logo_pixmap.size())
+                tinted.fill(Qt.GlobalColor.transparent)
+                painter = QPainter(tinted)
+                painter.drawPixmap(0, 0, logo_pixmap)
+                painter.setCompositionMode(
+                    QPainter.CompositionMode.CompositionMode_SourceIn)
+                painter.fillRect(tinted.rect(), QColor(
+                    theme.get_icon_tint('favicon.ico')))
+                painter.end()
+                logo_pixmap = tinted
             scaled_logo = logo_pixmap.scaledToHeight(
                 140, Qt.TransformationMode.SmoothTransformation,
             )
@@ -61,7 +75,7 @@ class SplashScreen(QSplashScreen):
         else:
             logo_label.setText('FTHR')
             logo_label.setStyleSheet(
-                f'color: {Colors.BAR_FG};'
+                f'color: {Colors.TEXT};'
                 f' font-size: {Fonts.SIZE_H1}px;'
                 f' font-weight: bold;'
                 f' font-family: {Fonts.DISPLAY};'
@@ -75,7 +89,7 @@ class SplashScreen(QSplashScreen):
         # ── Loading text ──
         self.loading_label = QLabel('Initializing…')
         self.loading_label.setStyleSheet(
-            f'color: {Colors.BAR_FG_DIM};'
+            f'color: {Colors.TEXT_DIM};'
             f' font-size: {Fonts.SIZE_BODY}px;'
             f' font-family: {Fonts.BODY};'
             f' letter-spacing: 2px;'
@@ -91,7 +105,7 @@ class SplashScreen(QSplashScreen):
         self.progress_bar.setFixedHeight(2)
         self.progress_bar.setStyleSheet(f'''
             QProgressBar {{
-                background-color: {Colors.BAR_HAIRLINE};
+                background-color: {Colors.HAIRLINE};
                 border: none;
                 border-radius: 0px;
             }}

@@ -42,6 +42,18 @@ FTHR_PLAYBACK_API int fthr_playback_pull(
     int gain_count,
     float master_gain);
 
+// Sets the source-time to output-time ratio used by Pull. With
+// ``preserve_pitch`` enabled, the bridge uses FFmpeg's atempo filter so a
+// faster or slower preview keeps its original pitch. With it disabled, Pull
+// retains the caller's lightweight resampling behaviour and pitch follows
+// speed. This can be called between pulls; a seek also flushes its state.
+FTHR_PLAYBACK_API int fthr_playback_set_playback_rate(
+    FTHRPlaybackMixer* mixer,
+    float playback_rate,
+    int preserve_pitch,
+    char* error_text,
+    size_t error_text_capacity);
+
 // Seeks every decoder to one media time and flushes stale decoded buffers.
 FTHR_PLAYBACK_API int fthr_playback_seek(
     FTHRPlaybackMixer* mixer,

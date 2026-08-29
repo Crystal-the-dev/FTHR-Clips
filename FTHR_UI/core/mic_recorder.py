@@ -81,6 +81,8 @@ class MicRecorder:
         # This is accurate regardless of when the Python callback fires.
         self._stream_start_time: float = 0.0
         self._total_frames: int = 0
+        self._latest_level: float = 0.0
+        self._latest_level_time: float = 0.0
 
     @staticmethod
     def is_available() -> bool:
@@ -130,12 +132,23 @@ class MicRecorder:
             self._stream = None
         with self._lock:
             self._chunks.clear()
+            self._latest_level = 0.0
+            self._latest_level_time = 0.0
 
     def is_running(self) -> bool:
         return self._stream is not None
 
     def set_gain(self, gain: float):
         self._gain = max(0.0, gain)
+
+    def latest_level(self) -> float:
+        """Return recent normalized 0–1 microphone loudness."""
+        with self._lock:
+            value = self._latest_level
+            updated_at = self._latest_level_time
+        if not updated_at or time.monotonic() - updated_at > 0.35:
+            return 0.0
+        return value
 
     def add_rms_listener(self, fn):
         """Register a callable(rms: float) called from the audio thread."""
@@ -165,6 +178,8 @@ class MicRecorder:
                 samples = _np.array(arr, dtype=_np.float32, copy=True)
             else:
                 samples = _np.asarray(arr, dtype=_np.float32) * gain
+            rms = float(_np.sqrt(_np.mean(_np.square(samples, dtype=_np.float32))))
+            normalized_level = min(max(rms * 4.0, 0.0), 1.0)
             with self._lock:
                 # Use frame-count-based time, NOT time.monotonic().
                 #
@@ -181,6 +196,8 @@ class MicRecorder:
                 self._total_frames += frames
                 t_end = self._stream_start_time + self._total_frames / SAMPLE_RATE
                 self._chunks.append((t_end, samples))
+                self._latest_level = normalized_level
+                self._latest_level_time = time.monotonic()
                 # Trim history older than KEEP_SECONDS
                 cutoff = t_end - KEEP_SECONDS
                 while self._chunks and self._chunks[0][0] < cutoff:

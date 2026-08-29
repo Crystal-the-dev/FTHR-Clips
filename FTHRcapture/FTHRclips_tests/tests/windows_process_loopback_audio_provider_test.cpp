@@ -1,5 +1,7 @@
 #include "windows_process_loopback_audio_provider.h"
 
+#include <windows.h>
+
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -146,6 +148,35 @@ void SourceLimitAndTrackContractRemainBounded() {
         "only admitted sources can become valid multi-stream manifest contracts");
 }
 
+void ExpiredReplayHistoryReleasesAnApplicationSlot() {
+    fthr::WindowsProcessLoopbackCapability supported{22631, true, false};
+    fthr::WindowsApplicationSourceCoordinator coordinator(
+        51, supported, Generator({
+            "51000000-0000-4000-8000-000000000001",
+            "51000000-0000-4000-8000-000000000002",
+            "51000000-0000-4000-8000-000000000003"}), 2, 1);
+    const auto one = coordinator.Discover(Session("one#1", 1, "one", "One"));
+    const auto two = coordinator.Discover(Session("two#2", 2, "two", "Two"));
+    const auto three = coordinator.Discover(Session("three#3", 3, "three", "Three"));
+    coordinator.ObserveActivity(one->source.identity.id, 0.02f, 100);
+    coordinator.ObserveActivity(one->source.identity.id, 0.02f, 200);
+    coordinator.RetireRuntimeGroup("one#1", 300);
+    coordinator.ObserveActivity(two->source.identity.id, 0.02f, 400);
+    coordinator.ObserveActivity(two->source.identity.id, 0.02f, 500);
+
+    coordinator.ObserveActivity(three->source.identity.id, 0.02f, 20'000'000);
+    CheckProcessLoopback(
+        coordinator.ObserveActivity(
+            three->source.identity.id, 0.02f, 20'000'100)
+            == fthr::AudioSourceAdmission::Accepted,
+        "an inactive source older than the replay window releases its stem slot");
+    const auto current = coordinator.SourcesForInterval(0, 21'000'000);
+    CheckProcessLoopback(current.size() == 2
+            && current[0].identity.display_name == "Two"
+            && current[1].identity.display_name == "Three",
+        "slot recycling retains current sources without reviving expired history");
+}
+
 void EightApplicationStemBoundaryIsExplicit() {
     fthr::WindowsProcessLoopbackCapability supported{22631, true, false};
     fthr::WindowsApplicationSourceCoordinator coordinator(
@@ -183,6 +214,34 @@ void EightApplicationStemBoundaryIsExplicit() {
         "the production app-stem boundary is exactly eight before Default Mix is added");
 }
 
+void OptionalLiveApplicationCaptureDiagnostics() {
+    wchar_t enabled[2] = {};
+    if (GetEnvironmentVariableW(
+            L"FTHR_TEST_LIVE_AUDIO_CAPTURE", enabled, 2) == 0) return;
+    fthr::WindowsApplicationAudioSourceManager manager(77, 10);
+    if (!manager.Start()) {
+        std::cout << "LIVE APPLICATION CAPTURE: unavailable: "
+                  << manager.last_error() << std::endl;
+        return;
+    }
+    Sleep(4000);
+    LARGE_INTEGER counter{};
+    LARGE_INTEGER frequency{};
+    QueryPerformanceCounter(&counter);
+    QueryPerformanceFrequency(&frequency);
+    const double end = static_cast<double>(counter.QuadPart)
+        / static_cast<double>(frequency.QuadPart);
+    const auto tracks = manager.TakeTracksForInterval(end - 3.5, end);
+    std::cout << "LIVE APPLICATION CAPTURE: " << tracks.size()
+              << " audible stem(s)" << std::endl;
+    for (const auto& track : tracks) {
+        std::cout << "  CAPTURED " << track.source.identity.display_name
+                  << " (" << track.snapshot.packets.size() << " AAC packets)"
+                  << std::endl;
+    }
+    manager.Stop();
+}
+
 }  // namespace
 
 int RunWindowsProcessLoopbackAudioProviderTests() {
@@ -190,7 +249,9 @@ int RunWindowsProcessLoopbackAudioProviderTests() {
     DiscoveryActivityAndSilentFilteringUseTheCommonModel();
     ExitRestartFailureAndGenerationHistoryStayIsolated();
     SourceLimitAndTrackContractRemainBounded();
+    ExpiredReplayHistoryReleasesAnApplicationSlot();
     EightApplicationStemBoundaryIsExplicit();
+    OptionalLiveApplicationCaptureDiagnostics();
     std::cout << "AUDIT-050 Windows process-loopback provider tests: "
               << process_loopback_checks << " checks passed" << std::endl;
     return process_loopback_checks;

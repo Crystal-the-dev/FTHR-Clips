@@ -25,7 +25,7 @@ def apply_app_style(app: QApplication) -> None:
     if "Fusion" in QStyleFactory.keys():
         app.setStyle(QStyleFactory.create("Fusion"))
 
-    app.setFont(QFont("DejaVu Sans", Fonts.SIZE_BODY))
+    app.setFont(QFont(Fonts.BODY_FAMILY, Fonts.SIZE_BODY))
 
     palette = QPalette()
     palette.setColor(QPalette.ColorRole.Window, QColor(Colors.BG))

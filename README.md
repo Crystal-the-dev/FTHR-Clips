@@ -2,184 +2,226 @@
 
 # FTHR Clips
 
-**Local-first instant replay for gamers.**
+**Local instant replay for Windows. Hit a hotkey and save the moment that just happened.**
 
-[![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](LICENSE)
-[![Windows](https://img.shields.io/badge/Windows-alpha-44CC88)](docs/SUPPORTED_PLATFORMS.md)
-[![Linux](https://img.shields.io/badge/Linux-experimental-lightgrey)](docs/SUPPORTED_PLATFORMS.md)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20experimental-lightgrey)](docs/SUPPORTED_PLATFORMS.md)
+[![Release](https://img.shields.io/github/v/release/FTHR-Community/FTHR-Clips?include_prereleases&label=latest)](https://github.com/FTHR-Community/FTHR-Clips/releases)
 [![CI](https://github.com/FTHR-Community/FTHR-Clips/actions/workflows/ci.yml/badge.svg)](https://github.com/FTHR-Community/FTHR-Clips/actions/workflows/ci.yml)
 
-FTHR Clips keeps a configurable replay history in the background. Press a
-hotkey after something happens and the application saves the moment as a local
-clip—without requiring an account, subscription, or cloud upload.
+*A local-first replay recorder: no account, no subscription, no required cloud.*
+
+[Download](#download) · [Linux Setup](#linux-setup) · [Windows Setup](#windows-setup) · [Build from Source](#build-from-source) · [Report a Bug](https://github.com/FTHR-Community/FTHR-Clips/issues/new?template=bug_report.yml)
 
 </div>
 
-> [!WARNING]
-> FTHR Clips is in pre-alpha qualification. There is currently no
-> public-release-qualified build. Treat the support states below literally.
+---
 
-## Current product status
+## What it does
 
-`READY` means the current source path has been exercised in its stated cohort.
-`UNVERIFIED` means code and automated coverage exist, but required physical
-testing has not happened. `EXPERIMENTAL` and `PLATFORM-LIMITED` are not broad
-support claims.
+FTHR Clips records your screen in the background at all times. When something clip-worthy happens, you hit a hotkey and it saves the last N seconds as a clip. No upload required, no account, no subscription.
 
-| Capability | Status | Current reality |
-|---|---|---|
-| Background replay and configurable clip duration | **READY** | Windows replay, 30/60-second saves, background operation, and audio were physically exercised on the NVIDIA qualification host. |
-| Selected-monitor recording and screenshots | **READY** | Windows monitor resolution and selected-monitor screenshot paths are integrated and tested. |
-| Tray operation, global hotkeys, and autostart | **READY** | Windows source-mode workflows are exercised. The final installed-app walkthrough remains open. |
-| Clip browser, trim, processing, and export | **READY** | Clip readiness is transactional, linked originals are protected, and export paths are regression-tested. |
-| NVIDIA H.264 / HEVC / AV1 | **READY** | Physically qualified on Windows with a same-adapter NVIDIA RTX 4060 Ti. |
-| AMD H.264 / HEVC / AV1 | **UNVERIFIED** | AMF paths are integrated and automated-tested; physical AMD hardware qualification has not run. |
-| Intel H.264 / HEVC / AV1 | **UNVERIFIED** | QSV paths are integrated and automated-tested; physical Intel hardware qualification has not run. |
-| System-output and microphone tracks | **READY** | Separate synchronized tracks and in-app mixed playback are implemented and exercised on the Windows qualification host. |
-| Windows 11 per-application audio stems | **UNVERIFIED** | Official process-loopback capture and dynamic source controls are code-integrated; physical Windows 11 qualification remains open. |
-| Windows 10 per-application audio | **PLATFORM-LIMITED** | Windows 10 intentionally exposes Master, System Audio, and Microphone rather than unsupported per-app stems. |
-| Windows capture-border suppression | **PLATFORM-LIMITED** | The supported WGC policy is implemented where the operating system exposes it; final Windows 11 physical confirmation remains open. |
-| Linux Wayland capture | **EXPERIMENTAL** | Engine builds, IPC, tests, audio-open, and bounded failure were verified under WSL2. Visible capture on a representative real desktop is still unverified. |
-| Linux X11 capture | **DISABLED** | `x11grab` is disabled for alpha because bounded cancellation is unresolved. |
+It runs as a tray icon. You forget it's there until you need it.
 
-Windows hybrid/cross-adapter capture is not supported for alpha. See
-[`docs/SUPPORTED_PLATFORMS.md`](docs/SUPPORTED_PLATFORMS.md) and
-[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) for the evidence and remaining limits.
+---
 
 ## Features
 
-- Configurable background replay history, frame rate, resolution, bitrate, and
-  scaling
-- Normal and extended clip saves through global hotkeys
-- Selected-monitor capture and selected-monitor screenshots
-- H.264, HEVC, and AV1 hardware-encoding paths for NVIDIA, AMD, and Intel on
-  Windows, with the qualification limits above
-- System-output and microphone capture with synchronized multi-track clip
-  infrastructure
-- Dynamic playback mixing for tracks actually present in a saved clip
-- System tray/background operation and persistent Windows autostart
-- Clip browser, viewer, trim editor, transactional processing, and export
-- Optional watermark, auto-crop, and webcam-overlay processing
-- Presets and game/window detection
-- Optional upload to an endpoint configured by the user
+| Category | Feature |
+|----------|---------|
+| **Capture** | GPU-accelerated recording via NVENC / AMF / QSV (CPU OpenH264 fallback) |
+| **Capture** | Crash-resilient manual recordings written directly as fragmented MP4 with live AAC; no stop-time re-encode or whole-file remux |
+| **Capture** | Configurable replay history up to 5 minutes and up to 240 FPS; Low, Medium, High, or custom bitrate |
+| **Capture** | H.264, HEVC and AV1 selection; Windows uses backend-defined presets |
+| **Capture** | Monitor selection and scaling modes |
+| **Hotkeys** | Global hotkeys via Hyprland binds (Linux) or system hooks (Windows); Windows supports controller chords |
+| **Hotkeys** | Save clip · Extended clip · Start/stop · Dismiss notification |
+| **Audio** | System-output and microphone tracks; Windows 11 per-app stems are code-ready but still require hardware qualification |
+| **Post-processing** | Watermark overlay |
+| **Post-processing** | Webcam overlay (picture-in-picture) |
+| **Game detection** | Auto-detects game window, prompts to switch capture focus |
+| **Settings** | Presets — save/load/delete full configuration snapshots |
+| **Clip browser** | Thumbnail grid, linked-folder protection, trim editor and transactional export |
+| **Upload** | Optional, consent-installed Catbox or Lustful uploader; Lustful hardware identity is a second install |
+| **Packaging** | Windows installer and experimental Linux AppImage build paths |
 
-## How it works
+---
 
-```text
-┌─────────────────────┐     Shared Memory v4      ┌────────────────────────┐
-│   FTHR_UI (Python)  │ ◄───────────────────────► │  Native capture engine │
-│   PySide6 frontend  │                            │  Windows: WGC + DXGI   │
-│   Library / editor  │                            │  Linux: Wayland        │
-│   Settings / upload │                            │  Platform audio input  │
-└─────────────────────┘                            └────────────────────────┘
+## Download
+
+There is currently **no public-release-qualified build**. Local pre-alpha
+qualification artifacts use the names below; do not publish them until the
+remaining signing and physical gates in `docs/RELEASE_CHECKLIST.md` pass.
+
+| Platform | File |
+|----------|------|
+| Linux (experimental Wayland) | `FTHRClips-1.0.0-alpha-x86_64.AppImage` |
+| Windows 10/11 (NVIDIA-qualified source) | `FTHRClips-Setup-<version>-x64.exe` |
+
+---
+
+## Linux Setup
+
+```bash
+chmod +x FTHRClips-1.0.0-alpha-x86_64.AppImage
+./FTHRClips-1.0.0-alpha-x86_64.AppImage
 ```
 
-The native capture engine owns capture, encoding, replay buffering, and clip
-publication. The PySide6 application owns settings, the library, playback,
-editing, notifications, and lifecycle. A versioned shared-memory contract keeps
-the two processes synchronized.
+Linux hotkeys use an owner-only Unix socket. Hyprland binds are generated by the
+app; KDE, GNOME and other compositors require the exact manual command shown in
+Settings → Hotkeys. Root access and the `input` group are not required.
 
-On Windows, capture uses WGC/DXGI with NVENC, AMF, or QSV and WASAPI audio. On
-Linux, the alpha engine supports compositors exposing `wlr-screencopy` or
-`ext-image-copy-capture`, with PulseAudio or PipeWire's PulseAudio compatibility
-layer for system audio.
+**Requirements:**
+- A Wayland compositor exposing `wlr-screencopy` or
+  `ext-image-copy-capture`
+- `nc` (netcat) for hotkeys — install via `sudo pacman -S openbsd-netcat` (Arch) or `sudo apt install netcat-openbsd` (Debian/Ubuntu)
+- `grim` for screenshot capture — install via `sudo pacman -S grim` (Arch) or `sudo apt install grim` (Debian/Ubuntu)
+- PulseAudio or PipeWire's PulseAudio compatibility layer; FTHR records the
+  default output sink's monitor source
+- NVIDIA GPU recommended. AMD/Intel Linux runtime support is not qualified.
+- `xdotool` required on KDE/GNOME for game detection — `sudo pacman -S xdotool`
 
-## Building from source
+The public alpha build disables FFmpeg `x11grab`: AUDIT-044 has no proven
+bounded-cancellation path. X11-only sessions and Wayland compositors without
+one of the protocols above are therefore unsupported in this alpha.
 
-Use Python 3.14 for the Windows alpha artifact. Python 3.12 remains the tested
-CI floor. Install the pinned dependencies rather than resolving loose package
-versions:
+**Hotkeys (default):**
 
-```powershell
-python -m pip install -r requirements-alpha.txt -r requirements-dev.txt
-python tools/fetch_third_party.py --all
-```
+| Key | Action |
+|-----|--------|
+| `F9` | Save clip (last 30 s) |
+| `F10` | Save extended clip (configurable length) |
+| `F11` | Save screenshot |
+| `F8` | Confirm game detection prompt |
 
-### Windows
+---
 
-Windows development requires Visual Studio 2022 with the C++ desktop workload.
-The native solution is `FTHRcapture/FTHRcapture.sln`; packaging uses
-`FTHR.spec` and `installer_windows.iss`.
+## Windows Setup
+
+Run a locally qualified `FTHRClips-Setup-<version>-x64.exe` and follow the setup steps. FTHR Clips
+installs for all users under Program Files and subsequent downloads of the same
+product update or repair that installation rather than creating a second entry.
+The uninstaller keeps clips, screenshots and exports. It keeps FTHR settings by
+default as well; removing settings/cache is an explicit choice. Global hotkeys
+work out of the box.
+
+**Requirements:** Windows 10 version 1903+ or Windows 11. Native NVIDIA
+H.264/HEVC/AV1 on a same-adapter display is the physically qualified alpha
+cohort. AMD and Intel paths are code-integrated but hardware-unverified; hybrid
+or cross-adapter capture is not an alpha-supported path.
+
+---
+
+## Build from Source
 
 ### Linux
 
-Linux builds require CMake, a C++ toolchain, Wayland development packages, and
-PulseAudio development headers. The build downloads and verifies the pinned
-LGPL FFmpeg distribution before assembling the AppImage:
+Dependencies: `cmake`, `gcc`, `ffmpeg`, `libpulse`, `wayland-protocols`, `python3 >= 3.11`, `PySide6`
+
+> FTHR uses the FFmpeg bundled next to the capture engine, falling back to
+> `ffmpeg` on your `PATH`. It no longer uses `imageio-ffmpeg`, whose bundled
+> binary is a GPL build.
 
 ```bash
+git clone https://github.com/FTHR-Community/FTHR-Clips.git
+cd FTHR-Clips
 bash build_linux.sh
 ```
 
-See [`BUILDING.md`](BUILDING.md) for the complete setup, build, packaging, and
-verification commands.
+The AppImage lands in `build_output/`.
 
-## Privacy and ownership
+### Windows
 
-**Your recordings belong to you. Privacy isn't a premium feature.**
+Visual Studio 2022 + Python 3.14. See [`BUILDING.md`](BUILDING.md) for the full walkthrough.
 
-FTHR Clips is local-first: capture and clip saving run on the user's machine.
-There is no required account, telemetry, analytics, or cloud service. Upload is
-optional and only targets the endpoint a user configures.
+---
 
-The alpha currently stores an optional upload token in plaintext in the local
-settings file. Do not use a high-value credential there. This limitation is
-documented rather than hidden.
+## Architecture
 
-Useful software should not automatically mean another monthly subscription.
-FTHR Clips is being built in the open-source tradition so users can inspect,
-modify, and understand the software running on their machines.
-
-## Verification
-
-```bash
-python -m pytest tests/
-python -m ruff check .
-python tools/verify_release_licenses.py --tree .
-python tools/verify_version_consistency.py
-python tools/verify_shared_memory_contract.py
-python tools/verify_engine_response_contract.py
-python tools/verify_exception_handling.py
-python tools/scan_repo_hygiene.py --all-files
+```
+┌─────────────────────┐     Shared Memory (v4)     ┌────────────────────────┐
+│   FTHR_UI (Python)  │ ◄─────────────────────────► │  Native capture engine │
+│   PySide6 frontend  │                              │  Windows: WGC + GPU    │
+│   Consent / Queue   │                              │  Linux: Wayland/X11    │
+│   Clip browser      │                              │  Platform audio input  │
+└─────────────────────┘                              └────────────────────────┘
+          │ JSON subprocess IPC
+          ▼
+┌─────────────────────┐       Lustful only       ┌────────────────────────┐
+│ Optional Uploader   │ ───────────────────────► │ Optional Hardware ID   │
+│ Catbox / Lustful    │   derived UUID only      │ local machine-ID read  │
+└─────────────────────┘                           └────────────────────────┘
 ```
 
-Hardware and desktop qualification cannot be replaced by CI. A green test run
-does not prove that an untested GPU, compositor, or Windows version is supported.
+The native capture engine runs as a separate process and communicates with the
+Python UI via shared memory. Windows uses WGC/DXGI capture with the selected
+NVENC, AMF, or QSV encoder and WASAPI audio. Linux uses supported Wayland
+capture protocols with FFmpeg and PulseAudio-compatible audio; X11 capture is
+disabled in the alpha because bounded cancellation is unresolved. Platform hotkey activation is
+forwarded by the UI through the same shared-memory command contract; Linux also
+uses an owner-only Unix socket for compositor key bindings.
+
+Upload networking is not part of Core. The uploader is a dormant verified
+package installed only after accepting its terms and privacy policy. Lustful
+requires an additional, separately consented Hardware Identity package; Catbox
+never installs or invokes it. See
+[`docs/OPTIONAL-UPLOADER-SECURITY-MODEL.md`](docs/OPTIONAL-UPLOADER-SECURITY-MODEL.md).
+
+---
 
 ## Contributing
 
-Issues and pull requests are welcome. Please open an issue before a large
-architectural change and keep platform claims tied to evidence.
+Issues and PRs are welcome. Please open an issue first for significant changes so we can discuss the approach.
 
-- Python style and checks are configured in `pyproject.toml`.
-- C++ changes should follow the surrounding source and include focused native
-  coverage where practical.
-- Never commit clips, user settings, credentials, build output, or downloaded
-  third-party runtime binaries.
+- Run tests: `QT_QPA_PLATFORM=offscreen pytest tests/`
+- Code style: standard Python (no formatter enforced yet)
+- C++ style: match the existing code
 
-Start with [`CONTRIBUTING.md`](CONTRIBUTING.md), [`BUILDING.md`](BUILDING.md), and
-[`docs/TESTING.md`](docs/TESTING.md).
+---
 
 ## License
 
-FTHR Clips' first-party source is licensed under the
-[GNU General Public License v3](LICENSE), identified as `GPL-3.0-only`.
+**FTHR Clips' own source code is licensed under the
+[GNU General Public License v3](LICENSE) (`GPL-3.0-only`).** You may use,
+study, modify, and redistribute it under those terms.
 
-Third-party components retain their respective licences. Their notices, exact
-versions, and redistribution information are documented in
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) and [`licenses/`](licenses/).
+Copyright © 2026 FTHR Community. The program comes without warranty; see the
+complete terms in [`LICENSE`](LICENSE).
 
-Copyright © 2026 FTHR Community. The program comes without warranty; see
-[`LICENSE`](LICENSE) for the complete terms.
+Downloadable builds contain the GPLv3-licensed FTHR application together with
+third-party components that retain their own licences:
 
-## Essential documentation
+| Component | Licence | Effect on the download |
+|---|---|---|
+| FFmpeg (dynamically linked) | LGPLv3 | Remains under LGPLv3; notices and source availability are required. |
+| PySide6 / Shiboken (separate extension modules) | LGPLv3 option selected | Remains under LGPLv3 with replacement and relinking rights. |
+| Qt 6 (separate shared libraries) | LGPLv3 option selected | Remains under LGPLv3 with replacement and relinking rights. |
 
-| Document | Purpose |
+The build uses PySide6 6.11.1 as its sole Qt binding and includes the LGPL text,
+notices, exact source locations, and separately replaceable libraries. Bundled
+media is either deterministically generated by the project under MIT or is the
+hash-verified Oswald 4.103 font under OFL-1.1; the asset allowlist is
+`tools/release_asset_manifest.json`.
+
+Full details and every bundled component: [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+Licence texts: [`licenses/`](licenses/), also installed alongside the app.
+
+---
+
+## Documentation
+
+| Document | What it is for |
 |---|---|
-| [`BUILDING.md`](BUILDING.md) | Windows/Linux setup, native builds, packaging, and dependency retrieval |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Source layout, conventions, and contribution workflow |
-| [`docs/TESTING.md`](docs/TESTING.md) | Automated, native, and physical verification guidance |
-| [`docs/SUPPORTED_PLATFORMS.md`](docs/SUPPORTED_PLATFORMS.md) | Evidence-based platform support matrix |
-| [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) | Current limitations and unverified paths |
-| [`SECURITY.md`](SECURITY.md) | Private vulnerability reporting |
-| [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | Third-party licences and notices |
+| [`BUILDING.md`](BUILDING.md) | Building the app and both engines, on Windows and Linux |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Tree layout, entry points, the shared-memory contract, conventions |
+| [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) | What is broken, unverified or missing — read before filing a bug |
+| [`SECURITY.md`](SECURITY.md) | Reporting a security issue |
+| [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | Every bundled component and its licence |
+| [`docs/SUPPORTED_PLATFORMS.md`](docs/SUPPORTED_PLATFORMS.md) | The real support matrix — what was actually tested, and where |
+| [`docs/TESTING.md`](docs/TESTING.md) | How to verify a build; build vs headless vs desktop tests |
+| [`docs/MAIN-PAGE-DESIGN-REFRESH.md`](docs/MAIN-PAGE-DESIGN-REFRESH.md) | Main-page popover spacing, game detection, bitrate, and fullscreen boundary changes |
+| [`docs/WINDOWS-11-QUALIFICATION.md`](docs/WINDOWS-11-QUALIFICATION.md) | Required physical app-stem and border qualification on Windows 11 |
+| [`docs/AUDIT_REPORT.md`](docs/AUDIT_REPORT.md) | Consolidated audit — all findings, all three passes |
+| [`docs/AUDIT-014-LINUX-FFMPEG.md`](docs/AUDIT-014-LINUX-FFMPEG.md) | How the Linux LGPL FFmpeg is pinned, built against and verified |
+| [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md) | The gates a release must pass before it may be tagged |
+| [`docs/SOURCE_OF_TRUTH.md`](docs/SOURCE_OF_TRUTH.md) | Which tree is authoritative, and how backups work |

@@ -1,10 +1,11 @@
 # screenshot_editor.py - Screenshot crop tool
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QMessageBox,
+    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
 )
 from PySide6.QtCore import Qt, QRect
 from PySide6.QtGui import QPixmap, QPainter, QPen
 from ui.style import Colors
+from ui.dialogs import FthrMessageDialog, install_fthr_titlebar
 from pathlib import Path
 import os
 from core.screenshot_save import (
@@ -82,16 +83,13 @@ class ScreenshotEditor(QDialog):
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
         self._setup_ui()
         self._apply_styles()
+        install_fthr_titlebar(
+            self, f'FTHR - {os.path.basename(final_image_path)}')
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(16)
-
-        hint = QLabel('DRAG TO SELECT CROP AREA')
-        hint.setStyleSheet(f'color: {Colors.ACCENT}; font-size: 12px;')
-        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(hint)
 
         pixmap = QPixmap(str(self.staged_image_path))
         self.canvas = CropCanvas(pixmap)
@@ -111,10 +109,10 @@ class ScreenshotEditor(QDialog):
         layout.addLayout(buttons)
 
     def _apply_styles(self):
-        self.setStyleSheet(f'''QDialog {{ background-color: #0d0d0d; }}
-            QPushButton {{ background-color: #1a1a1a;
-            border: 1px solid #333333; border-radius: 0px;
-            padding: 10px 24px; color: #ffffff; font-weight: bold; }}
+        self.setStyleSheet(f'''QDialog {{ background-color: {Colors.BG}; }}
+            QPushButton {{ background-color: {Colors.SURFACE_2};
+            border: 1px solid {Colors.BORDER_HI}; border-radius: 0px;
+            padding: 10px 24px; color: {Colors.TEXT}; font-weight: bold; }}
             QPushButton:hover {{ border-color: {Colors.ACCENT}; }}''')
 
     def _save_crop(self):
@@ -179,7 +177,7 @@ class ScreenshotEditor(QDialog):
         self.cancel_btn.setEnabled(not saving)
 
     def _show_save_error(self, code: str, detail: str) -> None:
-        QMessageBox.warning(self, 'Screenshot Failed', f'{code}\n\n{detail}')
+        FthrMessageDialog.warning(self, 'Screenshot Failed', f'{code}\n\n{detail}')
 
     def reject(self):
         if self._crop_worker is not None and self._crop_worker.isRunning():

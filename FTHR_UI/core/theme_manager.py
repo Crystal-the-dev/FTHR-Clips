@@ -1,8 +1,8 @@
-"""Theme color, icon, and notification-sound customization.
+"""Theme color, typography, icon, and notification-sound customization.
 
-Handles three kinds of customization: colors (hex tokens that feed the QSS),
-icons (PNG/SVG swaps), and sounds (the little blip when you grab a clip). All of
-it persists under ~/.fthr/theme/, and complete themes can be exported or imported.
+Handles colors (hex tokens that feed the QSS), typography, icons (PNG/SVG
+swaps), and sounds (the little blip when you grab a clip). All of it persists
+under ~/.fthr/theme/, and complete themes can be exported or imported.
 
 Themes are loaded once at startup and QSS is regenerated only when the user
 applies changes, avoiding repeated whole-tree restyling during color selection.
@@ -41,19 +41,66 @@ DEFAULT_COLORS: dict[str, str] = {
     'ACCENT_DIM':   '#00aa72',
     'ACCENT_SOFT':  '#0a2218',
     'ERROR':        '#cc0000',
+    'ERROR_SOFT':   '#240606',
+    'WARNING':      '#E8871A',
     'SUCCESS':      '#00aa00',
     'DELETE':       '#cc0000',
 }
 
+# Every semantic color consumed by the application is exposed here and in the
+# Customize page. Keeping this inventory beside the persisted defaults makes
+# adding a new themed surface an explicit, reviewable change instead of a
+# silent hard-coded exception.
+CUSTOMIZABLE_COLOR_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    ('Surfaces', (
+        ('BG', 'Background'),
+        ('SURFACE_1', 'Surface 1'),
+        ('SURFACE_2', 'Surface 2'),
+        ('SURFACE_3', 'Surface 3'),
+        ('SHELL_BG', 'Shell BG'),
+        ('SHELL_BG_2', 'Shell Secondary'),
+        ('SHELL_DIVIDER', 'Shell Line'),
+    )),
+    ('Accent', (
+        ('ACCENT', 'Accent'),
+        ('ACCENT_DIM', 'Accent Dim'),
+        ('ACCENT_SOFT', 'Accent Soft'),
+    )),
+    ('Text', (
+        ('TEXT', 'Primary'),
+        ('TEXT_DIM', 'Secondary'),
+        ('TEXT_MUTED', 'Muted'),
+        ('TEXT_GHOST', 'Ghost'),
+    )),
+    ('Borders', (
+        ('BORDER', 'Border'),
+        ('BORDER_HI', 'Border Light'),
+        ('HAIRLINE', 'Hairline'),
+    )),
+    ('Cards', (
+        ('CARD_BG', 'Card BG'),
+        ('CARD_BG_HI', 'Card Hover'),
+        ('CARD_BORDER', 'Card Border'),
+    )),
+    ('Status', (
+        ('ERROR', 'Error'),
+        ('ERROR_SOFT', 'Error Soft'),
+        ('WARNING', 'Warning'),
+        ('SUCCESS', 'Success'),
+        ('DELETE', 'Delete Button'),
+    )),
+)
+
 # Icons that can be customized (filename -> display label)
 CUSTOMIZABLE_ICONS: dict[str, str] = {
-    'fthr_logo.png':        'App Logo',
+    'favicon.ico':          'App Icon',
     'clip.png':             'Clip Tab',
     'sound.png':            'Audio Tab',
     'visuals.png':          'Visuals Tab',
     'settings(general).png': 'General Tab',
     'updates.png':          'Updates Tab',
     'personalize.png':      'Customize Tab',
+    'performance.png':      'Performance Tab',
     'home.png':             'Home Button',
     'refresh.png':          'Refresh Button',
     'play.png':             'Play Button',
@@ -61,6 +108,7 @@ CUSTOMIZABLE_ICONS: dict[str, str] = {
     'close.png':            'Close Button',
     'minimize.png':         'Minimize Button',
     'maximize.png':         'Maximize Button',
+    'shutdown.png':         'Shutdown Button',
     'dropdown.png':         'Dropdown Arrow',
 }
 
@@ -69,11 +117,15 @@ CUSTOMIZABLE_SOUNDS: dict[str, str] = {
     'clip_captured':       'Clip Captured',
     'screenshot_captured': 'Screenshot Captured',
     'error':               'Error',
+    'startup':             'Startup',
+    'upload_successful':   'Upload Successful',
+    'upload_failed':       'Upload Failed',
 }
 
 # Supported formats
 SUPPORTED_IMAGE_FORMATS = ('.png', '.jpg', '.jpeg', '.bmp', '.ico', '.svg')
 SUPPORTED_SOUND_FORMATS = ('.mp3', '.wav', '.ogg', '.flac', '.m4a', '.wma', '.aac')
+SUPPORTED_FONT_FORMATS = ('.ttf', '.otf')
 
 # Default icon tint — signature teal, applied to all default (non-imported) icons
 DEFAULT_ICON_TINT = '#00ffaa'
@@ -87,6 +139,11 @@ DEFAULT_CAPTURE_CARD_COLORS: dict[str, str] = {
     'CAPTURE_CARD_STATS_DIM':      '#666666',
     'CAPTURE_CARD_PROGRESS_TRACK': '#111111',
     'CAPTURE_CARD_PROGRESS_FILL':  '#ffffff',
+}
+
+DEFAULT_FONTS: dict[str, str] = {
+    'display': 'Oswald',
+    'body': 'Oswald',
 }
 
 
@@ -109,11 +166,13 @@ class ThemeManager:
         self._theme_dir = Path.home() / '.fthr' / 'theme'
         self._icons_dir = self._theme_dir / 'icons'
         self._sounds_dir = self._theme_dir / 'sounds'
+        self._fonts_dir = self._theme_dir / 'fonts'
         self._config_file = self._theme_dir / 'theme.json'
 
         self._theme_dir.mkdir(parents=True, exist_ok=True)
         self._icons_dir.mkdir(exist_ok=True)
         self._sounds_dir.mkdir(exist_ok=True)
+        self._fonts_dir.mkdir(exist_ok=True)
 
         self._data = self._load()
 
@@ -126,6 +185,8 @@ class ThemeManager:
             'sounds': {},  # key -> custom path (relative to sounds_dir)
             'icon_tints': {'_global': DEFAULT_ICON_TINT},
             'capture_card': dict(DEFAULT_CAPTURE_CARD_COLORS),
+            'fonts': dict(DEFAULT_FONTS),
+            'font_files': {},  # registered family -> file in fonts_dir
         }
         if not self._config_file.exists():
             return default
@@ -145,6 +206,19 @@ class ThemeManager:
             if 'capture_card' in loaded:
                 merged['capture_card'] = {**DEFAULT_CAPTURE_CARD_COLORS,
                                           **loaded['capture_card']}
+            if 'fonts' in loaded:
+                merged['fonts'] = {**DEFAULT_FONTS, **loaded['fonts']}
+            if 'font_files' in loaded:
+                merged['font_files'] = loaded['font_files']
+
+            # System-font menus were retired. Preserve only Oswald and font
+            # families that are backed by an imported theme file; old choices
+            # such as Arial/DejaVu otherwise migrate cleanly to the standard.
+            imported = set(merged['font_files'])
+            for role in DEFAULT_FONTS:
+                family = str(merged['fonts'].get(role, 'Oswald'))
+                if family != 'Oswald' and family not in imported:
+                    merged['fonts'][role] = 'Oswald'
             return merged
         except Exception as e:
             print(f'[Theme] Load failed: {e}')
@@ -281,10 +355,53 @@ class ThemeManager:
     def reset_capture_card_colors(self):
         self._data['capture_card'] = dict(DEFAULT_CAPTURE_CARD_COLORS)
 
+    # ─── Typography access ────────────────────────────────────────────
+
+    def get_font(self, role: str) -> str:
+        return str(self._data.get('fonts', {}).get(
+            role, DEFAULT_FONTS.get(role, '')))
+
+    def get_fonts(self) -> dict[str, str]:
+        return {**DEFAULT_FONTS, **self._data.get('fonts', {})}
+
+    def set_font(self, role: str, family: str) -> None:
+        if role not in DEFAULT_FONTS:
+            raise ValueError(f'Unknown font role: {role}')
+        clean = str(family or '').replace('"', '').strip()
+        self._data.setdefault('fonts', dict(DEFAULT_FONTS))
+        self._data['fonts'][role] = clean or DEFAULT_FONTS[role]
+
+    def reset_fonts(self) -> None:
+        self._data['fonts'] = dict(DEFAULT_FONTS)
+
+    def set_custom_font(self, families: list[str], source_path: Path) -> Path:
+        """Copy one user font into the theme and register its family names."""
+        source_path = Path(source_path)
+        if source_path.suffix.lower() not in SUPPORTED_FONT_FORMATS:
+            raise ValueError('Only .ttf and .otf font files are supported')
+        clean_families = [str(name).strip() for name in families if str(name).strip()]
+        if not clean_families:
+            raise ValueError('The font does not expose a usable family name')
+        dest = self._fonts_dir / source_path.name
+        shutil.copy2(source_path, dest)
+        files = self._data.setdefault('font_files', {})
+        for family in clean_families:
+            files[family] = dest.name
+        return dest
+
+    def get_custom_font_paths(self) -> dict[str, Path]:
+        """Return existing imported family paths, excluding stale entries."""
+        result: dict[str, Path] = {}
+        for family, rel_name in self._data.get('font_files', {}).items():
+            path = self._fonts_dir / Path(str(rel_name)).name
+            if path.is_file():
+                result[str(family)] = path
+        return result
+
     # ─── Export / Import ──────────────────────────────────────────────────
 
     def export_theme(self, dest_zip: Path) -> bool:
-        """Bundle the entire theme (colors + icons + sounds) into a ZIP."""
+        """Bundle the entire theme (colors, fonts, icons, and sounds) into a ZIP."""
         try:
             with zipfile.ZipFile(dest_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
                 # Write config
@@ -299,6 +416,14 @@ class ThemeManager:
                     sound_path = self._sounds_dir / rel_name
                     if sound_path.exists():
                         zf.write(sound_path, f'sounds/{rel_name}')
+                # Multiple family names can point at one font file. Store each
+                # physical file once while preserving the family mapping in
+                # theme.json.
+                font_names = set(self._data.get('font_files', {}).values())
+                for rel_name in font_names:
+                    font_path = self._fonts_dir / Path(str(rel_name)).name
+                    if font_path.exists():
+                        zf.write(font_path, f'fonts/{font_path.name}')
             return True
         except Exception as e:
             print(f'[Theme] Export failed: {e}')
@@ -327,7 +452,9 @@ class ThemeManager:
                 if not isinstance(config_data, dict):
                     print('[Theme] Invalid theme.json: not an object')
                     return False
-                for key in ('colors', 'icons', 'sounds', 'icon_tints', 'capture_card'):
+                for key in (
+                        'colors', 'icons', 'sounds', 'icon_tints',
+                        'capture_card', 'fonts', 'font_files'):
                     if key in config_data and not isinstance(config_data[key], dict):
                         print(f'[Theme] Invalid theme.json: "{key}" is not an object')
                         return False
@@ -337,12 +464,17 @@ class ThemeManager:
                         assets[self._icons_dir / Path(name).name] = zf.read(name)
                     elif name.startswith('sounds/') and len(name) > 7:
                         assets[self._sounds_dir / Path(name).name] = zf.read(name)
+                    elif name.startswith('fonts/') and len(name) > 6:
+                        assets[self._fonts_dir / Path(name).name] = zf.read(name)
 
                 # Clear existing custom assets
                 for f in self._icons_dir.iterdir():
                     if f.is_file():
                         f.unlink(missing_ok=True)
                 for f in self._sounds_dir.iterdir():
+                    if f.is_file():
+                        f.unlink(missing_ok=True)
+                for f in self._fonts_dir.iterdir():
                     if f.is_file():
                         f.unlink(missing_ok=True)
 
@@ -358,7 +490,14 @@ class ThemeManager:
                                                   {'_global': DEFAULT_ICON_TINT}),
                     'capture_card': {**DEFAULT_CAPTURE_CARD_COLORS,
                                      **config_data.get('capture_card', {})},
+                    'fonts': {**DEFAULT_FONTS, **config_data.get('fonts', {})},
+                    'font_files': config_data.get('font_files', {}),
                 }
+                imported = set(self._data['font_files'])
+                for role in DEFAULT_FONTS:
+                    family = str(self._data['fonts'].get(role, 'Oswald'))
+                    if family != 'Oswald' and family not in imported:
+                        self._data['fonts'][role] = 'Oswald'
                 self.save()
             return True
         except Exception as e:
@@ -375,8 +514,13 @@ class ThemeManager:
     def sounds_dir(self) -> Path:
         return self._sounds_dir
 
+    @property
+    def fonts_dir(self) -> Path:
+        return self._fonts_dir
+
     def has_any_customization(self) -> bool:
-        if self._data['icons'] or self._data['sounds']:
+        if (self._data['icons'] or self._data['sounds']
+                or self._data.get('font_files')):
             return True
         if self._data['colors'] != DEFAULT_COLORS:
             return True
@@ -384,5 +528,7 @@ class ThemeManager:
         if tints != {'_global': DEFAULT_ICON_TINT}:
             return True
         if self._data.get('capture_card', {}) != DEFAULT_CAPTURE_CARD_COLORS:
+            return True
+        if self._data.get('fonts', {}) != DEFAULT_FONTS:
             return True
         return False

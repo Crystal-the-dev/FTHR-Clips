@@ -113,22 +113,48 @@ bool Encoder::TryOpen(const char* codec_name, const EncoderConfig& cfg) {
 // Build priority list for Open()
 // ---------------------------------------------------------------------------
 
-static void BuildCodecList(CodecPref pref, std::vector<const char*>& out) {
-    auto add = [&](const char* name) { out.push_back(name); };
+static void BuildCodecList(
+    CodecPref codec_pref,
+    EncoderPref encoder_pref,
+    std::vector<const char*>& out) {
+    auto codec_allowed = [&](CodecPref codec) {
+        return codec_pref == CodecPref::Auto || codec_pref == codec;
+    };
+    auto backend_allowed = [&](EncoderPref backend) {
+        return encoder_pref == EncoderPref::Auto || encoder_pref == backend;
+    };
+    auto add_backend = [&](EncoderPref backend) {
+        if (!backend_allowed(backend)) return;
+        if (backend == EncoderPref::Nvidia) {
+            if (codec_allowed(CodecPref::H264)) out.push_back("h264_nvenc");
+            if (codec_allowed(CodecPref::HEVC)) out.push_back("hevc_nvenc");
+            if (codec_allowed(CodecPref::AV1)) out.push_back("av1_nvenc");
+        } else if (backend == EncoderPref::Amd) {
+            if (codec_allowed(CodecPref::H264)) out.push_back("h264_amf");
+            if (codec_allowed(CodecPref::HEVC)) out.push_back("hevc_amf");
+            if (codec_allowed(CodecPref::AV1)) out.push_back("av1_amf");
+        } else if (backend == EncoderPref::Intel) {
+            if (codec_allowed(CodecPref::H264)) out.push_back("h264_qsv");
+            if (codec_allowed(CodecPref::HEVC)) out.push_back("hevc_qsv");
+            if (codec_allowed(CodecPref::AV1)) out.push_back("av1_qsv");
+        } else if (backend == EncoderPref::Software) {
+            // LGPL-compatible software fallbacks only.
+            if (codec_allowed(CodecPref::H264)) out.push_back("libopenh264");
+            if (codec_allowed(CodecPref::HEVC)) out.push_back("libkvazaar");
+            if (codec_allowed(CodecPref::AV1)) {
+                out.push_back("libsvtav1");
+                out.push_back("libaom-av1");
+                out.push_back("librav1e");
+            }
+        }
+    };
 
-    if (pref == CodecPref::Auto || pref == CodecPref::AV1) {
-        add("av1_nvenc"); add("av1_amf"); add("av1_qsv"); add("libsvtav1"); add("libaom-av1");
-    }
-    if (pref == CodecPref::Auto || pref == CodecPref::HEVC) {
-        // libkvazaar (LGPLv2.1) replaces libx265 (GPL). Distro FFmpeg packages
-        // are usually GPL builds that still carry libx265, but FTHR must not
-        // *depend* on that: an LGPL-only FFmpeg has to work too.
-        add("hevc_nvenc"); add("hevc_amf"); add("hevc_qsv"); add("libkvazaar");
-    }
-    if (pref == CodecPref::Auto || pref == CodecPref::H264) {
-        // libopenh264 (BSD-2-Clause) replaces libx264 (GPL).
-        add("h264_nvenc"); add("h264_amf"); add("h264_qsv"); add("libopenh264");
-    }
+    // Auto is backend-first so a working hardware H.264 encoder wins over a
+    // much slower software AV1 encoder discovered earlier by codec family.
+    add_backend(EncoderPref::Nvidia);
+    add_backend(EncoderPref::Amd);
+    add_backend(EncoderPref::Intel);
+    add_backend(EncoderPref::Software);
 }
 
 // ---------------------------------------------------------------------------
@@ -137,7 +163,7 @@ static void BuildCodecList(CodecPref pref, std::vector<const char*>& out) {
 
 bool Encoder::Open(const EncoderConfig& cfg, std::string& codec_used_out) {
     std::vector<const char*> candidates;
-    BuildCodecList(cfg.codec_pref, candidates);
+    BuildCodecList(cfg.codec_pref, cfg.encoder_pref, candidates);
 
     for (const char* name : candidates) {
         std::cout << "[Encoder] Trying codec: " << name << std::endl;

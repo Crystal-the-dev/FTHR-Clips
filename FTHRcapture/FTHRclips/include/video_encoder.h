@@ -12,7 +12,7 @@
 //     disk I/O latency never stalls the encode loop
 //
 // Threading model:
-//   EncodeFrame()       - called from CaptureEngine (SaveClip or EncodeThread)
+//   EncodeFrame()       - called only by the legacy raw SaveClip fallback
 //   DiskWriterThread()  - private thread owned by VideoEncoder
 //                         started by Initialize(), joined by Finalize()
 //
@@ -87,6 +87,7 @@ namespace fthr {
         uint32_t    bitrate_kbps = 16000;       // Target bitrate in kbps
         const char* preset = "superfast";  // x264 preset
         const char* tune = nullptr;      // x264 tune (nullptr = none)
+        uint32_t    hardware_preset = 4;  // NVENC P1-P7 quality/performance level
 
         // 0 = stretch to enc dims (legacy default; aspect may distort).
         // 1 = preserve source aspect inside enc dims, pad with black bars.

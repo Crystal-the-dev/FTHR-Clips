@@ -43,9 +43,16 @@ class CaptureConfig:
     monitor: str
     scaling: str
     audio_enabled: bool
+    encoder: str = 'auto'
+    multiband_enabled: bool = False
     microphone_endpoint_id: str = ''
     normal_clip_seconds: int = 30
     extended_clip_seconds: int = 60
+    crop_enabled: bool = False
+    crop_x: float = 0.0
+    crop_y: float = 0.0
+    crop_w: float = 1.0
+    crop_h: float = 1.0
 
 
 def compute_buffer_seconds(normal_seconds: int, extended_seconds: int) -> int:

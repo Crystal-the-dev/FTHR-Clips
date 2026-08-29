@@ -12,6 +12,7 @@ IMAGE_SUFFIXES = ('.png', '.jpg', '.jpeg')
 PARTIAL_SUFFIX = '.partial'
 _AUDIO_MANIFEST_SUFFIX = '.fthr-audio.json'
 _FTHR_CLIP_MARKER = '_clip_from_'
+FTHR_TEMP_DIR_PREFIX = '.fthr-'
 DEFAULT_PARTIAL_MAX_AGE_SECONDS = 24 * 60 * 60
 
 
@@ -24,9 +25,21 @@ class PartialCleanupResult:
 
 
 def is_partial_clip_path(path: str | Path) -> bool:
-    """Return whether ``path`` uses FTHR's untrusted partial-file suffix."""
+    """Return whether ``path`` is an untrusted/in-progress media path.
 
-    return Path(path).name.casefold().endswith(PARTIAL_SUFFIX)
+    Export staging names use ``.partial.<token>`` before the final extension,
+    while the capture engine uses the older ``.mp4.partial`` form.  Neither
+    should be visible to the library or be handed to a media consumer.
+    """
+
+    name = Path(path).name.casefold()
+    return name.endswith(PARTIAL_SUFFIX) or '.partial.' in name
+
+
+def is_fthr_temporary_dir(path: str | Path) -> bool:
+    """Return whether ``path`` is an app-owned post-processing directory."""
+
+    return Path(path).name.casefold().startswith(FTHR_TEMP_DIR_PREFIX)
 
 
 def is_completed_video_path(path: str | Path) -> bool:

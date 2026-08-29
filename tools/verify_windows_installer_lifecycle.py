@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -149,6 +150,9 @@ def check_source(report: Report) -> None:
     require(report, source,
             'Name: "{code:UserProfilePath}\\.fthr"; Check: ShouldRemoveSettingsAndCache',
             'settings/cache removal is opt-in')
+    require(report, source,
+            'Name: "{localappdata}\\FTHR Clips\\plugins"',
+            'uninstall removes separately activated optional packages')
 
     delete_sections = '\n'.join(re.findall(
         r'(?ms)^\[(?:InstallDelete|UninstallDelete)\]\s*(.*?)(?=^\[|\Z)', source))
@@ -250,6 +254,56 @@ def check_bundle(report: Report, bundle: Path, *, require_signed: bool) -> None:
             report.fail(f'bundle missing {rel} at root or _internal')
         else:
             report.ok(f'bundle contains {found.relative_to(bundle)}')
+
+    sys.path.insert(0, str(ROOT / 'FTHR_UI'))
+    from core.uploader_bundle_manifest import (  # noqa: PLC0415
+        EXPECTED_HARDWARE_BUNDLE_SHA256,
+        EXPECTED_UPLOADER_BUNDLE_SHA256,
+        HARDWARE_PLUGIN_ID,
+        UPLOADER_PLUGIN_ID,
+    )
+    optional_packages = (
+        ('FTHR-Uploader.fthrplugin', EXPECTED_UPLOADER_BUNDLE_SHA256,
+         UPLOADER_PLUGIN_ID, 'FTHR Uploader.exe'),
+        ('FTHR-Hardware-Identity.fthrplugin', EXPECTED_HARDWARE_BUNDLE_SHA256,
+         HARDWARE_PLUGIN_ID, 'FTHR Hardware Identity.exe'),
+    )
+    package_root = bundle / '_internal' / 'plugin-packages'
+    for name, expected_hash, plugin_id, entrypoint in optional_packages:
+        package = package_root / name
+        if not package.is_file():
+            report.fail(f'bundle missing dormant optional package {name}')
+            continue
+        if sha256(package).lower() != expected_hash.lower():
+            report.fail(f'{name}: hash does not match the Core release binding')
+            continue
+        try:
+            with zipfile.ZipFile(package) as archive:
+                manifest = json.loads(archive.read('manifest.json'))
+                names = set(archive.namelist())
+        except (OSError, ValueError, KeyError, zipfile.BadZipFile) as exc:
+            report.fail(f'{name}: invalid dormant package ({exc})')
+            continue
+        expected_names = {
+            'manifest.json', 'TERMS_OF_SERVICE.txt', 'PRIVACY_POLICY.txt',
+            f'payload/{entrypoint}',
+        }
+        if (manifest.get('plugin_id') != plugin_id
+                or manifest.get('entrypoint') != entrypoint
+                or names != expected_names):
+            report.fail(f'{name}: manifest or exact-content boundary is invalid')
+        else:
+            report.ok(f'bundle contains verified dormant package {name}')
+
+    direct_optional_executables = [
+        path for path in bundle.rglob('*')
+        if path.is_file()
+        and path.name in {'FTHR Uploader.exe', 'FTHR Hardware Identity.exe'}
+    ]
+    if direct_optional_executables:
+        report.fail('optional executables were extracted into the Core bundle')
+    else:
+        report.ok('optional executables remain sealed in dormant packages')
     debug_files = [path for path in bundle.rglob('*')
                    if path.is_file() and path.suffix.lower() in {'.pdb', '.ilk', '.iobj', '.ipdb'}]
     if debug_files:

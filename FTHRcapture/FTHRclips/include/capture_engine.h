@@ -1,10 +1,9 @@
 ﻿// capture_engine.h
 // FTHR Capture Engine - Core capture loop and ring buffer management
 //
-// Capture backend (selected at Initialize() time, WGC is the default; DXGI
-// is a last-resort fallback for Windows 10 < build 1903):
+// Capture backend (selected at Initialize() time):
 //
-//   WGC path (wgc_active_ = true) — DEFAULT for every capture mode:
+//   WGC path (wgc_active_ = true) — preferred when it is borderless:
 //     - Windows Graphics Capture API — event-driven, lower overhead than DXGI.
 //     - Hooks at the DWM/compositor level. Survives independent flip mode,
 //       so it captures kernel-anti-cheat games (Valorant/Vanguard, EAC/BE
@@ -16,9 +15,10 @@
 //     - Variants: CreateForMonitor (desktop + AC games), CreateForWindow
 //       (regular window mode).
 //
-//   DXGI path (wgc_active_ = false) — FALLBACK ONLY:
+//   DXGI path (wgc_active_ = false) — border-free fallback:
 //     - IDXGIOutputDuplication — polling loop in CaptureThread.
-//     - Reached only when WGC init fails (rare, pre-1903 Windows 10).
+//     - Used whenever WGC cannot prove that Windows will hide its privacy
+//       border, so an active capture never leaves a visible system outline.
 //     - Returns black/stale frames for AC games in independent flip mode.
 //
 // Encode backend (selected after capture backend):
@@ -36,7 +36,7 @@
 // Threading model:
 //   CaptureThread  - grabs frames (WGC or DXGI), routes to NVENC or FramePool
 //   SaveClipThread - muxes encoded snapshots OR encodes raw frames
-//   EncodeThread   - continuous recording (StartRecording, x264 only for now)
+//   ContinuousRecordingWriter - durable packet tee to fragmented MP4
 
 #pragma once
 #ifndef FTHR_CAPTURE_ENGINE_H
@@ -52,6 +52,7 @@
 #include <thread>
 #include <atomic>
 #include <vector>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <cstdint>
@@ -66,6 +67,7 @@
 #include "audio_timeline.h"
 #include "windows_microphone_audio_provider.h"
 #include "windows_process_loopback_audio_provider.h"
+#include "continuous_recording_writer.h"
 #include "audio_ring_buffer.h"   // AudioRingBuffer (raw float32 PCM)
 #include "shared_memory.h"       // typed v4 capture-health flags
 #include "windows_capture_border_policy.h"
@@ -92,6 +94,9 @@ namespace fthr {
         // argv[11]: Auto and explicit H.264 both resolve to H.264 for this
         // NVIDIA stage; explicit HEVC/AV1 must never silently become H.264.
         VideoCodec video_codec = VideoCodec::H264;
+        EncoderPreference encoder_preference = EncoderPreference::Auto;
+        uint32_t encoder_preset = 4;
+        bool multiband_enabled = false;
 
         // Capture mode — set at startup, requires engine restart to change.
         enum class CaptureModeEnum : uint32_t { DESKTOP = 0, WINDOW = 1 };
@@ -115,6 +120,15 @@ namespace fthr {
         // back to another microphone.
         std::wstring microphone_endpoint_id;
         uint32_t microphone_gain_percent = 100;
+
+        // Optional per-game crop in normalized source coordinates. It is
+        // resolved to safe pixel geometry after the capture source opens and
+        // applied to encoder input frames, never guessed from encoded output.
+        bool crop_enabled = false;
+        double crop_x = 0.0;
+        double crop_y = 0.0;
+        double crop_width = 1.0;
+        double crop_height = 1.0;
 
         // Stable Windows monitor device interface path from the UI. Resolved
         // into transient HMONITOR/LUID/DXGI objects for each capture generation.
@@ -155,12 +169,13 @@ namespace fthr {
         void Shutdown();
 
         bool StartRecording(const wchar_t* path);
-        void StopRecording();
+        bool StopRecording();
 
         bool SaveClip(const wchar_t* path, uint32_t duration_seconds,
             SharedMemoryLayout* shared_memory);
 
         bool     IsRecording()   const;
+        std::string GetLastRecordingError() const;
         uint64_t GetFrameCount() const;
         bool     IsNvencActive() const { return nvenc_active_; }
         std::string GetActiveEncoderName() const {
@@ -207,7 +222,6 @@ namespace fthr {
         // -----------------------------------------------------------------------
         void CaptureThread();       // dispatches to WGC or DXGI
         void CaptureThreadWGC();    // WGC event-driven loop
-        void EncodeThread();
         void SaveClipThread();
 
         // -----------------------------------------------------------------------
@@ -228,7 +242,9 @@ namespace fthr {
         // -----------------------------------------------------------------------
         bool InitializeWGC();             // WGC capture of the resolved desktop monitor
         bool InitializeWindowCapture();   // WGC window/game capture
-        void ApplyCaptureBorderPolicy(const char* capture_target);
+        // Returns true only when the WGC session read back as borderless.
+        // Callers fail closed to DXGI when it returns false.
+        bool ApplyCaptureBorderPolicy(const char* capture_target);
         void ShutdownWGC();
         bool InitializeD3D11();           // DXGI fallback for the resolved adapter/output
         void ShutdownD3D11();
@@ -241,6 +257,10 @@ namespace fthr {
         bool InitializeMonitorCaptureDevice(
             const char* backend_name, IDXGIOutput** selected_output);
         bool EnsureStagingTexture();
+        bool ConfigureCrop(const CaptureConfig& config);
+        ID3D11Texture2D* PrepareEncodeTexture(ID3D11Texture2D* source);
+        const uint8_t* CropMappedData(
+            const uint8_t* data, uint32_t stride) const;
         bool EncodeGpuReplayTexture(
             ID3D11Texture2D* source,
             int64_t present_qpc,
@@ -255,6 +275,7 @@ namespace fthr {
         ID3D11DeviceContext*    context_;
         IDXGIOutputDuplication* duplication_;      // null when WGC is active
         ID3D11Texture2D*        staging_texture_;  // null on WGC+NVENC path
+        ID3D11Texture2D*        crop_texture_;     // encoder-sized GPU crop
         ID3D11Texture2D*        health_staging_texture_; // 16x9 grid, sampled ~1 Hz
 
         // Legacy cross-adapter resources. They remain null under the final alpha
@@ -272,13 +293,10 @@ namespace fthr {
         std::condition_variable wgc_frame_cv_;
         bool                    wgc_frame_ready_;
         std::atomic<bool>       monitor_source_invalidated_{false};
-        CaptureBorderRuntimeState capture_border_runtime_state_;
-
         // -----------------------------------------------------------------------
         // Thread handles
         // -----------------------------------------------------------------------
         std::thread* capture_thread_;
-        std::thread* encode_thread_;
         std::thread* save_clip_thread_;
         std::atomic<bool> running_;
         std::atomic<bool> is_recording_;
@@ -288,6 +306,11 @@ namespace fthr {
         // -----------------------------------------------------------------------
         uint32_t  width_;
         uint32_t  height_;
+        bool      crop_enabled_;
+        uint32_t  crop_x_;
+        uint32_t  crop_y_;
+        uint32_t  crop_width_;
+        uint32_t  crop_height_;
         uintptr_t target_hwnd_;  // 0 = desktop mode; non-zero = window capture mode
 
         // Focus gate: when true, CaptureThreadWGC drops every frame where
@@ -366,16 +389,12 @@ namespace fthr {
         // or the frozen Shared Memory v4 boundary.
         std::unique_ptr<WindowsMicrophoneAudioProvider> microphone_audio_source_;
         AudioSourceMetadata               microphone_audio_metadata_;
-        // Windows 11 only. This owns real process-loopback providers; Windows
-        // 10 remains Default-Mix-only and never attempts their activation.
-        std::unique_ptr<WindowsApplicationAudioSourceManager>
-            windows_application_audio_sources_;
-
         // -----------------------------------------------------------------------
         // Continuous recording state
         // -----------------------------------------------------------------------
-        std::wstring record_path_;
-        std::mutex   record_mutex_;
+        mutable std::mutex record_writer_mutex_;
+        std::shared_ptr<ContinuousRecordingWriter> record_writer_;
+        std::string last_recording_error_;
 
         // -----------------------------------------------------------------------
         // Stats

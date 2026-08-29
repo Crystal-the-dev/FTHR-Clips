@@ -9,6 +9,7 @@
 namespace {
 
 using fthr::EncoderVendor;
+using fthr::EncoderPreference;
 using fthr::ReplayEncoderBackend;
 using fthr::ReplayStartupError;
 using fthr::VideoCodec;
@@ -79,6 +80,22 @@ void CaptureAdapterCannotBeStolenByAnotherVendor() {
     CheckPolicy(!unknown.allowed
             && unknown.error == ReplayStartupError::CaptureAdapterUnsupported,
         "unknown capture adapter refuses startup instead of enumerating vendors");
+}
+
+void ExplicitNvidiaSelectionEnablesQualifiedHybridPath() {
+    const auto selected = fthr::SelectWindowsReplayPolicy(
+        EncoderVendor::Intel, EncoderPreference::Nvidia, VideoCodec::HEVC);
+    CheckPolicy(selected.allowed && !selected.same_adapter,
+        "explicit NVIDIA selection permits the hybrid CPU-input path");
+    CheckPolicy(selected.encoder_vendor == EncoderVendor::Nvidia
+            && selected.backend == ReplayEncoderBackend::NativeNvenc,
+        "explicit NVIDIA selection resolves to native NVENC");
+
+    const auto unsupported = fthr::SelectWindowsReplayPolicy(
+        EncoderVendor::Intel, EncoderPreference::Amd, VideoCodec::H264);
+    CheckPolicy(!unsupported.allowed
+            && unsupported.error == ReplayStartupError::CrossAdapterPathUnavailable,
+        "unimplemented AMD cross-adapter selection stays rejected");
 }
 
 void RawCapacityNeverOverclaimsConfiguredHistory() {
@@ -198,6 +215,7 @@ int RunWindowsReplayPolicyTests() {
     SameAdapterVendorMatrixIsAuthoritative();
     MissingRuntimeAndUnsupportedCodecStayFailed();
     CaptureAdapterCannotBeStolenByAnotherVendor();
+    ExplicitNvidiaSelectionEnablesQualifiedHybridPath();
     RawCapacityNeverOverclaimsConfiguredHistory();
     DeadlineSchedulerPreservesCadenceAcrossRefreshRates();
     EncodedReplayCapacityHasBoundedHeadroom();

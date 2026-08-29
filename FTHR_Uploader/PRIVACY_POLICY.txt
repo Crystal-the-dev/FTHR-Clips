@@ -1,0 +1,35 @@
+FTHR UPLOAD EXTENSION — PRIVACY POLICY
+Version: 2026-08-24-v1
+
+Installation and execution
+
+FTHR Clips Core contains no provider upload client. This extension is stored as
+a dormant, integrity-checked package and is extracted only after consent. It
+runs only for an upload, account, or connection-test request; it has no idle
+background service.
+
+Data kept locally
+
+- uploader enable state, selected provider, schedule, and Catbox userhash;
+- upload history, returned links, file IDs, and expiry timestamps;
+- for Lustful, the account ID and the derived hardware UUID.
+
+Data sent
+
+- Catbox: the selected clip, filename, optional userhash, and connection data;
+- Lustful: the selected clip, filename, account ID, derived hardware UUID, file
+  metadata, and connection data required by the service.
+
+The general uploader cannot read raw hardware identifiers. Lustful requires a
+second, separately consented Hardware Identity capability. That capability
+derives a UUID locally and returns only the derived value.
+
+Provider policies and retention
+
+Catbox: https://catbox.moe/legal.php
+Lustful terms: https://fthr.lustful.wtf/tos
+Lustful privacy: https://fthr.lustful.wtf/privacy
+
+Disabling uploads stops network actions. Uninstalling FTHR Clips removes the
+activated package files; local uploader settings can also be removed with the
+installer's settings-cleanup option.

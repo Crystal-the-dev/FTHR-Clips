@@ -17,40 +17,39 @@ import sys
 import subprocess
 from core import linux_tools
 import hashlib
+from pathlib import Path
 import cv2
 from datetime import datetime
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QGridLayout,
-    QGraphicsOpacityEffect, QMenu, QMessageBox, QApplication,
-    QPushButton, QComboBox, QSizePolicy,
+    QGraphicsOpacityEffect, QMenu, QApplication,
+    QPushButton, QSizePolicy,
 )
 from PySide6.QtCore import (
     Qt, Signal, QTimer, QRunnable, QThreadPool, QObject,
     QFileSystemWatcher, QPropertyAnimation, QEasingCurve, QRect, QPoint,
+    QUrl,
 )
-from PySide6.QtGui import QPixmap, QPainter
+from PySide6.QtGui import QDesktopServices, QPixmap, QPainter, QColor
 
 from core.clip_files import (
     IMAGE_SUFFIXES,
     VIDEO_SUFFIXES,
     is_completed_video_path,
+    is_fthr_temporary_dir,
     is_library_media_path,
 )
 from core.library_ownership import MediaOwnership, classify_media_path
+from core.media_metadata import probe_video_metadata
+from core.settings_manager import clips_directory_from
+from ui.style import WheelSafeComboBox, paint_dropdown_arrow
 
 
-class _DropdownCombo(QComboBox):
+class _DropdownCombo(WheelSafeComboBox):
     """QComboBox that shows icons/dropdown.png as its arrow, rotated when open."""
-    _arrow_pix: 'QPixmap | None' = None
 
-    @classmethod
-    def _get_arrow(cls) -> 'QPixmap | None':
-        if cls._arrow_pix is None:
-            path = os.path.join(os.path.dirname(__file__), '..', 'assets', 'icons', 'dropdown.png')
-            if os.path.exists(path):
-                cls._arrow_pix = QPixmap(path)
-        return cls._arrow_pix
+    _custom_arrow_managed = True
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -68,29 +67,16 @@ class _DropdownCombo(QComboBox):
 
     def paintEvent(self, event):
         super().paintEvent(event)
-        pix = self._get_arrow()
-        if pix is None or pix.isNull():
-            return
-        sz = 14
-        scaled = pix.scaled(sz, sz, Qt.AspectRatioMode.KeepAspectRatio,
-                             Qt.TransformationMode.SmoothTransformation)
-        x = self.width() - sz - 8
-        y = (self.height() - sz) // 2
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        if self._popup_open:
-            p.translate(x + sz / 2.0, y + sz / 2.0)
-            p.rotate(180)
-            p.drawPixmap(QRect(-sz // 2, -sz // 2, sz, sz), scaled)
-        else:
-            p.drawPixmap(x, y, scaled)
+        paint_dropdown_arrow(p, self.rect(), self._popup_open)
         p.end()
 
 from ui.style import (
     Colors, Fonts, Sizes,
-    label_display, label_body,
+    label_display,
     context_menu_qss, combo_qss,
 )
+from ui.dialogs import FthrMessageDialog
 
 
 THUMB_CACHE_DIR = os.path.join(os.path.expanduser('~'), '.fthr', 'thumbnails')
@@ -101,11 +87,46 @@ _VIDEO_EXTS = VIDEO_SUFFIXES
 _IMAGE_EXTS = IMAGE_SUFFIXES
 
 
+def _rgba(hex_color: str, alpha: int) -> str:
+    """Turn a theme hex token into a QSS rgba color with the given alpha."""
+    color = QColor(hex_color)
+    return f'rgba({color.red()},{color.green()},{color.blue()},{alpha})'
+
+
+def _is_grid_excluded_dir(path: str) -> bool:
+    """Keep app-owned post-processing directories out of the library scan."""
+
+    name = os.path.basename(os.fspath(path))
+    return name in _GRID_EXCLUDED_DIRS or is_fthr_temporary_dir(name)
+
+
+def _show_in_file_manager(file_path: str) -> None:
+    """Open the containing folder and highlight ``file_path`` when possible."""
+
+    path = os.path.abspath(os.path.normpath(os.fspath(file_path)))
+    if sys.platform == 'win32':
+        # Explorer expects /select,"path" as a single command-line expression.
+        # Passing the switch as a list argument makes subprocess quote the whole
+        # /select expression, which causes Explorer to ignore the selection and
+        # only open its default location.
+        subprocess.Popen(f'explorer.exe /select,"{path}"')
+        return
+
+    _opener = linux_tools.path('xdg-open')
+    if _opener:
+        subprocess.Popen([_opener, os.path.dirname(path)])
+    else:
+        print(f'[Clips] {linux_tools.missing_message("xdg-open")}')
+
+
 # ─── Card geometry ──────────────────────────────────────────────────
-# Thumbnail aspect 16:9 → 320×180. Card body adds 64px below for title row.
-_CARD_W      = 320
+# Cards flex with the viewport. The thumbnail *surface* remains 16:9, while
+# source pixels are fitted inside it without cropping or distortion.
+_CARD_W      = 320  # preferred / cache sizing reference
+_CARD_MIN_W  = 240
+_CARD_MAX_W  = 420
 _THUMB_H     = 180
-_CARD_BODY_H = 72
+_CARD_BODY_H = 104
 _CARD_H      = _THUMB_H + _CARD_BODY_H
 
 
@@ -116,56 +137,58 @@ def _get_cached_thumb_path(file_path: str) -> str:
     is overwritten without requiring a separate cache index.
     """
     mtime = os.path.getmtime(file_path)
-    key = f'{file_path}|{mtime}'.encode('utf-8', errors='surrogateescape')
+    # v2 caches preserve the source aspect ratio.  Including the cache format
+    # here prevents an older, force-stretched 16:9 thumbnail from surviving an
+    # application update.
+    key = f'{file_path}|{mtime}|aspect-v2'.encode(
+        'utf-8', errors='surrogateescape')
     return os.path.join(THUMB_CACHE_DIR, hashlib.md5(key).hexdigest() + '.jpg')
 
 
 def _get_cached_duration_path(thumb_path: str) -> str:
-    """Sidecar file storing clip metadata so we don't reopen the video on cache hits.
+    """Sidecar storing authoritative clip metadata for thumbnail/viewer reuse.
 
-    Format: a single line of "duration_sec width height fps" — duration alone is
-    kept first for backwards compatibility with caches written before the
-    width/height/fps fields were added; readers tolerate the old single-int form.
-    The same .dur path is shared by ClipViewer so it can skip cv2.VideoCapture
-    entirely on cache hits.
+    The v2 filename deliberately invalidates old OpenCV-derived FPS caches.
+    Format: ``duration width height fps video_bitrate total_bitrate``.
     """
-    return thumb_path[:-4] + '.dur'  # replace '.jpg' with '.dur'
+    return thumb_path[:-4] + '.meta-v2'
 
 
 def _read_cached_duration(dur_path: str) -> int:
     """Backwards-compatible reader that returns just the duration."""
     meta = read_cached_metadata(dur_path)
-    return meta[0] if meta else 0
+    return int(meta[0]) if meta else 0
 
 
 def read_cached_metadata(dur_path: str):
-    """
-    Return (duration_sec, width, height, fps) from the .dur sidecar, or None.
-
-    Older caches contained only the duration; in that case width/height are 0
-    and fps is 0.0 — callers should treat zeros as "unknown" and fall back to
-    cv2.VideoCapture themselves.
-    """
+    """Return factual cached metadata, or ``None`` when unavailable."""
     try:
         with open(dur_path, 'r') as f:
             parts = f.read().strip().split()
         if not parts:
             return None
-        duration = int(parts[0])
+        duration = float(parts[0])
         width    = int(parts[1]) if len(parts) > 1 else 0
         height   = int(parts[2]) if len(parts) > 2 else 0
         fps      = float(parts[3]) if len(parts) > 3 else 0.0
-        return (duration, width, height, fps)
+        video_bitrate = int(parts[4]) if len(parts) > 4 else 0
+        total_bitrate = int(parts[5]) if len(parts) > 5 else 0
+        return (duration, width, height, fps,
+                video_bitrate, total_bitrate)
     except (OSError, ValueError):
         return None
 
 
-def _write_cached_duration(dur_path: str, duration: int,
-                            width: int = 0, height: int = 0, fps: float = 0.0):
-    """Persist duration plus optional width/height/fps so ClipViewer can skip cv2."""
+def _write_cached_duration(dur_path: str, duration: float,
+                            width: int = 0, height: int = 0, fps: float = 0.0,
+                            video_bitrate: int = 0,
+                            total_bitrate: int = 0):
+    """Persist factual FFprobe metadata so ClipViewer can skip a second probe."""
     try:
         with open(dur_path, 'w') as f:
-            f.write(f'{int(duration)} {int(width)} {int(height)} {fps:.3f}')
+            f.write(
+                f'{float(duration):.6f} {int(width)} {int(height)} '
+                f'{float(fps):.6f} {int(video_bitrate)} {int(total_bitrate)}')
     except OSError:
         pass
 
@@ -213,11 +236,12 @@ def _section_label_for(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime('%a, %b %d').upper()
 
 
-def _game_name_from_path(file_path: str) -> str:
+def _game_name_from_path(file_path: str, clips_root: str | None = None) -> str:
     """Best-effort game / source name from the parent folder."""
     parent = os.path.basename(os.path.dirname(file_path))
-    if parent in ('FTHR_Clips', '') or parent == os.path.basename(
-            os.path.expanduser('~/FTHR_Clips')):
+    root_name = os.path.basename(os.path.normpath(
+        clips_root or os.path.expanduser('~/FTHR_Clips')))
+    if parent in (root_name, ''):
         return 'DESKTOP'
     return parent.upper()
 
@@ -268,26 +292,54 @@ class _ThumbnailWorker(QRunnable):
             return
 
         ret, frame = cap.read()
-        fps = cap.get(cv2.CAP_PROP_FPS)
+        decoder_fps = cap.get(cv2.CAP_PROP_FPS)
         frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
         width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        duration = int(frames / fps) if fps > 0 else 0
+        decoder_duration = frames / decoder_fps if decoder_fps > 0 else 0.0
         cap.release()
 
+        probed = probe_video_metadata(self.file_path)
+        duration = (probed.duration_seconds
+                    if probed and probed.duration_seconds is not None
+                    else decoder_duration)
+        width = probed.width if probed and probed.width else width
+        height = probed.height if probed and probed.height else height
+        # Never persist CAP_PROP_FPS as factual media metadata. It is commonly
+        # reconstructed from approximate frame counts/timestamps.
+        fps = probed.average_fps if probed and probed.average_fps else 0.0
+        video_bitrate = (
+            probed.video_bitrate_bps if probed and probed.video_bitrate_bps else 0)
+        total_bitrate = (
+            probed.total_bitrate_bps if probed and probed.total_bitrate_bps else 0)
+
         if not ret or frame is None:
-            self.signals.finished.emit(self.file_path, '', duration)
+            self.signals.finished.emit(self.file_path, '', int(duration))
             return
 
         os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
         if not os.path.exists(cache_path):
-            thumb = cv2.resize(frame, (_CARD_W, _THUMB_H))
+            # Cache the real aspect ratio. The old forced 320×180 resize baked
+            # distortion into portrait, ultrawide, and cropped thumbnails even
+            # before Qt displayed them.
+            source_h, source_w = frame.shape[:2]
+            scale = min(1.0, 640 / max(source_w, 1), 360 / max(source_h, 1))
+            if scale < 1.0:
+                thumb = cv2.resize(
+                    frame,
+                    (max(1, int(source_w * scale)), max(1, int(source_h * scale))),
+                    interpolation=cv2.INTER_AREA)
+            else:
+                thumb = frame
             cv2.imwrite(cache_path, thumb, [cv2.IMWRITE_JPEG_QUALITY, 85])
         # Persist full metadata so ClipViewer can skip its own cv2.VideoCapture
         # on subsequent opens — this is what removes the first-launch lag for
         # clips that already appear on the grid.
-        _write_cached_duration(dur_path, duration, width, height, fps)
-        self.signals.finished.emit(self.file_path, cache_path, duration)
+        _write_cached_duration(
+            dur_path, duration, width, height, fps,
+            video_bitrate, total_bitrate)
+        self.signals.finished.emit(
+            self.file_path, cache_path, int(duration))
 
 
 class _FileCollectSignals(QObject):
@@ -320,7 +372,7 @@ class _FileCollectWorker(QRunnable):
             full = os.path.join(self.clips_dir, name)
             if os.path.isfile(full) and is_library_media_path(name):
                 found.add(full)
-            elif os.path.isdir(full) and name not in _GRID_EXCLUDED_DIRS:
+            elif os.path.isdir(full) and not _is_grid_excluded_dir(name):
                 subdirs.append(full)
                 try:
                     for sub in os.listdir(full):
@@ -340,7 +392,7 @@ class _FileCollectWorker(QRunnable):
                     if os.path.isfile(full) and is_library_media_path(name):
                         found.add(full)
                         imported.add(full)
-                    elif os.path.isdir(full):
+                    elif os.path.isdir(full) and not _is_grid_excluded_dir(full):
                         subdirs.append(full)
                         try:
                             for sub in os.listdir(full):
@@ -385,17 +437,31 @@ class ClipThumbnail(QFrame):
     upload_requested = Signal(str)
 
     def __init__(self, file_path: str, is_video: bool = True, imported: bool = False,
-                 upload_enabled: bool = False, uploaded: bool = False,
-                 ready: bool = True, parent=None):
+                  upload_enabled: bool = False, uploaded: bool = False,
+                  upload_info: dict | None = None, ready: bool = True,
+                  card_width: int = _CARD_W, parent=None,
+                  clips_root: str | None = None):
         super().__init__(parent)
         self.file_path      = file_path
         self.is_video       = is_video
         self.imported       = imported
         self.upload_enabled = upload_enabled
         self.uploaded       = uploaded
+        self.upload_info    = dict(upload_info or {})
+        self._clips_root    = clips_root or os.path.expanduser('~/FTHR_Clips')
+        self.upload_link    = ''
         self.ready          = ready
+        # A cold thumbnail decode also produces the metadata used by the
+        # editor.  Do not let a click race that worker and force ClipViewer
+        # back onto its synchronous OpenCV fallback on the UI thread.
+        self._thumbnail_ready = not is_video
+        self._open_pending = False
+        self._card_width = max(_CARD_MIN_W, min(_CARD_MAX_W, int(card_width)))
+        self._thumb_height = max(1, round(self._card_width * 9 / 16))
+        self._thumb_pixmap = QPixmap()
         self.setObjectName('clipCard')
-        self.setFixedSize(_CARD_W, _CARD_H)
+        self.setFixedSize(
+            self._card_width, self._thumb_height + _CARD_BODY_H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self._fade_anim: QPropertyAnimation | None = None
@@ -414,22 +480,24 @@ class ClipThumbnail(QFrame):
 
         # ── Thumbnail container ───────────────────────────────────────────
         thumb = QFrame(self)
+        self._thumb_frame = thumb
         thumb.setObjectName('cardThumb')
-        thumb.setFixedSize(_CARD_W, _THUMB_H)
+        thumb.setFixedSize(self._card_width, self._thumb_height)
 
         self.thumb_label = QLabel(thumb)
-        self.thumb_label.setGeometry(0, 0, _CARD_W, _THUMB_H)
+        self.thumb_label.setGeometry(0, 0, self._card_width, self._thumb_height)
         self.thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.thumb_label.setScaledContents(True)
+        self.thumb_label.setScaledContents(False)
         self.thumb_label.setStyleSheet('background: transparent; border: none;')
 
         # Center play glyph (video only)
         if self.is_video:
             self._play_icon = QLabel('▶', thumb)
-            self._play_icon.setGeometry(0, 0, _CARD_W, _THUMB_H)
+            self._play_icon.setGeometry(
+                0, 0, self._card_width, self._thumb_height)
             self._play_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self._play_icon.setStyleSheet(
-                'color: rgba(255,255,255,210); font-size: 36px;'
+                f'color: {_rgba(Colors.TEXT, 210)}; font-size: 36px;'
                 ' background: transparent; border: none;'
             )
             self._play_icon.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
@@ -443,38 +511,46 @@ class ClipThumbnail(QFrame):
             self.duration_label.setStyleSheet(
                 f'QLabel#cardDurationBadge {{'
                 f' color: {Colors.TEXT};'
-                f' background: rgba(0,0,0,170);'
+                f' background: {_rgba(Colors.SURFACE_1, 170)};'
                 f' border-radius: 0px; padding: 2px 9px;'
                 f' font-family: {Fonts.BODY}; font-size: {Fonts.SIZE_LABEL}px;'
                 f' font-weight: bold; letter-spacing: 1px;'
                 f'}}'
             )
             self.duration_label.adjustSize()
-            self.duration_label.move(_CARD_W - self.duration_label.width() - 10, 10)
+            self.duration_label.move(
+                self._card_width - self.duration_label.width() - 10, 10)
 
         # Bottom-left imported badge (only for clips from imported folders)
         self._imported_badge_h = 0
+        self._imported_badge = None
         if self.imported:
             imp = QLabel('IMPORTED', thumb)
+            self._imported_badge = imp
             imp.setObjectName('cardImportedBadge')
             imp.setStyleSheet(
                 f'QLabel#cardImportedBadge {{'
                 f' color: {Colors.ACCENT};'
-                f' background: rgba(0,0,0,180);'
+                f' background: {_rgba(Colors.SURFACE_1, 180)};'
                 f' border-radius: 0px; padding: 2px 7px;'
                 f' font-family: {Fonts.DISPLAY}; font-size: {Fonts.SIZE_MICRO}px;'
                 f' font-weight: bold; letter-spacing: 2px;'
                 f'}}'
             )
             imp.adjustSize()
-            imp.move(8, _THUMB_H - imp.height() - 8)
+            imp.move(8, self._thumb_height - imp.height() - 8)
             imp.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             self._imported_badge_h = imp.height() + 4   # used to stack UPLOADED above it
 
+        self._finalizing_badge = None
         if not self.ready:
             finalizing = QLabel('FINALIZING', thumb)
+            self._finalizing_badge = finalizing
             finalizing.setStyleSheet(
-                'color: white; background: rgba(180,110,0,220); '
+                f'color: {Colors.TEXT}; '
+                f'background: {_rgba(Colors.WARNING, 220)}; '
+                f'font-family: {Fonts.DISPLAY}; '
+                f'font-size: {Fonts.SIZE_MICRO}px; '
                 'padding: 3px 7px; font-weight: bold;')
             finalizing.adjustSize()
             finalizing.move(8, 8)
@@ -485,14 +561,14 @@ class ClipThumbnail(QFrame):
         self._upload_badge.setStyleSheet(
             f'QLabel#cardUploadedBadge {{'
             f' color: {Colors.BG};'
-            f' background: rgba(0,170,0,210);'
+            f' background: {_rgba(Colors.SUCCESS, 210)};'
             f' border-radius: 0px; padding: 2px 7px;'
             f' font-family: {Fonts.DISPLAY}; font-size: {Fonts.SIZE_MICRO}px;'
             f' font-weight: bold; letter-spacing: 2px;'
             f'}}'
         )
         self._upload_badge.adjustSize()
-        _badge_bottom = _THUMB_H - 8 - self._imported_badge_h
+        _badge_bottom = self._thumb_height - 8 - self._imported_badge_h
         self._upload_badge.move(8, _badge_bottom - self._upload_badge.height())
         self._upload_badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self._upload_badge.setVisible(self.uploaded)
@@ -502,7 +578,8 @@ class ClipThumbnail(QFrame):
         # ── Card body (game / title / share+menu / time-ago) ─────────────
         body = QFrame(self)
         body.setObjectName('cardBody')
-        body.setFixedSize(_CARD_W, _CARD_BODY_H)
+        self._body_frame = body
+        body.setFixedSize(self._card_width, _CARD_BODY_H)
 
         bl = QVBoxLayout(body)
         bl.setContentsMargins(12, 8, 8, 8)
@@ -513,7 +590,8 @@ class ClipThumbnail(QFrame):
         top_row.setContentsMargins(0, 0, 0, 0)
         top_row.setSpacing(6)
 
-        self.game_label = QLabel(_game_name_from_path(self.file_path))
+        self.game_label = QLabel(
+            _game_name_from_path(self.file_path, self._clips_root))
         self.game_label.setObjectName('cardGame')
         top_row.addWidget(self.game_label)
         top_row.addStretch(1)
@@ -550,9 +628,35 @@ class ClipThumbnail(QFrame):
         self.time_label.setObjectName('cardTime')
         bl.addWidget(self.time_label)
 
+        # Returned provider links are the useful post-upload action. Keep the
+        # action row out of the card entirely until history has a valid URL.
+        bl.addSpacing(3)
+        self._link_actions = QWidget(body)
+        link_row = QHBoxLayout(self._link_actions)
+        link_row.setContentsMargins(0, 0, 0, 0)
+        link_row.setSpacing(5)
+
+        self.copy_link_btn = QPushButton('COPY LINK')
+        self.copy_link_btn.setObjectName('cardLinkBtn')
+        self.copy_link_btn.setFixedHeight(22)
+        self.copy_link_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.copy_link_btn.setToolTip('Copy the uploaded file link')
+        self.copy_link_btn.clicked.connect(self._copy_upload_link)
+        link_row.addWidget(self.copy_link_btn, 1)
+
+        self.open_link_btn = QPushButton('OPEN LINK')
+        self.open_link_btn.setObjectName('cardLinkBtn')
+        self.open_link_btn.setFixedHeight(22)
+        self.open_link_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.open_link_btn.setToolTip('Open the uploaded file link')
+        self.open_link_btn.clicked.connect(self._open_upload_link)
+        link_row.addWidget(self.open_link_btn, 1)
+        bl.addWidget(self._link_actions)
+
         layout.addWidget(body)
 
         self.setStyleSheet(self._card_qss())
+        self.set_upload_info(self.upload_info)
 
     @staticmethod
     def _card_qss() -> str:
@@ -607,21 +711,148 @@ class ClipThumbnail(QFrame):
             QPushButton#cardIconBtn:hover {{
                 color: {Colors.ACCENT};
             }}
+            QPushButton#cardLinkBtn {{
+                background-color: {Colors.SURFACE_2};
+                border: 1px solid {Colors.BORDER};
+                color: {Colors.TEXT_DIM};
+                font-family: {Fonts.DISPLAY};
+                font-size: {Fonts.SIZE_MICRO}px;
+                font-weight: bold;
+                letter-spacing: 1px;
+                padding: 0 4px;
+            }}
+            QPushButton#cardLinkBtn:hover {{
+                background-color: {Colors.SURFACE_3};
+                border-color: {Colors.ACCENT};
+                color: {Colors.ACCENT};
+            }}
+            QPushButton#cardLinkBtn:disabled {{
+                background-color: transparent;
+                border-color: {Colors.CARD_BORDER};
+                color: {Colors.TEXT_MUTED};
+            }}
         '''
 
     def set_uploaded(self, val: bool):
         self.uploaded = val
         self._upload_badge.setVisible(val)
 
+    @staticmethod
+    def _upload_url(info: dict | None) -> str:
+        if not isinstance(info, dict):
+            return ''
+        for key in ('url', 'raw_url'):
+            value = str(info.get(key, '') or '').strip()
+            if value.startswith(('https://', 'http://')):
+                return value
+        return ''
+
+    def set_upload_info(self, info: dict | None):
+        """Update the link actions from the provider's persisted upload result."""
+        self.upload_info = dict(info or {})
+        self.upload_link = self._upload_url(self.upload_info)
+        enabled = bool(self.upload_link)
+        self._link_actions.setVisible(enabled)
+        self.copy_link_btn.setEnabled(enabled)
+        self.open_link_btn.setEnabled(enabled)
+
+    def _copy_upload_link(self):
+        if self.upload_link:
+            QApplication.clipboard().setText(self.upload_link)
+
+    def _open_upload_link(self):
+        if self.upload_link:
+            QDesktopServices.openUrl(QUrl(self.upload_link))
+
+    def resize_card(self, width: int):
+        """Resize a card without recreating it or distorting its media."""
+        width = max(_CARD_MIN_W, min(_CARD_MAX_W, int(width)))
+        if width == self._card_width:
+            return
+        self._card_width = width
+        self._thumb_height = max(1, round(width * 9 / 16))
+        self.setFixedSize(width, self._thumb_height + _CARD_BODY_H)
+        self._thumb_frame.setFixedSize(width, self._thumb_height)
+        self.thumb_label.setGeometry(0, 0, width, self._thumb_height)
+        self._body_frame.setFixedSize(width, _CARD_BODY_H)
+        if hasattr(self, '_play_icon'):
+            self._play_icon.setGeometry(0, 0, width, self._thumb_height)
+        if hasattr(self, 'duration_label'):
+            self.duration_label.move(
+                width - self.duration_label.width() - 10, 10)
+        if self._imported_badge is not None:
+            self._imported_badge.move(
+                8, self._thumb_height - self._imported_badge.height() - 8)
+        badge_bottom = self._thumb_height - 8 - self._imported_badge_h
+        self._upload_badge.move(
+            8, badge_bottom - self._upload_badge.height())
+        self._render_thumbnail()
+
+    def _render_thumbnail(self):
+        """Fit media inside the 16:9 surface; never stretch or crop it."""
+        if self._thumb_pixmap.isNull():
+            self.thumb_label.clear()
+            return
+        fitted = self._thumb_pixmap.scaled(
+            self._card_width,
+            self._thumb_height,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.thumb_label.setPixmap(fitted)
+
     def refresh_theme(self):
         self.setStyleSheet(self._card_qss())
+        if hasattr(self, '_play_icon'):
+            self._play_icon.setStyleSheet(
+                f'color: {_rgba(Colors.TEXT, 210)}; font-size: 36px;'
+                ' background: transparent; border: none;')
+        if hasattr(self, 'duration_label'):
+            self.duration_label.setStyleSheet(
+                f'QLabel#cardDurationBadge {{'
+                f' color: {Colors.TEXT};'
+                f' background: {_rgba(Colors.SURFACE_1, 170)};'
+                f' border-radius: 0px; padding: 2px 9px;'
+                f' font-family: {Fonts.BODY}; font-size: {Fonts.SIZE_LABEL}px;'
+                f' font-weight: bold; letter-spacing: 1px; }}')
+        if self._imported_badge is not None:
+            self._imported_badge.setStyleSheet(
+                f'QLabel#cardImportedBadge {{'
+                f' color: {Colors.ACCENT};'
+                f' background: {_rgba(Colors.SURFACE_1, 180)};'
+                f' border-radius: 0px; padding: 2px 7px;'
+                f' font-family: {Fonts.DISPLAY}; font-size: {Fonts.SIZE_MICRO}px;'
+                f' font-weight: bold; letter-spacing: 2px; }}')
+        if self._finalizing_badge is not None:
+            self._finalizing_badge.setStyleSheet(
+                f'color: {Colors.TEXT}; '
+                f'background: {_rgba(Colors.WARNING, 220)}; '
+                f'font-family: {Fonts.DISPLAY}; '
+                f'font-size: {Fonts.SIZE_MICRO}px; '
+                'padding: 3px 7px; font-weight: bold;')
+        self._upload_badge.setStyleSheet(
+            f'QLabel#cardUploadedBadge {{'
+            f' color: {Colors.BG};'
+            f' background: {_rgba(Colors.SUCCESS, 210)};'
+            f' border-radius: 0px; padding: 2px 7px;'
+            f' font-family: {Fonts.DISPLAY}; font-size: {Fonts.SIZE_MICRO}px;'
+            f' font-weight: bold; letter-spacing: 2px; }}')
 
     def _on_share_click(self):
         # Share is wired through ClipViewer for now — open the viewer
-        if self.is_video and self.ready:
-            px = self.thumb_label.pixmap() or QPixmap()
-            global_rect = QRect(self.mapToGlobal(QPoint(0, 0)), self.size())
-            self.opened.emit(self.file_path, px, global_rect)
+        if not (self.is_video and self.ready):
+            return
+        if not self._thumbnail_ready:
+            self._open_pending = True
+            return
+        self._emit_opened()
+
+    def _emit_opened(self):
+        if not (self.is_video and self.ready):
+            return
+        px = self.thumb_label.pixmap() or QPixmap()
+        global_rect = QRect(self.mapToGlobal(QPoint(0, 0)), self.size())
+        self.opened.emit(self.file_path, px, global_rect)
 
     def _show_menu(self):
         menu = QMenu(self)
@@ -643,14 +874,7 @@ class ClipThumbnail(QFrame):
         if action == open_act:
             self._on_share_click()
         elif action == explorer_act:
-            if sys.platform == 'win32':
-                subprocess.Popen(['explorer', f'/select,{self.file_path}'])
-            else:
-                _opener = linux_tools.path('xdg-open')
-                if _opener:
-                    subprocess.Popen([_opener, os.path.dirname(self.file_path)])
-                else:
-                    print(f'[Clips] {linux_tools.missing_message("xdg-open")}')
+            _show_in_file_manager(self.file_path)
         elif action == copy_act:
             QApplication.clipboard().setText(self.file_path)
         elif upload_act and action == upload_act:
@@ -661,23 +885,20 @@ class ClipThumbnail(QFrame):
     def _confirm_delete(self):
         if not self.ready:
             return
-        ownership = classify_media_path(
-            self.file_path, os.path.expanduser('~/FTHR_Clips'), [])
+        ownership = classify_media_path(self.file_path, self._clips_root, [])
         if self.imported or ownership is not MediaOwnership.FTHR_OWNED:
-            QMessageBox.information(
+            FthrMessageDialog.information(
                 self,
                 'Linked Original Protected',
                 'Imported files stay in their original folder. FTHR will not '
                 'delete this file with the generic Delete action.',
             )
             return
-        reply = QMessageBox.question(
+        reply = FthrMessageDialog.question(
             self, 'Delete',
             f'Delete {os.path.basename(self.file_path)}?',
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
         )
-        if reply != QMessageBox.StandardButton.Yes:
+        if not reply:
             return
 
         # Resolve cache paths BEFORE the delete — _get_cached_thumb_path needs
@@ -711,14 +932,14 @@ class ClipThumbnail(QFrame):
                     if attempt < 2:
                         _time.sleep(0.2)
                         continue
-                    QMessageBox.warning(
+                    FthrMessageDialog.warning(
                         self, 'Delete Failed',
                         f'"{os.path.basename(self.file_path)}" is still in use.\n\n'
                         'Close the clip viewer and wait for any active clip save\n'
                         'or upload to finish, then try again.',
                     )
                     return
-                QMessageBox.warning(self, 'Delete Failed', str(e))
+                FthrMessageDialog.warning(self, 'Delete Failed', str(e))
                 return
 
     # ── Hover (large play glyph + slight border highlight) ───────────────
@@ -752,14 +973,7 @@ class ClipThumbnail(QFrame):
         if action == open_act:
             self._on_share_click()
         elif action == explorer_act:
-            if sys.platform == 'win32':
-                subprocess.Popen(['explorer', f'/select,{self.file_path}'])
-            else:
-                _opener = linux_tools.path('xdg-open')
-                if _opener:
-                    subprocess.Popen([_opener, os.path.dirname(self.file_path)])
-                else:
-                    print(f'[Clips] {linux_tools.missing_message("xdg-open")}')
+            _show_in_file_manager(self.file_path)
         elif action == copy_act:
             QApplication.clipboard().setText(self.file_path)
         elif upload_act and action == upload_act:
@@ -803,24 +1017,24 @@ class ClipThumbnail(QFrame):
             _start()
 
     def _load_image_thumbnail(self):
-        pixmap = QPixmap(self.file_path)
-        self.thumb_label.setPixmap(
-            pixmap.scaled(_CARD_W, _THUMB_H,
-                          Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                          Qt.TransformationMode.SmoothTransformation))
+        self._thumb_pixmap = QPixmap(self.file_path)
+        self._render_thumbnail()
 
     def set_video_thumbnail(self, cache_path: str, duration: int):
         if cache_path and os.path.exists(cache_path):
-            pixmap = QPixmap(cache_path)
-            self.thumb_label.setPixmap(
-                pixmap.scaled(_CARD_W, _THUMB_H,
-                              Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                              Qt.TransformationMode.SmoothTransformation))
+            self._thumb_pixmap = QPixmap(cache_path)
+            self._render_thumbnail()
         if self.is_video and hasattr(self, 'duration_label'):
             mins, secs = divmod(duration, 60)
             self.duration_label.setText(f'{mins}:{secs:02d}')
             self.duration_label.adjustSize()
-            self.duration_label.move(_CARD_W - self.duration_label.width() - 10, 10)
+            self.duration_label.move(
+                self._card_width - self.duration_label.width() - 10, 10)
+        if self.is_video:
+            self._thumbnail_ready = True
+            if self._open_pending:
+                self._open_pending = False
+                QTimer.singleShot(0, self._emit_opened)
 
     def mousePressEvent(self, event):
         if not self.ready:
@@ -833,11 +1047,13 @@ class ClipThumbnail(QFrame):
             child = self.childAt(local)
             if isinstance(child, QPushButton):
                 return
+            if self.is_video:
+                if not self._thumbnail_ready:
+                    self._open_pending = True
+                    return
             self.clicked.emit(self.file_path)
             if self.is_video:
-                px = self.thumb_label.pixmap() or QPixmap()
-                global_rect = QRect(self.mapToGlobal(QPoint(0, 0)), self.size())
-                self.opened.emit(self.file_path, px, global_rect)
+                self._emit_opened()
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -850,17 +1066,19 @@ class ClipGrid(QWidget):
     screenshot_clicked    = Signal(str)
     clip_upload_requested = Signal(str)
 
-    # Left+right margins from _setup_ui (28+28) — used for column calculation.
-    _H_MARGIN = 56
-    _GRID_SPACING = 18
+    # Compact gutters keep the media surface visually dominant while still
+    # separating cards at desktop widths.
+    _H_MARGIN = 48
+    _GRID_SPACING = 12
 
     def __init__(self, settings_manager=None, parent=None):
         super().__init__(parent)
         self._sm              = settings_manager
         self._upload_checker  = None   # callable(path) -> bool
+        self._upload_info_checker = None  # callable(path) -> dict | None
         self._upload_enabled  = None   # callable() -> bool
         self._readiness_checker = None  # callable(path) -> bool
-        self.clips_dir      = os.path.expanduser('~/FTHR_Clips')
+        self.clips_dir      = str(clips_directory_from(self._sm))
         self.thumbnails     = []
         self._thumb_widgets = {}
         self._known_files   = set()
@@ -870,16 +1088,26 @@ class ClipGrid(QWidget):
         # and CPU; throwing 16 threads at it just thrashes and makes everything
         # slower. 400ms of profiling led me here. don't touch this.
         self._thread_pool.setMaxThreadCount(2)
+        # File scans must not sit behind a long queue of video decoders.  A
+        # separate single-worker pool makes filter/sort changes respond as soon
+        # as the current scan (if any) completes.
+        self._scan_thread_pool = QThreadPool()
+        self._scan_thread_pool.setMaxThreadCount(1)
         # Pre-compute the column count from the primary screen's available
         # width so the first paint already matches the maximized window.
         # Without this, the grid renders at 3 cols then snaps to N cols once
         # the resize event fires after showMaximized() — visible lag.
-        self._current_columns = self._initial_columns_from_screen()
+        initial_width = self._initial_viewport_width()
+        (self._current_columns,
+         self._current_card_widths) = self._layout_metrics(initial_width)
 
         self._filter = 'all'
         self._sort = 'newest'
         self._in_transition = False
         self._transition_anim = None
+        # Keep transition workers (and, critically, their signal objects) alive
+        # until the queued completion callback has run on the GUI thread.
+        self._transition_workers: dict[int, _FileCollectWorker] = {}
 
         # Watcher must exist before _load_clips() runs
         self._watcher = QFileSystemWatcher()
@@ -913,13 +1141,32 @@ class ClipGrid(QWidget):
     def set_upload_checker(self, checker):
         """checker(path: str) -> bool  — True if the clip has been uploaded."""
         self._upload_checker = checker
+        self._refresh_upload_states()
+
+    def set_upload_info_checker(self, checker):
+        """checker(path: str) -> dict | None — persisted provider result."""
+        self._upload_info_checker = checker
+        self._refresh_upload_states()
 
     def set_upload_enabled_checker(self, checker):
         """checker() -> bool  — True if uploads are enabled (shows Upload menu item)."""
         self._upload_enabled = checker
+        enabled = bool(checker and checker())
+        for card in self._thumb_widgets.values():
+            card.upload_enabled = enabled
 
     def set_readiness_checker(self, checker):
         self._readiness_checker = checker
+
+    def _refresh_upload_states(self):
+        """Refresh badges and returned-link actions on cards already in the grid."""
+        for path, card in self._thumb_widgets.items():
+            uploaded = bool(self._upload_checker and self._upload_checker(path))
+            info = (
+                self._upload_info_checker(path)
+                if uploaded and self._upload_info_checker else None)
+            card.set_upload_info(info)
+            card.set_uploaded(uploaded)
 
     def refresh_theme(self):
         for card in self._thumb_widgets.values():
@@ -931,23 +1178,51 @@ class ClipGrid(QWidget):
         vp = self.parentWidget()
         return vp.width() if vp else self.width()
 
-    def _initial_columns_from_screen(self) -> int:
-        """Best-guess column count before the parent viewport has been laid out.
+    def _initial_viewport_width(self) -> int:
+        """Best-guess viewport width before the parent has been laid out.
 
-        Used at __init__ time so the first grid build matches the maximized
-        window and avoids a visible 3-to-N-column reflow during startup."""
+        This lets the first build match the maximized window and avoids a
+        visible reflow during startup.
+        """
         screen = QApplication.primaryScreen()
         if screen is None:
-            return 3
-        screen_w = screen.availableGeometry().width()
-        available = screen_w - self._H_MARGIN
-        cols = (available + self._GRID_SPACING) // (_CARD_W + self._GRID_SPACING)
-        return max(3, int(cols))
+            return 1100
+        return screen.availableGeometry().width()
+
+    @classmethod
+    def _layout_metrics(cls, viewport_width: int) -> tuple[int, list[int]]:
+        """Return column count and exact per-column widths for a viewport."""
+        available = max(_CARD_MIN_W, int(viewport_width) - cls._H_MARGIN)
+        cols = max(
+            1,
+            int((available + cls._GRID_SPACING)
+                // (_CARD_W + cls._GRID_SPACING)),
+        )
+        while cols > 1:
+            card_width = (
+                available - cls._GRID_SPACING * (cols - 1)) // cols
+            if card_width >= _CARD_MIN_W:
+                break
+            cols -= 1
+        while True:
+            card_width = (
+                available - cls._GRID_SPACING * (cols - 1)) // cols
+            if card_width <= _CARD_MAX_W:
+                break
+            cols += 1
+
+        usable = available - cls._GRID_SPACING * (cols - 1)
+        base, remainder = divmod(usable, cols)
+        widths = [base + (1 if col < remainder else 0)
+                  for col in range(cols)]
+        return cols, widths
+
+    def _initial_columns_from_screen(self) -> int:
+        """Compatibility helper used by a few downstream integrations."""
+        return self._layout_metrics(self._initial_viewport_width())[0]
 
     def _compute_columns(self) -> int:
-        available = self._viewport_width() - self._H_MARGIN
-        cols = (available + self._GRID_SPACING) // (_CARD_W + self._GRID_SPACING)
-        return max(3, cols)
+        return self._layout_metrics(self._viewport_width())[0]
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -966,9 +1241,11 @@ class ClipGrid(QWidget):
         return super().eventFilter(obj, event)
 
     def _on_resize_settled(self):
-        new_cols = self._compute_columns()
-        if new_cols != self._current_columns:
+        new_cols, new_widths = self._layout_metrics(self._viewport_width())
+        if (new_cols != self._current_columns
+                or new_widths != self._current_card_widths):
             self._current_columns = new_cols
+            self._current_card_widths = new_widths
             self._relayout_grids()
 
     def _on_dir_changed(self, path: str):
@@ -978,7 +1255,7 @@ class ClipGrid(QWidget):
 
     def _setup_ui(self):
         self.layout = QVBoxLayout(self)
-        self.layout.setContentsMargins(28, 18, 28, 28)
+        self.layout.setContentsMargins(24, 18, 24, 24)
         self.layout.setSpacing(0)
 
         # ── Filter bar ────────────────────────────────────────────────────
@@ -1034,7 +1311,15 @@ class ClipGrid(QWidget):
         self._no_clips_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         ev_layout.addWidget(self._no_clips_lbl)
 
-        ev_layout.addSpacing(Sizes.SPACE_5)
+        self._empty_detail_lbl = QLabel()
+        self._empty_detail_lbl.setStyleSheet(
+            label_display(Colors.TEXT_DIM, Fonts.SIZE_LABEL, Fonts.TRACK_LABEL))
+        self._empty_detail_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_detail_lbl.setVisible(False)
+        ev_layout.addSpacing(Sizes.SPACE_2)
+        ev_layout.addWidget(self._empty_detail_lbl)
+
+        ev_layout.addSpacing(Sizes.SPACE_4)
 
         mark_row = QHBoxLayout()
         mark_row.setContentsMargins(0, 0, 0, 0)
@@ -1045,30 +1330,6 @@ class ClipGrid(QWidget):
         mark_row.addWidget(mark)
         mark_row.addStretch()
         ev_layout.addLayout(mark_row)
-
-        ev_layout.addSpacing(Sizes.SPACE_5)
-
-        hint_row = QHBoxLayout()
-        hint_row.setContentsMargins(0, 0, 0, 0)
-        hint_row.setSpacing(8)
-        hint_row.addStretch()
-        prefix = QLabel('press')
-        prefix.setStyleSheet(label_body(Colors.TEXT_MUTED, Fonts.SIZE_BODY_L))
-        hint_row.addWidget(prefix)
-        key_pill = QLabel('F9')
-        key_pill.setStyleSheet(
-            f'color: {Colors.TEXT}; background: {Colors.SURFACE_2};'
-            f' border: 1px solid {Colors.BORDER_HI}; border-radius: 0px;'
-            f' padding: 3px 10px;'
-            f' font-family: {Fonts.BODY}; font-size: {Fonts.SIZE_BODY}px;'
-            f' font-weight: bold; letter-spacing: 1px;'
-        )
-        hint_row.addWidget(key_pill)
-        suffix = QLabel('to capture the last few seconds')
-        suffix.setStyleSheet(label_body(Colors.TEXT_MUTED, Fonts.SIZE_BODY_L))
-        hint_row.addWidget(suffix)
-        hint_row.addStretch()
-        ev_layout.addLayout(hint_row)
 
         self.layout.addWidget(self._empty_widget)
         self.layout.addStretch()
@@ -1135,7 +1396,13 @@ class ClipGrid(QWidget):
         self._fade_out_then_reload()
 
     def _fade_out_then_reload(self):
-        """Fade out → background I/O → fade in. Never blocks the main thread."""
+        """Refresh a category through a background scan without hiding its cards.
+
+        QGraphicsOpacityEffect occasionally left the section host fully
+        transparent after a category change on Windows.  The cards remained
+        interactive, but the library looked like a black, empty surface.  Keep
+        the current result visible until the replacement is ready instead.
+        """
         if self._transition_anim is not None:
             self._transition_anim.stop()
             self._transition_anim = None
@@ -1151,29 +1418,21 @@ class ClipGrid(QWidget):
         def _launch_worker():
             import_dirs = self._sm.get('imported_clip_folders', []) if self._sm else []
             worker = _FileCollectWorker(self.clips_dir, import_dirs, self._filter, self._sort)
+            self._transition_workers[seq] = worker
 
             def _on_done(raw, pairs, imported, subdirs):
+                self._transition_workers.pop(seq, None)
                 if self._transition_seq == seq:
                     self._on_files_collected_for_transition(raw, pairs, imported, subdirs)
 
             worker.signals.finished.connect(_on_done)
-            self._thread_pool.start(worker)
+            self._scan_thread_pool.start(worker)
 
-        if not self._sections_host.isVisible():
-            _launch_worker()
-            return
-
-        out_effect = QGraphicsOpacityEffect(self._sections_host)
-        self._sections_host.setGraphicsEffect(out_effect)
-
-        out = QPropertyAnimation(out_effect, b'opacity', self)
-        out.setDuration(140)
-        out.setStartValue(1.0)
-        out.setEndValue(0.0)
-        out.setEasingCurve(QEasingCurve.Type.OutCubic)
-        out.finished.connect(_launch_worker)
-        out.start()
-        self._transition_anim = out
+        # Do not use a graphics effect here. Besides being unnecessary for the
+        # scan, it can leave Qt's backing store transparent on some Windows
+        # GPU/driver combinations.
+        self._sections_host.setGraphicsEffect(None)
+        _launch_worker()
 
     def _on_files_collected_for_transition(self, raw_files, sorted_pairs, imported_files, subdirs):
         """Runs on the main thread once the background worker finishes."""
@@ -1207,25 +1466,9 @@ class ClipGrid(QWidget):
                 self._add_section(section_key, section_files, global_idx)
                 global_idx += len(section_files)
 
-        # Fade back in
-        in_effect = QGraphicsOpacityEffect(self._sections_host)
-        in_effect.setOpacity(0.0)
-        self._sections_host.setGraphicsEffect(in_effect)
-
-        fade_in = QPropertyAnimation(in_effect, b'opacity', self)
-        fade_in.setDuration(220)
-        fade_in.setStartValue(0.0)
-        fade_in.setEndValue(1.0)
-        fade_in.setEasingCurve(QEasingCurve.Type.OutCubic)
-
-        def _done():
-            self._sections_host.setGraphicsEffect(None)
-            self._in_transition = False
-            self._transition_anim = None
-
-        fade_in.finished.connect(_done)
-        fade_in.start()
-        self._transition_anim = fade_in
+        self._sections_host.setGraphicsEffect(None)
+        self._in_transition = False
+        self._transition_anim = None
 
     def _filter_heading(self) -> str:
         if self._filter == 'clips':
@@ -1252,7 +1495,7 @@ class ClipGrid(QWidget):
             if os.path.isfile(full):
                 if is_library_media_path(name):
                     found.add(full)
-            elif os.path.isdir(full) and name not in _GRID_EXCLUDED_DIRS:
+            elif os.path.isdir(full) and not _is_grid_excluded_dir(name):
                 self._watch_subdir(full)
                 try:
                     for sub in os.listdir(full):
@@ -1274,7 +1517,7 @@ class ClipGrid(QWidget):
                     if os.path.isfile(full) and is_library_media_path(name):
                         found.add(full)
                         self._imported_files.add(full)
-                    elif os.path.isdir(full):
+                    elif os.path.isdir(full) and not _is_grid_excluded_dir(full):
                         self._watch_subdir(full)
                         try:
                             for sub in os.listdir(full):
@@ -1400,7 +1643,8 @@ class ClipGrid(QWidget):
         hdr_row.addWidget(date_lbl)
 
         # Game/source name comes from the most-recent file's parent folder
-        sample_game = _game_name_from_path(files[0]) if files else ''
+        sample_game = (
+            _game_name_from_path(files[0], self.clips_dir) if files else '')
         if sample_game:
             sub_lbl = QLabel(f'·  {sample_game}')
             sub_lbl.setStyleSheet(
@@ -1413,14 +1657,19 @@ class ClipGrid(QWidget):
         sl.addLayout(hdr_row)
 
         cols = self._current_columns
+        widths = self._current_card_widths
         grid = QGridLayout()
-        grid.setSpacing(self._GRID_SPACING)
+        grid.setHorizontalSpacing(self._GRID_SPACING)
+        grid.setVerticalSpacing(self._GRID_SPACING)
         grid.setContentsMargins(0, 0, 0, 0)
 
         upload_enabled = bool(self._upload_enabled and self._upload_enabled())
         for i, fp in enumerate(files):
             is_video = is_completed_video_path(fp)
             uploaded = bool(self._upload_checker and self._upload_checker(fp))
+            upload_info = (
+                self._upload_info_checker(fp)
+                if uploaded and self._upload_info_checker else None)
             ready = bool(
                 self._readiness_checker(fp)
                 if self._readiness_checker else True)
@@ -1429,14 +1678,23 @@ class ClipGrid(QWidget):
                 imported=fp in self._imported_files,
                 upload_enabled=upload_enabled,
                 uploaded=uploaded,
+                upload_info=upload_info,
                 ready=ready,
+                card_width=widths[i % cols],
+                clips_root=self.clips_dir,
             )
             thumb.opened.connect(self.clip_opened.emit)
             thumb.clicked.connect(
                 self.clip_clicked.emit if is_video else self.screenshot_clicked.emit)
             thumb.deleted.connect(self._on_clip_deleted)
             thumb.upload_requested.connect(self.clip_upload_requested.emit)
-            grid.addWidget(thumb, i // cols, i % cols)
+            # Cards have a fixed width.  Explicit left/top alignment prevents
+            # Qt from centering a short final row (especially a one-card date
+            # section) inside a column that received surplus layout space.
+            grid.addWidget(
+                thumb, i // cols, i % cols,
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+            )
             self.thumbnails.append(thumb)
             self._thumb_widgets[fp] = thumb
             if not self._in_transition:
@@ -1447,9 +1705,8 @@ class ClipGrid(QWidget):
                 worker.signals.finished.connect(self._on_thumb_ready)
                 self._thread_pool.start(worker)
 
-        # Push all leftover horizontal space to a phantom column on the right
-        # so cards stay left-aligned instead of spreading out with huge gaps.
-        grid.setColumnStretch(cols, 1)
+        for col, width in enumerate(widths):
+            grid.setColumnMinimumWidth(col, width)
         sl.addLayout(grid)
         self._sections_layout.addWidget(section)
 
@@ -1463,6 +1720,7 @@ class ClipGrid(QWidget):
         back at its new (row, col). Same widgets, new positions. works on my
         machine ✓ (and yours, hopefully)."""
         cols = self._current_columns
+        widths = self._current_card_widths
         for si in range(self._sections_layout.count()):
             section_widget = self._sections_layout.itemAt(si).widget()
             if section_widget is None:
@@ -1484,8 +1742,44 @@ class ClipGrid(QWidget):
                     if w:
                         widgets.append(w)
                 for i, w in enumerate(widgets):
-                    grid.addWidget(w, i // cols, i % cols)
-                grid.setColumnStretch(cols, 1)
+                    if isinstance(w, ClipThumbnail):
+                        w.resize_card(widths[i % cols])
+                    grid.addWidget(
+                        w, i // cols, i % cols,
+                        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+                    )
+                for col, width in enumerate(widths):
+                    grid.setColumnMinimumWidth(col, width)
+
+    def set_clips_directory(self, path: str) -> None:
+        """Switch the primary library root and refresh the visible media."""
+        resolved = str(Path(path).expanduser().resolve(strict=False))
+        if resolved == self.clips_dir:
+            self.force_refresh()
+            return
+
+        self._transition_seq = getattr(self, '_transition_seq', 0) + 1
+        if self._transition_anim is not None:
+            self._transition_anim.stop()
+            self._transition_anim = None
+        self._in_transition = False
+        self._sections_host.setGraphicsEffect(None)
+
+        old_root = Path(self.clips_dir).resolve(strict=False)
+        for watched in list(self._watcher.directories()):
+            try:
+                Path(watched).resolve(strict=False).relative_to(old_root)
+            except ValueError:
+                continue
+            self._watcher.removePath(watched)
+
+        self.clips_dir = resolved
+        self._known_files = set()
+        self._imported_files = set()
+        Path(resolved).mkdir(parents=True, exist_ok=True)
+        if resolved not in self._watcher.directories():
+            self._watcher.addPath(resolved)
+        self._load_clips()
 
     def force_refresh(self):
         """Clear the file cache and immediately reload — called when import folders change."""
@@ -1501,14 +1795,20 @@ class ClipGrid(QWidget):
 
     def _show_empty(self, show: bool):
         if show:
+            detail = ''
             if self._filter == 'screenshots':
                 self._no_clips_lbl.setText('NO SCREENSHOTS YET')
+                hotkeys = self._sm.get('hotkeys', {}) if self._sm else {}
+                screenshot_key = hotkeys.get('save_screenshot', 'F11')
+                detail = f'PRESS {screenshot_key} TO TAKE A SCREENSHOT'
             elif self._filter == 'clips':
                 self._no_clips_lbl.setText('NO CLIPS YET')
             elif self._filter == 'imported':
                 self._no_clips_lbl.setText('NO IMPORTED CLIPS')
             else:
                 self._no_clips_lbl.setText('NO CLIPS YET')
+            self._empty_detail_lbl.setText(detail)
+            self._empty_detail_lbl.setVisible(bool(detail))
         self._empty_widget.setVisible(show)
         self._sections_host.setVisible(not show)
 

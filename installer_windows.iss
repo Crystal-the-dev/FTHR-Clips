@@ -56,18 +56,17 @@ LZMANumBlockThreads=2
 
 ; Visual style
 WizardStyle=modern
-WizardResizable=yes
 WizardSizePercent=120
 WizardImageFile=installer_assets\wizard_banner.bmp
 WizardSmallImageFile=installer_assets\wizard_small.bmp
 
 ; Icon
-SetupIconFile=FTHR_UI\assets\fthr_logo.ico
+SetupIconFile=FTHR_UI\assets\favicon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 
 ; Platform
 PrivilegesRequired=admin
-ArchitecturesInstallIn64BitMode=x64
+ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 
 ; Never force-kill a capture session. Restart Manager offers to close the
@@ -134,6 +133,10 @@ Filename: "{app}\{#MyAppExeName}"; \
     Flags: nowait postinstall skipifsilent unchecked
 
 [UninstallDelete]
+; Optional packages are activated outside Program Files only after in-app
+; consent. Remove those executables on uninstall; uploader preferences remain
+; governed by the existing settings-cleanup prompt below.
+Type: filesandordirs; Name: "{localappdata}\FTHR Clips\plugins"
 ; Clips, screenshots, exports, and sidecar manifests are deliberately outside
 ; the installer tree at %USERPROFILE%\FTHR_Clips and are never an uninstall
 ; target. The app-owned settings/cache directory is opt-in only.

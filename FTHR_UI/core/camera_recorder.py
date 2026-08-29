@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import threading
 import time
+import re
+import subprocess
+import sys
 from collections import deque
 from typing import Optional
 
@@ -44,6 +47,49 @@ class CameraRecorder:
     def is_available(cls) -> bool:
         return _AVAILABLE
 
+    @classmethod
+    def list_devices(cls) -> list[dict]:
+        """Return camera indices with real Windows device names when available."""
+        if not _AVAILABLE:
+            return []
+        if sys.platform == 'win32':
+            try:
+                from core.ffmpeg_tools import get_ffmpeg_exe
+                ffmpeg = get_ffmpeg_exe()
+                result = subprocess.run(
+                    [ffmpeg, '-hide_banner', '-list_devices', 'true',
+                     '-f', 'dshow', '-i', 'dummy'],
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    timeout=12,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                output = (result.stderr or '') + '\n' + (result.stdout or '')
+                names = re.findall(r'"([^"]+)"\s+\(video\)', output)
+                if names:
+                    return [
+                        {'index': index, 'name': name}
+                        for index, name in enumerate(dict.fromkeys(names))
+                    ]
+            except Exception as exc:
+                print(f'[Camera] Named device scan failed: {exc}')
+
+        # Cross-platform fallback: do not invent four entries. Only expose
+        # indices that OpenCV can actually open.
+        devices = []
+        for index in range(8):
+            try:
+                cap = _cv2.VideoCapture(index)
+                opened = cap.isOpened()
+                cap.release()
+                if opened:
+                    devices.append({'index': index, 'name': f'Camera {index + 1}'})
+            except Exception:
+                pass
+        return devices
+
     def is_running(self) -> bool:
         return self._running
 
@@ -53,6 +99,17 @@ class CameraRecorder:
         if not _AVAILABLE:
             return False
         with self._op_lock:
+            # Settings refreshes and unrelated UI updates can ask for the
+            # already-active device again. Reopening MSMF here caused visible
+            # camera freezes and could briefly leave two native sessions alive.
+            if (self._running and self._device_index == device_index
+                    and self._cap is not None):
+                try:
+                    if self._cap.isOpened():
+                        return True
+                except (AttributeError, RuntimeError):
+                    # A stale backend is treated as closed and replaced below.
+                    pass
             self._stop_locked()
             self._device_index = device_index
             self._cap = _cv2.VideoCapture(device_index)
@@ -91,6 +148,7 @@ class CameraRecorder:
             self._cap = None
         with self._lock:
             self._chunks.clear()
+        self._latest_frame = None
 
     @property
     def latest_frame(self):

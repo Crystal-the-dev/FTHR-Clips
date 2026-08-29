@@ -31,8 +31,9 @@ def test_audio_history_matches_maximum_replay_duration():
     assert 'kMaxSeconds  = 300' in AUDIO_H
 
 
-def test_multiband_request_is_forced_off_at_native_boundary():
+def test_multiband_request_is_ignored_at_native_boundary():
     assert 'cfg.multiband_enabled = false;' in MAIN_CPP
+    assert 'arg_u32(argv, 13, 0) == 1' not in MAIN_CPP
 
 
 def test_x11grab_is_default_off_and_compilation_is_conditional():
