@@ -280,6 +280,8 @@ def _resolution_to_dims(name: str) -> tuple[int, int]:
 
 def _load_logo_asset(path: Path) -> QPixmap:
     """Load the supplied brand mark without altering its colors."""
+    if QApplication.instance() is None:
+        QApplication([])
     return QPixmap(str(path))
 
 
@@ -477,18 +479,24 @@ def _load_icon(name: str, size: int = 20) -> QIcon:
     Custom (imported) icons are used as-is.
     Default icons are tinted with the icon tint color from the theme.
     """
+    if QApplication.instance() is None:
+        QApplication([])
     theme = ThemeManager()
+    qapp_exists = True
+
+    def _file_icon(path: Path) -> QIcon:
+        pix = QPixmap(str(path)).scaled(
+            size, size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        return QIcon(pix)
 
     # Custom imported icon — use as-is, no tinting
     try:
         custom = theme.get_custom_icon_path(name)
         if custom and custom.exists():
-            pix = QPixmap(str(custom)).scaled(
-                size, size,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            return QIcon(pix)
+            return _file_icon(custom)
     except Exception:
         # Missing/corrupt optional icons fall through to the text fallback.
         pass
@@ -525,6 +533,11 @@ def _load_icon(name: str, size: int = 20) -> QIcon:
         tint_hex = theme.get_icon_tint(name)
         pix = _tint_pixmap(pix, QColor(tint_hex))
         return QIcon(pix)
+    # Window/tray branding lives at assets/ rather than assets/icons/. Keep
+    # brand artwork in its original colours instead of applying an icon tint.
+    brand_path = Path(__file__).parent / 'assets' / name
+    if brand_path.exists():
+        return QIcon(str(brand_path))
     # QPainter fallback (registered by feature modules for icons with no PNG)
     maker = _PAINTER_ICON_FALLBACKS.get(name)
     if maker:
@@ -3380,7 +3393,7 @@ class MainWindow(QMainWindow):
                 0, self._settings_page_widget._populate_mic_devices)
 
     def _init_gary_mode(self):
-        default_image = Path(__file__).parent / 'assets' / 'gary_default.png'
+        default_image = Path(__file__).parent / 'assets' / 'fthr_logo.png'
         self._gary_overlay = GaryOverlay(default_image, anchor=self)
         self._gary_current_intensity = 0.0
         self._gary_enabled = False
@@ -9240,7 +9253,7 @@ class _SettingsPage(QWidget):
             candidate = Path(self.gary_image_path).expanduser()
             if candidate.is_file():
                 return candidate
-        return Path(__file__).parent / 'assets' / 'gary_default.png'
+        return Path(__file__).parent / 'assets' / 'fthr_logo.png'
 
     def _refresh_gary_preview(self):
         path = self._effective_gary_image_path()

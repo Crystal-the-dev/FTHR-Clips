@@ -218,8 +218,9 @@ project material under MIT; the notice and exact file list are in
 
 The predecessor images and four MP3 files had no usable authorship, source, or
 redistribution evidence. All predecessor image bytes were replaced, the MP3s
-were removed, and none is allowlisted for a release. The investigation is
-recorded in `docs/AUDIT-013-ASSET-PROVENANCE.md`.
+were removed, and none is allowlisted for a release. Machine-readable evidence
+is recorded in `tools/release_asset_manifest.json` and enforced by
+`tools/verify_release_licenses.py`; any failure keeps public release blocked.
 
 ### Oswald Bold
 

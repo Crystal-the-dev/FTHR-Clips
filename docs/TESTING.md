@@ -21,9 +21,9 @@ python -m ruff check .
 `tests/conftest.py` sets `QT_QPA_PLATFORM=offscreen`, so widget tests work
 headless without exporting anything.
 
-Current Windows result: **518 passed / 34 skipped**. Platform-specific tests
-skip on the other operating system; record the result of each release run
-instead of treating this count as a permanent expectation.
+Test counts change with the source. Record the command, commit, platform,
+passed/failed/skipped counts, and any generated worktree files for each release
+run instead of treating an older count as a permanent expectation.
 
 ### What the suite covers
 

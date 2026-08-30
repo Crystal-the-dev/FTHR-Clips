@@ -349,5 +349,7 @@ Ubuntu 24.04 / WSL2, 2026-08-06:
 | Licence gate | **PASS** — 83 checks, 0 failed, 0 warnings |
 | AppImage produced | **YES** — 219 MB, starts (offscreen), engine loads all 7 bundled FFmpeg libraries |
 
-Full detail in [`docs/SUPPORTED_PLATFORMS.md`](docs/SUPPORTED_PLATFORMS.md) and
-[`docs/AUDIT_REPORT.md`](docs/AUDIT_REPORT.md).
+Current platform evidence and remaining physical gaps are recorded in
+[`docs/SUPPORTED_PLATFORMS.md`](docs/SUPPORTED_PLATFORMS.md) and
+[`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md). Historical build
+numbers are not release evidence for the current commit.

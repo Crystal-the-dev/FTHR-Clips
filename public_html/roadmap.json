@@ -9,7 +9,7 @@
                 { "text": "Encoded ring buffer \u2014 no raw frames in RAM", "done": true },
                 { "text": "Hotkey \u2192 instant clip save (mux only, no re-encode)", "done": true },
                 { "text": "x264 software fallback for non-NVIDIA GPUs", "done": true },
-                { "text": "PyQt6 UI \u2014 clip grid, settings, hotkey config", "done": true },
+                { "text": "PySide6 UI \u2014 clip grid, settings, hotkey config", "done": true },
                 { "text": "Python \u2194 C++ IPC via shared memory", "done": true }
             ]
         },

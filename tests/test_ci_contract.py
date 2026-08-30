@@ -56,6 +56,28 @@ def test_windows_package_and_source_loader_use_supported_mixer_outputs() -> None
     assert project_path in loader
 
 
+def test_windows_bundle_excludes_path_injected_icu_runtime() -> None:
+    spec = (ROOT / "FTHR.spec").read_text(encoding="utf-8")
+    verifier = (ROOT / "tools" / "verify_windows_installer_lifecycle.py").read_text(
+        encoding="utf-8"
+    )
+
+    for dll_marker in ("icuuc.dll", "icudt", "icuin"):
+        assert dll_marker in spec
+        assert dll_marker in verifier
+
+
+def test_windows_hardware_gate_requires_ten_saves_and_fresh_frames() -> None:
+    qualifier = (ROOT / "tools" / "qualify_windows_hardware.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "for index in range(1, 11):" in qualifier
+    rapid = qualifier[qualifier.index("frames_before_rapid") :]
+    assert "wait_for_frames(" in rapid
+    assert "frames_before_rapid + max(args.fps, 1)" in rapid
+
+
 def test_release_ci_runs_response_and_exception_contracts() -> None:
     workflow = _workflow()
     release_job = workflow[workflow.index("  release-verification:") :]

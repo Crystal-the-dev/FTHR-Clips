@@ -226,9 +226,9 @@ Licence texts: [`licenses/`](licenses/), also installed alongside the app.
 | [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | Every bundled component and its licence |
 | [`docs/SUPPORTED_PLATFORMS.md`](docs/SUPPORTED_PLATFORMS.md) | The real support matrix — what was actually tested, and where |
 | [`docs/TESTING.md`](docs/TESTING.md) | How to verify a build; build vs headless vs desktop tests |
-| [`docs/MAIN-PAGE-DESIGN-REFRESH.md`](docs/MAIN-PAGE-DESIGN-REFRESH.md) | Main-page popover spacing, game detection, bitrate, and fullscreen boundary changes |
 | [`docs/WINDOWS-11-QUALIFICATION.md`](docs/WINDOWS-11-QUALIFICATION.md) | Required physical app-stem and border qualification on Windows 11 |
-| [`docs/AUDIT_REPORT.md`](docs/AUDIT_REPORT.md) | Consolidated audit — all findings, all three passes |
-| [`docs/AUDIT-014-LINUX-FFMPEG.md`](docs/AUDIT-014-LINUX-FFMPEG.md) | How the Linux LGPL FFmpeg is pinned, built against and verified |
+| [`docs/WINDOWS-CAPTURE-BORDER.md`](docs/WINDOWS-CAPTURE-BORDER.md) | Windows privacy-border capability and fallback policy |
+| [`docs/WINDOWS-INSTALLER-LIFECYCLE.md`](docs/WINDOWS-INSTALLER-LIFECYCLE.md) | Installer, update and uninstall contract |
+| [`docs/WINDOWS-LIFECYCLE.md`](docs/WINDOWS-LIFECYCLE.md) | Tray, background replay and autostart behaviour |
+| [`docs/OPTIONAL-UPLOADER-SECURITY-MODEL.md`](docs/OPTIONAL-UPLOADER-SECURITY-MODEL.md) | Dormant optional uploader trust boundary |
 | [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md) | The gates a release must pass before it may be tagged |
-| [`docs/SOURCE_OF_TRUTH.md`](docs/SOURCE_OF_TRUTH.md) | Which tree is authoritative, and how backups work |

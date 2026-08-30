@@ -30,8 +30,10 @@ yet approved for public distribution.
 
 ## Qualification status
 
-- Windows 10 with same-adapter NVIDIA hardware is physically qualified for the
-  core replay, audio, screenshot, and background workflows.
+- Windows 10 with same-adapter NVIDIA hardware is only partially qualified:
+  HEVC replay completed the latest run, while H.264 and AV1 capture stalled.
+  Screenshots, second-monitor HEVC replay, and background lifecycle were
+  exercised separately.
 - AMD and Intel encoder paths are automated-tested but hardware-unverified.
 - Windows 11 per-app stems and the official borderless-capture capability still
   require a physical Windows 11 qualification run.
@@ -39,6 +41,9 @@ yet approved for public distribution.
   Wayland desktop, PipeWire per-app audio, and AppImage runtime remain unverified.
 - Local Windows artifacts are unsigned until a release operator supplies an
   approved code-signing identity.
+- The public alpha also remains blocked by the asset/provenance release gate,
+  HEVC editor playback failure, and a silent microphone stream in the latest
+  physical run.
 
 Linux hotkeys use an owner-only Unix socket and do not require root or membership
 in the `input` group. See `README.md`, `KNOWN_ISSUES.md`, and

@@ -290,6 +290,9 @@ def draw_icon(name: str) -> Canvas:
         c.polygon([(20, 51), (42, 51), (66, 30), (66, 98), (42, 77), (20, 77)], color)
         c.arc(66, 64, 27, -0.75, 0.75, color, 7)
         c.arc(66, 64, 43, -0.75, 0.75, color, 7)
+    elif name == 'shutdown.png':
+        c.arc(64, 68, 39, math.radians(-55), math.radians(235), color, t)
+        c.line(64, 17, 64, 68, color, t)
     elif name == 'updates.png':
         c.rect(57, 20, 71, 78, color)
         c.polygon([(32, 66), (96, 66), (64, 104)], color)
@@ -389,7 +392,7 @@ def generated_files() -> dict[Path, bytes]:
             'clip.png', 'close.png', 'dropdown.png', 'home.png',
             'maximize.png', 'minimize.png', 'pause.png', 'personalize.png',
             'play.png', 'refresh.png', 'settings(general).png', 'sound.png',
-            'updates.png', 'visuals.png',
+            'shutdown.png', 'updates.png', 'visuals.png',
         )
     }
     sounds = {
@@ -399,12 +402,20 @@ def generated_files() -> dict[Path, bytes]:
             sound([(329.63, 0.18), (220.00, 0.28)], 0.015),
         ROOT / 'FTHR_UI' / 'assets' / 'sounds' / 'screenshot_saved.wav':
             sound([(1174.66, 0.09), (1760.00, 0.14)], 0.012),
+        ROOT / 'FTHR_UI' / 'assets' / 'sounds' / 'startup.wav':
+            sound([(440.00, 0.10), (659.25, 0.15)], 0.012),
+        ROOT / 'FTHR_UI' / 'assets' / 'sounds' / 'upload_successful.wav':
+            sound([(659.25, 0.09), (987.77, 0.15)], 0.012),
+        ROOT / 'FTHR_UI' / 'assets' / 'sounds' / 'upload_failed.wav':
+            sound([(392.00, 0.12), (261.63, 0.18)], 0.015),
     }
     files = {
         ROOT / '.github' / 'social_preview.png': social_preview().png(),
         ROOT / 'AppDir' / 'fthr-clips.png': logo,
         ROOT / 'FTHR_UI' / 'assets' / 'fthr_logo.png': logo,
         ROOT / 'FTHR_UI' / 'assets' / 'fthr_logo.ico': ico(
+            [draw_mark(size, BLACK) for size in (16, 32, 48, 256)]),
+        ROOT / 'FTHR_UI' / 'assets' / 'favicon.ico': ico(
             [draw_mark(size, BLACK) for size in (16, 32, 48, 256)]),
         ROOT / 'installer_assets' / 'wizard_banner.bmp':
             installer_banner(164, 314).bmp(),

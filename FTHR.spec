@@ -133,7 +133,6 @@ a = Analysis(
         'ui.customize_page',
         'ui.app_style',
         'ui.screenshot_editor',
-        'ui.splash_screen',
         'ui.style',
         'ui.upload_settings_widget',
         # Core submodules
@@ -196,8 +195,14 @@ def _keep_reviewed_qt_runtime(entry):
     dest = str(entry[0]).replace('\\', '/').casefold()
     name = dest.rsplit('/', 1)[-1]
     forbidden_prefixes = ('qt6qml', 'qt6quick', 'qt6virtualkeyboard')
+    # Qt on supported Windows versions resolves the operating system ICU.
+    # Never collect unrelated ICU copies which happen to be on PATH: a newer
+    # Poppler/Codex ICU beside Qt6Core makes QtWidgets fail during import.
+    foreign_icu = (name == 'icuuc.dll'
+                   or name.startswith(('icudt', 'icuin')))
     return ('virtualkeyboard' not in dest
-            and not name.startswith(forbidden_prefixes))
+            and not name.startswith(forbidden_prefixes)
+            and not foreign_icu)
 
 
 a.binaries = [entry for entry in a.binaries
@@ -218,7 +223,7 @@ exe = EXE(
     strip=False,      # strip doesn't work reliably on Windows DLLs
     upx=True,
     console=False,
-    icon=str(ASSETS_DIR / 'favicon.ico'),
+    icon=str(ASSETS_DIR / 'fthr_logo.ico'),
     version=str(_VER_FILE),
 )
 

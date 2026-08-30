@@ -301,12 +301,24 @@ def qualify_codec(args, codec: str, monitor_path: str, monitor_name: str) -> dic
             clips.append(probe_clip(
                 args.ffprobe, args.ffmpeg, clip60, 'full-60', 60, latency))
 
-            for index in (1, 2):
+            frames_before_rapid = int(
+                bridge.get_status().get('frames_captured', 0))
+            for index in range(1, 11):
                 rapid = codec_dir / f'{codec}_rapid_{index}.mp4'
                 latency = save_and_wait(bridge, rapid, 5)
                 clips.append(probe_clip(
                     args.ffprobe, args.ffmpeg, rapid,
                     f'rapid-{index}', 5, latency))
+
+            # A valid ring can still save old footage after capture has frozen.
+            # Require fresh frames after the rapid-save burst so a stale replay
+            # buffer cannot produce a false qualification PASS.
+            wait_for_frames(
+                bridge,
+                process,
+                frames_before_rapid + max(args.fps, 1),
+                12.0,
+            )
 
             working_set, private_bytes = process_memory_bytes(process)
             cpu_seconds = process_cpu_seconds(process)

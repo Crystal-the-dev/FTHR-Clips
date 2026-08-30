@@ -62,7 +62,7 @@ def test_editor_failure_removes_staged_output_and_never_publishes_final(
         Path(cmd[-1]).write_bytes(b'partial')
         raise subprocess.CalledProcessError(1, cmd, stderr=b'failed')
 
-    monkeypatch.setattr('ui.clip_viewer.subprocess.run', _failed_run)
+    monkeypatch.setattr('ui.clip_viewer._run_export_process', _failed_run)
 
     ClipViewer._export_worker(fake, 0.0, 1.0, str(final), None)
 

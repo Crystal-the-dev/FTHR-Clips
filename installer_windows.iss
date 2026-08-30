@@ -61,7 +61,7 @@ WizardImageFile=installer_assets\wizard_banner.bmp
 WizardSmallImageFile=installer_assets\wizard_small.bmp
 
 ; Icon
-SetupIconFile=FTHR_UI\assets\favicon.ico
+SetupIconFile=FTHR_UI\assets\fthr_logo.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 
 ; Platform

@@ -156,7 +156,6 @@ a = Analysis(
         'ui.customize_page',
         'ui.app_style',
         'ui.screenshot_editor',
-        'ui.splash_screen',
         'ui.style',
         'ui.upload_settings_widget',
         # Core submodules

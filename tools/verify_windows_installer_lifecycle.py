@@ -311,6 +311,17 @@ def check_bundle(report: Report, bundle: Path, *, require_signed: bool) -> None:
             str(path.relative_to(bundle)) for path in debug_files[:5]))
     else:
         report.ok('bundle contains no PDB/ILK/IPDB debug artifacts')
+    foreign_icu = [
+        path for path in bundle.rglob('*.dll')
+        if path.name.casefold() == 'icuuc.dll'
+        or path.name.casefold().startswith(('icudt', 'icuin'))
+    ]
+    if foreign_icu:
+        report.fail(
+            'bundle contains foreign ICU DLLs which can break QtWidgets: '
+            + ', '.join(str(path.relative_to(bundle)) for path in foreign_icu[:5]))
+    else:
+        report.ok('bundle contains no foreign ICU DLLs')
     exe = bundle / 'FTHRClips.exe'
     if exe.is_file():
         check_authenticode(report, exe, microsoft=False, require_signed=require_signed)

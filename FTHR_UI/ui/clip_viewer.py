@@ -44,6 +44,18 @@ from pathlib import Path
 from datetime import datetime
 
 _NO_WINDOW = {'creationflags': subprocess.CREATE_NO_WINDOW} if sys.platform == 'win32' else {}
+
+
+def _run_export_process(*args, **kwargs):
+    """Run an editor export without exposing the global subprocess module.
+
+    Keeping this narrow seam lets export-failure tests replace only the editor
+    invocation. Patching ``subprocess.run`` itself can otherwise intercept
+    unrelated background FFmpeg probes running in the same test process.
+    """
+    return subprocess.run(*args, **kwargs)
+
+
 if sys.platform == 'win32':
     # Direct editor/test entry points may bypass main.py; select the qualified
     # bounded-resource backend before the first QMediaPlayer is constructed.
@@ -5806,8 +5818,8 @@ class ClipViewer(QDialog):
         )
 
         try:
-            subprocess.run(cmd, check=True, capture_output=True,
-                           timeout=600, **_NO_WINDOW)
+            _run_export_process(cmd, check=True, capture_output=True,
+                                timeout=600, **_NO_WINDOW)
             commit_staged_output(staged, out)
             self._export_done.emit(True, out)
         except subprocess.TimeoutExpired:

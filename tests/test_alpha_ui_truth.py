@@ -27,6 +27,18 @@ def test_dead_splash_control_is_not_exposed():
     assert 'Enable startup splash screen' not in MAIN_SOURCE
 
 
+def test_root_favicon_loads_for_window_and_tray():
+    pytest.importorskip('PySide6.QtGui')
+    from main import _load_icon
+
+    assert not _load_icon('favicon.ico', 32).isNull()
+
+
+def test_gary_default_uses_the_approved_generated_logo():
+    assert 'gary_default.png' not in MAIN_SOURCE
+    assert "'assets' / 'fthr_logo.png'" in MAIN_SOURCE
+
+
 @pytest.mark.parametrize(
     ('handler', 'next_handler'),
     [

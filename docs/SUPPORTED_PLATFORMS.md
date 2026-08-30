@@ -10,16 +10,16 @@ Last updated: 2026-08-29.
 
 | Platform | State |
 |---|---|
-| Windows 10 x64 + same-adapter NVIDIA | **Physically verified** on RTX 4060 Ti: native H.264/HEVC/AV1, audio, 30/60-second saves |
+| Windows 10 x64 + same-adapter NVIDIA | **Partial** on RTX 4060 Ti: HEVC replay passed; H.264 and AV1 capture stalled in the latest run |
 | Windows + AMD / Intel | Code-integrated and automated-tested; physical hardware `NOT RUN` |
 | Windows hybrid/cross-adapter | Unsupported for alpha; no CPU full-frame fallback |
 | Linux — engine, IPC and bounded failure | **Verified** on Ubuntu 24.04 / WSL2 |
 | Linux — real Wayland desktop capture (visible pixels) | **NOT VERIFIED** |
 | Linux — native X11 | Source-integrated with RandR-selected geometry; physical qualification `NOT RUN` |
 
-FTHR Clips must not be advertised as broadly Linux-supported. The current Linux
-build is experimental and requires a compositor that exposes one of the two
-implemented Wayland capture protocols.
+FTHR Clips must not be advertised as broadly Windows- or Linux-qualified. AMD,
+Intel, Windows 11-specific paths, and representative Linux desktops remain
+unverified; NVIDIA H.264/AV1 currently have reproducible stall evidence.
 
 ## The environment that was actually tested
 
