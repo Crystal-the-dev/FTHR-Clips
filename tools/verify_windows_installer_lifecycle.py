@@ -167,10 +167,9 @@ def check_source(report: Report) -> None:
             'VC++ prerequisite checks the official x64 runtime location')
     require(report, source, 'Check: NeedsVCRedist',
             'VC++ prerequisite runs only when the guard requires it')
-    require(report, source, 'Name: "{app}\\_internal\\imageio_ffmpeg"',
-            'upgrade purges the known excluded imageio-ffmpeg remnant only')
-    require(report, source, 'Name: "{app}\\_internal\\PyQt6"',
-            'upgrade purges the known excluded PyQt6 remnant only')
+    require(report, source,
+            'Type: filesandordirs; Name: "{app}\\_internal"',
+            'upgrade replaces the complete installer-owned runtime tree')
     require(report, source, 'function HasOwnedAutostart: Boolean;',
             'upgrade detects product-owned autostart state')
     require(report, source, 'RegWriteStringValue(HKCU, RunKey, RunValueName,',
@@ -194,6 +193,11 @@ def check_source(report: Report) -> None:
 
     delete_sections = '\n'.join(re.findall(
         r'(?ms)^\[(?:InstallDelete|UninstallDelete)\]\s*(.*?)(?=^\[|\Z)', source))
+    if re.search(r'(?mi)^\s*Type:\s*filesandordirs;\s*Name:\s*"\{app\}"\s*$',
+                 delete_sections):
+        report.fail('installer broadly deletes the application root during upgrade')
+    else:
+        report.ok('upgrade cleanup is bounded below the application root')
     if re.search(r'(?mi)^\s*Type:.*\{(?:userprofile|userappdata|localappdata)\}\\FTHR_Clips',
                  delete_sections):
         report.fail('installer names the user clip root as a deletion target')

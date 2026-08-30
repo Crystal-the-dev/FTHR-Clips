@@ -103,15 +103,11 @@ english.SelectTasksLabel2=Choose whether Setup should create a desktop shortcut.
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
 
 [InstallDelete]
-; These are exact remnants from the pre-AUDIT-005/013 Windows bundle. Leaving
-; them beside a current PySide6/LGPL payload would keep excluded GPL FFmpeg and
-; PyQt6 bytes installed after an otherwise normal in-place update. Do not turn
-; this into a broad {app} cleanup: only these project-known stale paths are safe
-; to remove before the current files are copied.
-Type: filesandordirs; Name: "{app}\_internal\imageio_ffmpeg"
-Type: filesandordirs; Name: "{app}\_internal\imageio_ffmpeg-*.dist-info"
-Type: filesandordirs; Name: "{app}\_internal\PyQt6"
-Type: filesandordirs; Name: "{app}\_internal\PyQt6-*.dist-info"
+; PyInstaller owns the complete _internal tree. Replace it atomically at the
+; installer boundary so an in-place update cannot retain incompatible DLLs,
+; retired modules, or removed assets from an older bundle. This deliberately
+; does not delete {app} itself and cannot reach clips or user settings.
+Type: filesandordirs; Name: "{app}\_internal"
 
 [Files]
 ; Windows bundle — produced by: pyinstaller FTHR.spec --clean --noconfirm

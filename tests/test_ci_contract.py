@@ -73,6 +73,13 @@ def test_windows_bundle_does_not_require_retired_input_overlay_module() -> None:
     assert "core.input_overlay" not in spec
 
 
+def test_windows_installer_replaces_only_its_internal_runtime_tree() -> None:
+    installer = (ROOT / "installer_windows.iss").read_text(encoding="utf-8")
+
+    assert 'Type: filesandordirs; Name: "{app}\\_internal"' in installer
+    assert 'Type: filesandordirs; Name: "{app}"' not in installer
+
+
 def test_windows_hardware_gate_requires_ten_saves_and_fresh_frames() -> None:
     qualifier = (ROOT / "tools" / "qualify_windows_hardware.py").read_text(
         encoding="utf-8"
