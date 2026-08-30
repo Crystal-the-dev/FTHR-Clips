@@ -11,6 +11,7 @@
     </ProjectConfiguration>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="tests\nvenc_input_lifecycle_test.cpp" />
     <ClCompile Include="tests\continuous_recording_writer_test.cpp" />
     <ClCompile Include="tests\audio_source_model_test.cpp" />
     <ClCompile Include="tests\windows_audio_session_registry_test.cpp" />

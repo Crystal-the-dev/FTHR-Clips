@@ -36,6 +36,7 @@
 #include <memory>
 
 #include "replay_encoder.h"
+#include "nvenc_input_lifecycle.h"
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
@@ -114,6 +115,7 @@ namespace fthr {
         EncodedVideoConfig GetVideoConfig() const override;
         ActiveEncoderInfo GetActiveEncoderInfo() const override;
         std::string GetLastError() const override { return last_error_; }
+        ReplayEncoderDiagnostics GetDiagnostics() const noexcept override;
 
         // Return the QPC epoch used for PTS computation.
         // Returns false if the first frame has not been encoded yet.
@@ -143,7 +145,7 @@ namespace fthr {
         void DrainThread();
 
         // Block until the submit ring has a free slot (pending_count_ < buffer_count_).
-        void WaitForFreeSlot();
+        bool WaitForFreeSlot();
 
         // -----------------------------------------------------------------------
         // Async drain state
@@ -178,6 +180,8 @@ namespace fthr {
         // -----------------------------------------------------------------------
         ID3D11Texture2D** input_textures_;        // GPU-only D3D11_USAGE_DEFAULT
         void**            registered_resources_;  // NV_ENC_REGISTERED_PTR handles
+        void**            mapped_input_resources_; // Kept mapped until output lock completes
+        NvencInputSlotLifecycle* input_slot_lifecycle_;
 
         // -----------------------------------------------------------------------
         // CPU-input path: NVENC system-memory input buffers
@@ -188,6 +192,7 @@ namespace fthr {
         // Shared I/O pool state
         // -----------------------------------------------------------------------
         void**   output_buffers_;    // NV_ENC bitstream output buffer handles
+        void**   completion_events_; // Registered Windows events, one per output
         int64_t* slot_qpc_;         // Per-slot raw QPC ticks, indexed same as output_buffers_
         uint32_t buffer_count_;
         uint32_t current_buf_idx_;
@@ -236,6 +241,33 @@ namespace fthr {
         // diagnostic output is visible on every Initialize() instead of only once
         // per process lifetime (static locals never reset after Finalize).
         int callback_log_count_;
+
+        // Forward-progress accounting. Stage values are intentionally numeric
+        // and stable so a watchdog can report a compact snapshot without locks.
+        // Submit: 0 idle, 1 waiting-slot, 2 mapping, 3 encode-picture, 4 queued.
+        // Drain: 0 idle, 5 dequeue, 6 completion wait, 9 lock-bitstream,
+        // 7 callback, 8 unlock/unmap.
+        std::atomic<uint64_t> diag_input_slots_acquired_{0};
+        std::atomic<uint64_t> diag_map_attempts_{0};
+        std::atomic<uint64_t> diag_maps_succeeded_{0};
+        std::atomic<uint64_t> diag_encode_attempts_{0};
+        std::atomic<uint64_t> diag_encode_returns_{0};
+        std::atomic<uint64_t> diag_encode_successes_{0};
+        std::atomic<uint64_t> diag_drain_dequeues_{0};
+        std::atomic<uint64_t> diag_completion_events_{0};
+        std::atomic<uint64_t> diag_bitstream_lock_attempts_{0};
+        std::atomic<uint64_t> diag_bitstream_locks_{0};
+        std::atomic<uint64_t> diag_bitstream_unlocks_{0};
+        std::atomic<uint64_t> diag_resources_unmapped_{0};
+        std::atomic<uint64_t> diag_packets_produced_{0};
+        std::atomic<uint64_t> diag_slots_recycled_{0};
+        std::atomic<uint32_t> diag_mapped_resources_{0};
+        std::atomic<uint32_t> diag_locked_bitstreams_{0};
+        std::atomic<uint32_t> diag_pending_resources_{0};
+        std::atomic<uint32_t> diag_queued_outputs_{0};
+        std::atomic<uint32_t> diag_submit_stage_{0};
+        std::atomic<uint32_t> diag_drain_stage_{0};
+        std::atomic<int32_t> diag_last_nvenc_status_{0};
     };
 
 } // namespace fthr

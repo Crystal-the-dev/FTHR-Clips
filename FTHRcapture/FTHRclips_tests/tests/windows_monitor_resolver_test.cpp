@@ -23,6 +23,7 @@ int RunWindowsProcessLoopbackAudioProviderTests();
 int RunWindowsMicrophoneAudioProviderTests();
 int RunWindowsCaptureBorderPolicyTests();
 int RunContinuousRecordingWriterTests();
+int RunNvencInputLifecycleTests();
 
 namespace {
 
@@ -481,11 +482,13 @@ int main() {
     const int windows_microphone_checks = RunWindowsMicrophoneAudioProviderTests();
     const int capture_border_checks = RunWindowsCaptureBorderPolicyTests();
     const int recording_checks = RunContinuousRecordingWriterTests();
+    const int nvenc_lifecycle_checks = RunNvencInputLifecycleTests();
     std::cout << "FTHRclips_tests: native suites completed ("
               << (checks + amf_checks + qsv_checks + policy_checks + audio_source_checks
                   + windows_audio_checks + windows_process_loopback_checks)
                   + windows_microphone_checks + capture_border_checks
                   + recording_checks
+                  + nvenc_lifecycle_checks
               << " checks total)" << std::endl;
     return 0;
 }

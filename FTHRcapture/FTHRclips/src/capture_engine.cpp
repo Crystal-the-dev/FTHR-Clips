@@ -229,6 +229,7 @@ namespace fthr {
 
     CaptureEngine::CaptureEngine()
         : capture_thread_(nullptr)
+        , stall_watchdog_thread_(nullptr)
         , save_clip_thread_(nullptr)
         , running_(false)
         , is_recording_(false)
@@ -305,6 +306,18 @@ namespace fthr {
         scaling_mode_ = (config.scaling_mode == CaptureConfig::ScalingModeEnum::FIT) ? 1u : 0u;
         monitor_device_path_ = monitor::NormalizeMonitorDevicePath(
             config.monitor_device_path);
+        capture_loop_iterations_.store(0);
+        capture_acquire_attempts_.store(0);
+        capture_acquire_successes_.store(0);
+        capture_timeouts_.store(0);
+        capture_frames_released_.store(0);
+        source_textures_received_.store(0);
+        conversion_submissions_.store(0);
+        conversion_completions_.store(0);
+        video_packets_produced_.store(0);
+        video_ring_insertions_.store(0);
+        capture_thread_stage_.store(0);
+        last_capture_hresult_.store(0);
 
         std::cout << "[CaptureEngine] Initializing..." << std::endl;
         std::cout << "  FPS        : " << fps_ << std::endl;
@@ -475,6 +488,8 @@ namespace fthr {
                 }
             }
             encoded_ring_->Push(data, size, pts, is_keyframe, wall_qpc);
+            video_packets_produced_.fetch_add(1, std::memory_order_relaxed);
+            video_ring_insertions_.fetch_add(1, std::memory_order_relaxed);
 
             std::shared_ptr<ContinuousRecordingWriter> writer;
             {
@@ -750,6 +765,8 @@ namespace fthr {
         SetThreadPriority(capture_thread_->native_handle(), THREAD_PRIORITY_NORMAL);
 
         save_clip_thread_ = new std::thread(&CaptureEngine::SaveClipThread, this);
+        stall_watchdog_thread_ = new std::thread(
+            &CaptureEngine::ReplayStallWatchdogThread, this);
 
         std::cout << "[CaptureEngine] Running." << std::endl;
         return true;
@@ -761,7 +778,8 @@ namespace fthr {
     // ===========================================================================
 
     void CaptureEngine::Shutdown() {
-        const bool has_resources = capture_thread_ || save_clip_thread_
+        const bool has_resources = capture_thread_ || stall_watchdog_thread_
+            || save_clip_thread_
             || device_ || context_ || wgc_state_
             || replay_encoder_ || audio_active_ || nvenc_device_
             || nvenc_context_ || record_writer_;
@@ -782,6 +800,12 @@ namespace fthr {
         wgc_frame_cv_.notify_all();
 
         save_clip_queue_.Shutdown();
+
+        if (stall_watchdog_thread_) {
+            stall_watchdog_thread_->join();
+            delete stall_watchdog_thread_;
+            stall_watchdog_thread_ = nullptr;
+        }
 
         if (capture_thread_) {
             capture_thread_->join();
@@ -840,6 +864,104 @@ namespace fthr {
 
         std::cout << "[CaptureEngine] Shutdown complete. Frames captured: "
             << frames_captured_.load() << std::endl;
+    }
+
+    void CaptureEngine::ReplayStallWatchdogThread() {
+        using clock = std::chrono::steady_clock;
+        uint64_t previous_packets = 0;
+        uint64_t previous_acquire_attempts = 0;
+        auto last_progress = clock::now();
+        auto last_acquire_progress = clock::now();
+        bool snapshot_emitted = false;
+
+        while (running_.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            const uint64_t packets = video_packets_produced_.load(
+                std::memory_order_relaxed);
+            const uint64_t acquire_attempts = capture_acquire_attempts_.load(
+                std::memory_order_relaxed);
+            const auto now = clock::now();
+            if (acquire_attempts != previous_acquire_attempts) {
+                previous_acquire_attempts = acquire_attempts;
+                last_acquire_progress = now;
+            }
+            if (packets != previous_packets) {
+                previous_packets = packets;
+                last_progress = now;
+                snapshot_emitted = false;
+                continue;
+            }
+            if (packets == 0 || snapshot_emitted
+                || now - last_progress <= std::chrono::seconds(2)) {
+                continue;
+            }
+
+            const auto encoder = replay_encoder_
+                ? replay_encoder_->GetDiagnostics()
+                : ReplayEncoderDiagnostics{};
+            const bool dxgi_is_alive_but_desktop_is_static =
+                static_cast<HRESULT>(last_capture_hresult_.load(
+                    std::memory_order_relaxed)) == DXGI_ERROR_WAIT_TIMEOUT
+                && now - last_acquire_progress < std::chrono::seconds(1)
+                && encoder.pending_resources == 0
+                && encoder.queued_outputs == 0
+                && encoder.submit_stage == 0
+                && encoder.drain_stage == 0;
+            if (dxgi_is_alive_but_desktop_is_static) {
+                // Desktop Duplication reports only changed frames. Repeated
+                // WAIT_TIMEOUT with a live acquire loop and an empty encoder
+                // is expected and must not be diagnosed as a replay stall.
+                last_progress = now;
+                continue;
+            }
+            const HRESULT removed_reason = device_
+                ? device_->GetDeviceRemovedReason()
+                : E_POINTER;
+            std::cerr
+                << "[ReplayStall] no encoded packet for >2s"
+                << " capture_stage=" << capture_thread_stage_.load()
+                << " loops=" << capture_loop_iterations_.load()
+                << " acquire_attempts=" << capture_acquire_attempts_.load()
+                << " acquired=" << capture_acquire_successes_.load()
+                << " timeouts=" << capture_timeouts_.load()
+                << " released=" << capture_frames_released_.load()
+                << " owned=" << (capture_acquire_successes_.load()
+                    - capture_frames_released_.load())
+                << " textures=" << source_textures_received_.load()
+                << " conversion_submit=" << conversion_submissions_.load()
+                << " conversion_complete=" << conversion_completions_.load()
+                << " frames=" << frames_captured_.load()
+                << " packets=" << video_packets_produced_.load()
+                << " ring_push=" << video_ring_insertions_.load()
+                << " last_hr=0x" << std::hex
+                << static_cast<uint32_t>(last_capture_hresult_.load())
+                << " removed_reason=0x"
+                << static_cast<uint32_t>(removed_reason) << std::dec
+                << " encoder_submit_stage=" << encoder.submit_stage
+                << " encoder_drain_stage=" << encoder.drain_stage
+                << " slots_acquired=" << encoder.input_slots_acquired
+                << " map=" << encoder.maps_succeeded << '/'
+                << encoder.map_attempts
+                << " mapped_now=" << encoder.mapped_resources
+                << " encode_return=" << encoder.encode_returns << '/'
+                << encoder.encode_attempts
+                << " encode_ok=" << encoder.encode_successes
+                << " drain=" << encoder.drain_dequeues
+                << " completion=" << encoder.completion_events
+                << " lock=" << encoder.bitstream_locks << '/'
+                << encoder.bitstream_lock_attempts
+                << " locked_now=" << encoder.locked_bitstreams
+                << " unlock=" << encoder.bitstream_unlocks
+                << " unmap=" << encoder.resources_unmapped
+                << " recycled=" << encoder.slots_recycled
+                << " pending=" << encoder.pending_resources
+                << " queue=" << encoder.queued_outputs
+                << " pool=" << encoder.pool_capacity
+                << " registered=" << encoder.registered_resources
+                << " nvenc_status=" << encoder.last_nvenc_status
+                << std::endl;
+            snapshot_emitted = true;
+        }
     }
 
 
@@ -2446,12 +2568,22 @@ namespace fthr {
 
         while (running_.load(std::memory_order_relaxed)) {
 
+            capture_loop_iterations_.fetch_add(1, std::memory_order_relaxed);
+
             DXGI_OUTDUPL_FRAME_INFO info{};
             IDXGIResource* resource = nullptr;
 
+            capture_thread_stage_.store(1, std::memory_order_relaxed);
+            capture_acquire_attempts_.fetch_add(1, std::memory_order_relaxed);
             HRESULT hr = duplication_->AcquireNextFrame(33, &info, &resource);
+            last_capture_hresult_.store(
+                static_cast<int32_t>(hr), std::memory_order_relaxed);
 
-            if (hr == DXGI_ERROR_WAIT_TIMEOUT) continue;
+            if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+                capture_timeouts_.fetch_add(1, std::memory_order_relaxed);
+                capture_thread_stage_.store(0, std::memory_order_relaxed);
+                continue;
+            }
 
             if (hr == DXGI_ERROR_ACCESS_LOST) {
                 // A new D3D11 device cannot be substituted under the live native
@@ -2487,6 +2619,8 @@ namespace fthr {
                 continue;
             }
             consecutive_acquire_errors = 0;
+            capture_acquire_successes_.fetch_add(1, std::memory_order_relaxed);
+            capture_thread_stage_.store(2, std::memory_order_relaxed);
 
             // Frame rate limiting BEFORE QueryInterface.
             // At high game FPS (e.g. 300fps, 60fps target) most frames are dropped.
@@ -2498,6 +2632,8 @@ namespace fthr {
             if (!frame_scheduler.ShouldCapture(now.QuadPart)) {
                 resource->Release();
                 duplication_->ReleaseFrame();
+                capture_frames_released_.fetch_add(1, std::memory_order_relaxed);
+                capture_thread_stage_.store(0, std::memory_order_relaxed);
                 frames_dropped_.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
@@ -2509,8 +2645,12 @@ namespace fthr {
 
             if (FAILED(hr)) {
                 duplication_->ReleaseFrame();
+                capture_frames_released_.fetch_add(1, std::memory_order_relaxed);
+                capture_thread_stage_.store(0, std::memory_order_relaxed);
                 continue;
             }
+            source_textures_received_.fetch_add(1, std::memory_order_relaxed);
+            capture_thread_stage_.store(3, std::memory_order_relaxed);
 
             if (nvenc_active_ && !replay_encoder_cpu_input_) {
                 // ----------------------------------------------------------
@@ -2518,13 +2658,20 @@ namespace fthr {
                 // CopyResource is a pure GPU op; there is no full-frame CPU
                 // readback or upload on the normal AMD path.
                 // ----------------------------------------------------------
+                capture_thread_stage_.store(4, std::memory_order_relaxed);
+                conversion_submissions_.fetch_add(1, std::memory_order_relaxed);
                 ID3D11Texture2D* encode_texture = PrepareEncodeTexture(tex);
+                if (encode_texture)
+                    conversion_completions_.fetch_add(1, std::memory_order_relaxed);
+                capture_thread_stage_.store(5, std::memory_order_relaxed);
                 const bool encoded = encode_texture && EncodeGpuReplayTexture(
                     encode_texture,
                     info.LastPresentTime.QuadPart,
                     frames_captured_.load(std::memory_order_relaxed) + 1);
                 tex->Release();
                 duplication_->ReleaseFrame();
+                capture_frames_released_.fetch_add(1, std::memory_order_relaxed);
+                capture_thread_stage_.store(0, std::memory_order_relaxed);
                 if (!encoded) break;
             }
             else if (nvenc_active_ && replay_encoder_cpu_input_) {
@@ -2543,6 +2690,8 @@ namespace fthr {
                 context_->CopyResource(staging_texture_, tex);
                 tex->Release();
                 duplication_->ReleaseFrame();
+                capture_frames_released_.fetch_add(1, std::memory_order_relaxed);
+                capture_thread_stage_.store(4, std::memory_order_relaxed);
 
                 D3D11_MAPPED_SUBRESOURCE mapped{};
                 hr = context_->Map(staging_texture_, 0, D3D11_MAP_READ, 0, &mapped);
@@ -2572,6 +2721,8 @@ namespace fthr {
                     }
                 }
                 context_->Unmap(staging_texture_, 0);
+                conversion_submissions_.fetch_add(1, std::memory_order_relaxed);
+                conversion_completions_.fetch_add(1, std::memory_order_relaxed);
                 if (!encoded) {
                     FailReplayEncoder("hybrid NVENC CPU-input submission");
                     break;
@@ -2584,6 +2735,8 @@ namespace fthr {
                 context_->CopyResource(staging_texture_, tex);
                 tex->Release();
                 duplication_->ReleaseFrame();
+                capture_frames_released_.fetch_add(1, std::memory_order_relaxed);
+                capture_thread_stage_.store(4, std::memory_order_relaxed);
 
                 D3D11_MAPPED_SUBRESOURCE mapped{};
                 hr = context_->Map(staging_texture_, 0, D3D11_MAP_READ, 0, &mapped);
@@ -2624,6 +2777,7 @@ namespace fthr {
             }
 
             uint64_t fc = frames_captured_.fetch_add(1, std::memory_order_relaxed) + 1;
+            capture_thread_stage_.store(0, std::memory_order_relaxed);
             if (fc == 1 || fc == 10 || fc == 100 || (fc % 500 == 0)) {
                 std::cout << "[CaptureThread] Frames captured: " << fc << std::endl;
             }

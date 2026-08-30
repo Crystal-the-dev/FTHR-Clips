@@ -222,6 +222,7 @@ namespace fthr {
         // -----------------------------------------------------------------------
         void CaptureThread();       // dispatches to WGC or DXGI
         void CaptureThreadWGC();    // WGC event-driven loop
+        void ReplayStallWatchdogThread();
         void SaveClipThread();
 
         // -----------------------------------------------------------------------
@@ -297,6 +298,7 @@ namespace fthr {
         // Thread handles
         // -----------------------------------------------------------------------
         std::thread* capture_thread_;
+        std::thread* stall_watchdog_thread_;
         std::thread* save_clip_thread_;
         std::atomic<bool> running_;
         std::atomic<bool> is_recording_;
@@ -401,6 +403,18 @@ namespace fthr {
         // -----------------------------------------------------------------------
         std::atomic<uint64_t> frames_captured_;
         std::atomic<uint64_t> frames_dropped_;
+        std::atomic<uint64_t> capture_loop_iterations_{0};
+        std::atomic<uint64_t> capture_acquire_attempts_{0};
+        std::atomic<uint64_t> capture_acquire_successes_{0};
+        std::atomic<uint64_t> capture_timeouts_{0};
+        std::atomic<uint64_t> capture_frames_released_{0};
+        std::atomic<uint64_t> source_textures_received_{0};
+        std::atomic<uint64_t> conversion_submissions_{0};
+        std::atomic<uint64_t> conversion_completions_{0};
+        std::atomic<uint64_t> video_packets_produced_{0};
+        std::atomic<uint64_t> video_ring_insertions_{0};
+        std::atomic<uint32_t> capture_thread_stage_{0};
+        std::atomic<int32_t> last_capture_hresult_{0};
         std::atomic<uint32_t> capture_health_flags_{CAPTURE_HEALTH_NONE};
         std::atomic<uint32_t> capture_generation_{0};
         std::atomic<uint32_t> content_sample_sequence_{0};

@@ -39,6 +39,9 @@
     <ClInclude Include="include\nvenc_codec_config.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="include\nvenc_input_lifecycle.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="include\encoded_ring_buffer.h">
       <Filter>Header Files</Filter>
     </ClInclude>

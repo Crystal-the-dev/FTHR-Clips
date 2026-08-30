@@ -40,6 +40,7 @@
     <ClInclude Include="include\ffmpeg_qsv_replay_encoder.h" />
     <ClInclude Include="include\hardware_encoder.h" />
     <ClInclude Include="include\nvenc_codec_config.h" />
+    <ClInclude Include="include\nvenc_input_lifecycle.h" />
     <ClInclude Include="include\packet_buffer_pool.h" />
     <ClInclude Include="include\replay_encoder.h" />
     <ClInclude Include="include\save_clip_task.h" />

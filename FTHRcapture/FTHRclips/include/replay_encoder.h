@@ -90,6 +90,34 @@ struct ActiveEncoderInfo {
     std::string name;
 };
 
+// Lock-free progress snapshot used by CaptureEngine's diagnostic watchdog.
+// Backends that do not expose native resource pools keep the zero defaults.
+struct ReplayEncoderDiagnostics {
+    uint64_t input_slots_acquired = 0;
+    uint64_t map_attempts = 0;
+    uint64_t maps_succeeded = 0;
+    uint64_t encode_attempts = 0;
+    uint64_t encode_returns = 0;
+    uint64_t encode_successes = 0;
+    uint64_t drain_dequeues = 0;
+    uint64_t completion_events = 0;
+    uint64_t bitstream_lock_attempts = 0;
+    uint64_t bitstream_locks = 0;
+    uint64_t bitstream_unlocks = 0;
+    uint64_t resources_unmapped = 0;
+    uint64_t packets_produced = 0;
+    uint64_t slots_recycled = 0;
+    uint32_t registered_resources = 0;
+    uint32_t pool_capacity = 0;
+    uint32_t pending_resources = 0;
+    uint32_t queued_outputs = 0;
+    uint32_t mapped_resources = 0;
+    uint32_t locked_bitstreams = 0;
+    uint32_t submit_stage = 0;
+    uint32_t drain_stage = 0;
+    int32_t last_nvenc_status = 0;
+};
+
 constexpr ReplayEncoderBackend SelectProductionReplayBackend(
     EncoderVendor vendor,
     VideoCodec codec) noexcept {
@@ -267,6 +295,9 @@ public:
     virtual bool IsVideoConfigReady() const { return true; }
     virtual ActiveEncoderInfo GetActiveEncoderInfo() const = 0;
     virtual std::string GetLastError() const { return {}; }
+    virtual ReplayEncoderDiagnostics GetDiagnostics() const noexcept {
+        return {};
+    }
     virtual bool GetEncodeEpoch(
         int64_t& start_qpc, int64_t& qpc_frequency) const = 0;
     virtual bool IsInitialized() const = 0;
