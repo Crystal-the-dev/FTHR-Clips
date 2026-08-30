@@ -1,15 +1,10 @@
 # Known Issues — 1.0.0-alpha
 
-This is a pre-alpha test build. The items below are current as of 2026-08-30;
+This is a pre-alpha test build. The items below are current as of 2026-08-31;
 `NOT RUN` means exactly that and must not be presented as working.
 
 ## Public-release blockers
 
-- **Asset redistribution is not cleared.** The source licence gate still
-  rejects packaging references for `FTHR_UI/assets/fthr_logo.ico` and finds
-  shipped assets that are absent from `tools/release_asset_manifest.json`.
-  Keep the public release blocked until every shipped asset has approved,
-  hash-bound provenance or is removed from the artifact.
 - **Windows NVIDIA replay can stall.** On the current RTX 4060 Ti / Windows 10
   host, HEVC completed the long qualification, but H.264 stopped advancing
   after about 4,079 frames and AV1 after about 704 frames. A stale replay ring
@@ -23,6 +18,10 @@ This is a pre-alpha test build. The items below are current as of 2026-08-30;
   selection and real audible content require another physical test.
 - **Release artifacts are unsigned.** No approved Authenticode identity is
   configured. Unsigned local friend builds are not public releases.
+
+The machine-readable asset gate is technically clean after unused MP3s and the
+unprovenanced Gary default were removed. Gary now uses the generated FTHR logo;
+user-selected images are unchanged. This does not replace final legal approval.
 
 ## Platform and hardware gaps
 
@@ -54,5 +53,4 @@ This is a pre-alpha test build. The items below are current as of 2026-08-30;
 - Linux hotkeys use an owner-only Unix socket; direct root key capture is not
   used.
 
-See `docs/SUPPORTED_PLATFORMS.md` and `docs/RELEASE_CHECKLIST.md` for the exact
-qualification boundary.
+Build and package commands are documented in `BUILDING.md`.

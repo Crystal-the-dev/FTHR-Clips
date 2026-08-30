@@ -4,8 +4,7 @@ Two native engines and one Python frontend. The Windows and Linux builds are
 independent — neither artifact contains the other's engine.
 
 - [Common setup](#common-setup) · [Windows](#windows) · [Linux](#linux)
-- What has actually been tested: [`docs/SUPPORTED_PLATFORMS.md`](docs/SUPPORTED_PLATFORMS.md)
-- How to verify a build: [`docs/TESTING.md`](docs/TESTING.md)
+- Current physical gaps and limits: [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)
 
 ---
 
@@ -65,8 +64,8 @@ python -m pytest tests/
 python -m ruff check .
 ```
 
-All must pass. See [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md) for
-the full gate list. AUDIT-013 selected PySide6/LGPLv3 and hash-locks every
+All must pass. `KNOWN_ISSUES.md` lists the physical checks that automation
+cannot prove. AUDIT-013 selected PySide6/LGPLv3 and hash-locks every
 release asset in `tools/release_asset_manifest.json`. Before packaging, also
 verify that the committed generated media matches its reviewed source:
 
@@ -181,9 +180,9 @@ sidecars under `%USERPROFILE%\FTHR_Clips` are never uninstaller targets;
 settings/cache in `%USERPROFILE%\.fthr` are retained unless the user explicitly
 chooses their removal.
 
-See [`docs/WINDOWS-INSTALLER-LIFECYCLE.md`](docs/WINDOWS-INSTALLER-LIFECYCLE.md)
-for update, repair, legacy-install, autostart, signing, and package-identity
-decisions.
+The installer lifecycle verifier checks update/repair policy, autostart
+ownership, signing state, package identity, user-data preservation, and the
+reviewed bundle boundary.
 
 ### Notes
 
@@ -358,6 +357,5 @@ Ubuntu 24.04 / WSL2, 2026-08-06:
 | AppImage produced | **YES** — 219 MB, starts (offscreen), engine loads all 7 bundled FFmpeg libraries |
 
 Current platform evidence and remaining physical gaps are recorded in
-[`docs/SUPPORTED_PLATFORMS.md`](docs/SUPPORTED_PLATFORMS.md) and
-[`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md). Historical build
-numbers are not release evidence for the current commit.
+[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md). Historical build numbers are not release
+evidence for the current commit.

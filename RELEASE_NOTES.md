@@ -42,10 +42,10 @@ yet approved for public distribution.
   Wayland desktop, PipeWire per-app audio, and AppImage runtime remain unverified.
 - Local Windows artifacts are unsigned until a release operator supplies an
   approved code-signing identity.
-- The public alpha also remains blocked by the asset/provenance release gate,
-  HEVC editor playback failure, and a silent microphone stream in the latest
-  physical run.
+- The public alpha remains blocked by NVIDIA H.264/AV1 stalls, HEVC editor
+  playback failure, a silent microphone stream in the latest physical run,
+  and missing physical/platform qualification.
 
 Linux hotkeys use an owner-only Unix socket and do not require root or membership
-in the `input` group. See `README.md`, `KNOWN_ISSUES.md`, and
-`docs/RELEASE_CHECKLIST.md` before installing or distributing this build.
+in the `input` group. See `README.md`, `KNOWN_ISSUES.md`, and `BUILDING.md`
+before installing or distributing this build.

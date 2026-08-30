@@ -5,7 +5,7 @@
 **Local instant replay for Windows. Hit a hotkey and save the moment that just happened.**
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20experimental-lightgrey)](docs/SUPPORTED_PLATFORMS.md)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20experimental-lightgrey)](KNOWN_ISSUES.md)
 [![Release](https://img.shields.io/github/v/release/FTHR-Community/FTHR-Clips?include_prereleases&label=latest)](https://github.com/FTHR-Community/FTHR-Clips/releases)
 [![CI](https://github.com/FTHR-Community/FTHR-Clips/actions/workflows/ci.yml/badge.svg)](https://github.com/FTHR-Community/FTHR-Clips/actions/workflows/ci.yml)
 
@@ -52,7 +52,7 @@ It runs as a tray icon. You forget it's there until you need it.
 
 There is currently **no public-release-qualified build**. Local pre-alpha
 qualification artifacts use the names below; do not publish them until the
-remaining signing and physical gates in `docs/RELEASE_CHECKLIST.md` pass.
+remaining signing and physical gaps in `KNOWN_ISSUES.md` are closed.
 
 | Platform | File |
 |----------|------|
@@ -172,8 +172,8 @@ uses an owner-only Unix socket for compositor key bindings.
 Upload networking is not part of Core. The uploader is a dormant verified
 package installed only after accepting its terms and privacy policy. Lustful
 requires an additional, separately consented Hardware Identity package; Catbox
-never installs or invokes it. See
-[`docs/OPTIONAL-UPLOADER-SECURITY-MODEL.md`](docs/OPTIONAL-UPLOADER-SECURITY-MODEL.md).
+never installs or invokes it. The package boundary and notices are enforced by
+the release verifiers and documented in `THIRD_PARTY_NOTICES.md`.
 
 ---
 
@@ -225,11 +225,3 @@ Licence texts: [`licenses/`](licenses/), also installed alongside the app.
 | [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) | What is broken, unverified or missing — read before filing a bug |
 | [`SECURITY.md`](SECURITY.md) | Reporting a security issue |
 | [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | Every bundled component and its licence |
-| [`docs/SUPPORTED_PLATFORMS.md`](docs/SUPPORTED_PLATFORMS.md) | The real support matrix — what was actually tested, and where |
-| [`docs/TESTING.md`](docs/TESTING.md) | How to verify a build; build vs headless vs desktop tests |
-| [`docs/WINDOWS-11-QUALIFICATION.md`](docs/WINDOWS-11-QUALIFICATION.md) | Required physical app-stem and border qualification on Windows 11 |
-| [`docs/WINDOWS-CAPTURE-BORDER.md`](docs/WINDOWS-CAPTURE-BORDER.md) | Windows privacy-border capability and fallback policy |
-| [`docs/WINDOWS-INSTALLER-LIFECYCLE.md`](docs/WINDOWS-INSTALLER-LIFECYCLE.md) | Installer, update and uninstall contract |
-| [`docs/WINDOWS-LIFECYCLE.md`](docs/WINDOWS-LIFECYCLE.md) | Tray, background replay and autostart behaviour |
-| [`docs/OPTIONAL-UPLOADER-SECURITY-MODEL.md`](docs/OPTIONAL-UPLOADER-SECURITY-MODEL.md) | Dormant optional uploader trust boundary |
-| [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md) | The gates a release must pass before it may be tagged |
