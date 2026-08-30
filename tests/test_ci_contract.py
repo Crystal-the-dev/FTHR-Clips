@@ -67,6 +67,12 @@ def test_windows_bundle_excludes_path_injected_icu_runtime() -> None:
         assert dll_marker in verifier
 
 
+def test_windows_bundle_does_not_require_retired_input_overlay_module() -> None:
+    spec = (ROOT / "FTHR.spec").read_text(encoding="utf-8")
+
+    assert "core.input_overlay" not in spec
+
+
 def test_windows_hardware_gate_requires_ten_saves_and_fresh_frames() -> None:
     qualifier = (ROOT / "tools" / "qualify_windows_hardware.py").read_text(
         encoding="utf-8"

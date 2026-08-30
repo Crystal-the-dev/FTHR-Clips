@@ -146,7 +146,6 @@ a = Analysis(
         'core.ffmpeg_playback',
         'core.game_detector',
         'core.hotkey_manager',
-        'core.input_overlay',
         'core.instance_activation',
         'core.mic_recorder',
         'core.presets_manager',
