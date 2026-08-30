@@ -112,7 +112,6 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import (
     QTimer, QProcess, Signal, Qt, QPoint, QPointF, QSize, QRect, QEvent,
     QPropertyAnimation, QEasingCurve,
-    QParallelAnimationGroup,
 )
 from PySide6.QtGui import QImage, QPixmap, QFontDatabase, QFont, QCursor, QPainter, QPen, QColor, QIcon, QBrush, QPolygonF, QPalette, QAction
 
@@ -494,7 +493,6 @@ def _load_icon(name: str, size: int = 20) -> QIcon:
     if QApplication.instance() is None:
         QApplication([])
     theme = ThemeManager()
-    qapp_exists = True
 
     def _file_icon(path: Path) -> QIcon:
         pix = QPixmap(str(path)).scaled(
@@ -8124,26 +8122,23 @@ def _settings_vsep() -> QFrame:
 
 
 # ---------------------------------------------------------------------------
-# Sliding stacked widget — gives the settings page its swipe animation
+# Lightweight settings page stack
 # ---------------------------------------------------------------------------
 
 class SlidingStackedWidget(QWidget):
-    """
-    Drop-in replacement for QStackedWidget that slides pages horizontally
-    when the index changes. Forward = slides left, back = slides right.
-    Rapid clicks queue to the most recent target so the UI never desyncs.
-    """
+    """Small QStackedWidget-compatible container with instant page changes.
 
-    _DURATION = 260   # ms
+    Settings pages contain scroll areas, previews and many styled children.
+    Moving two complete pages every animation frame caused measurable CPU
+    spikes when tabs were clicked rapidly. Only the selected page is now
+    visible and laid out.
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._pages = []
         self._current = -1
-        self._animating = False
-        self._pending = None
-        self._anim_group = None
 
     # API mirrors QStackedWidget ------------------------------------------------
 
@@ -8163,12 +8158,15 @@ class SlidingStackedWidget(QWidget):
     def setCurrentIndex(self, new_idx):
         if new_idx < 0 or new_idx >= len(self._pages):
             return
-        if new_idx == self._current and not self._animating:
+        if new_idx == self._current:
             return
-        if self._animating:
-            self._pending = new_idx
-            return
-        self._slide(new_idx)
+        if self._current >= 0:
+            self._pages[self._current].hide()
+        self._current = new_idx
+        page = self._pages[new_idx]
+        page.setGeometry(0, 0, self.width(), self.height())
+        page.show()
+        page.raise_()
 
     def currentIndex(self):
         return self._current
@@ -8202,61 +8200,9 @@ class SlidingStackedWidget(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if not self._animating and self._current >= 0:
+        if self._current >= 0:
             w, h = self.width(), self.height()
             self._pages[self._current].setGeometry(0, 0, w, h)
-
-    # Animation -----------------------------------------------------------------
-
-    def _slide(self, new_idx):
-        old_idx = self._current
-        direction = 1 if new_idx > old_idx else -1   # 1 = new from right
-        w, h = self.width(), self.height()
-
-        old_page = self._pages[old_idx]
-        new_page = self._pages[new_idx]
-
-        new_page.setGeometry(direction * w, 0, w, h)
-        new_page.show()
-        new_page.raise_()
-
-        self._current = new_idx
-        self._animating = True
-
-        anim_out = QPropertyAnimation(old_page, b'geometry', self)
-        anim_out.setDuration(self._DURATION)
-        anim_out.setStartValue(QRect(0, 0, w, h))
-        anim_out.setEndValue(QRect(-direction * w, 0, w, h))
-        anim_out.setEasingCurve(QEasingCurve.Type.OutCubic)
-
-        anim_in = QPropertyAnimation(new_page, b'geometry', self)
-        anim_in.setDuration(self._DURATION)
-        anim_in.setStartValue(QRect(direction * w, 0, w, h))
-        anim_in.setEndValue(QRect(0, 0, w, h))
-        anim_in.setEasingCurve(QEasingCurve.Type.OutCubic)
-
-        group = QParallelAnimationGroup(self)
-        group.addAnimation(anim_out)
-        group.addAnimation(anim_in)
-        group.finished.connect(self._finish)
-        self._anim_group = group
-        group.start()
-
-    def _finish(self):
-        w, h = self.width(), self.height()
-        for i, page in enumerate(self._pages):
-            if i != self._current:
-                page.hide()
-                page.setGeometry(0, 0, w, h)
-        self._anim_group = None
-        self._animating = False
-        if self._pending is not None:
-            nxt = self._pending
-            self._pending = None
-            if nxt == self._current:
-                self._pages[self._current].show()
-            else:
-                self._slide(nxt)
 
 
 # ---------------------------------------------------------------------------
@@ -8387,6 +8333,11 @@ class _SettingsPage(QWidget):
         self._encoder_capabilities: tuple[EncoderCapability, ...] = ()
         self._encoder_probe_started = False
         self._encoder_probe_from_cache = False
+        self._audio_preview_timer = QTimer(self)
+        self._audio_preview_timer.setSingleShot(True)
+        self._audio_preview_timer.setInterval(180)
+        self._audio_preview_timer.timeout.connect(
+            self._start_audio_preview_if_current)
         self.encoder_capabilities_ready.connect(
             self._on_encoder_capabilities_ready)
         self._setup_ui()
@@ -8476,15 +8427,16 @@ class _SettingsPage(QWidget):
 
     def _on_category_changed(self, idx):
         self.stack.setCurrentIndex(idx)
-        self._set_settings_content_surface()
         if idx in (1, 5):
             self._start_encoder_probe()
         # Audio sub-page is index 2 — start the live meter only there
         if hasattr(self, 'mic_level_meter'):
+            self._audio_preview_timer.stop()
             if (idx == 2 and self.isVisible()
                     and not getattr(self, '_background_ui_paused', False)):
-                self.mic_level_meter.set_gain(self.mic_vol_slider.value() / 100.0)
-                self.mic_level_meter.start(self._selected_mic_index())
+                # Opening a native audio device is expensive. A short debounce
+                # avoids start/stop churn while the user is skimming tabs.
+                self._audio_preview_timer.start()
             else:
                 self.mic_level_meter.stop()
                 self._stop_loopback()
@@ -8498,6 +8450,13 @@ class _SettingsPage(QWidget):
                 self._keyboard_preview_timer.start()
             else:
                 self._keyboard_preview_timer.stop()
+
+    def _start_audio_preview_if_current(self) -> None:
+        if (not self.isVisible() or not hasattr(self, 'mic_level_meter')
+                or self.stack.currentIndex() != 2):
+            return
+        self.mic_level_meter.set_gain(self.mic_vol_slider.value() / 100.0)
+        self.mic_level_meter.start(self._selected_mic_index())
 
     def _set_settings_content_surface(self) -> None:
         """Keep the settings canvas black outside the raised category cards."""
@@ -10419,8 +10378,7 @@ class _SettingsPage(QWidget):
         # Only run the meter when the audio sub-page is selected
         if (hasattr(self, 'stack') and self.stack.currentIndex() == 2
                 and not getattr(self, '_background_ui_paused', False)):
-            self.mic_level_meter.set_gain(self.mic_vol_slider.value() / 100.0)
-            self.mic_level_meter.start(self._selected_mic_index())
+            self._audio_preview_timer.start()
         if (hasattr(self, '_keyboard_preview_timer')
                 and hasattr(self, 'stack')
                 and self.stack.currentIndex() == 3
@@ -10428,6 +10386,7 @@ class _SettingsPage(QWidget):
             self._keyboard_preview_timer.start()
 
     def hideEvent(self, event):
+        self._audio_preview_timer.stop()
         self._stop_loopback()
         if hasattr(self, 'mic_level_meter'):
             self.mic_level_meter.stop()

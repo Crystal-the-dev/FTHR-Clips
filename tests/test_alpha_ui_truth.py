@@ -39,6 +39,64 @@ def test_gary_default_uses_the_approved_generated_logo():
     assert "'assets' / 'fthr_logo.png'" in MAIN_SOURCE
 
 
+def test_settings_stack_rapid_switch_keeps_only_latest_page(qapp):
+    pytest.importorskip('PySide6.QtWidgets')
+    from PySide6.QtWidgets import QWidget
+    from main import SlidingStackedWidget
+
+    stack = SlidingStackedWidget()
+    pages = [QWidget() for _ in range(3)]
+    for page in pages:
+        stack.addWidget(page)
+    stack.resize(800, 500)
+    stack.show()
+
+    for index in (1, 2, 0, 2, 1, 2):
+        stack.setCurrentIndex(index)
+    qapp.processEvents()
+
+    assert stack.currentIndex() == 2
+    assert pages[0].isHidden()
+    assert pages[1].isHidden()
+    assert not pages[2].isHidden()
+    source = MAIN_SOURCE[
+        MAIN_SOURCE.index('class SlidingStackedWidget'):
+        MAIN_SOURCE.index('class _SettingsPage')
+    ]
+    assert 'QPropertyAnimation' not in source
+
+
+def test_rapid_settings_tabs_debounce_audio_device_open():
+    pytest.importorskip('PySide6.QtCore')
+    from main import _SettingsPage
+
+    calls = []
+    timer = SimpleNamespace(
+        stop=lambda: calls.append('timer-stop'),
+        start=lambda: calls.append('timer-start'),
+    )
+    meter = SimpleNamespace(
+        stop=lambda: calls.append('meter-stop'),
+        start=lambda _idx: calls.append('meter-start'),
+    )
+    fake = SimpleNamespace(
+        stack=SimpleNamespace(
+            setCurrentIndex=lambda idx: calls.append(('page', idx))),
+        _audio_preview_timer=timer,
+        mic_level_meter=meter,
+        isVisible=lambda: True,
+        _start_encoder_probe=lambda: calls.append('encoder-probe'),
+        _stop_loopback=lambda: calls.append('loopback-stop'),
+    )
+
+    _SettingsPage._on_category_changed(fake, 2)
+    _SettingsPage._on_category_changed(fake, 0)
+
+    assert 'meter-start' not in calls
+    assert calls.count('timer-start') == 1
+    assert calls[-2:] == ['meter-stop', 'loopback-stop']
+
+
 @pytest.mark.parametrize(
     ('handler', 'next_handler'),
     [
