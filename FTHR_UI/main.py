@@ -183,6 +183,7 @@ from core.theme_manager import ThemeManager
 from core.windows_monitor import (
     default_windows_monitor_path,
     enumerate_windows_monitors,
+    is_valid_monitor_device_path,
     normalize_monitor_device_path,
 )
 from core.screenshot_target import (
@@ -4795,11 +4796,13 @@ class MainWindow(QMainWindow):
                 bitrate = BITRATE_PRESETS[resolution].get(
                     quality, BITRATE_PRESETS[resolution]['high'])
         monitor = self.settings_manager.get('capture_monitor', '')
-        if sys.platform == 'win32' and not normalize_monitor_device_path(monitor):
-            monitor = default_windows_monitor_path()
-            if monitor:
-                self.settings_manager.set('capture_monitor', monitor)
-                self.settings_manager.save_settings()
+        if sys.platform == 'win32':
+            current_choices = enumerate_windows_monitors()
+            if not is_valid_monitor_device_path(monitor, current_choices):
+                monitor = default_windows_monitor_path(current_choices)
+                if monitor:
+                    self.settings_manager.set('capture_monitor', monitor)
+                    self.settings_manager.save_settings()
         crop = None
         active_game = getattr(self, '_active_game_window', None)
         try:
@@ -4991,7 +4994,8 @@ class MainWindow(QMainWindow):
                 **popen_options
             )
             # Poll for connection in a background thread so the UI stays responsive.
-            # Up to 3s total (20 × 150ms). On success, fire UI updates back on
+            # Allow up to 10s total for large encoded ring buffers and slower
+            # hardware initialization before declaring startup failed.
             # the main thread via the _ui_call signal (queued cross-thread).
             #
             # Generation guard: a restart while an old poll is still running
@@ -5001,7 +5005,7 @@ class MainWindow(QMainWindow):
             _my_gen = self._engine_gen
 
             def _poll_connect():
-                for _ in range(20):
+                for _ in range(60):
                     time.sleep(0.15)
                     if self._engine_gen != _my_gen:
                         return   # superseded by a newer start/restart

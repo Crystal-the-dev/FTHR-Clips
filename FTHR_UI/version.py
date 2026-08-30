@@ -1,6 +1,6 @@
 # version.py — the single source of truth for the FTHR Clips product version.
 #
-# AUDIT-008: the version used to be hardcoded in five unrelated places
+# the version used to be hardcoded in five unrelated places
 # (window title, About label, installer script, AppImage filename, docs) and
 # they had already drifted apart once. Everything that needs to state a
 # product version now derives it from here.

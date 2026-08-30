@@ -42,7 +42,21 @@ class MonitorChoice:
 
 def normalize_monitor_device_path(device_path: str) -> str:
     """Match the engine's case/slash-insensitive persistent identity."""
+    if device_path is None:
+        return ''
     return device_path.strip().replace('/', '\\').lower()
+
+
+def is_valid_monitor_device_path(
+        device_path: str,
+        choices: Iterable[MonitorChoice] | None = None) -> bool:
+    """True when the saved device path still matches one of the active monitors."""
+    normalized = normalize_monitor_device_path(device_path)
+    if not normalized:
+        return False
+    available = list(enumerate_windows_monitors() if choices is None else choices)
+    valid_paths = {normalize_monitor_device_path(choice.device_path) for choice in available}
+    return normalized in valid_paths
 
 
 def build_monitor_choices(records: Iterable[DisplayDeviceRecord]) -> list[MonitorChoice]:

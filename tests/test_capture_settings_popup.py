@@ -127,9 +127,40 @@ def test_recording_profile_builds_the_encoder_config(monkeypatch):
         extended_clip_duration=60,
         _active_game_window=None,
     )
-    monkeypatch.setattr(main, 'default_windows_monitor_path', lambda: '')
+    monkeypatch.setattr(main, 'default_windows_monitor_path', lambda choices=None: '')
+    monkeypatch.setattr(main, 'enumerate_windows_monitors', lambda: [])
 
     config = main.MainWindow._requested_capture_config(host, 'recording')
 
     assert (config.fps, config.width, config.height, config.bitrate_kbps) == (
         30, 1280, 720, 12_500)
+
+
+def test_invalid_stored_monitor_falls_back_to_primary_monitor(monkeypatch):
+    import main
+
+    settings = _SettingsStub()
+    settings.settings['capture_monitor'] = r'\\?\display#stale-monitor'
+    host = SimpleNamespace(
+        settings_manager=settings,
+        capture_fps=60,
+        capture_width=1920,
+        capture_height=1080,
+        capture_bitrate=25_000,
+        clip_duration=30,
+        extended_clip_duration=60,
+        _active_game_window=None,
+    )
+
+    monitor_choices = [
+        SimpleNamespace(device_path=r'\\?\display#primary'),
+        SimpleNamespace(device_path=r'\\?\display#secondary'),
+    ]
+    monkeypatch.setattr(main, 'enumerate_windows_monitors', lambda: monitor_choices)
+    monkeypatch.setattr(main, 'default_windows_monitor_path',
+                        lambda choices=None: r'\\?\display#primary')
+
+    config = main.MainWindow._requested_capture_config(host)
+
+    assert config.monitor == r'\\?\display#primary'
+    assert settings.get('capture_monitor') == r'\\?\display#primary'
