@@ -30,10 +30,8 @@ if sys.platform == 'win32':
 
 
 # ---------------------------------------------------------------------------
-# File logging — every print() in the app also lands in ~/.fthr/logs/fthr.log.
-# Essential for alpha builds: packaged Windows apps (pythonw) have NO console,
-# so without this every diagnostic message vanishes into the void.
-# ---------------------------------------------------------------------------
+# File logging - all output also goes to ~/.fthr/logs/fthr.log
+# Important for packaged apps (pythonw) which have no console
 
 class _LogTee:
     """Mirror a stream (may be None in frozen GUI builds) into a log file."""
@@ -54,14 +52,14 @@ class _LogTee:
             try:
                 self._stream.write(text)
             except Exception:
-                # Logging must never crash the GUI when a console disappears.
+                # console may have disappeared
                 pass
         if self._log is not None:
             try:
                 self._log.write(text)
                 self._log.flush()
             except Exception:
-                # A failed diagnostic write cannot be recovered recursively.
+                # can't recursively try to log this
                 pass
 
     def flush(self):
@@ -70,7 +68,7 @@ class _LogTee:
                 try:
                     s.flush()
                 except Exception:
-                    # Streams may already be closed during interpreter teardown.
+                    # may be closed at shutdown
                     pass
 
 
@@ -81,21 +79,14 @@ def _setup_file_logging():
         log_file = log_dir / 'fthr.log'
         sys.stdout = _LogTee(sys.stdout, log_file)
         sys.stderr = _LogTee(sys.stderr, log_file)
-        # Version goes in the banner so a pasted log identifies its build
-        # without the reporter having to remember which one they installed.
         from version import __version__ as _ver
         print(f"\n===== FTHR Clips {_ver} started "
               f"{datetime.now():%Y-%m-%d %H:%M:%S} ({sys.platform}) =====")
-        # Structured logging into the SAME file the tee writes to, so testers
-        # keep sending one log. print() keeps working; new diagnostics go
-        # through core.diagnostics, which timestamps them, names the thread and
-        # redacts credentials on the way out (AUDIT-007).
+        # Structured logging uses the same file; print() still works
         from core import diagnostics
         diagnostics.configure(log_file=log_file)
     except Exception as e:
-        # Logging must never prevent startup — but a swallowed failure here is
-        # why a tester's log can be empty with no explanation. Say it on
-        # stderr, which is the one channel that has not been set up yet.
+        # Log setup failed - report on stderr before redirection
         print(f'[Startup] File logging unavailable: {type(e).__name__}: {e}',
               file=sys.__stderr__ or sys.stderr)
 
@@ -251,9 +242,7 @@ except Exception:
     _SD_AVAILABLE = False
 
 
-# ---------------------------------------------------------------------------
-# Constants / helpers
-# ---------------------------------------------------------------------------
+# Global constants
 
 # The bottom bar is deliberately a failure channel, not a general-purpose
 # status feed. Routine advisories and successful-but-degraded processing are
@@ -279,14 +268,13 @@ def _resolution_to_dims(name: str) -> tuple[int, int]:
 
 
 def _load_logo_asset(path: Path) -> QPixmap:
-    """Load the supplied brand mark without altering its colors."""
     if QApplication.instance() is None:
         QApplication([])
     return QPixmap(str(path))
 
 
 def _make_settings_icon(size: int = 18, color: str = Colors.TEXT) -> QIcon:
-    """Draw a minimal 3-line sliders icon using QPainter."""
+    """Minimal 3-line sliders icon."""
     pix = QPixmap(size, size)
     pix.fill(QColor(0, 0, 0, 0))
     p = QPainter(pix)
@@ -303,7 +291,7 @@ def _make_settings_icon(size: int = 18, color: str = Colors.TEXT) -> QIcon:
 
 
 def _make_power_icon(size: int = 18, color: str = Colors.TEXT) -> QIcon:
-    """Power glyph drawn at runtime so it stays crisp at Windows DPI scales."""
+    """Power glyph icon."""
     pix, painter = _icon_canvas(size)
     pen = QPen(QColor(color), max(1.4, size * 0.09))
     pen.setCapStyle(Qt.PenCapStyle.RoundCap)
@@ -325,7 +313,7 @@ def _make_power_icon(size: int = 18, color: str = Colors.TEXT) -> QIcon:
 
 
 def _icon_canvas(size: int):
-    """Return (QPixmap, QPainter) ready for stroke drawing."""
+    """Create a blank canvas for drawing an icon."""
     pix = QPixmap(size, size)
     pix.fill(QColor(0, 0, 0, 0))
     p = QPainter(pix)
