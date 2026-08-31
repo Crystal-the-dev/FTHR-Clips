@@ -13,6 +13,7 @@ enum class NvencInputSlotState : uint8_t {
     Submitted,
     CompletionSignaled,
     OutputLocked,
+    OutputConsumed,
 };
 
 class NvencInputSlotLifecycle final {
@@ -39,17 +40,28 @@ public:
             NvencInputSlotState::OutputLocked);
     }
 
+    bool OnOutputConsumed() noexcept {
+        return Transition(
+            NvencInputSlotState::OutputLocked,
+            NvencInputSlotState::OutputConsumed);
+    }
+
     bool OnRejectedSubmissionUnmapped() noexcept {
         return Transition(NvencInputSlotState::Mapped, NvencInputSlotState::Available);
     }
 
     bool OnCompletedInputUnmapped() noexcept {
-        return Transition(NvencInputSlotState::OutputLocked, NvencInputSlotState::Available);
+        return Transition(
+            NvencInputSlotState::OutputConsumed,
+            NvencInputSlotState::Available);
     }
 
     constexpr NvencInputSlotState state() const noexcept { return state_; }
     constexpr bool is_available() const noexcept {
         return state_ == NvencInputSlotState::Available;
+    }
+    constexpr bool is_ready_to_unmap() const noexcept {
+        return state_ == NvencInputSlotState::OutputConsumed;
     }
 
     void ResetForShutdown() noexcept { state_ = NvencInputSlotState::Available; }

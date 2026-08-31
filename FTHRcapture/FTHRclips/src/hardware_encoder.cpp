@@ -433,6 +433,7 @@ namespace fthr {
         , last_frame_qpc_(0)
         , drain_thread_(nullptr)
         , drain_stop_(false)
+        , drain_failed_(false)
         , callback_log_count_(0)
     {
     }
@@ -483,6 +484,7 @@ namespace fthr {
         first_frame_ = true;
         current_buf_idx_ = 0;
         pending_count_ = 0;
+        drain_failed_.store(false);
         diag_input_slots_acquired_.store(0);
         diag_map_attempts_.store(0);
         diag_maps_succeeded_.store(0);
@@ -1015,9 +1017,10 @@ namespace fthr {
         initialized_ = true;
 
         // Start async drain thread: submit threads enqueue slot indices, this
-        // thread pops FIFO and blocks in nvEncLockBitstream until each output
-        // is ready — keeping the GPU-sync wait off the CaptureThread.
+        // thread waits for completion and performs bounded output polling while
+        // keeping the GPU-sync work off the CaptureThread.
         drain_stop_.store(false);
+        drain_failed_.store(false);
         drain_thread_ = new std::thread(&HardwareEncoder::DrainThread, this);
 
         last_error_.clear();
@@ -1110,7 +1113,8 @@ namespace fthr {
             return false;
         }
 
-        // Backpressure: if drain hasn't caught up, wait for a slot. Normally a no-op.
+        // Backpressure: the preceding submission prepares this slot before exposing
+        // its texture to CaptureEngine. Keep this wait as an invariant guard.
         diag_submit_stage_.store(1);
         if (!WaitForFreeSlot()) {
             diag_submit_stage_.store(0);
@@ -1205,6 +1209,10 @@ namespace fthr {
 
         diag_submit_stage_.store(4);
         current_buf_idx_ = (current_buf_idx_ + 1) % buffer_count_;
+        if (!PrepareCurrentGpuInputSlot()) {
+            diag_submit_stage_.store(0);
+            return false;
+        }
         diag_submit_stage_.store(0);
         return true;
     }
@@ -1216,7 +1224,10 @@ namespace fthr {
 
     ID3D11Texture2D* HardwareEncoder::GetCurrentInputTexture() const noexcept {
         if (!input_textures_ || !initialized_) return nullptr;
-        return input_textures_[current_buf_idx_ % buffer_count_];
+        const uint32_t idx = current_buf_idx_ % buffer_count_;
+        if (input_slot_lifecycle_ && !input_slot_lifecycle_[idx].is_available())
+            return nullptr;
+        return input_textures_[idx];
     }
 
 
@@ -1346,14 +1357,27 @@ namespace fthr {
 
         NV_ENC_LOCK_BITSTREAM lock_bs = { NV_ENC_LOCK_BITSTREAM_VER };
         lock_bs.outputBitstream = static_cast<NV_ENC_OUTPUT_PTR>(output_buffers_[buf_idx]);
-        lock_bs.doNotWait = 0;
+        lock_bs.doNotWait = 1;
 
         diag_drain_stage_.store(9);
-        diag_bitstream_lock_attempts_.fetch_add(1);
-        NVENCSTATUS status = api->nvEncLockBitstream(nvenc_session_, &lock_bs);
-        diag_last_nvenc_status_.store(static_cast<int32_t>(status));
+        constexpr ULONGLONG kBitstreamLockTimeoutMs = 2000;
+        const ULONGLONG lock_deadline = GetTickCount64() + kBitstreamLockTimeoutMs;
+        NVENCSTATUS status = NV_ENC_ERR_LOCK_BUSY;
+        do {
+            diag_bitstream_lock_attempts_.fetch_add(1);
+            status = api->nvEncLockBitstream(nvenc_session_, &lock_bs);
+            diag_last_nvenc_status_.store(static_cast<int32_t>(status));
+            if (status != NV_ENC_ERR_LOCK_BUSY) break;
+            if (drain_stop_.load() || GetTickCount64() >= lock_deadline) break;
+            Sleep(1);
+        } while (true);
+
         if (status != NV_ENC_SUCCESS) {
             diag_drain_stage_.store(0);
+            last_error_ = status == NV_ENC_ERR_LOCK_BUSY
+                ? "NVENC bitstream remained busy after its completion event"
+                : std::string("NVENC bitstream lock failed: ")
+                    + NvencStatusToString(status);
             std::cerr << "[RetrieveOutput] nvEncLockBitstream: " << NvencStatusToString(status) << std::endl;
             return false;
         }
@@ -1418,29 +1442,14 @@ namespace fthr {
             diag_locked_bitstreams_.fetch_sub(1);
         }
 
-        // nvEncodeAPI.h requires the mapped input to remain valid until
-        // nvEncLockBitstream() returns successfully. Only release it after the
-        // corresponding output has been consumed and unlocked.
-        NVENCSTATUS unmap_status = NV_ENC_SUCCESS;
-        if (!cpu_input_mode_) {
-            void* mapped_input = mapped_input_resources_[buf_idx];
-            unmap_status = mapped_input
-                ? api->nvEncUnmapInputResource(
-                    nvenc_session_, static_cast<NV_ENC_INPUT_PTR>(mapped_input))
-                : NV_ENC_ERR_RESOURCE_NOT_MAPPED;
-            diag_last_nvenc_status_.store(static_cast<int32_t>(unmap_status));
-            if (unmap_status == NV_ENC_SUCCESS) {
-                mapped_input_resources_[buf_idx] = nullptr;
-                if (!input_slot_lifecycle_[buf_idx].OnCompletedInputUnmapped()) {
-                    unmap_status = NV_ENC_ERR_INVALID_CALL;
-                } else {
-                    diag_resources_unmapped_.fetch_add(1);
-                    diag_mapped_resources_.fetch_sub(1);
-                }
-            }
+        if (status == NV_ENC_SUCCESS && !cpu_input_mode_
+            && !input_slot_lifecycle_[buf_idx].OnOutputConsumed()) {
+            status = NV_ENC_ERR_INVALID_CALL;
+            last_error_ = "NVENC output unlock completed in an invalid input-slot state";
+            std::cerr << "[RetrieveOutput] " << last_error_ << std::endl;
         }
         diag_drain_stage_.store(0);
-        return status == NV_ENC_SUCCESS && unmap_status == NV_ENC_SUCCESS;
+        return status == NV_ENC_SUCCESS;
     }
 
 
@@ -1452,15 +1461,64 @@ namespace fthr {
         std::unique_lock<std::mutex> lk(drain_mutex_);
         // Leave at least one output buffer untouched by submit while drain holds it.
         slot_cv_.wait(lk, [this] {
-            return pending_count_ < buffer_count_ || drain_stop_.load();
+            return pending_count_ < buffer_count_
+                || drain_stop_.load()
+                || drain_failed_.load();
         });
-        return !drain_stop_.load();
+        return !drain_stop_.load() && !drain_failed_.load();
+    }
+
+    bool HardwareEncoder::PrepareCurrentGpuInputSlot() {
+        if (cpu_input_mode_) return true;
+
+        diag_submit_stage_.store(1);
+        if (!WaitForFreeSlot()) return false;
+
+        const uint32_t idx = current_buf_idx_ % buffer_count_;
+        NvencInputSlotLifecycle& lifecycle = input_slot_lifecycle_[idx];
+        if (lifecycle.is_ready_to_unmap()) {
+            void* mapped_input = mapped_input_resources_[idx];
+            if (!mapped_input) {
+                last_error_ = "NVENC completed input slot lost its mapped resource";
+                std::cerr << "[PrepareCurrentGpuInputSlot] " << last_error_ << std::endl;
+                return false;
+            }
+
+            diag_submit_stage_.store(10);
+            NV_ENCODE_API_FUNCTION_LIST* api =
+                static_cast<NV_ENCODE_API_FUNCTION_LIST*>(nvenc_encoder_);
+            const NVENCSTATUS status = api->nvEncUnmapInputResource(
+                nvenc_session_, static_cast<NV_ENC_INPUT_PTR>(mapped_input));
+            diag_last_nvenc_status_.store(static_cast<int32_t>(status));
+            if (status != NV_ENC_SUCCESS) {
+                last_error_ = std::string("NVENC input unmap failed: ")
+                    + NvencStatusToString(status);
+                std::cerr << "[PrepareCurrentGpuInputSlot] " << last_error_ << std::endl;
+                return false;
+            }
+            mapped_input_resources_[idx] = nullptr;
+            if (!lifecycle.OnCompletedInputUnmapped()) {
+                last_error_ = "NVENC input slot rejected its completed unmap";
+                std::cerr << "[PrepareCurrentGpuInputSlot] " << last_error_ << std::endl;
+                return false;
+            }
+            diag_resources_unmapped_.fetch_add(1);
+            diag_mapped_resources_.fetch_sub(1);
+            diag_slots_recycled_.fetch_add(1);
+        }
+
+        if (!lifecycle.is_available()) {
+            last_error_ = "NVENC next input slot is not available for capture";
+            std::cerr << "[PrepareCurrentGpuInputSlot] " << last_error_ << std::endl;
+            return false;
+        }
+        return true;
     }
 
     void HardwareEncoder::DrainThread() {
         // SetThreadDescription for easier profiling.
-        // Runs at NORMAL priority — it spends most of its time blocked inside
-        // nvEncLockBitstream (a kernel wait on the GPU), not burning CPU.
+        // Runs at NORMAL priority and sleeps between non-blocking lock attempts,
+        // so driver failure cannot hold the thread indefinitely or burn CPU.
         while (true) {
             uint32_t idx;
             {
@@ -1479,9 +1537,7 @@ namespace fthr {
             diag_drain_stage_.store(5);
             diag_drain_dequeues_.fetch_add(1);
 
-            // RetrieveOutput blocks in nvEncLockBitstream until this slot's
-            // encoded output is ready, then fires packet_callback_.
-            RetrieveOutput(idx);
+            const bool output_ok = RetrieveOutput(idx);
 
             {
                 std::lock_guard<std::mutex> lk(drain_mutex_);
@@ -1489,9 +1545,14 @@ namespace fthr {
                 if (diag_pending_resources_.load() > 0)
                     diag_pending_resources_.fetch_sub(1);
             }
-            diag_slots_recycled_.fetch_add(1);
+            if (!output_ok) {
+                drain_failed_.store(true);
+            } else if (cpu_input_mode_) {
+                diag_slots_recycled_.fetch_add(1);
+            }
             diag_drain_stage_.store(0);
             slot_cv_.notify_all();
+            if (!output_ok) return;
         }
     }
 
@@ -1521,7 +1582,8 @@ namespace fthr {
             {
                 std::unique_lock<std::mutex> lk(drain_mutex_);
                 slot_cv_.wait(lk, [this] {
-                    return drain_queue_.empty() && pending_count_ == 0;
+                    return (drain_queue_.empty() && pending_count_ == 0)
+                        || drain_failed_.load();
                 });
             }
         }
@@ -1619,6 +1681,7 @@ namespace fthr {
         last_forced_idr_pts_ = -1;
         first_frame_ = true;
         drain_stop_.store(false);
+        drain_failed_.store(false);
         drain_queue_.clear();
         callback_log_count_ = 0;
 

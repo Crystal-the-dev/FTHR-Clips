@@ -32,6 +32,12 @@ int RunNvencInputLifecycleTests() {
     Require(slot.OnCompletionSignaled(),
         "submitted slot must accept its completion event"); ++checks;
     Require(slot.OnOutputLocked(), "submitted slot must accept output completion"); ++checks;
+    Require(!slot.OnCompletedInputUnmapped(),
+        "locked output must be consumed before input unmap"); ++checks;
+    Require(slot.OnOutputConsumed(),
+        "unlocked output must become ready for submit-thread unmap"); ++checks;
+    Require(slot.is_ready_to_unmap(),
+        "consumed output must advertise submit-thread unmap readiness"); ++checks;
     Require(slot.OnCompletedInputUnmapped(),
         "completed slot must unmap and recycle"); ++checks;
     Require(slot.is_available(), "completed slot must return to the pool"); ++checks;
@@ -41,6 +47,7 @@ int RunNvencInputLifecycleTests() {
         Require(slot.OnSubmitted(), "1000-cycle submit transition"); ++checks;
         Require(slot.OnCompletionSignaled(), "1000-cycle completion transition"); ++checks;
         Require(slot.OnOutputLocked(), "1000-cycle output transition"); ++checks;
+        Require(slot.OnOutputConsumed(), "1000-cycle output-consumed transition"); ++checks;
         Require(slot.OnCompletedInputUnmapped(), "1000-cycle recycle transition"); ++checks;
     }
 

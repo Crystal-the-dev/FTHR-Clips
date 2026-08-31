@@ -138,20 +138,24 @@ namespace fthr {
         // Compute wall-clock PTS from a DXGI present QPC (or current QPC if 0).
         int64_t ComputePts(int64_t dxgi_present_qpc);
 
-        // Drain thread: pops submitted slot indices in FIFO order, blocks in
-        // nvEncLockBitstream until each output is ready, fires packet_callback_.
-        // Keeps nvEncLockBitstream off the CaptureThread so video capture never
-        // waits on GPU encode completion.
+        // Drain thread: pops submitted slot indices in FIFO order, waits for the
+        // completion event, then polls nvEncLockBitstream with a bounded timeout.
+        // Keeps GPU encode completion work off the CaptureThread.
         void DrainThread();
 
         // Block until the submit ring has a free slot (pending_count_ < buffer_count_).
         bool WaitForFreeSlot();
+
+        // Prepare the next GPU slot on the submit thread. This owns the matching
+        // unmap operation so map/unmap calls cannot race across threads.
+        bool PrepareCurrentGpuInputSlot();
 
         // -----------------------------------------------------------------------
         // Async drain state
         // -----------------------------------------------------------------------
         std::thread*            drain_thread_;
         std::atomic<bool>       drain_stop_;
+        std::atomic<bool>       drain_failed_;
         std::mutex              drain_mutex_;
         std::condition_variable drain_cv_;     // signalled when an idx is enqueued
         std::condition_variable slot_cv_;      // signalled when drain frees a slot
