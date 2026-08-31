@@ -140,3 +140,17 @@ def test_asset_artifact_rejects_unapproved_extra_file(tmp_path):
     vrl.check_asset_artifact(
         artifact, rep, 'windows', manifest_root=source)
     assert any('unapproved assets' in failure for failure in rep.failures)
+
+
+def test_asset_artifact_rejects_unapproved_os_metadata(tmp_path):
+    source, content = _fixture(tmp_path / 'source')
+    artifact = tmp_path / 'artifact'
+    path = artifact / '_internal' / 'assets' / 'logo.png'
+    path.parent.mkdir(parents=True)
+    path.write_bytes(content)
+    (path.parent / 'desktop.ini').write_text(
+        '[LocalizedFileNames]\n', encoding='utf-8')
+    rep = vrl.Report()
+    vrl.check_asset_artifact(
+        artifact, rep, 'windows', manifest_root=source)
+    assert any('desktop.ini' in failure for failure in rep.failures)

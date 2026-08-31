@@ -650,10 +650,8 @@ def check_asset_artifact(root: Path, rep: Report, platform: str,
             rep.ok(f'{platform} artifact asset: {rel}')
 
     actual = set()
-    extensions = {str(item).casefold()
-                  for item in data.get('asset_extensions') or ()}
     for path in root.rglob('*'):
-        if not path.is_file() or path.suffix.casefold() not in extensions:
+        if not path.is_file():
             continue
         rel = path.relative_to(root).as_posix()
         if rel.startswith('_internal/assets/') or rel == 'fthr-clips.png':

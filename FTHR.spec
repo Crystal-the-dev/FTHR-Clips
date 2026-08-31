@@ -13,6 +13,17 @@ OPTIONAL_PLUGIN_BUNDLES = [
     PLUGIN_DIR / 'FTHR-Uploader.fthrplugin',
     PLUGIN_DIR / 'FTHR-Hardware-Identity.fthrplugin',
 ]
+
+
+def _asset_files(source, destination, allowed_suffixes):
+    """Collect only product asset types, never OS folder metadata."""
+    return [
+        (str(path), destination)
+        for path in sorted(source.iterdir())
+        if path.is_file() and path.suffix.casefold() in allowed_suffixes
+    ]
+
+
 for _plugin_bundle in OPTIONAL_PLUGIN_BUNDLES:
     if not _plugin_bundle.is_file():
         raise FileNotFoundError(
@@ -103,9 +114,9 @@ a = Analysis(
         (str(ROOT / 'THIRD_PARTY_NOTICES.md'), '.'),
         (str(ROOT / 'licenses'), 'licenses'),
         (str(ROOT / 'tools' / 'release_asset_manifest.json'), 'licenses'),
-        (str(ASSETS_DIR / 'fonts'),            'assets/fonts'),
-        (str(ASSETS_DIR / 'icons'),            'assets/icons'),
-        (str(ASSETS_DIR / 'sounds'),           'assets/sounds'),
+        *_asset_files(ASSETS_DIR / 'fonts', 'assets/fonts', {'.ttf'}),
+        *_asset_files(ASSETS_DIR / 'icons', 'assets/icons', {'.ico', '.png'}),
+        *_asset_files(ASSETS_DIR / 'sounds', 'assets/sounds', {'.wav'}),
         (str(UI_DIR / 'ui' / 'capture_card_process.py'), 'ui'),
     ],
     hiddenimports=[
