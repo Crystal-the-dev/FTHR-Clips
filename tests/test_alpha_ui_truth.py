@@ -97,6 +97,28 @@ def test_rapid_settings_tabs_debounce_audio_device_open():
     assert calls[-2:] == ['meter-stop', 'loopback-stop']
 
 
+def test_delayed_audio_preview_does_not_start_after_background_pause():
+    pytest.importorskip('PySide6.QtCore')
+    from main import _SettingsPage
+
+    calls = []
+    fake = SimpleNamespace(
+        stack=SimpleNamespace(currentIndex=lambda: 2),
+        mic_level_meter=SimpleNamespace(
+            set_gain=lambda _gain: calls.append('gain'),
+            start=lambda _idx: calls.append('start'),
+        ),
+        mic_vol_slider=SimpleNamespace(value=lambda: 100),
+        _selected_mic_index=lambda: None,
+        _background_ui_paused=True,
+        isVisible=lambda: True,
+    )
+
+    _SettingsPage._start_audio_preview_if_current(fake)
+
+    assert calls == []
+
+
 @pytest.mark.parametrize(
     ('handler', 'next_handler'),
     [

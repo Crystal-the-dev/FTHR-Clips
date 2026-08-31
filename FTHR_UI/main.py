@@ -8453,7 +8453,8 @@ class _SettingsPage(QWidget):
 
     def _start_audio_preview_if_current(self) -> None:
         if (not self.isVisible() or not hasattr(self, 'mic_level_meter')
-                or self.stack.currentIndex() != 2):
+                or self.stack.currentIndex() != 2
+                or getattr(self, '_background_ui_paused', False)):
             return
         self.mic_level_meter.set_gain(self.mic_vol_slider.value() / 100.0)
         self.mic_level_meter.start(self._selected_mic_index())
@@ -10399,6 +10400,7 @@ class _SettingsPage(QWidget):
         paused = bool(paused)
         self._background_ui_paused = paused
         if paused:
+            self._audio_preview_timer.stop()
             if hasattr(self, 'mic_level_meter'):
                 self.mic_level_meter.stop()
             for name in ('_camera_preview_timer', '_keyboard_preview_timer'):
@@ -10411,9 +10413,7 @@ class _SettingsPage(QWidget):
             return
         idx = self.stack.currentIndex()
         if idx == 2 and hasattr(self, 'mic_level_meter'):
-            self.mic_level_meter.set_gain(
-                self.mic_vol_slider.value() / 100.0)
-            self.mic_level_meter.start(self._selected_mic_index())
+            self._audio_preview_timer.start()
         if (idx == 3
                 and self.sm.get('camera_enabled', False)
                 and hasattr(self, '_camera_preview_timer')):
