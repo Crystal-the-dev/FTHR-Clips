@@ -71,6 +71,9 @@ def test_rapid_settings_tabs_debounce_audio_device_open():
     from main import _SettingsPage
 
     calls = []
+    category_timer = SimpleNamespace(
+        start=lambda: calls.append('category-start'),
+    )
     timer = SimpleNamespace(
         stop=lambda: calls.append('timer-stop'),
         start=lambda: calls.append('timer-start'),
@@ -81,8 +84,12 @@ def test_rapid_settings_tabs_debounce_audio_device_open():
     )
     fake = SimpleNamespace(
         stack=SimpleNamespace(
+            count=lambda: 6,
             setCurrentIndex=lambda idx: calls.append(('page', idx))),
         _audio_preview_timer=timer,
+        _category_switch_timer=category_timer,
+        _pending_category_index=0,
+        _background_ui_paused=False,
         mic_level_meter=meter,
         isVisible=lambda: True,
         _start_encoder_probe=lambda: calls.append('encoder-probe'),
@@ -91,10 +98,47 @@ def test_rapid_settings_tabs_debounce_audio_device_open():
 
     _SettingsPage._on_category_changed(fake, 2)
     _SettingsPage._on_category_changed(fake, 0)
+    assert ('page', 2) not in calls
+    assert ('page', 0) not in calls
+
+    _SettingsPage._apply_pending_category(fake)
 
     assert 'meter-start' not in calls
-    assert calls.count('timer-start') == 1
+    assert calls.count('timer-start') == 0
     assert calls[-2:] == ['meter-stop', 'loopback-stop']
+
+
+def test_rapid_settings_tabs_only_apply_the_latest_page():
+    pytest.importorskip('PySide6.QtCore')
+    from main import _SettingsPage
+
+    calls = []
+    fake = SimpleNamespace(
+        stack=SimpleNamespace(
+            count=lambda: 6,
+            setCurrentIndex=lambda idx: calls.append(('page', idx))),
+        _category_switch_timer=SimpleNamespace(
+            start=lambda: calls.append('category-start')),
+        _audio_preview_timer=SimpleNamespace(
+            stop=lambda: calls.append('audio-stop'),
+            start=lambda: calls.append('audio-start')),
+        _pending_category_index=0,
+        _background_ui_paused=False,
+        isVisible=lambda: True,
+        _start_encoder_probe=lambda: calls.append('encoder-probe'),
+        _stop_loopback=lambda: calls.append('loopback-stop'),
+    )
+
+    for index in (3, 4, 1, 5):
+        _SettingsPage._on_category_changed(fake, index)
+
+    assert not any(isinstance(call, tuple) for call in calls)
+    assert fake._pending_category_index == 5
+
+    _SettingsPage._apply_pending_category(fake)
+
+    assert [call for call in calls if isinstance(call, tuple)] == [('page', 5)]
+    assert calls.count('encoder-probe') == 1
 
 
 def test_delayed_audio_preview_does_not_start_after_background_pause():

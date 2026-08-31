@@ -8327,6 +8327,7 @@ class _SettingsPage(QWidget):
         self.sm = settings_manager
         self._keyboard_capture = keyboard_capture
         self._keyboard_windows: list[dict] = []
+        self._background_ui_paused = False
         self.setObjectName('settingsPage')
         self._loopback_stream = None
         self._presets_mgr = PresetsManager()
@@ -8338,6 +8339,12 @@ class _SettingsPage(QWidget):
         self._audio_preview_timer.setInterval(180)
         self._audio_preview_timer.timeout.connect(
             self._start_audio_preview_if_current)
+        self._pending_category_index = 0
+        self._category_switch_timer = QTimer(self)
+        self._category_switch_timer.setSingleShot(True)
+        self._category_switch_timer.setInterval(60)
+        self._category_switch_timer.timeout.connect(
+            self._apply_pending_category)
         self.encoder_capabilities_ready.connect(
             self._on_encoder_capabilities_ready)
         self._setup_ui()
@@ -8426,6 +8433,22 @@ class _SettingsPage(QWidget):
         self._tab_buttons[0].setChecked(True)
 
     def _on_category_changed(self, idx):
+        """Coalesce rapid tab clicks so intermediate heavy pages are not painted."""
+        if idx < 0 or idx >= self.stack.count():
+            return
+        self._pending_category_index = idx
+        self._audio_preview_timer.stop()
+        if idx != 2 and hasattr(self, 'mic_level_meter'):
+            self.mic_level_meter.stop()
+            self._stop_loopback()
+        if idx != 3 and hasattr(self, '_keyboard_preview_timer'):
+            self._keyboard_preview_timer.stop()
+        self._category_switch_timer.start()
+
+    def _apply_pending_category(self):
+        if getattr(self, '_background_ui_paused', False):
+            return
+        idx = self._pending_category_index
         self.stack.setCurrentIndex(idx)
         if idx in (1, 5):
             self._start_encoder_probe()
@@ -10376,6 +10399,11 @@ class _SettingsPage(QWidget):
     # Page lifecycle — start/stop the live meter as the page comes/goes
     def showEvent(self, event):
         super().showEvent(event)
+        if (hasattr(self, '_category_switch_timer')
+                and self._pending_category_index != self.stack.currentIndex()
+                and not getattr(self, '_background_ui_paused', False)):
+            self._category_switch_timer.start()
+            return
         # Only run the meter when the audio sub-page is selected
         if (hasattr(self, 'stack') and self.stack.currentIndex() == 2
                 and not getattr(self, '_background_ui_paused', False)):
@@ -10387,6 +10415,7 @@ class _SettingsPage(QWidget):
             self._keyboard_preview_timer.start()
 
     def hideEvent(self, event):
+        self._category_switch_timer.stop()
         self._audio_preview_timer.stop()
         self._stop_loopback()
         if hasattr(self, 'mic_level_meter'):
@@ -10400,6 +10429,7 @@ class _SettingsPage(QWidget):
         paused = bool(paused)
         self._background_ui_paused = paused
         if paused:
+            self._category_switch_timer.stop()
             self._audio_preview_timer.stop()
             if hasattr(self, 'mic_level_meter'):
                 self.mic_level_meter.stop()
@@ -10410,6 +10440,9 @@ class _SettingsPage(QWidget):
             return
 
         if not self.isVisible() or not hasattr(self, 'stack'):
+            return
+        if self._pending_category_index != self.stack.currentIndex():
+            self._category_switch_timer.start()
             return
         idx = self.stack.currentIndex()
         if idx == 2 and hasattr(self, 'mic_level_meter'):
