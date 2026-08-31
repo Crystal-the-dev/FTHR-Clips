@@ -46,6 +46,9 @@ def test_native_engine_has_a_graceful_shutdown_command_without_layout_change():
 
 
 def test_source_mode_prefers_the_fresh_direct_project_engine():
+    cfr_release = (
+        "project_root / 'FTHRclips' / 'x64' / 'CFRRelease' / 'FTHRclips.exe'"
+    )
     direct_release = (
         "project_root / 'FTHRclips' / 'x64' / 'Release' / 'FTHRclips.exe'"
     )
@@ -53,7 +56,10 @@ def test_source_mode_prefers_the_fresh_direct_project_engine():
         "project_root / 'x64' / 'Release' / 'FTHRClips.exe'"
     )
 
+    assert cfr_release in MAIN_SOURCE
     assert direct_release in MAIN_SOURCE
     assert compatibility_release in MAIN_SOURCE
+    assert MAIN_SOURCE.index(cfr_release) < MAIN_SOURCE.index(direct_release)
     assert MAIN_SOURCE.index(direct_release) < MAIN_SOURCE.index(compatibility_release)
-    assert 'print(f"Engine found: {p.resolve()}")' in MAIN_SOURCE
+    assert 'self.engine_path = max(' in MAIN_SOURCE
+    assert 'print(f"Engine found: {self.engine_path.resolve()}")' in MAIN_SOURCE

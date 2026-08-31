@@ -13,6 +13,8 @@ rem Source mode needs both a Windows capture engine and a Python interpreter.
 rem The engine is checked in build-output order, with Release preferred.
 set "ENGINE_PATH="
 for %%P in (
+    "%ROOT%FTHRcapture\FTHRclips\x64\CFRReleaseFinal\FTHRclips.exe"
+    "%ROOT%FTHRcapture\FTHRclips\x64\CFRRelease\FTHRclips.exe"
     "%ROOT%FTHRcapture\FTHRclips\x64\Release\FTHRclips.exe"
     "%ROOT%FTHRcapture\FTHRclips\x64\Debug\FTHRclips.exe"
     "%ROOT%FTHRcapture\x64\Release\FTHRClips.exe"

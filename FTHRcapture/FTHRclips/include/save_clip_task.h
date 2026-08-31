@@ -103,6 +103,9 @@ namespace fthr {
         // above are converted to one Default Mix only while older callers
         // remain in the tree.
         std::vector<EncodedAudioTrack> encoded_audio_tracks;
+        // Native Windows saves are assembled from source packets first. The
+        // UI's combined-mode finalizer collapses those streams after commit.
+        bool separate_audio_enabled = false;
 
         // ------------------------------------------------------------------
         // Shared fields

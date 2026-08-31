@@ -16,6 +16,7 @@ def test_new_defaults_present(tmp_path, monkeypatch):
     assert sm.get('recording_resolution') == 'source'
     assert sm.get('recording_bitrate_level') == 'medium'
     assert sm.get('error_notifications_enabled') is True
+    assert sm.get('audio_capture_mode') == 'combined'
     assert sm.get('clips_directory') == str(tmp_path / 'FTHR_Clips')
 
 

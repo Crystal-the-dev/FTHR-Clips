@@ -27,7 +27,6 @@ from core.upload_manager import (
     CATBOX_LEGAL_VERSION,
     LUSTFUL_LEGAL_VERSION,
 )
-from core.export_profiles import provider_limit_mb
 from core.uploader_bundle_manifest import (
     HARDWARE_POLICY_VERSION,
     UPLOADER_PRIVACY_VERSION,
@@ -58,6 +57,7 @@ LUSTFUL_HOME_URL = 'https://fthr.lustful.wtf/'
 LUSTFUL_TERMS_URL = 'https://fthr.lustful.wtf/tos'
 LUSTFUL_PRIVACY_URL = 'https://fthr.lustful.wtf/privacy'
 LUSTFUL_DONATE_URL = 'https://fthr.lustful.wtf/donate'
+_CUSTOM_PROVIDER = 'custom'
 
 
 def _section_header(title: str) -> QWidget:
@@ -278,12 +278,6 @@ class UploadSettingsWidget(QWidget):
         self.enable_check.setStyleSheet(checkbox_qss())
         self.enable_check.stateChanged.connect(self._on_enabled_changed)
         layout.addWidget(self.enable_check)
-        install_note = QLabel(
-            'The uploader is a separate package. It is installed only after you '
-            'enable it and accept its Terms of Service and Privacy Policy.')
-        install_note.setWordWrap(True)
-        install_note.setStyleSheet(label_body(Colors.TEXT_MUTED, Fonts.SIZE_BODY))
-        layout.addWidget(install_note)
 
         support_row = QHBoxLayout()
         support_row.setContentsMargins(0, 16, 0, 0)
@@ -333,6 +327,7 @@ class UploadSettingsWidget(QWidget):
         self.provider_combo = WheelSafeComboBox()
         self.provider_combo.addItem('Catbox', 'catbox')
         self.provider_combo.addItem('Lustful', 'lustful')
+        self.provider_combo.addItem('Your server', _CUSTOM_PROVIDER)
         self.provider_combo.setStyleSheet(combo_qss())
         self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
         provider_row.addWidget(self.provider_combo, 1)
@@ -341,12 +336,6 @@ class UploadSettingsWidget(QWidget):
         self.website_btn.clicked.connect(self._open_provider)
         provider_row.addWidget(self.website_btn)
         body.addLayout(provider_row)
-
-        self.provider_note = QLabel()
-        self.provider_note.setWordWrap(True)
-        self.provider_note.setStyleSheet(label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
-        body.addSpacing(8)
-        body.addWidget(self.provider_note)
 
         self.catbox_panel = QWidget()
         catbox_row = QHBoxLayout(self.catbox_panel)
@@ -357,6 +346,33 @@ class UploadSettingsWidget(QWidget):
         self.catbox_userhash.setStyleSheet(lineedit_qss())
         catbox_row.addWidget(self.catbox_userhash, 1)
         body.addWidget(self.catbox_panel)
+
+        self.custom_panel = QFrame()
+        self.custom_panel.setStyleSheet(
+            f'background: {Colors.SURFACE_1}; border: 1px solid {Colors.BORDER}; '
+            f'border-left: 3px solid {Colors.ACCENT};')
+        custom_body = QVBoxLayout(self.custom_panel)
+        custom_body.setContentsMargins(16, 14, 16, 14)
+        custom_body.setSpacing(8)
+
+        server_url_row = QHBoxLayout()
+        server_url_row.setSpacing(10)
+        server_url_row.addWidget(_field_label('Server URL'))
+        self.server_url_edit = QLineEdit()
+        self.server_url_edit.setPlaceholderText('https://your-server.example.com/upload')
+        self.server_url_edit.setStyleSheet(lineedit_qss())
+        server_url_row.addWidget(self.server_url_edit, 1)
+        custom_body.addLayout(server_url_row)
+
+        server_auth_row = QHBoxLayout()
+        server_auth_row.setSpacing(10)
+        server_auth_row.addWidget(_field_label('Auth header'))
+        self.server_auth_edit = QLineEdit()
+        self.server_auth_edit.setPlaceholderText('Bearer token123  (optional)')
+        self.server_auth_edit.setStyleSheet(lineedit_qss())
+        server_auth_row.addWidget(self.server_auth_edit, 1)
+        custom_body.addLayout(server_auth_row)
+        body.addWidget(self.custom_panel)
 
         self.lustful_panel = QFrame()
         self.lustful_panel.setStyleSheet(
@@ -451,12 +467,6 @@ class UploadSettingsWidget(QWidget):
             'Automatically compress oversized clips before upload')
         self.auto_compress_check.setStyleSheet(checkbox_qss())
         body.addWidget(self.auto_compress_check)
-        compress_note = QLabel(
-            f'Uses a provider-safe target: Catbox {provider_limit_mb("catbox")} MB · '
-            f'Lustful {provider_limit_mb("lustful")} MB. The original clip stays unchanged.')
-        compress_note.setWordWrap(True)
-        compress_note.setStyleSheet(label_body(Colors.TEXT_MUTED, Fonts.SIZE_BODY))
-        body.addWidget(compress_note)
 
         body.addSpacing(24)
         body.addWidget(_section_header('Post-Upload'))
@@ -478,10 +488,14 @@ class UploadSettingsWidget(QWidget):
         provider = self._sm.get('upload_provider', 'catbox')
         if provider == 'fthr':
             provider = 'lustful'
+        if provider in {'own_server', 'your_server'}:
+            provider = _CUSTOM_PROVIDER
         index = self.provider_combo.findData(provider)
         self.provider_combo.setCurrentIndex(index if index >= 0 else 0)
         self._selected_provider = provider
         self.catbox_userhash.setText(self._sm.get('catbox_userhash', ''))
+        self.server_url_edit.setText(self._sm.get('upload_server_url', ''))
+        self.server_auth_edit.setText(self._sm.get('upload_auth_header', ''))
         mode = self._sm.get('upload_mode', 'manual')
         self.mode_immediate.setChecked(mode == 'immediate')
         self.mode_interval.setChecked(mode == 'interval')
@@ -551,6 +565,8 @@ class UploadSettingsWidget(QWidget):
         self._body.setVisible(False)
 
     def _ensure_provider_ready(self, provider: str) -> bool:
+        if provider == _CUSTOM_PROVIDER:
+            return True
         if not self._sm.provider_consent_current(provider):
             if not _provider_consent_dialog(self, provider):
                 return False
@@ -602,21 +618,24 @@ class UploadSettingsWidget(QWidget):
 
     def _apply_provider(self, provider: str) -> None:
         catbox = provider == 'catbox'
+        lustful = provider == 'lustful'
+        custom = provider == _CUSTOM_PROVIDER
         self.catbox_panel.setVisible(catbox)
-        self.lustful_panel.setVisible(not catbox)
+        self.lustful_panel.setVisible(lustful)
+        self.custom_panel.setVisible(custom)
+        self.website_btn.setVisible(not custom)
         self.website_btn.setText('OPEN CATBOX' if catbox else 'OPEN LUSTFUL')
-        self.provider_note.setText(
-            'Public file hosting through Catbox. Anonymous uploads work without a userhash.'
-            if catbox else
-            'Seven-day clip hosting with a hardware-bound account. Hardware Identity '
-            'is a second optional install and is never needed by Catbox.')
         self.catbox_donate_btn.setVisible(catbox)
-        self.lustful_donate_btn.setVisible(not catbox)
+        self.lustful_donate_btn.setVisible(lustful)
 
     def _open_provider(self) -> None:
         provider = self.provider_combo.currentData() or 'catbox'
-        QDesktopServices.openUrl(QUrl(
-            'https://catbox.moe/' if provider == 'catbox' else LUSTFUL_HOME_URL))
+        if provider == _CUSTOM_PROVIDER:
+            url = self.server_url_edit.text().strip()
+        else:
+            url = 'https://catbox.moe/' if provider == 'catbox' else LUSTFUL_HOME_URL
+        if url:
+            QDesktopServices.openUrl(QUrl(url))
 
     def _on_save(self) -> None:
         provider = self.provider_combo.currentData() or 'catbox'
@@ -627,6 +646,12 @@ class UploadSettingsWidget(QWidget):
             return
         self._sm.set('upload_provider', provider)
         self._sm.set('catbox_userhash', self.catbox_userhash.text().strip())
+        server_url = self.server_url_edit.text().strip()
+        if server_url and not server_url.lower().startswith(('http://', 'https://')):
+            server_url = f'https://{server_url}'
+            self.server_url_edit.setText(server_url)
+        self._sm.set('upload_server_url', server_url)
+        self._sm.set('upload_auth_header', self.server_auth_edit.text().strip())
         mode = {0: 'immediate', 1: 'interval', 2: 'manual'}.get(
             self._mode_group.checkedId(), 'manual')
         self._sm.set('upload_mode', mode)
@@ -650,6 +675,10 @@ class UploadSettingsWidget(QWidget):
         provider = self.provider_combo.currentData() or 'catbox'
         if not self._ensure_provider_ready(provider):
             return
+        if provider == _CUSTOM_PROVIDER and not self.server_url_edit.text().strip():
+            self._test_status.setText('Enter a server URL first')
+            self._test_status.setStyleSheet(label_body(Colors.ERROR, Fonts.SIZE_BODY))
+            return
         self.test_btn.setEnabled(False)
         self._test_status.setText('Testing…')
 
@@ -658,6 +687,8 @@ class UploadSettingsWidget(QWidget):
                 ok, message = self._sm.test_connection({
                     'upload_provider': provider,
                     'catbox_userhash': self.catbox_userhash.text().strip(),
+                    'upload_server_url': self.server_url_edit.text().strip(),
+                    'upload_auth_header': self.server_auth_edit.text().strip(),
                 })
             except Exception as exc:
                 ok, message = False, str(exc)

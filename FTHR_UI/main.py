@@ -8,6 +8,7 @@ Layout:
 """
 
 import sys
+import json
 import subprocess
 import time
 import math
@@ -18,6 +19,12 @@ import threading
 from pathlib import Path
 from datetime import datetime
 _NO_WINDOW = {'creationflags': subprocess.CREATE_NO_WINDOW} if sys.platform == 'win32' else {}
+_BACKGROUND_NO_WINDOW = {
+    'creationflags': (
+        subprocess.CREATE_NO_WINDOW
+        | getattr(subprocess, 'BELOW_NORMAL_PRIORITY_CLASS', 0)
+    ),
+} if sys.platform == 'win32' else {}
 
 # Qt 6.11 defaults to its FFmpeg multimedia plugin on Windows. Profiling this
 # editor found that plugin retained one native handle on every media-source
@@ -100,14 +107,14 @@ from PySide6.QtWidgets import (
     QCheckBox, QSlider,
     QToolButton, QButtonGroup, QFileDialog, QLineEdit, QMenu,
     QSystemTrayIcon, QSpinBox, QAbstractSpinBox,
-    QLayout, QDialog,
+    QLayout, QDialog, QStyle, QStyleOptionSlider,
 )
 from PySide6.QtCore import (
-    QTimer, QProcess, Signal, Qt, QPoint, QPointF, QSize, QRect,
+    QTimer, QProcess, Signal, Qt, QPoint, QPointF, QSize, QRect, QEvent,
     QPropertyAnimation, QEasingCurve,
     QParallelAnimationGroup,
 )
-from PySide6.QtGui import QPixmap, QFontDatabase, QFont, QCursor, QPainter, QPen, QColor, QIcon, QBrush, QPolygonF, QPalette, QAction
+from PySide6.QtGui import QImage, QPixmap, QFontDatabase, QFont, QCursor, QPainter, QPen, QColor, QIcon, QBrush, QPolygonF, QPalette, QAction
 
 from version import __version__ as APP_VERSION, APP_NAME
 from core import linux_tools
@@ -124,6 +131,9 @@ from core.capture_settings import (
     CaptureConfig,
     CaptureConfigTracker,
     compute_buffer_seconds,
+    AUDIO_CAPTURE_MODE_COMBINED,
+    AUDIO_CAPTURE_MODE_SEPARATED,
+    normalize_audio_capture_mode,
     validate_extended_clip_length,
     validate_fps,
     validate_normal_clip_length,
@@ -147,8 +157,8 @@ from core.engine_startup_diagnostics import (
     extract_startup_warnings,
 )
 from core.clip_files import cleanup_stale_partial_clips, is_completed_video_path
-from core.audio_manifest import rebind_manifest_after_media_replace
-from core.clip_readiness import get_clip_readiness_registry
+from core.audio_manifest import manifest_path_for, rebind_manifest_after_media_replace
+from core.clip_readiness import ClipReadinessState, get_clip_readiness_registry
 from core.save_state import (SaveStateMachine, EngineEvent, OutcomeKind)
 from core.hotkey_manager import (
     CONTROLLER_BUTTON_ORDER,
@@ -185,6 +195,7 @@ from core.screenshot_target import (
 from core.screenshot_save import (
     ScreenshotPngSaveWorker,
     ScreenshotSaveError,
+    publish_staged_png,
     reserve_screenshot_paths,
 )
 from core.x11_monitor import (
@@ -203,21 +214,34 @@ from core.camera_overlay import (
     clamp_overlay_rect, image_overlay_layers, legacy_overlay_rect,
     new_image_overlay_layer,
 )
+from core.third_party_keyboard import (
+    DEFAULT_KEYBOARD_COLOR,
+    DEFAULT_KEYBOARD_INTENSITY,
+    DEFAULT_KEYBOARD_OVERLAY_RECT,
+    KEYBOARD_COMPOSITE_FPS,
+    ThirdPartyKeyboardCapture,
+    chroma_key_rgba,
+    enumerate_keyboard_windows,
+    third_party_keyboard_settings,
+)
 from core.windows_microphone_devices import (
     list_native_microphones,
     migrate_legacy_microphone_name,
 )
 from core.ffmpeg_tools import (
-    get_ffmpeg_exe, software_video_args, FFmpegUnavailable)
+    get_ffmpeg_exe, get_ffprobe_exe, postprocess_video_args,
+    software_video_args, FFmpegUnavailable)
 from core.export_profiles import probe_media
+from core.media_metadata import probe_video_cfr, probe_video_metadata
 from ui.capture_card_client import CaptureCardClient
 from ui.error_bar import ErrorBar
-from ui.clip_grid import ClipGrid
+from ui.clip_grid import ClipGrid, _show_in_file_manager
 from ui.customize_page import CustomizePage
 from ui.gary_overlay import GaryOverlay
 from ui.camera_overlay_editor import (
     CameraOverlayEditor, OverlayPlacementEditor, UnifiedOverlayPreview,
 )
+from ui.keyboard_overlay_preview import KeyboardSourcePreview
 from ui.game_crop_dialog import GameCropDialog
 from ui.capture_settings_widget import (
     _enumerate_capturable_windows,
@@ -561,11 +585,15 @@ def _dims_to_label(w: int, h: int) -> str:
 
 def select_post_route(*, audio_on: bool, multiband_enabled: bool,
                       mic_running: bool, watermark: bool, manual_crop: bool,
-                      camera: bool) -> tuple[str, bool]:
+                      camera: bool, audio_capture_mode: str = 'combined',
+                      native_audio: bool = False,
+                      keyboard: bool = False) -> tuple[str, bool]:
     """Decide which post-processing route a saved clip takes.
 
     Returns ``(route, has_async_mux)`` where route is exactly one of
-    ``'mic'`` or ``'finalize'``. ``multiband_enabled`` remains in the
+    ``'mic'`` or ``'finalize'``. ``'mic'`` now also covers the native Windows
+    audio finalization pass used to collapse system + microphone streams into
+    the default combined track. ``multiband_enabled`` remains in the
     compatibility signature for callers using an older capture config, but
     per-application audio is intentionally ignored.
 
@@ -577,20 +605,31 @@ def select_post_route(*, audio_on: bool, multiband_enabled: bool,
     it is a pure function now so the exclusivity can actually be tested.
 
     ``has_async_mux`` says whether *any* route will touch the file after this
-    returns, which is what the upload manager needs in order to wait.
-    'finalize' only rewrites the file when there is something to apply, so a
-    plain clip with no manual crop/visual overlay is ready immediately. ``watermark``
-    remains in the compatibility signature, but Capture Card watermarking now
-    belongs to export/share and never rewrites the source clip.
+    returns, which is what the upload manager needs in order to wait. Every
+    completed clip is asynchronous because the finalizer verifies and repairs
+    the physical MP4 sample cadence before publication. ``keyboard`` covers
+    the Windows external-window visualizer; ``watermark`` remains in the
+    compatibility signature, but Capture Card watermarking belongs to
+    export/share and never rewrites the source clip.
     """
     del multiband_enabled
     mic_active = audio_on and mic_running
 
+    mode = normalize_audio_capture_mode(audio_capture_mode)
+    # The Windows engine captures the system and microphone sources natively
+    # as separate packets. Combined mode needs one asynchronous remux even
+    # when the microphone endpoint is unavailable; separated mode can publish
+    # the native result directly.
+    if audio_on and native_audio and mode == AUDIO_CAPTURE_MODE_COMBINED:
+        return 'mic', True
+
     if mic_active:
         return 'mic', True
-    # finalize is the fallback route and always runs, but it only rewrites the
-    # file when one of these is on.
-    return 'finalize', bool(manual_crop or camera)
+    # Every completed clip passes through the finalizer. Native capture keeps
+    # wall-clock timestamps so playback cannot speed up; the finalizer repairs
+    # the sample table to CFR before the file is published. Visual options are
+    # still applied by that same worker.
+    return 'finalize', True
 
 
 def _sanitize_foldername(name: str) -> str:
@@ -1029,6 +1068,8 @@ class _MicLevelMeter(QWidget):
 class _PopupPanel(QFrame):
     """Base class for top-bar dropdown panels (capture settings, source, hotkeys)."""
 
+    popup_hidden = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent, Qt.WindowType.Popup)
         self.setObjectName('popupPanel')
@@ -1054,6 +1095,16 @@ class _PopupPanel(QFrame):
     def refresh_theme(self):
         """Refresh the shared popup shell after an Apply Theme action."""
         self._apply_popup_style()
+
+    def hideEvent(self, event):  # noqa: N802 - Qt API name
+        """Tell the trigger button when Qt closes the popup for any reason.
+
+        Popup windows are also hidden by Qt when the user clicks outside them.
+        That path does not pass through MainWindow's toggle handlers, so the
+        trigger arrow needs the popup's actual visibility transition.
+        """
+        super().hideEvent(event)
+        self.popup_hidden.emit()
 
     def show_below(self, button: QWidget):
         self.adjustSize()
@@ -3096,6 +3147,8 @@ class MainWindow(QMainWindow):
         self._shutdown_complete = False
         self._shutdown_timer_started = None
         self._tray_icon = None
+        self._background_ui_paused = False
+        self._pending_status_display: tuple[str, str] | None = None
         self._capture_settings_applying = False
         self._screenshot_inflight = False
         self._screenshot_pending_requests = 0
@@ -3109,6 +3162,12 @@ class MainWindow(QMainWindow):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
 
         self.settings_manager = SettingsManager()
+        # Windows keyboard visualizers are sampled independently from the
+        # native replay engine.  Keeping this service alive with MainWindow
+        # means the timestamped source ring continues while the settings page
+        # is hidden or the app is sitting in the tray.
+        self._keyboard_overlay_capture = ThirdPartyKeyboardCapture()
+        self._keyboard_overlay_capture.apply_settings(self.settings_manager)
 
         from core.clip_metadata_manager import ClipMetadataManager
         self.clip_metadata_manager = ClipMetadataManager()
@@ -3204,6 +3263,8 @@ class MainWindow(QMainWindow):
                     # solution-level engine is locked. Prefer the freshly
                     # compiled source-checkout artifact; frozen releases still
                     # use only their bundled _MEIPASS engine above.
+                    project_root / 'FTHRclips' / 'x64' / 'CFRReleaseFinal' / 'FTHRclips.exe',
+                    project_root / 'FTHRclips' / 'x64' / 'CFRRelease' / 'FTHRclips.exe',
                     project_root / 'FTHRclips' / 'x64' / 'Release' / 'FTHRclips.exe',
                     project_root / 'FTHRclips' / 'x64' / 'Debug'   / 'FTHRclips.exe',
                     project_root / 'x64' / 'Release' / 'FTHRClips.exe',
@@ -3223,11 +3284,14 @@ class MainWindow(QMainWindow):
                     linux_root / 'build' / 'FTHRclips',
                 ]
         self.engine_path = None
-        for p in possible_paths:
-            if p.exists():
-                self.engine_path = p
-                print(f"Engine found: {p.resolve()}")
-                break
+        existing_engines = [p for p in possible_paths if p.is_file()]
+        if existing_engines:
+            try:
+                self.engine_path = max(
+                    existing_engines, key=lambda path: path.stat().st_mtime)
+            except OSError:
+                self.engine_path = existing_engines[0]
+            print(f"Engine found: {self.engine_path.resolve()}")
         if not self.engine_path:
             print("Engine not found.")
 
@@ -3358,6 +3422,12 @@ class MainWindow(QMainWindow):
         self._save_poll_timer.timeout.connect(self._on_save_poll_tick)
         self._published_final_clips: set[str] = set()
 
+        app = QApplication.instance()
+        if app is not None:
+            app.applicationStateChanged.connect(
+                self._on_application_state_changed)
+        QTimer.singleShot(0, self._refresh_background_ui_pause_state)
+
     def ensure_main_ui(self) -> None:
         """Build the heavy library/settings UI only when a window is needed.
 
@@ -3375,6 +3445,10 @@ class MainWindow(QMainWindow):
         self._load_saved_theme()
         self._apply_styles()
         self._ui_ready = True
+        # A tray-started window can build its UI after background suspension
+        # was already entered. Force the new widgets into the current state.
+        self._apply_background_ui_paused(
+            self._background_ui_paused, force=True)
         is_connected = getattr(self.bridge, 'is_connected', lambda: False)
         if self.bridge and is_connected():
             QTimer.singleShot(
@@ -3468,6 +3542,7 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
         self._background_start = False
+        QTimer.singleShot(0, self._refresh_background_ui_pause_state)
         print('[Lifecycle] WindowRestored')
 
     def _on_close_to_tray_changed(self, enabled: bool) -> None:
@@ -3489,6 +3564,7 @@ class MainWindow(QMainWindow):
     def _hide_main_window_to_tray(self) -> None:
         """Hide only the main UI and confirm that replay capture continues."""
         self.hide()
+        self._refresh_background_ui_pause_state()
         source = self._current_capture_source_label()
         self.capture_card.show_background_capture(source)
         print(f'[Lifecycle] WindowHiddenToTray source={source!r}')
@@ -3599,6 +3675,13 @@ class MainWindow(QMainWindow):
         self.hotkey_btn = TopBarButton('HOTKEYS')
         self.hotkey_btn.clicked.connect(self._toggle_hotkeys)
         mc.addWidget(self.hotkey_btn)
+
+        for popup in (
+                self.cap_settings_popup,
+                self.source_popup,
+                self.game_detection_popup,
+                self.hotkey_popup):
+            popup.popup_hidden.connect(self._sync_topbar_dropdown_arrows)
 
         # NVENC / HW status label (hidden by default)
         self.hw_label = QLabel()
@@ -3735,13 +3818,17 @@ class MainWindow(QMainWindow):
         self.clip_grid = ClipGrid(settings_manager=self.settings_manager)
         self.clip_grid.set_readiness_checker(self._clip_readiness.can_access)
         self.clip_grid.clip_opened.connect(self._on_clip_opened)
+        self.clip_grid.screenshot_clicked.connect(_show_in_file_manager)
         scroll.setWidget(self.clip_grid)
         body_layout.addWidget(scroll, stretch=1)
 
         self.main_stack.addWidget(body_page)
 
         # Page 1: full-screen settings
-        self._settings_page_widget = _SettingsPage(self.settings_manager)
+        self._settings_page_widget = _SettingsPage(
+            self.settings_manager,
+            keyboard_capture=self._keyboard_overlay_capture,
+        )
         self._settings_page_widget.close_requested.connect(
             self._toggle_settings_page)
         self._settings_page_widget.clips_directory_changed.connect(
@@ -3760,8 +3847,12 @@ class MainWindow(QMainWindow):
             self._on_encoder_config_changed)
         self._settings_page_widget.audio_capture_changed.connect(
             self._on_audio_capture_changed)
+        self._settings_page_widget.audio_capture_mode_changed.connect(
+            self._on_audio_capture_mode_changed)
         self._settings_page_widget.capture_card_changed.connect(
             self._on_capture_card_changed)
+        self._settings_page_widget.background_ui_pause_changed.connect(
+            self._on_background_ui_pause_changed)
         self.main_stack.addWidget(self._settings_page_widget)
 
         # The manager itself starts before the optional UI exists, so background
@@ -3808,6 +3899,7 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, event):
         super().showEvent(event)
+        QTimer.singleShot(0, self._refresh_background_ui_pause_state)
         if not getattr(self, '_native_style_applied', False):
             self._native_style_applied = True
             # Defer SetWindowPos(SWP_FRAMECHANGED) to after the event loop starts.
@@ -3819,6 +3911,11 @@ class MainWindow(QMainWindow):
             # stylesheet compilation. The page is already constructed; we just
             # need Qt to do its first-show work for it.
             QTimer.singleShot(0, self._prerealize_settings_page)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            QTimer.singleShot(0, self._refresh_background_ui_pause_state)
 
     def _prerealize_settings_page(self):
         """Force Qt to do the deferred first-show work for the settings page.
@@ -4227,7 +4324,7 @@ class MainWindow(QMainWindow):
         except OSError:
             staged_size = 0
         if exit_code == 0 and staged_size > 0 and not timed_out:
-            self._open_screenshot_editor(paths)
+            self._publish_screenshot(paths)
             return
         if self._shutdown_requested:
             paths.staged.unlink(missing_ok=True)
@@ -4256,7 +4353,14 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            pixmap = screen.grabWindow(0)
+            # Passing the screen bounds explicitly fixes a Windows/Qt edge
+            # case where grabWindow(0) can return an empty pixmap for a hidden
+            # tray-started application or a secondary display.
+            geometry = screen.geometry()
+            pixmap = screen.grabWindow(
+                0, 0, 0, geometry.width(), geometry.height())
+            if pixmap.isNull():
+                pixmap = screen.grabWindow(0)
         except Exception as error:
             self._fail_screenshot_request(
                 paths,
@@ -4284,44 +4388,24 @@ class MainWindow(QMainWindow):
         worker = ScreenshotPngSaveWorker(image, paths.staged, self)
         self._screenshot_save_worker = worker
         worker.succeeded.connect(
-            lambda _staged, target=paths: self._open_screenshot_editor(target))
+            lambda _staged, target=paths: self._publish_screenshot(target))
         worker.failed.connect(
             lambda code, detail, target=paths: self._on_screenshot_save_failed(
                 target, code, detail))
         worker.finished.connect(worker.deleteLater)
         worker.start()
 
-    def _open_screenshot_editor(self, paths) -> None:
-        """Offer crop/full save only after the complete staged PNG exists."""
-
+    def _publish_screenshot(self, paths) -> None:
+        """Publish a completed PNG immediately and refresh the library."""
         self._screenshot_save_worker = None
-        from ui.screenshot_editor import ScreenshotEditor
-        from PySide6.QtCore import QDialog
-
-        if QPixmap(str(paths.staged)).isNull():
-            paths.staged.unlink(missing_ok=True)
-            self._finish_screenshot_request()
-            self._show_screenshot_error(
-                'IMAGE_ENCODE_FAILED',
-                'The screenshot backend returned an unreadable PNG.',
-            )
-            return
-
-        # Background/tray mode opens only this standalone dialog; it never
-        # builds or restores the deferred library/settings widget tree.
-        parent = self if self._ui_ready else None
-        editor = ScreenshotEditor(str(paths.staged), str(paths.final), parent)
         try:
-            accepted = editor.exec() == QDialog.DialogCode.Accepted
-            if accepted and paths.final.is_file():
-                self.capture_card.show_screenshot()
-            elif accepted:
-                self._show_screenshot_error(
-                    'WRITE_FAILED',
-                    'The screenshot editor closed without publishing a PNG.',
-                )
-            else:
-                paths.staged.unlink(missing_ok=True)
+            publish_staged_png(paths.staged, paths.final)
+            self.capture_card.show_screenshot()
+            if hasattr(self, 'clip_grid'):
+                self.clip_grid.force_refresh()
+        except ScreenshotSaveError as error:
+            paths.staged.unlink(missing_ok=True)
+            self._show_screenshot_error(error.code, error.detail)
         finally:
             self._finish_screenshot_request()
 
@@ -4714,6 +4798,12 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_gary_overlay'):
             self._sync_gary_settings()
 
+    def _on_audio_capture_mode_changed(self, _mode: str):
+        # The mode is part of the capture generation contract. Restarting here
+        # also makes the first clip after a toggle unambiguous if a save and a
+        # settings change happen close together.
+        self._restart_capture_engine()
+
     def _on_capture_card_changed(self, enabled: bool):
         setter = getattr(self.capture_card, 'set_visuals_enabled', None)
         if setter is not None:
@@ -4832,9 +4922,13 @@ class MainWindow(QMainWindow):
             audio_enabled=bool(
                 self.settings_manager.get('audio_capture_enabled', True)),
             encoder=str(self.settings_manager.get('encoder_pref', 'auto')),
-            # Kept in the engine launch ABI, permanently disabled. Capture is
-            # one system mix plus one microphone stream.
+            # Kept in the engine launch ABI, permanently disabled. The new
+            # audio capture mode is carried in its own argument below.
             multiband_enabled=False,
+            separate_audio_enabled=(normalize_audio_capture_mode(
+                self.settings_manager.get('audio_capture_mode',
+                                          AUDIO_CAPTURE_MODE_COMBINED))
+                                    == AUDIO_CAPTURE_MODE_SEPARATED),
             microphone_endpoint_id=str(
                 self.settings_manager.get('mic_device_id') or ''),
             normal_clip_seconds=self.clip_duration,
@@ -4959,6 +5053,8 @@ class MainWindow(QMainWindow):
         # argv[13] is retained for native ABI compatibility only.
         multiband_arg = '0'
         audio_arg = '1' if launch_config.audio_enabled else '0'
+        audio_mode_arg = (
+            '1' if launch_config.separate_audio_enabled else '0')
         microphone_id_arg = launch_config.microphone_endpoint_id
         try:
             microphone_gain = int(self.settings_manager.get('mic_volume', 100))
@@ -4991,7 +5087,8 @@ class MainWindow(QMainWindow):
                  f'{launch_config.crop_x:.9g}',
                  f'{launch_config.crop_y:.9g}',
                  f'{launch_config.crop_w:.9g}',
-                 f'{launch_config.crop_h:.9g}'],
+                 f'{launch_config.crop_h:.9g}',
+                 audio_mode_arg],
                 **popen_options
             )
             # Poll for connection in a background thread so the UI stays responsive.
@@ -5602,6 +5699,11 @@ class MainWindow(QMainWindow):
         if not publish_ui:
             try:
                 probe_media(recording)
+                normalize = getattr(self, '_normalize_clip_to_cfr', None)
+                if callable(normalize) and normalize(str(recording)) is False:
+                    raise RuntimeError(
+                        'Frame-rate repair failed; the recording was retained '
+                        'but not published.')
             except (OSError, RuntimeError) as exc:
                 self._fail_manual_recording(
                     str(exc), keep_recording=True,
@@ -5616,6 +5718,11 @@ class MainWindow(QMainWindow):
                 # Validation is the only close-time work. Video and AAC are
                 # already in the destination file, fragment by fragment.
                 probe_media(recording)
+                normalize = getattr(self, '_normalize_clip_to_cfr', None)
+                if callable(normalize) and normalize(str(recording)) is False:
+                    raise RuntimeError(
+                        'Frame-rate repair failed; the recording was retained '
+                        'but not published.')
             except (OSError, RuntimeError) as exc:
                 detail = str(exc)
                 self._ui_call.emit(
@@ -6060,9 +6167,18 @@ class MainWindow(QMainWindow):
         # Pick the post-processing route. Exactly one runs — see
         # select_post_route() for why that exclusivity is load-bearing.
         active_config = self._capture_config.active
+        audio_mode = normalize_audio_capture_mode(
+            AUDIO_CAPTURE_MODE_SEPARATED
+            if active_config and getattr(
+                active_config, 'separate_audio_enabled', False)
+            else self.settings_manager.get(
+                'audio_capture_mode', AUDIO_CAPTURE_MODE_COMBINED))
+        audio_enabled = (active_config.audio_enabled if active_config else
+                         self.settings_manager.get('audio_capture_enabled', True))
+        keyboard_overlay_enabled = third_party_keyboard_settings(
+            self.settings_manager)['enabled']
         route, has_async_mux = select_post_route(
-            audio_on=(active_config.audio_enabled if active_config else
-                      self.settings_manager.get('audio_capture_enabled', True)),
+            audio_on=audio_enabled,
             multiband_enabled=False,
             mic_running=(sys.platform != 'win32' and MicRecorder.is_available()
                          and MicRecorder().is_running()),
@@ -6070,6 +6186,11 @@ class MainWindow(QMainWindow):
             manual_crop=bool(crop_profile),
             camera=any(self.settings_manager.get(key, False) for key in (
                 'camera_enabled', 'image_overlay_enabled')),
+            keyboard=keyboard_overlay_enabled,
+            audio_capture_mode=audio_mode,
+            native_audio=(sys.platform == 'win32'
+                          and audio_enabled
+                          and audio_mode == AUDIO_CAPTURE_MODE_COMBINED),
         )
 
         # Notify the upload manager and get the clip-ready event.
@@ -6104,6 +6225,14 @@ class MainWindow(QMainWindow):
 
     def _complete_clip_finalization(
             self, clip_path: str, duration_seconds: int) -> None:
+        if self._clip_readiness.state(clip_path) is not ClipReadinessState.FINALIZATION_FAILED:
+            # Covers the race where a Linux mic route loses its recorder after
+            # route selection and completes directly without a worker gate.
+            self._normalize_clip_to_cfr(clip_path)
+        if self._clip_readiness.state(clip_path) is ClipReadinessState.FINALIZATION_FAILED:
+            self._ui_call.emit(
+                lambda: self._publish_final_clip(clip_path, duration_seconds))
+            return
         try:
             usable = os.path.isfile(clip_path) and os.path.getsize(clip_path) > 0
         except OSError:
@@ -6272,9 +6401,11 @@ class MainWindow(QMainWindow):
                            mic_end_time: float,
                            clip_ready=None, crop_profile=None):
         """
-        Wait for the engine to finish writing the clip, then mix the matching
-        mic-recording segment into the clip's audio track. Runs in a daemon
-        thread so the UI stays responsive.
+        Finalize the capture's audio layout, then apply any other source-clip
+        post-processing. On Windows the native engine already captured the
+        system and microphone streams, so combined mode only needs a remux.
+        On Linux the microphone is still supplied by the Python recorder and
+        is either mixed or appended as a second stream here.
 
         clip_ready is a threading.Event returned by UploadManager.notify_clip_saved().
         The mux worker sets it after os.replace() so the upload can start.
@@ -6282,6 +6413,25 @@ class MainWindow(QMainWindow):
         """
         if not self._allow_completed_clip_pipeline(clip_path, clip_ready):
             return
+
+        audio_mode = normalize_audio_capture_mode(
+            self.settings_manager.get(
+                'audio_capture_mode', AUDIO_CAPTURE_MODE_COMBINED))
+        if sys.platform == 'win32':
+            if audio_mode == AUDIO_CAPTURE_MODE_COMBINED:
+                self._spawn_mux_thread(
+                    target=self._combine_native_audio_worker,
+                    args=(clip_path, duration_seconds, mic_end_time,
+                          clip_ready, crop_profile),
+                )
+            else:
+                # Separated Windows clips are already published as distinct
+                # native audio streams with a matching FTHR manifest. The
+                # normal route selector sends visual-only work to finalize.
+                if clip_ready is not None:
+                    clip_ready.set()
+            return
+
         if not MicRecorder.is_available() or not MicRecorder().is_running():
             self._record_finalization_warning(
                 clip_path, 'Microphone capture stopped before finalization; '
@@ -6292,7 +6442,8 @@ class MainWindow(QMainWindow):
         self._spawn_mux_thread(
             target=self._mic_mux_worker,
             args=(clip_path, duration_seconds, mic_end_time, clip_ready,
-                  crop_profile),
+                  crop_profile,
+                  audio_mode == AUDIO_CAPTURE_MODE_SEPARATED),
         )
 
     def _spawn_mux_thread(self, target, args):
@@ -6302,26 +6453,319 @@ class MainWindow(QMainWindow):
         if not hasattr(self, '_mux_threads'):
             self._mux_threads = []
         self._mux_threads = [t for t in self._mux_threads if t.is_alive()]
+
+        # All current post-processing entrypoints carry clip_ready at index 3.
+        # Wrap it so the upload gate is not released until the final MP4 has
+        # also passed the CFR repair. This matters for native-audio early
+        # returns, which otherwise could publish a VFR base file before the
+        # common completion callback runs.
+        worker_args = list(args)
+        original_ready = worker_args[3] if len(worker_args) > 3 else None
+        if original_ready is not None:
+            host = self
+            clip_path = str(worker_args[0])
+
+            class _CfrReadyGate:
+                def __init__(self):
+                    self._released = False
+
+                def set(self):
+                    if self._released:
+                        return
+                    self._released = True
+                    try:
+                        host._normalize_clip_to_cfr(clip_path)
+                    finally:
+                        original_ready.set()
+
+            worker_args[3] = _CfrReadyGate()
+
         def _run_and_publish():
             try:
-                target(*args)
+                target(*worker_args)
             except Exception as exc:
-                clip_path = str(args[0])
+                worker_clip_path = str(worker_args[0])
                 print(f'[Finalize] Unhandled worker error: {exc}')
                 self._record_finalization_warning(
-                    clip_path, f'Optional clip processing failed: {exc}')
+                    worker_clip_path, f'Optional clip processing failed: {exc}')
             finally:
-                self._complete_clip_finalization(str(args[0]), int(args[1]))
+                if original_ready is not None:
+                    worker_args[3].set()
+                else:
+                    self._normalize_clip_to_cfr(str(worker_args[0]))
+                self._complete_clip_finalization(
+                    str(worker_args[0]), int(worker_args[1]))
 
         t = threading.Thread(target=_run_and_publish, daemon=True)
         self._mux_threads.append(t)
         t.start()
         return t
 
+    def _combine_native_audio_worker(self, clip_path: str,
+                                     duration_seconds: int,
+                                     clip_end_time: float,
+                                     clip_ready=None, crop_profile=None):
+        """Collapse native Windows audio sources into one combined AAC track.
+
+        The native engine keeps system and microphone packets separate while
+        the replay ring is alive so timing remains precise. The default user
+        facing format is simpler: one MP4 audio stream. This worker performs
+        that short, loss-bounded final mix after the native clip is committed.
+        """
+        try:
+            ffmpeg = get_ffmpeg_exe()
+            ffprobe = get_ffprobe_exe()
+        except FFmpegUnavailable as error:
+            print(f'[Audio] {error} — keeping native audio layout')
+            self._record_finalization_warning(
+                clip_path, 'Combined audio was skipped because FFmpeg is unavailable.')
+            if clip_ready is not None:
+                clip_ready.set()
+            return
+
+        deadline = time.monotonic() + max(duration_seconds * 2, 15)
+        last_size = -1
+        while time.monotonic() < deadline:
+            try:
+                if os.path.exists(clip_path):
+                    size = os.path.getsize(clip_path)
+                    if size > 0 and size == last_size:
+                        break
+                    last_size = size
+            except OSError:
+                pass
+            time.sleep(0.25)
+        else:
+            self._record_finalization_warning(
+                clip_path, 'Combined audio was skipped because the clip did not stabilize.')
+            if clip_ready is not None:
+                clip_ready.set()
+            return
+
+        try:
+            probe = subprocess.run(
+                [ffprobe, '-v', 'error', '-select_streams', 'a',
+                 '-show_entries', 'stream=index', '-of', 'json', clip_path],
+                capture_output=True, text=True, timeout=30, **_NO_WINDOW)
+            streams = json.loads(probe.stdout).get('streams', [])
+            audio_count = sum(
+                1 for stream in streams
+                if isinstance(stream, dict) and isinstance(stream.get('index'), int))
+        except (OSError, subprocess.SubprocessError, TypeError, ValueError,
+                json.JSONDecodeError) as error:
+            print(f'[Audio] Could not inspect native audio streams: {error}')
+            self._record_finalization_warning(
+                clip_path, 'Combined audio was skipped because the clip audio could not be inspected.')
+            if clip_ready is not None:
+                clip_ready.set()
+            return
+
+        if audio_count == 0:
+            self._record_finalization_warning(
+                clip_path, 'The saved clip contained no audio streams.')
+            if clip_ready is not None:
+                clip_ready.set()
+            return
+
+        audio_inputs = ''.join(f'[0:a:{index}]' for index in range(audio_count))
+        if audio_count == 1:
+            audio_filter = f'{audio_inputs}anull[aout]'
+        else:
+            audio_filter = (
+                f'{audio_inputs}amix=inputs={audio_count}:normalize=0:'
+                'duration=longest:dropout_transition=0,'
+                'alimiter=limit=0.98:level=disabled[aout]')
+
+        with tempfile.TemporaryDirectory(
+                prefix='.fthr-audio-', dir=os.path.dirname(clip_path)) as td:
+            output = os.path.join(td, 'combined.mp4')
+            command = [
+                ffmpeg, '-y', '-i', clip_path,
+                '-filter_complex', audio_filter,
+                '-map', '0:v?', '-map', '[aout]',
+                '-map_metadata', '0', '-map_chapters', '0',
+                '-movflags', 'use_metadata_tags',
+                '-metadata', 'comment=fthr-audio-mode=combined',
+                '-metadata:s:a:0', 'title=Combined Audio',
+                '-metadata:s:a:0', 'handler_name=Combined Audio',
+                '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
+                '-shortest', output,
+            ]
+            try:
+                result = subprocess.run(
+                    command, capture_output=True, timeout=120, **_NO_WINDOW)
+            except subprocess.TimeoutExpired:
+                print('[Audio] Native audio combine timed out after 120s')
+                self._record_finalization_warning(
+                    clip_path, 'Combined audio timed out; the native audio layout was retained.')
+                return
+            except Exception as error:
+                print(f'[Audio] Native audio combine failed: {error}')
+                self._record_finalization_warning(
+                    clip_path, 'Combined audio failed; the native audio layout was retained.')
+                return
+
+            if result.returncode != 0:
+                detail = result.stderr.decode(errors='replace').strip().splitlines()
+                print(f'[Audio] Native audio combine ffmpeg failed: '
+                      f'{detail[-1] if detail else "(no stderr)"}')
+                self._record_finalization_warning(
+                    clip_path, 'Combined audio failed; the native audio layout was retained.')
+                return
+
+            try:
+                os.replace(output, clip_path)
+                # The old sidecar described the pre-combine stream topology.
+                # Its hash would already make it unreadable, but removing it
+                # avoids leaving misleading metadata next to a combined clip.
+                manifest_path_for(clip_path).unlink(missing_ok=True)
+                print(f'[Audio] Combined {audio_count} native stream(s) into '
+                      f'{os.path.basename(clip_path)}')
+            except OSError as error:
+                print(f'[Audio] Could not publish combined audio clip: {error}')
+                self._record_finalization_warning(
+                    clip_path, 'Combined audio could not replace the base clip.')
+                return
+
+        self._apply_crop(clip_path, ffmpeg, crop_profile)
+        self._apply_image_overlay(clip_path, ffmpeg)
+        self._apply_keyboard_overlay(
+            clip_path, ffmpeg, clip_end_time, duration_seconds)
+        self._apply_camera_overlay(clip_path, ffmpeg, clip_end_time, duration_seconds)
+
+    @staticmethod
+    def _cfr_video_args(clip_path: str) -> list[str]:
+        """Return output options that make every visual finalizer CFR.
+
+        Reading the configured value here protects visual re-encode paths from
+        inheriting a jittery input timestamp sequence. ``-r`` plus
+        ``-fps_mode cfr`` is intentional: Explorer reads the resulting MP4
+        sample timing, not FTHR's private tag.
+        """
+        metadata = probe_video_metadata(clip_path)
+        fps = metadata.average_fps if metadata is not None else None
+        if fps is None or not math.isfinite(fps) or fps <= 0:
+            return []
+        fps_text = (str(int(round(fps)))
+                    if abs(fps - round(fps)) < 0.005
+                    else f'{fps:.6f}'.rstrip('0').rstrip('.'))
+        return ['-fps_mode', 'cfr', '-r', fps_text]
+
+    def _normalize_clip_to_cfr(self, clip_path: str,
+                               ffmpeg: str | None = None) -> bool:
+        """Publish a source clip with real CFR sample timing.
+
+        The native replay engine intentionally retains wall-clock PTS so a
+        delayed capture cannot make video play faster. That can leave an MP4
+        whose private/configured FPS is 60 while its sample table contains
+        30-FPS gaps. Decode/re-encode only those files with FFmpeg CFR mode;
+        FFmpeg duplicates the last decoded frame into missing time slots and
+        therefore preserves the original duration.
+        """
+        def fail(message: str) -> bool:
+            self._clip_readiness.finalization_failed(
+                clip_path, message, base_clip_usable=False)
+            return False
+
+        metadata = probe_video_metadata(clip_path)
+        fps = metadata.average_fps if metadata is not None else None
+        if fps is None or not math.isfinite(fps) or fps <= 0:
+            return fail(
+                'Frame-rate repair failed because the configured FPS could '
+                'not be read; the clip was not published.')
+
+        if probe_video_cfr(clip_path, fps) is True:
+            return True
+
+        if ffmpeg is None:
+            try:
+                ffmpeg = get_ffmpeg_exe()
+            except FFmpegUnavailable as error:
+                print(f'[CFR] {error} — retaining the source clip')
+                return fail(
+                    'Frame-rate repair failed because FFmpeg is unavailable; '
+                    'the clip was not published.')
+
+        fps_text = (str(int(round(fps)))
+                    if abs(fps - round(fps)) < 0.005
+                    else f'{fps:.6f}'.rstrip('0').rstrip('.'))
+        configured_bitrate = metadata.video_bitrate_bps or 16_000_000
+        bitrate_kbps = max(2_500, min(200_000,
+            int(round(configured_bitrate / 1000))))
+        bridge = getattr(self, 'bridge', None)
+        active_codec = ''
+        if bridge is not None and hasattr(bridge, 'get_active_codec'):
+            try:
+                active_codec = bridge.get_active_codec()
+            except Exception:
+                active_codec = ''
+
+        video_arg_sets = [
+            postprocess_video_args(
+                active_codec, bitrate_kbps, ffmpeg=ffmpeg),
+            software_video_args(bitrate_kbps, ffmpeg=ffmpeg),
+        ]
+        # Keep one command when the active codec is already the reviewed
+        # software fallback; otherwise a failed GPU post-process gets one safe
+        # software retry instead of leaving a VFR clip published.
+        unique_video_arg_sets = []
+        for args in video_arg_sets:
+            if args not in unique_video_arg_sets:
+                unique_video_arg_sets.append(args)
+
+        try:
+            with tempfile.TemporaryDirectory(
+                    prefix='.fthr-cfr-', dir=os.path.dirname(clip_path)) as td:
+                output = os.path.join(td, 'cfr.mp4')
+                common = [
+                    ffmpeg, '-y', '-i', clip_path,
+                    '-map', '0:v:0', '-map', '0:a?',
+                    '-map_metadata', '0', '-map_chapters', '0',
+                    '-movflags', 'use_metadata_tags',
+                    '-fps_mode', 'cfr', '-r', fps_text,
+                    '-metadata', f'fthr_frame_rate={fps_text}',
+                    '-metadata',
+                    f'fthr_video_bitrate_bps={bitrate_kbps * 1000}',
+                ]
+                timeout = max(
+                    180,
+                    int((metadata.duration_seconds or 30.0) * 5),
+                )
+                last_error = '(no stderr)'
+                for video_args in unique_video_arg_sets:
+                    result = subprocess.run(
+                        [*common, *video_args, '-c:a', 'copy', output],
+                        capture_output=True, timeout=timeout, **_NO_WINDOW,
+                    )
+                    if result.returncode == 0 and os.path.isfile(output):
+                        os.replace(output, clip_path)
+                        rebind_manifest_after_media_replace(clip_path)
+                        print(f'[CFR] Repaired {os.path.basename(clip_path)} '
+                              f'to {fps_text} FPS without changing duration')
+                        return True
+                    detail = (result.stderr.decode(errors='replace')
+                              .strip().splitlines())
+                    last_error = detail[-1] if detail else '(no stderr)'
+                    try:
+                        os.remove(output)
+                    except FileNotFoundError:
+                        pass
+                print(f'[CFR] FFmpeg failed: {last_error}')
+        except subprocess.TimeoutExpired:
+            print(f'[CFR] FFmpeg timed out while repairing '
+                  f'{os.path.basename(clip_path)}')
+        except (OSError, subprocess.SubprocessError) as error:
+            print(f'[CFR] Repair error: {error}')
+
+        return fail(
+            'Frame-rate repair failed; the original source clip was not '
+            'published.')
+
     def _mic_mux_worker(self, clip_path: str,
                         duration_seconds: int,
                         mic_end_time: float,
-                        clip_ready=None, crop_profile=None):
+                        clip_ready=None, crop_profile=None,
+                        separate_audio: bool = False):
         try:
             ffmpeg = get_ffmpeg_exe()
         except FFmpegUnavailable as e:
@@ -6362,21 +6806,50 @@ class MainWindow(QMainWindow):
                 with tempfile.TemporaryDirectory(
                         prefix='.fthr-audio-', dir=os.path.dirname(clip_path)) as td:
                     mic_wav = os.path.join(td, 'mic.wav')
-                    mixed_mp4 = os.path.join(td, 'mixed.mp4')
+                    mixed_mp4 = os.path.join(td, 'audio-layout.mp4')
                     if write_wav(mic_wav, samples):
-                        cmd = [
-                            ffmpeg, '-y',
-                            '-i', clip_path,
-                            '-i', mic_wav,
-                            '-filter_complex',
-                            '[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=0[aout]',
-                            '-map', '0:v',
-                            '-map', '[aout]',
-                            '-c:v', 'copy',
-                            '-c:a', 'aac', '-b:a', '192k',
-                            '-shortest',
-                            mixed_mp4,
-                        ]
+                        if separate_audio:
+                            cmd = [
+                                ffmpeg, '-y',
+                                '-i', clip_path,
+                                '-i', mic_wav,
+                                '-map', '0:v?',
+                                '-map', '0:a?',
+                                '-map', '1:a:0',
+                                '-map_metadata', '0',
+                                '-map_chapters', '0',
+                                '-movflags', 'use_metadata_tags',
+                                '-metadata', 'comment=fthr-audio-mode=separated',
+                                '-metadata:s:a:0', 'title=System Audio',
+                                '-metadata:s:a:0', 'handler_name=System Audio',
+                                '-metadata:s:a:1', 'title=Microphone',
+                                '-metadata:s:a:1', 'handler_name=Microphone',
+                                '-c:v', 'copy',
+                                '-c:a', 'aac', '-b:a', '192k',
+                                '-shortest',
+                                mixed_mp4,
+                            ]
+                        else:
+                            cmd = [
+                                ffmpeg, '-y',
+                                '-i', clip_path,
+                                '-i', mic_wav,
+                                '-filter_complex',
+                                '[0:a:0][1:a:0]amix=inputs=2:duration=first:'
+                                'dropout_transition=0,alimiter=limit=0.98:'
+                                'level=disabled[aout]',
+                                '-map', '0:v?',
+                                '-map', '[aout]',
+                                '-map_metadata', '0',
+                                '-map_chapters', '0',
+                                '-movflags', 'use_metadata_tags',
+                                '-metadata', 'comment=fthr-audio-mode=combined',
+                                '-metadata:s:a:0', 'handler_name=Combined Audio',
+                                '-c:v', 'copy',
+                                '-c:a', 'aac', '-b:a', '192k',
+                                '-shortest',
+                                mixed_mp4,
+                            ]
                         try:
                             result = subprocess.run(
                                 cmd, capture_output=True, timeout=120,
@@ -6385,7 +6858,12 @@ class MainWindow(QMainWindow):
                             if result.returncode == 0:
                                 try:
                                     os.replace(mixed_mp4, clip_path)
-                                    print(f'[Mic] Mixed mic into {os.path.basename(clip_path)}')
+                                    layout_text = (
+                                        'Kept separate mic track in'
+                                        if separate_audio else 'Mixed mic into')
+                                    print(
+                                        f'[Mic] {layout_text} '
+                                        f'{os.path.basename(clip_path)}')
                                 except OSError as e:
                                     print(f'[Mic] Could not replace clip: {e}')
                                     self._record_finalization_warning(
@@ -6426,6 +6904,8 @@ class MainWindow(QMainWindow):
             # (either the muxed version or the original if mux failed).
             self._apply_crop(clip_path, ffmpeg, crop_profile)
             self._apply_image_overlay(clip_path, ffmpeg)
+            self._apply_keyboard_overlay(
+                clip_path, ffmpeg, mic_end_time, duration_seconds)
             self._apply_camera_overlay(clip_path, ffmpeg, mic_end_time, duration_seconds)
         finally:
             # Always unblock the upload worker, regardless of success or failure.
@@ -6513,6 +6993,8 @@ class MainWindow(QMainWindow):
                  '-filter_complex', ';'.join(filters),
                  '-map', '[vout]', '-map', '0:a?',
                  '-map_metadata', '0', '-map_chapters', '0',
+                 '-movflags', 'use_metadata_tags',
+                 *MainWindow._cfr_video_args(clip_path),
                  *software_video_args(),
                  '-c:a', 'copy',
                  tmp_path],
@@ -6544,6 +7026,171 @@ class MainWindow(QMainWindow):
                 os.rmdir(tmp_dir)
             except OSError:
                 # Temporary directory cleanup is best-effort after publication.
+                pass
+
+    def _apply_keyboard_overlay(self, clip_path: str, ffmpeg: str,
+                                clip_end_time: float,
+                                duration_sec: int) -> None:
+        """Composite the timestamp-matched external keyboard source.
+
+        The source was sampled continuously by ``ThirdPartyKeyboardCapture``;
+        this pass streams the bounded ring segment as keyed RGBA directly into
+        the compositor, using the same chroma-key operation as the live
+        preview.  Settings changes never restart the native replay engine, and
+        a missing/closed source leaves the base clip intact with a visible
+        finalization warning.
+        """
+        config = third_party_keyboard_settings(self.settings_manager)
+        if not config['enabled']:
+            return
+        capture = getattr(self, '_keyboard_overlay_capture', None)
+        if capture is None:
+            self._record_finalization_warning(
+                clip_path, 'Keyboard overlay capture was unavailable.')
+            return
+
+        tmp_dir = tempfile.mkdtemp(
+            prefix='.fthr-keyboard-', dir=os.path.dirname(clip_path))
+        output_path = os.path.join(tmp_dir, 'output.mp4')
+        process = None
+        try:
+            clip_w, clip_h = self._clip_dimensions(clip_path, ffmpeg)
+            rect = clamp_overlay_rect(
+                config.get('rect'), DEFAULT_KEYBOARD_OVERLAY_RECT)
+            keyboard_w = max(64, int(clip_w * rect['w'])) & ~1
+            keyboard_h = max(48, int(clip_h * rect['h'])) & ~1
+            keyboard_x = max(0, int(clip_w * rect['x']))
+            keyboard_y = max(0, int(clip_h * rect['y']))
+            filter_complex = (
+                '[1:v]setpts=PTS-STARTPTS,format=rgba[keyboard];'
+                f'[0:v][keyboard]overlay={keyboard_x}:{keyboard_y}:'
+                'format=auto:eof_action=repeat:shortest=0[vout]')
+            bridge = getattr(self, 'bridge', None)
+            active_codec = (
+                bridge.get_active_codec()
+                if bridge is not None and hasattr(bridge, 'get_active_codec')
+                else '')
+
+            stream_state = {'wrote_frame': False, 'error': None}
+            writer_thread = None
+            with tempfile.TemporaryFile() as ffmpeg_log:
+                process = subprocess.Popen(
+                    [ffmpeg, '-y', '-loglevel', 'error', '-i', clip_path,
+                     '-f', 'rawvideo', '-pix_fmt', 'rgba',
+                     '-video_size', f'{keyboard_w}x{keyboard_h}',
+                     '-framerate', str(KEYBOARD_COMPOSITE_FPS), '-i', '-',
+                     '-filter_complex', filter_complex,
+                     '-map', '[vout]', '-map', '0:a?',
+                     '-map_metadata', '0', '-map_chapters', '0',
+                     '-movflags', 'use_metadata_tags',
+                     *MainWindow._cfr_video_args(clip_path),
+                     *postprocess_video_args(active_codec, ffmpeg=ffmpeg),
+                     '-c:a', 'copy', output_path],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    # A PIPE can fill while Python is blocked writing raw
+                    # frames, deadlocking both processes before wait() gets a
+                    # chance to enforce its timeout. A seekable temporary log
+                    # cannot apply that back-pressure.
+                    stderr=ffmpeg_log,
+                    **_BACKGROUND_NO_WINDOW)
+
+                def _feed_keyboard_frames():
+                    try:
+                        for frame in capture.iter_segment_rgba(
+                                clip_end_time, duration_sec,
+                                (keyboard_w, keyboard_h),
+                                config['color'], config['intensity'],
+                                KEYBOARD_COMPOSITE_FPS):
+                            if process.stdin is None:
+                                break
+                            process.stdin.write(memoryview(frame).cast('B'))
+                            stream_state['wrote_frame'] = True
+                    except BrokenPipeError:
+                        # FFmpeg's return code and log hold the useful error.
+                        pass
+                    except Exception as error:
+                        stream_state['error'] = error
+                    finally:
+                        if process.stdin is not None and not process.stdin.closed:
+                            try:
+                                process.stdin.close()
+                            except (BrokenPipeError, OSError):
+                                pass
+
+                # Feeding on a helper thread makes the total timeout real: if
+                # FFmpeg stops consuming stdin, the finalizer can still kill
+                # it and release the blocked write instead of staying stuck in
+                # FINALIZING forever.
+                writer_thread = threading.Thread(
+                    target=_feed_keyboard_frames,
+                    name='FTHR-KeyboardCompositorFeed',
+                    daemon=True,
+                )
+                writer_thread.start()
+                timeout_seconds = max(180, int(duration_sec) * 3)
+                try:
+                    returncode = process.wait(timeout=timeout_seconds)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=10)
+                    writer_thread.join(timeout=10)
+                    print('[KeyboardOverlay] ffmpeg timed out after '
+                          f'{timeout_seconds}s')
+                    self._record_finalization_warning(
+                        clip_path,
+                        'Keyboard overlay timed out; the base clip was retained.')
+                    return
+                writer_thread.join(timeout=10)
+                ffmpeg_log.seek(0)
+                stderr = ffmpeg_log.read()
+
+            wrote_frame = bool(stream_state['wrote_frame'])
+            if stream_state['error'] is not None:
+                raise stream_state['error']
+            if writer_thread is not None and writer_thread.is_alive():
+                self._record_finalization_warning(
+                    clip_path,
+                    'Keyboard overlay input did not finish; the base clip was retained.')
+                return
+            if not wrote_frame:
+                self._record_finalization_warning(
+                    clip_path,
+                    'Keyboard overlay source had no recent frames; the base clip was retained.')
+                return
+            if returncode == 0:
+                os.replace(output_path, clip_path)
+                rebind_manifest_after_media_replace(clip_path)
+                print(f'[KeyboardOverlay] Applied to {os.path.basename(clip_path)}')
+            else:
+                detail = stderr.decode(errors='replace').strip().splitlines()
+                print('[KeyboardOverlay] ffmpeg failed: '
+                      f'{detail[-1] if detail else "(no stderr)"}')
+                self._record_finalization_warning(
+                    clip_path,
+                    'Keyboard overlay failed; the base clip was retained.')
+        except Exception as error:
+            print(f'[KeyboardOverlay] Error: {error}')
+            self._record_finalization_warning(
+                clip_path, 'Keyboard overlay failed; the base clip was retained.')
+        finally:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait(timeout=10)
+            if (process is not None and process.stdin is not None
+                    and not process.stdin.closed):
+                try:
+                    process.stdin.close()
+                except (BrokenPipeError, OSError):
+                    pass
+            for path in (output_path,):
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+            try:
+                os.rmdir(tmp_dir)
+            except OSError:
                 pass
 
     def _apply_camera_overlay(self, clip_path: str, ffmpeg: str,
@@ -6599,6 +7246,8 @@ class MainWindow(QMainWindow):
                   f'[0:v][cam]overlay={overlay_pos}[vout]',
                  '-map', '[vout]', '-map', '0:a?',
                  '-map_metadata', '0', '-map_chapters', '0',
+                 '-movflags', 'use_metadata_tags',
+                 *MainWindow._cfr_video_args(clip_path),
                  *software_video_args(),
                  '-c:a', 'copy',
                  out_path],
@@ -6683,6 +7332,8 @@ class MainWindow(QMainWindow):
                  '-vf', f'crop={crop}',
                  '-map', '0:v:0', '-map', '0:a?',
                  '-map_metadata', '0', '-map_chapters', '0',
+                 '-movflags', 'use_metadata_tags',
+                 *MainWindow._cfr_video_args(clip_path),
                  *video_args,
                  '-c:a', 'copy', tmp_path],
                 capture_output=True, timeout=120, **run_options,
@@ -6729,12 +7380,6 @@ class MainWindow(QMainWindow):
                        crop_profile=None):
         if not self._allow_completed_clip_pipeline(clip_path, clip_ready):
             return
-        if (not crop_profile
-                and not any(self.settings_manager.get(key, False) for key in (
-                    'camera_enabled', 'image_overlay_enabled'))):
-            if clip_ready is not None:
-                clip_ready.set()
-            return
         self._spawn_mux_thread(
             target=self._finalize_clip_worker,
             args=(clip_path, duration_seconds, clip_end_time, clip_ready,
@@ -6772,6 +7417,8 @@ class MainWindow(QMainWindow):
                 return
             self._apply_crop(clip_path, ffmpeg, crop_profile)
             self._apply_image_overlay(clip_path, ffmpeg)
+            self._apply_keyboard_overlay(
+                clip_path, ffmpeg, clip_end_time, duration_seconds)
             self._apply_camera_overlay(clip_path, ffmpeg, clip_end_time, duration_seconds)
         finally:
             if clip_ready is not None:
@@ -6854,7 +7501,7 @@ class MainWindow(QMainWindow):
                 new_enc_text = f'{codec} — P{preset}'
             else:
                 new_enc_text = codec
-            if self._ui_ready:
+            if self._ui_ready and not self._background_ui_paused:
                 lbl = self._settings_page_widget.active_encoder_lbl
                 if lbl.text() != new_enc_text:
                     lbl.setText(new_enc_text)
@@ -6940,23 +7587,18 @@ class MainWindow(QMainWindow):
                          CaptureHealthState.RECOVERING,
                      }
                      else status_warning_qss())
-            if self._ui_ready and self.status_label.text() != new_text:
-                self.status_label.setText(new_text)
-                # setStyleSheet triggers a full re-style of the label and is
-                # expensive (~1ms). Only call it on actual style transitions —
-                # the frame count text updates twice/sec but the style stays
-                # status_active_qss() the whole time we're capturing.
-                if getattr(self, '_last_status_style', None) != style:
-                    self.status_label.setStyleSheet(style)
-                    self._last_status_style = style
+            self._set_status(new_text, style)
             if snapshot.request_recovery:
                 self._capture_health_log.warning(
                     'Capture stalled; bounded automatic backend recovery is '
                     'engine-owned and a manual process restart is available')
 
     def _set_status(self, text: str, style: str):
+        self._pending_status_display = (text, style)
         if not hasattr(self, 'status_label'):
             print(f'[Lifecycle] Status={text}')
+            return
+        if self._background_ui_paused:
             return
         self.status_label.setText(text)
         # Skip the QSS reapply when the style didn't change (CONNECTING ticks
@@ -6964,6 +7606,46 @@ class MainWindow(QMainWindow):
         if getattr(self, '_last_status_style', None) != style:
             self.status_label.setStyleSheet(style)
             self._last_status_style = style
+
+    def _on_application_state_changed(self, state) -> None:
+        self._refresh_background_ui_pause_state(state)
+
+    def _refresh_background_ui_pause_state(self, state=None) -> None:
+        """Apply the performance preference without touching core services."""
+        app = QApplication.instance()
+        if state is None and app is not None:
+            state = app.applicationState()
+        inactive = (
+            self._background_start
+            or not self.isVisible()
+            or self.isMinimized()
+            or state != Qt.ApplicationState.ApplicationActive
+        )
+        enabled = bool(self.settings_manager.get(
+            'pause_ui_in_background', True))
+        self._apply_background_ui_paused(enabled and inactive)
+
+    def _apply_background_ui_paused(
+            self, paused: bool, *, force: bool = False) -> None:
+        """Pause presentation work; capture, cards, sounds and saves stay live."""
+        paused = bool(paused)
+        if paused == self._background_ui_paused and not force:
+            return
+        self._background_ui_paused = paused
+        if not self._ui_ready:
+            return
+
+        self.setUpdatesEnabled(not paused)
+        self.clip_grid.set_background_paused(paused)
+        self._settings_page_widget.set_background_ui_paused(paused)
+        if not paused:
+            if self._pending_status_display is not None:
+                text, style = self._pending_status_display
+                self._set_status(text, style)
+            self.update()
+
+    def _on_background_ui_pause_changed(self, _enabled: bool) -> None:
+        self._refresh_background_ui_pause_state()
 
     def _on_clip_opened(self, clip_path: str, thumb_pixmap: QPixmap, card_global_rect: QRect):
         if not self._clip_readiness.can_access(clip_path):
@@ -7309,6 +7991,12 @@ class MainWindow(QMainWindow):
             print(f'[Shutdown] Camera release failed: {error}')
         self._shutdown_mark('CameraStopped')
 
+        try:
+            self._keyboard_overlay_capture.stop()
+        except Exception as error:
+            print(f'[Shutdown] Keyboard overlay release failed: {error}')
+        self._shutdown_mark('KeyboardOverlayStopped')
+
         self.upload_manager.stop()
         self._shutdown_mark('UploadsStopped')
         self.capture_card.close()
@@ -7575,6 +8263,64 @@ class SlidingStackedWidget(QWidget):
 # Full-screen settings page (embedded in main content stack)
 # ---------------------------------------------------------------------------
 
+class _SettingsSlider(QSlider):
+    """Audio slider with absolute click-to-set and a forgiving hit area."""
+
+    _HIT_HEIGHT = 26
+
+    def __init__(self, orientation: Qt.Orientation, parent=None):
+        super().__init__(orientation, parent)
+        self.setMinimumHeight(self._HIT_HEIGHT)
+        self._dragging_from_anywhere = False
+
+    def _value_from_position(self, position: QPoint) -> int:
+        option = QStyleOptionSlider()
+        self.initStyleOption(option)
+        groove = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider, option,
+            QStyle.SubControl.SC_SliderGroove, self)
+        handle = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider, option,
+            QStyle.SubControl.SC_SliderHandle, self)
+        span = max(1, groove.width() - handle.width())
+        slider_position = position.x() - groove.x() - handle.width() / 2
+        slider_position = max(0.0, min(float(span), slider_position))
+        return QStyle.sliderValueFromPosition(
+            self.minimum(), self.maximum(), int(round(slider_position)), span,
+            option.upsideDown)
+
+    def mousePressEvent(self, event):
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self.isEnabled()):
+            self._dragging_from_anywhere = True
+            self.setSliderDown(True)
+            self.setSliderPosition(self._value_from_position(
+                event.position().toPoint()))
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (self._dragging_from_anywhere
+                and event.buttons() & Qt.MouseButton.LeftButton):
+            self.setSliderPosition(self._value_from_position(
+                event.position().toPoint()))
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if (self._dragging_from_anywhere
+                and event.button() == Qt.MouseButton.LeftButton):
+            self.setSliderPosition(self._value_from_position(
+                event.position().toPoint()))
+            self._dragging_from_anywhere = False
+            self.setSliderDown(False)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class _SettingsPage(QWidget):
     close_requested           = Signal()
     clips_directory_changed  = Signal(str)
@@ -7586,7 +8332,9 @@ class _SettingsPage(QWidget):
     close_to_tray_changed        = Signal(bool)
     encoder_config_changed    = Signal()
     audio_capture_changed     = Signal(bool)
+    audio_capture_mode_changed = Signal(str)
     capture_card_changed      = Signal(bool)
+    background_ui_pause_changed = Signal(bool)
     encoder_capabilities_ready = Signal(object)
 
     def _init_autostart_checkbox(self):
@@ -7627,9 +8375,12 @@ class _SettingsPage(QWidget):
         self.sm.save_settings()
         self.error_notifications_changed.emit(enabled)
 
-    def __init__(self, settings_manager: SettingsManager = None, parent=None):
+    def __init__(self, settings_manager: SettingsManager = None, parent=None,
+                 keyboard_capture: ThirdPartyKeyboardCapture | None = None):
         super().__init__(parent)
         self.sm = settings_manager
+        self._keyboard_capture = keyboard_capture
+        self._keyboard_windows: list[dict] = []
         self.setObjectName('settingsPage')
         self._loopback_stream = None
         self._presets_mgr = PresetsManager()
@@ -7730,7 +8481,8 @@ class _SettingsPage(QWidget):
             self._start_encoder_probe()
         # Audio sub-page is index 2 — start the live meter only there
         if hasattr(self, 'mic_level_meter'):
-            if idx == 2 and self.isVisible():
+            if (idx == 2 and self.isVisible()
+                    and not getattr(self, '_background_ui_paused', False)):
                 self.mic_level_meter.set_gain(self.mic_vol_slider.value() / 100.0)
                 self.mic_level_meter.start(self._selected_mic_index())
             else:
@@ -7740,6 +8492,12 @@ class _SettingsPage(QWidget):
                     self.mic_loopback_check.blockSignals(True)
                     self.mic_loopback_check.setChecked(False)
                     self.mic_loopback_check.blockSignals(False)
+        if hasattr(self, '_keyboard_preview_timer'):
+            if (idx == 3 and self.isVisible()
+                    and not getattr(self, '_background_ui_paused', False)):
+                self._keyboard_preview_timer.start()
+            else:
+                self._keyboard_preview_timer.stop()
 
     def _set_settings_content_surface(self) -> None:
         """Keep the settings canvas black outside the raised category cards."""
@@ -8508,6 +9266,16 @@ class _SettingsPage(QWidget):
         right_layout.addWidget(_flat_section_header('Notifications'))
         right_layout.addSpacing(12)
 
+        self.notification_sounds_check = QCheckBox('Enable notification sounds')
+        self.notification_sounds_check.setStyleSheet(checkbox_qss())
+        self.notification_sounds_check.setToolTip(
+            'Toggle every FTHR notification sound on or off without changing '
+            'the individual volume levels.')
+        self.notification_sounds_check.toggled.connect(
+            self._on_notification_sounds_toggled)
+        right_layout.addWidget(self.notification_sounds_check)
+        right_layout.addSpacing(12)
+
         mon_row = QHBoxLayout()
         mon_row.setSpacing(8)
         mon_lbl = QLabel('Monitor:')
@@ -8546,7 +9314,7 @@ class _SettingsPage(QWidget):
             sound_label.setFixedWidth(150)
             sound_row.addWidget(sound_label)
 
-            slider = QSlider(Qt.Orientation.Horizontal)
+            slider = _SettingsSlider(Qt.Orientation.Horizontal)
             slider.setRange(0, 100)
             slider.setSingleStep(1)
             slider.setPageStep(10)
@@ -8592,7 +9360,33 @@ class _SettingsPage(QWidget):
         self.audio_capture_check.setChecked(self.sm.get('audio_capture_enabled', True))
         self.audio_capture_check.toggled.connect(self._on_audio_capture_toggled)
         outer.addWidget(self.audio_capture_check)
+        outer.addSpacing(12)
+
+        self.separate_audio_check = QCheckBox(
+            'Keep system and microphone audio as separate tracks')
+        self.separate_audio_check.setObjectName('separateAudioCheck')
+        self.separate_audio_check.setStyleSheet(checkbox_qss())
+        self.separate_audio_check.setChecked(
+            normalize_audio_capture_mode(self.sm.get(
+                'audio_capture_mode', AUDIO_CAPTURE_MODE_COMBINED))
+            == AUDIO_CAPTURE_MODE_SEPARATED)
+        self.separate_audio_check.setToolTip(
+            'Off (default): system and microphone audio are combined into one '
+            'MP4 track, so the clip editor exposes only MASTER. On: keep the '
+            'sources as separate audio tracks with individual editor controls.')
+        self.separate_audio_check.toggled.connect(
+            self._on_separate_audio_toggled)
+        outer.addWidget(self.separate_audio_check)
+        # Keep a descriptive alias for integrations that refer to the control
+        # by its behavior rather than its visual label.
+        self.audio_separation_check = self.separate_audio_check
         outer.addSpacing(4)
+        mode_hint = QLabel(
+            'Combined audio is the default. Enable separate tracks only when '
+            'you need independent system and microphone mixing in the editor.')
+        mode_hint.setWordWrap(True)
+        mode_hint.setStyleSheet(label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
+        outer.addWidget(mode_hint)
 
         return page
 
@@ -8615,6 +9409,13 @@ class _SettingsPage(QWidget):
         self._sync_audio_controls()
         self.audio_capture_changed.emit(checked)
 
+    def _on_separate_audio_toggled(self, checked: bool):
+        mode = (AUDIO_CAPTURE_MODE_SEPARATED if checked
+                else AUDIO_CAPTURE_MODE_COMBINED)
+        self.sm.set('audio_capture_mode', mode)
+        self.sm.save_settings()
+        self.audio_capture_mode_changed.emit(mode)
+
     def _sync_audio_controls(self):
         """Keep Audio and Performance views backed by one audio setting."""
         audio_enabled = bool(self.sm.get('audio_capture_enabled', True))
@@ -8624,6 +9425,9 @@ class _SettingsPage(QWidget):
                 control.blockSignals(True)
                 control.setChecked(audio_enabled)
                 control.blockSignals(False)
+        separate = getattr(self, 'separate_audio_check', None)
+        if separate is not None:
+            separate.setEnabled(audio_enabled)
 
     def _on_watermark_toggled(self, checked: bool):
         self.sm.set('watermark_enabled', checked)
@@ -8968,6 +9772,205 @@ class _SettingsPage(QWidget):
                 layer['rect'] = clamp_overlay_rect(
                     rects[key], DEFAULT_IMAGE_OVERLAY_RECT)
         self._save_image_layers(layers)
+        if 'keyboard' in rects:
+            keyboard = third_party_keyboard_settings(self.sm)
+            keyboard['rect'] = clamp_overlay_rect(
+                rects.get('keyboard'), DEFAULT_KEYBOARD_OVERLAY_RECT)
+            self.sm.set('third_party_keyboard', keyboard)
+            self.sm.save_settings()
+
+    def _keyboard_config_for_write(self) -> dict:
+        return third_party_keyboard_settings(self.sm)
+
+    def _save_keyboard_config(self, config: dict) -> None:
+        self.sm.set('third_party_keyboard', {
+            'enabled': bool(config.get('enabled', False)),
+            'hwnd': max(0, int(config.get('hwnd', 0) or 0)),
+            'window_name': str(config.get('window_name', '') or ''),
+            'color': str(config.get('color', DEFAULT_KEYBOARD_COLOR)),
+            'intensity': int(config.get('intensity', DEFAULT_KEYBOARD_INTENSITY)),
+            'rect': clamp_overlay_rect(
+                config.get('rect'), DEFAULT_KEYBOARD_OVERLAY_RECT),
+        })
+        self.sm.save_settings()
+        if self._keyboard_capture is not None:
+            self._keyboard_capture.configure(
+                third_party_keyboard_settings(self.sm))
+
+    def _refresh_keyboard_windows(self) -> None:
+        if not hasattr(self, 'keyboard_window_combo'):
+            return
+        if sys.platform != 'win32':
+            self.keyboard_window_combo.clear()
+            self.keyboard_window_combo.addItem('Windows only')
+            self.keyboard_window_combo.setEnabled(False)
+            return
+
+        self._keyboard_windows = enumerate_keyboard_windows()
+        config = third_party_keyboard_settings(self.sm)
+        saved_hwnd = config['hwnd']
+        if saved_hwnd and not any(
+                int(item.get('hwnd', 0) or 0) == saved_hwnd
+                for item in self._keyboard_windows):
+            self._keyboard_windows.insert(0, {
+                'hwnd': saved_hwnd,
+                'display_name': (
+                    f"{config['window_name'] or 'Saved keyboard'} · NOT VISIBLE"),
+                'title': config['window_name'],
+                'is_keyboard_candidate': True,
+            })
+
+        combo = self.keyboard_window_combo
+        combo.blockSignals(True)
+        combo.clear()
+        for item in self._keyboard_windows:
+            marker = '★ ' if item.get('is_keyboard_candidate') else ''
+            combo.addItem(
+                marker + str(item.get('display_name') or item.get('title')
+                            or 'Window'),
+                int(item.get('hwnd', 0) or 0))
+        if self._keyboard_windows:
+            selected = next((index for index, item in enumerate(
+                self._keyboard_windows)
+                if int(item.get('hwnd', 0) or 0) == saved_hwnd), 0)
+            combo.setCurrentIndex(selected)
+        else:
+            combo.addItem('No titled windows detected')
+        combo.setEnabled(bool(self._keyboard_windows))
+        combo.blockSignals(False)
+        self._sync_keyboard_overlay_controls()
+
+    def _on_keyboard_window_changed(self, index: int) -> None:
+        if index < 0 or not hasattr(self, 'keyboard_window_combo'):
+            return
+        value = self.keyboard_window_combo.itemData(index)
+        if value is None:
+            return
+        try:
+            hwnd = max(0, int(value))
+        except (TypeError, ValueError):
+            # User-editable window data is allowed to become stale between a
+            # refresh and a selection; leave the current source unchanged.
+            return
+        if not hwnd:
+            return
+        config = self._keyboard_config_for_write()
+        config['hwnd'] = hwnd
+        config['window_name'] = self.keyboard_window_combo.itemText(index)
+        config['enabled'] = True
+        self.keyboard_overlay_check.blockSignals(True)
+        self.keyboard_overlay_check.setChecked(True)
+        self.keyboard_overlay_check.blockSignals(False)
+        self._save_keyboard_config(config)
+        if hasattr(self, 'unified_overlay_editor'):
+            self.unified_overlay_editor.set_overlay_enabled('keyboard', True)
+        self._sync_keyboard_overlay_controls()
+
+    def _on_keyboard_overlay_toggled(self, checked: bool) -> None:
+        config = self._keyboard_config_for_write()
+        if checked and not config['hwnd']:
+            self.keyboard_overlay_check.blockSignals(True)
+            self.keyboard_overlay_check.setChecked(False)
+            self.keyboard_overlay_check.blockSignals(False)
+            self._sync_keyboard_overlay_controls()
+            return
+        config['enabled'] = bool(checked)
+        self._save_keyboard_config(config)
+        if hasattr(self, 'unified_overlay_editor'):
+            self.unified_overlay_editor.set_overlay_enabled(
+                'keyboard', bool(checked))
+            if not checked:
+                self.unified_overlay_editor.set_keyboard_pixmap(QPixmap())
+        self._sync_keyboard_overlay_controls()
+
+    def _sync_keyboard_color_swatch(self, color: str) -> None:
+        if not hasattr(self, 'keyboard_color_swatch'):
+            return
+        color = str(color or DEFAULT_KEYBOARD_COLOR).lower()
+        self.keyboard_color_swatch.setStyleSheet(
+            f'QPushButton {{ background: {color}; border: 1px solid '
+            f'{Colors.BORDER_HI}; }} QPushButton:hover {{ border-color: '
+            f'{Colors.ACCENT}; }}')
+        self.keyboard_color_value.setText(color.upper())
+
+    def _start_keyboard_color_picker(self) -> None:
+        if not hasattr(self, 'keyboard_source_preview'):
+            return
+        self.keyboard_source_preview.set_pick_mode(True)
+
+    def _on_keyboard_color_picked(self, color) -> None:
+        config = self._keyboard_config_for_write()
+        config['color'] = color.name().lower()
+        self._save_keyboard_config(config)
+        self._sync_keyboard_color_swatch(config['color'])
+        self._update_keyboard_preview()
+
+    def _on_keyboard_intensity_changed(self, value: int) -> None:
+        value = max(0, min(100, int(value)))
+        self.keyboard_intensity_value.setText(f'{value}%')
+        config = self._keyboard_config_for_write()
+        config['intensity'] = value
+        self._save_keyboard_config(config)
+        self._update_keyboard_preview()
+
+    def _sync_keyboard_overlay_controls(self) -> None:
+        if not hasattr(self, 'keyboard_overlay_check'):
+            return
+        config = third_party_keyboard_settings(self.sm)
+        has_source = bool(config['hwnd'])
+        windows = sys.platform == 'win32'
+        self.keyboard_overlay_check.setEnabled(windows and has_source)
+        self.keyboard_intensity.setEnabled(windows and has_source)
+        self.keyboard_pick_color.setEnabled(windows and has_source)
+        self.keyboard_color_swatch.setEnabled(windows and has_source)
+        self.keyboard_source_preview.setEnabled(windows and has_source)
+        self._sync_keyboard_color_swatch(config['color'])
+        if hasattr(self, 'unified_overlay_editor'):
+            self.unified_overlay_editor.set_overlay_enabled(
+                'keyboard', config['enabled'])
+
+    def _update_keyboard_preview(self) -> None:
+        if sys.platform != 'win32' or self._keyboard_capture is None:
+            return
+        preview = getattr(self, 'unified_overlay_editor', None)
+        source_preview = getattr(self, 'keyboard_source_preview', None)
+        if preview is None or source_preview is None:
+            return
+        frame, _timestamp = self._keyboard_capture.latest_frame()
+        if frame is None:
+            error = self._keyboard_capture.last_error
+            source_preview.set_empty_text(
+                error or 'WAITING FOR KEYBOARD WINDOW')
+            source_preview.set_image(QImage())
+            preview.set_keyboard_pixmap(QPixmap())
+            return
+
+        import cv2 as _cv2
+        source_h, source_w = frame.shape[:2]
+        scale = min(1.0, 720 / max(1, source_w), 405 / max(1, source_h))
+        if scale < 1.0:
+            frame = _cv2.resize(
+                frame,
+                (max(2, int(source_w * scale)), max(2, int(source_h * scale))),
+                interpolation=_cv2.INTER_AREA,
+            )
+        rgb = _cv2.cvtColor(frame, _cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        raw_image = QImage(
+            rgb.tobytes(), w, h, ch * w,
+            QImage.Format.Format_RGB888).copy()
+        source_preview.set_image(raw_image)
+
+        config = third_party_keyboard_settings(self.sm)
+        rgba = chroma_key_rgba(
+            frame, config['color'], config['intensity'])
+        if rgba is None:
+            preview.set_keyboard_pixmap(QPixmap())
+            return
+        keyed_image = QImage(
+            rgba.tobytes(), w, h, 4 * w,
+            QImage.Format.Format_RGBA8888).copy()
+        preview.set_keyboard_pixmap(QPixmap.fromImage(keyed_image))
 
     def _refresh_preset_combo(self):
         self.preset_combo.blockSignals(True)
@@ -9124,9 +10127,12 @@ class _SettingsPage(QWidget):
         self.mic_combo.blockSignals(True)
         self.mic_vol_slider.blockSignals(True)
         self.mic_loopback_check.blockSignals(True)
+        if hasattr(self, 'separate_audio_check'):
+            self.separate_audio_check.blockSignals(True)
         self.notif_monitor_combo.blockSignals(True)
         for slider in self.sound_sliders.values():
             slider.blockSignals(True)
+        self.notification_sounds_check.blockSignals(True)
         try:
             endpoint_id = self.sm.get('mic_device_id')
             name = self.sm.get('mic_device_name')
@@ -9144,6 +10150,10 @@ class _SettingsPage(QWidget):
             self.mic_vol_value.setText(f'{vol}%')
             self.mic_level_meter.set_gain(vol / 100.0)
             self.mic_loopback_check.setChecked(bool(self.sm.get('mic_loopback', False)))
+            self.separate_audio_check.setChecked(
+                normalize_audio_capture_mode(self.sm.get(
+                    'audio_capture_mode', AUDIO_CAPTURE_MODE_COMBINED))
+                == AUDIO_CAPTURE_MODE_SEPARATED)
             saved_mon = self.sm.get('notification_monitor', 'auto')
             idx = self.notif_monitor_combo.findData(saved_mon)
             if idx >= 0:
@@ -9152,14 +10162,21 @@ class _SettingsPage(QWidget):
                 sv = int(self.sm.get(f'sound_volume_{key}', 100))
                 slider.setValue(sv)
                 self.sound_value_labels[key].setText(f'{sv}%')
+            self.notification_sounds_check.setChecked(bool(self.sm.get(
+                'notification_sounds_enabled', True)))
+            self._set_notification_sound_controls_enabled(
+                self.notification_sounds_check.isChecked())
             self._sync_audio_controls()
         finally:
             self.mic_combo.blockSignals(False)
             self.mic_vol_slider.blockSignals(False)
             self.mic_loopback_check.blockSignals(False)
+            if hasattr(self, 'separate_audio_check'):
+                self.separate_audio_check.blockSignals(False)
             self.notif_monitor_combo.blockSignals(False)
             for slider in self.sound_sliders.values():
                 slider.blockSignals(False)
+            self.notification_sounds_check.blockSignals(False)
         self._load_gary_settings()
 
     def _load_gary_settings(self):
@@ -9315,11 +10332,24 @@ class _SettingsPage(QWidget):
         self.sm.set(f'sound_volume_{key}', v)
         self.sm.save_settings()
 
+    def _set_notification_sound_controls_enabled(self, enabled: bool) -> None:
+        for slider in self.sound_sliders.values():
+            slider.setEnabled(bool(enabled))
+
+    def _on_notification_sounds_toggled(self, enabled: bool) -> None:
+        if self.sm is None:
+            return
+        enabled = bool(enabled)
+        self._set_notification_sound_controls_enabled(enabled)
+        self.sm.set('notification_sounds_enabled', enabled)
+        self.sm.save_settings()
+
     def _on_mic_device_changed(self, _idx: int):
         idx = self._selected_mic_index()
         # Restart meter on the new device
         self.mic_level_meter.stop()
-        if self.isVisible() and self.stack.currentIndex() == 2:
+        if (self.isVisible() and self.stack.currentIndex() == 2
+                and not getattr(self, '_background_ui_paused', False)):
             self.mic_level_meter.set_gain(self.mic_vol_slider.value() / 100.0)
             self.mic_level_meter.start(idx)
         # Restart loopback if currently on
@@ -9387,15 +10417,50 @@ class _SettingsPage(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         # Only run the meter when the audio sub-page is selected
-        if hasattr(self, 'stack') and self.stack.currentIndex() == 2:
+        if (hasattr(self, 'stack') and self.stack.currentIndex() == 2
+                and not getattr(self, '_background_ui_paused', False)):
             self.mic_level_meter.set_gain(self.mic_vol_slider.value() / 100.0)
             self.mic_level_meter.start(self._selected_mic_index())
+        if (hasattr(self, '_keyboard_preview_timer')
+                and hasattr(self, 'stack')
+                and self.stack.currentIndex() == 3
+                and not getattr(self, '_background_ui_paused', False)):
+            self._keyboard_preview_timer.start()
 
     def hideEvent(self, event):
         self._stop_loopback()
         if hasattr(self, 'mic_level_meter'):
             self.mic_level_meter.stop()
+        if hasattr(self, '_keyboard_preview_timer'):
+            self._keyboard_preview_timer.stop()
         super().hideEvent(event)
+
+    def set_background_ui_paused(self, paused: bool) -> None:
+        """Suspend settings-only previews without changing saved features."""
+        paused = bool(paused)
+        self._background_ui_paused = paused
+        if paused:
+            if hasattr(self, 'mic_level_meter'):
+                self.mic_level_meter.stop()
+            for name in ('_camera_preview_timer', '_keyboard_preview_timer'):
+                timer = getattr(self, name, None)
+                if timer is not None:
+                    timer.stop()
+            return
+
+        if not self.isVisible() or not hasattr(self, 'stack'):
+            return
+        idx = self.stack.currentIndex()
+        if idx == 2 and hasattr(self, 'mic_level_meter'):
+            self.mic_level_meter.set_gain(
+                self.mic_vol_slider.value() / 100.0)
+            self.mic_level_meter.start(self._selected_mic_index())
+        if (idx == 3
+                and self.sm.get('camera_enabled', False)
+                and hasattr(self, '_camera_preview_timer')):
+            self._camera_preview_timer.start()
+        if idx == 3 and hasattr(self, '_keyboard_preview_timer'):
+            self._keyboard_preview_timer.start()
 
     def _make_visuals_page_unified_legacy(self):
         page = QWidget()
@@ -9543,6 +10608,122 @@ class _SettingsPage(QWidget):
         image_controls.addWidget(self.image_overlay_opacity_value)
         options_layout.addLayout(image_controls)
         options_layout.addSpacing(20)
+
+        # Third-party keyboard options. The source is a separate top-level
+        # Windows window (Noboard/NohBoard/Keyviz/etc.), just like an OBS
+        # window-capture source. The capture worker stays independent of the
+        # native replay engine so the eyedropper and intensity slider never
+        # trigger an engine restart.
+        option_header('Third-party keyboard')
+        keyboard_config = third_party_keyboard_settings(self.sm)
+        self.keyboard_overlay_check = QCheckBox(
+            'Show external keyboard in clips')
+        self.keyboard_overlay_check.setStyleSheet(checkbox_qss())
+        self.keyboard_overlay_check.setChecked(keyboard_config['enabled'])
+        self.keyboard_overlay_check.toggled.connect(
+            self._on_keyboard_overlay_toggled)
+        options_layout.addWidget(self.keyboard_overlay_check)
+        options_layout.addSpacing(8)
+
+        keyboard_window_row = QHBoxLayout()
+        keyboard_window_row.setSpacing(6)
+        keyboard_window_label = QLabel('WINDOW')
+        keyboard_window_label.setStyleSheet(_LABEL_STYLE)
+        keyboard_window_label.setFixedWidth(58)
+        keyboard_window_row.addWidget(keyboard_window_label)
+        self.keyboard_window_combo = _DropdownCombo()
+        self.keyboard_window_combo.setStyleSheet(_COMBO_STYLE)
+        self.keyboard_window_combo.currentIndexChanged.connect(
+            self._on_keyboard_window_changed)
+        keyboard_window_row.addWidget(self.keyboard_window_combo, 1)
+        keyboard_refresh = QPushButton('↻')
+        keyboard_refresh.setObjectName('micRefreshBtn')
+        keyboard_refresh.setFixedSize(26, 26)
+        keyboard_refresh.setToolTip('Re-scan external keyboard windows')
+        keyboard_refresh.clicked.connect(self._refresh_keyboard_windows)
+        keyboard_window_row.addWidget(keyboard_refresh)
+        options_layout.addLayout(keyboard_window_row)
+        options_layout.addSpacing(8)
+
+        self.keyboard_source_preview = KeyboardSourcePreview()
+        self.keyboard_source_preview.set_empty_text(
+            'SELECT A WINDOW TO PREVIEW')
+        self.keyboard_source_preview.setFixedHeight(132)
+        self.keyboard_source_preview.color_picked.connect(
+            self._on_keyboard_color_picked)
+        options_layout.addWidget(self.keyboard_source_preview)
+        options_layout.addSpacing(8)
+
+        keyboard_color_row = QHBoxLayout()
+        keyboard_color_row.setSpacing(6)
+        keyboard_color_label = QLabel('KEY COLOR')
+        keyboard_color_label.setStyleSheet(_LABEL_STYLE)
+        keyboard_color_label.setFixedWidth(58)
+        keyboard_color_row.addWidget(keyboard_color_label)
+        self.keyboard_color_swatch = QPushButton()
+        self.keyboard_color_swatch.setFixedSize(36, 26)
+        self.keyboard_color_swatch.setToolTip(
+            'Pick the color to remove from the live keyboard preview')
+        keyboard_color_row.addWidget(self.keyboard_color_swatch)
+        self.keyboard_color_value = QLabel(keyboard_config['color'].upper())
+        self.keyboard_color_value.setStyleSheet(
+            label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
+        keyboard_color_row.addWidget(self.keyboard_color_value)
+        keyboard_color_row.addStretch()
+        self.keyboard_pick_color = QPushButton('PICK FROM PREVIEW')
+        self.keyboard_pick_color.setStyleSheet(button_outline_qss())
+        self.keyboard_pick_color.setMinimumHeight(30)
+        self.keyboard_pick_color.clicked.connect(
+            self._start_keyboard_color_picker)
+        keyboard_color_row.addWidget(self.keyboard_pick_color)
+        options_layout.addLayout(keyboard_color_row)
+        options_layout.addSpacing(8)
+
+        keyboard_intensity_row = QHBoxLayout()
+        keyboard_intensity_row.setSpacing(6)
+        keyboard_intensity_label = QLabel('INTENSITY')
+        keyboard_intensity_label.setStyleSheet(_LABEL_STYLE)
+        keyboard_intensity_label.setFixedWidth(58)
+        keyboard_intensity_row.addWidget(keyboard_intensity_label)
+        self.keyboard_intensity = _SettingsSlider(Qt.Orientation.Horizontal)
+        self.keyboard_intensity.setRange(0, 100)
+        self.keyboard_intensity.setValue(keyboard_config['intensity'])
+        self.keyboard_intensity.setStyleSheet(slider_qss())
+        self.keyboard_intensity.valueChanged.connect(
+            self._on_keyboard_intensity_changed)
+        keyboard_intensity_row.addWidget(self.keyboard_intensity, 1)
+        self.keyboard_intensity_value = QLabel(
+            f"{keyboard_config['intensity']}%")
+        self.keyboard_intensity_value.setFixedWidth(34)
+        self.keyboard_intensity_value.setStyleSheet(
+            label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
+        keyboard_intensity_row.addWidget(self.keyboard_intensity_value)
+        options_layout.addLayout(keyboard_intensity_row)
+        options_layout.addSpacing(6)
+
+        keyboard_hint = QLabel(
+            'Capture a Noboard/NohBoard-style window, then click its solid '
+            'background above. Changes are applied to the live preview '
+            'immediately.')
+        keyboard_hint.setWordWrap(True)
+        keyboard_hint.setStyleSheet(label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
+        options_layout.addWidget(keyboard_hint)
+        if sys.platform != 'win32':
+            keyboard_platform_hint = QLabel('WINDOWS ONLY')
+            keyboard_platform_hint.setStyleSheet(
+                label_uppercase(Colors.TEXT_MUTED, Fonts.SIZE_MICRO, 1))
+            options_layout.addWidget(keyboard_platform_hint)
+            for control in (
+                    self.keyboard_overlay_check, self.keyboard_window_combo,
+                    keyboard_refresh, self.keyboard_source_preview,
+                    self.keyboard_color_swatch, self.keyboard_pick_color,
+                    self.keyboard_intensity):
+                control.setEnabled(False)
+        self._refresh_keyboard_windows()
+        self._sync_keyboard_color_swatch(keyboard_config['color'])
+        self._sync_keyboard_overlay_controls()
+        options_layout.addSpacing(20)
+
         option_header('Preview background')
         self.input_overlay_preview_background_path = QLineEdit(
             preview_background_path or 'DEFAULT · DESKTOP SCREENSHOT')
@@ -9600,12 +10781,16 @@ class _SettingsPage(QWidget):
         self.unified_overlay_editor.set_background(preview_background)
         self.unified_overlay_editor.set_rects({
             'camera': self.sm.get('camera_overlay_rect', DEFAULT_OVERLAY_RECT),
+            'keyboard': keyboard_config['rect'],
         })
         self.unified_overlay_editor.set_camera_pixmap(QPixmap())
+        self.unified_overlay_editor.set_keyboard_pixmap(QPixmap())
         self.unified_overlay_editor.set_image_layers(
             image_overlay_layers(self.sm))
         self.unified_overlay_editor.set_overlay_enabled(
             'camera', bool(self.sm.get('camera_enabled', False)))
+        self.unified_overlay_editor.set_overlay_enabled(
+            'keyboard', keyboard_config['enabled'])
         self.unified_overlay_editor.rects_changed.connect(
             self._on_input_overlay_rects_changed)
         self.unified_overlay_editor.setSizePolicy(
@@ -9618,6 +10803,11 @@ class _SettingsPage(QWidget):
         self._camera_preview_timer = QTimer(self)
         self._camera_preview_timer.setInterval(100)
         self._camera_preview_timer.timeout.connect(self._update_camera_preview)
+
+        self._keyboard_preview_timer = QTimer(self)
+        self._keyboard_preview_timer.setInterval(33)
+        self._keyboard_preview_timer.timeout.connect(
+            self._update_keyboard_preview)
 
         self._refresh_image_overlay_controls(0)
 
@@ -9839,6 +11029,9 @@ class _SettingsPage(QWidget):
         # the newly applied tokens. The preview remains the one intentional
         # pure-black sample of the customization surface.
         self._customize_page.refresh_theme()
+        if hasattr(self, 'keyboard_color_swatch'):
+            self._sync_keyboard_color_swatch(
+                third_party_keyboard_settings(self.sm)['color'])
         # Signal the main window to rebuild its stylesheet
         top = self.window()
         if hasattr(top, '_apply_theme'):
@@ -9850,6 +11043,34 @@ class _SettingsPage(QWidget):
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
+
+        layout.addWidget(_flat_section_header('Background Activity'))
+        layout.addSpacing(12)
+
+        self.performance_background_pause_check = QCheckBox(
+            'Pause non-essential UI while in background')
+        self.performance_background_pause_check.setStyleSheet(checkbox_qss())
+        self.performance_background_pause_check.setChecked(bool(
+            self.sm.get('pause_ui_in_background', True)))
+        self.performance_background_pause_check.setToolTip(
+            'Pauses library refreshes and settings previews while FTHR is not '
+            'active. Capture, save handling, capture cards, and notification '
+            'sounds continue with their existing settings.')
+        self.performance_background_pause_check.toggled.connect(
+            self._on_background_ui_pause_toggled)
+        layout.addWidget(self.performance_background_pause_check)
+
+        background_hint = QLabel(
+            'Capture keeps running normally. Capture-card visibility and each '
+            'notification volume remain controlled by their own options.')
+        background_hint.setWordWrap(True)
+        background_hint.setStyleSheet(
+            label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
+        layout.addWidget(background_hint)
+
+        layout.addSpacing(28)
+        layout.addWidget(_settings_hsep())
+        layout.addSpacing(20)
 
         layout.addWidget(_flat_section_header('Audio Processing'))
         layout.addSpacing(12)
@@ -9952,6 +11173,14 @@ class _SettingsPage(QWidget):
 
         layout.addStretch()
         return page
+
+    def _on_background_ui_pause_toggled(self, checked: bool):
+        if self.sm is None:
+            return
+        checked = bool(checked)
+        self.sm.set('pause_ui_in_background', checked)
+        self.sm.save_settings()
+        self.background_ui_pause_changed.emit(checked)
 
     def _on_clip_editor_preview_toggled(self, checked: bool):
         if self.sm is None:

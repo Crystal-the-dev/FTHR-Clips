@@ -320,7 +320,7 @@ def probe_audio_streams(media_path: str) -> tuple[ProbedAudioStream, ...]:
     try:
         result = subprocess.run(
             [probe, '-v', 'error', '-show_entries',
-             'stream=index,codec_type:stream_tags=title,handler_name',
+             'format_tags=comment,fthr_audio_mode:stream=index,codec_type:stream_tags=title,handler_name',
              '-of', 'json', media_path],
             capture_output=True, text=True, timeout=4, **_NO_WINDOW)
     except (OSError, subprocess.SubprocessError) as error:
@@ -328,9 +328,24 @@ def probe_audio_streams(media_path: str) -> tuple[ProbedAudioStream, ...]:
     if result.returncode != 0:
         raise PlaybackError('could not inspect clip audio streams')
     try:
-        raw_streams = json.loads(result.stdout).get('streams', [])
+        raw = json.loads(result.stdout)
+        raw_streams = raw.get('streams', [])
     except (TypeError, json.JSONDecodeError) as error:
         raise PlaybackError('clip stream metadata was not valid JSON') from error
+    format_section = raw.get('format') if isinstance(raw, dict) else None
+    format_tags = (format_section.get('tags', {})
+                   if isinstance(format_section, dict) else {})
+    raw_audio_mode = (format_tags.get('fthr_audio_mode')
+                      if isinstance(format_tags, dict) else None)
+    if not isinstance(raw_audio_mode, str) and isinstance(format_tags, dict):
+        comment = format_tags.get('comment')
+        if isinstance(comment, str) and comment.casefold().startswith(
+                'fthr-audio-mode='):
+            raw_audio_mode = comment.split('=', 1)[1]
+    audio_mode = (raw_audio_mode.strip().lower()
+                  if isinstance(raw_audio_mode, str)
+                  and raw_audio_mode.strip().lower() in {'combined', 'separated'}
+                  else None)
     streams: list[ProbedAudioStream] = []
     for stream in raw_streams:
         if stream.get('codec_type') != 'audio' or not isinstance(stream.get('index'), int):
@@ -339,7 +354,27 @@ def probe_audio_streams(media_path: str) -> tuple[ProbedAudioStream, ...]:
         title = tags.get('title') or tags.get('handler_name')
         streams.append(ProbedAudioStream(
             container_index=stream['index'], audio_index=len(streams),
-            title=title if isinstance(title, str) else None))
+            title=title if isinstance(title, str) else None,
+            audio_mode=audio_mode))
+    if audio_mode is None:
+        labels = {
+            str((stream.get('tags') or {}).get('title')
+                or (stream.get('tags') or {}).get('handler_name')
+                or '').strip().casefold()
+            for stream in raw_streams
+            if isinstance(stream, dict) and stream.get('codec_type') == 'audio'
+        }
+        if 'combined audio' in labels:
+            audio_mode = 'combined'
+        elif {'system audio', 'microphone'} <= labels:
+            audio_mode = 'separated'
+        if audio_mode is not None:
+            streams = [ProbedAudioStream(
+                container_index=stream.container_index,
+                audio_index=stream.audio_index,
+                title=stream.title,
+                audio_mode=audio_mode)
+                       for stream in streams]
     return tuple(streams)
 
 

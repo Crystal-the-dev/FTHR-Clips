@@ -7,3 +7,10 @@ It is included in the application at the owner's request and is not a
 project-generated or third-party asset.
 
 The asset is intended for this workspace and its packaged FTHR Clips builds.
+
+FTHR Clips brand icon
+=====================
+
+The files FTHR_UI/assets/favicon.ico and FTHR_UI/assets/fthr_logo.ico were
+supplied by the workspace owner for use as the FTHR Clips application,
+executable, tray, shortcut, and Windows installer icon.

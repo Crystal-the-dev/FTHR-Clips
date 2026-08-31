@@ -15,6 +15,9 @@ extern "C" {
 #pragma warning(pop)
 #endif
 
+struct AVStream;
+struct AVFormatContext;
+
 namespace fthr {
 
 AVCodecID ToAvCodecId(VideoCodec codec) noexcept;
@@ -23,6 +26,15 @@ AVCodecID ToAvCodecId(VideoCodec codec) noexcept;
 // converts them to studio-range BT.709 YUV; publish that contract in the MP4
 // stream so players do not guess full range and lift the picture/exposure.
 void ApplySdrBt709ColorMetadata(AVCodecParameters* parameters) noexcept;
+
+// Publish the configured capture values instead of leaving FFmpeg/MP4 readers
+// to infer them from packet timing and payload size. The packet stream remains
+// untouched; this sets the stream declarations and records global MP4 metadata
+// that survives later remuxes.
+void ApplyConfiguredVideoMetadata(
+    AVFormatContext* format_context,
+    AVStream* stream,
+    const EncodedVideoConfig& config) noexcept;
 
 } // namespace fthr
 

@@ -90,6 +90,13 @@ bool Encoder::TryOpen(const char* codec_name, const EncoderConfig& cfg) {
     ctx->bit_rate     = static_cast<int64_t>(cfg.bitrate_kbps) * 1000LL;
     ctx->gop_size     = static_cast<int>(cfg.fps) * 2;
     ctx->max_b_frames = 0;
+    // Keep Linux's output contract identical to the Windows encoders:
+    // desktop BGRA is full-range, encoded SDR video is studio-range BT.709.
+    ctx->color_range = AVCOL_RANGE_MPEG;
+    ctx->color_primaries = AVCOL_PRI_BT709;
+    ctx->color_trc = AVCOL_TRC_BT709;
+    ctx->colorspace = AVCOL_SPC_BT709;
+    ctx->chroma_sample_location = AVCHROMA_LOC_LEFT;
 
     bool is_hw = (strstr(codec_name, "nvenc") || strstr(codec_name, "amf") ||
                   strstr(codec_name, "qsv"));
@@ -195,6 +202,14 @@ bool Encoder::Open(const EncoderConfig& cfg, std::string& codec_used_out) {
     );
     if (!sws_ctx_) {
         std::cerr << "[Encoder] sws_getContext failed" << std::endl;
+        Close();
+        return false;
+    }
+    const int* bt709 = sws_getCoefficients(SWS_CS_ITU709);
+    if (!bt709 || sws_setColorspaceDetails(
+            sws_ctx_, bt709, 1, bt709, 0, 0, 1 << 16, 1 << 16) < 0) {
+        std::cerr << "[Encoder] Failed to configure explicit full-range BGRA -> "
+                     "studio-range BT.709 conversion" << std::endl;
         Close();
         return false;
     }

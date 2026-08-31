@@ -12,8 +12,9 @@ core.linux_runtime.hotkey_socket_path() for the resolved path; do not hardcode
 one, and do not print one you did not resolve.
 
 On Hyprland these lines are written automatically to ~/.config/hypr/fthr-hotkeys.conf
-whenever a hotkey is changed. The `keyboard` library fallback is kept for
-non-Wayland / Windows use.
+whenever a hotkey is changed. Windows uses RegisterHotKey/WM_HOTKEY so hiding
+the UI cannot suspend shortcut delivery. The `keyboard` library remains the
+fallback for non-Wayland Linux desktops.
 """
 import ctypes
 import keyboard
@@ -25,7 +26,7 @@ import sys
 import subprocess
 import threading
 import time
-from PySide6.QtCore import QAbstractNativeEventFilter, QCoreApplication, QObject, Signal, QTimer, Qt
+from PySide6.QtCore import QObject, Signal, QTimer, Qt
 import json
 from pathlib import Path
 
@@ -87,11 +88,17 @@ _XINPUT_BUTTON_FLAGS = {
 }
 _XINPUT_TRIGGER_THRESHOLD = 30
 WM_INPUT = 0x00FF
+WM_POWERBROADCAST = 0x0218
+WM_WTSSESSION_CHANGE = 0x02B1
+WM_HOTKEY = 0x0312
 RID_INPUT = 0x10000003
 RIDI_DEVICENAME = 0x20000007
 RIDEV_INPUTSINK = 0x00000100
 RIDEV_DEVNOTIFY = 0x00002000
+RIM_TYPEKEYBOARD = 1
 RIM_TYPEHID = 2
+RI_KEY_BREAK = 0x0001
+RAW_KEYBOARD_USAGE = (0x01, 0x06)
 RAW_GAME_CONTROLLER_USAGES = (
     (0x01, 0x04),  # Joystick
     (0x01, 0x05),  # Game Pad
@@ -102,6 +109,58 @@ _KEYBOARD_MODIFIERS = ('Ctrl', 'Alt', 'Shift', 'Win')
 _KEYBOARD_MODIFIER_ALIASES = {
     'ctrl': 'Ctrl', 'control': 'Ctrl', 'alt': 'Alt', 'shift': 'Shift',
     'win': 'Win', 'windows': 'Win', 'meta': 'Win', 'cmd': 'Win', 'command': 'Win',
+}
+
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_WIN = 0x0008
+MOD_NOREPEAT = 0x4000
+PBT_APMRESUMESUSPEND = 0x0007
+PBT_APMRESUMEAUTOMATIC = 0x0012
+WTS_SESSION_UNLOCK = 0x0008
+NOTIFY_FOR_THIS_SESSION = 0
+_WINDOWS_HOTKEY_ID_BASE = 0x4600
+_WINDOWS_HOTKEY_IDS = {
+    action: _WINDOWS_HOTKEY_ID_BASE + index
+    for index, action in enumerate(_HOTKEY_ACTIONS)
+}
+_WINDOWS_MODIFIER_FLAGS = {
+    'Alt': MOD_ALT,
+    'Ctrl': MOD_CONTROL,
+    'Shift': MOD_SHIFT,
+    'Win': MOD_WIN,
+}
+_WINDOWS_NAMED_VIRTUAL_KEYS = {
+    'Backspace': 0x08,
+    'Tab': 0x09,
+    'Enter': 0x0D,
+    'Esc': 0x1B,
+    'Escape': 0x1B,
+    'Space': 0x20,
+    'Page Up': 0x21,
+    'Page Down': 0x22,
+    'End': 0x23,
+    'Home': 0x24,
+    'Left': 0x25,
+    'Up': 0x26,
+    'Right': 0x27,
+    'Down': 0x28,
+    'Insert': 0x2D,
+    'Delete': 0x2E,
+}
+_WINDOWS_MODIFIER_VIRTUAL_KEYS = {
+    0x10: MOD_SHIFT,   # VK_SHIFT
+    0x11: MOD_CONTROL, # VK_CONTROL
+    0x12: MOD_ALT,     # VK_MENU
+    0x5B: MOD_WIN,     # VK_LWIN
+    0x5C: MOD_WIN,     # VK_RWIN
+    0xA0: MOD_SHIFT,   # VK_LSHIFT
+    0xA1: MOD_SHIFT,   # VK_RSHIFT
+    0xA2: MOD_CONTROL, # VK_LCONTROL
+    0xA3: MOD_CONTROL, # VK_RCONTROL
+    0xA4: MOD_ALT,     # VK_LMENU
+    0xA5: MOD_ALT,     # VK_RMENU
 }
 
 
@@ -154,8 +213,26 @@ class _RAWINPUTHEADER(ctypes.Structure):
     ]
 
 
+class _RAWKEYBOARD(ctypes.Structure):
+    _fields_ = [
+        ('MakeCode', ctypes.c_ushort),
+        ('Flags', ctypes.c_ushort),
+        ('Reserved', ctypes.c_ushort),
+        ('VKey', ctypes.c_ushort),
+        ('Message', ctypes.c_uint),
+        ('ExtraInformation', ctypes.c_uint),
+    ]
+
+
 _USER32 = ctypes.WinDLL('user32', use_last_error=True) if sys.platform == 'win32' else None
 if _USER32 is not None:
+    _USER32.RegisterHotKey.argtypes = (
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_uint, ctypes.c_uint)
+    _USER32.RegisterHotKey.restype = ctypes.c_bool
+    _USER32.UnregisterHotKey.argtypes = (ctypes.c_void_p, ctypes.c_int)
+    _USER32.UnregisterHotKey.restype = ctypes.c_bool
+    _USER32.VkKeyScanW.argtypes = (ctypes.c_wchar,)
+    _USER32.VkKeyScanW.restype = ctypes.c_short
     _USER32.RegisterRawInputDevices.argtypes = (
         ctypes.POINTER(_RAWINPUTDEVICE), ctypes.c_uint, ctypes.c_uint)
     _USER32.RegisterRawInputDevices.restype = ctypes.c_bool
@@ -167,6 +244,18 @@ if _USER32 is not None:
         ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p,
         ctypes.POINTER(ctypes.c_uint))
     _USER32.GetRawInputDeviceInfoW.restype = ctypes.c_uint
+
+try:
+    _WTSAPI32 = (ctypes.WinDLL('wtsapi32', use_last_error=True)
+                 if sys.platform == 'win32' else None)
+except OSError:
+    _WTSAPI32 = None
+if _WTSAPI32 is not None:
+    _WTSAPI32.WTSRegisterSessionNotification.argtypes = (
+        ctypes.c_void_p, ctypes.c_uint)
+    _WTSAPI32.WTSRegisterSessionNotification.restype = ctypes.c_bool
+    _WTSAPI32.WTSUnRegisterSessionNotification.argtypes = (ctypes.c_void_p,)
+    _WTSAPI32.WTSUnRegisterSessionNotification.restype = ctypes.c_bool
 
 
 def _load_xinput_get_state():
@@ -257,6 +346,50 @@ def format_keyboard_combo(combo) -> str:
     return normalize_keyboard_combo(combo) or 'Unset'
 
 
+def windows_hotkey_parts(combo: str) -> tuple[int, int]:
+    """Translate a saved keyboard chord into RegisterHotKey flags and a VK.
+
+    Keeping the conversion independent from registration makes unsupported
+    bindings fail before they can leave a half-registered shortcut behind.
+    """
+    normalized = normalize_keyboard_combo(combo)
+    parts = normalized.split('+') if normalized else []
+    key_parts = [part for part in parts if part not in _KEYBOARD_MODIFIERS]
+    if len(key_parts) != 1:
+        raise ValueError('a hotkey must contain exactly one non-modifier key')
+
+    modifiers = MOD_NOREPEAT
+    for part in parts:
+        modifiers |= _WINDOWS_MODIFIER_FLAGS.get(part, 0)
+
+    key_name = key_parts[0]
+    if len(key_name) == 1 and key_name.isalnum():
+        virtual_key = ord(key_name.upper())
+    elif re.fullmatch(r'F(?:[1-9]|1\d|2[0-4])', key_name):
+        virtual_key = 0x70 + int(key_name[1:]) - 1
+    else:
+        virtual_key = _WINDOWS_NAMED_VIRTUAL_KEYS.get(key_name)
+
+    # Qt's binding selector can produce a printable punctuation key. Ask the
+    # active Windows keyboard layout for that key instead of hard-coding a US
+    # layout. VkKeyScanW's high byte contributes Shift/Ctrl/Alt when required.
+    if virtual_key is None and len(key_name) == 1 and _USER32 is not None:
+        translated = int(_USER32.VkKeyScanW(key_name))
+        if translated != -1:
+            virtual_key = translated & 0xFF
+            layout_modifiers = (translated >> 8) & 0xFF
+            if layout_modifiers & 1:
+                modifiers |= MOD_SHIFT
+            if layout_modifiers & 2:
+                modifiers |= MOD_CONTROL
+            if layout_modifiers & 4:
+                modifiers |= MOD_ALT
+
+    if virtual_key is None:
+        raise ValueError(f'unsupported Windows hotkey key: {key_name!r}')
+    return modifiers, virtual_key
+
+
 def normalize_controller_combo(combo) -> str:
     """Canonicalise a controller chord using the legacy selector's order."""
     if combo is None:
@@ -295,7 +428,7 @@ def format_controller_combo(combo) -> str:
                       for button in normalized.split('+'))
 
 
-class HotkeyManager(QObject, QAbstractNativeEventFilter):
+class HotkeyManager(QObject):
     """Manages global keyboard and Windows controller hotkeys."""
     
     # Signals
@@ -318,7 +451,7 @@ class HotkeyManager(QObject, QAbstractNativeEventFilter):
         self.hotkeys = {
             'save_clip': 'F9',
             'save_extended_clip': 'F10',
-            'save_screenshot': 'F11',
+            'save_screenshot': 'F12',
             # Recording controls are opt-in so an upgrade never claims a key
             # the user already relies on in a game or another recorder.
             'start_recording': '',
@@ -328,9 +461,18 @@ class HotkeyManager(QObject, QAbstractNativeEventFilter):
         }
         self.controller_hotkeys = {action: '' for action in self.hotkeys}
 
-        # We track what we've actually registered so we can cleanly unhook later.
-        # The `keyboard` lib gets cranky if you remove a hotkey you never added.
+        # Non-Windows fallback registrations. Native Windows registrations are
+        # tracked by action/id below so they survive a hidden main window.
         self._registered_hotkeys = []
+        self._windows_hotkey_actions: dict[int, str] = {}
+        self._windows_hotkey_combos: dict[str, str] = {}
+        self._windows_failed_actions: set[str] = set()
+        self._session_notifications_registered = False
+        self._windows_refresh_pending = False
+        self._windows_hotkey_watchdog_timer = QTimer(self)
+        self._windows_hotkey_watchdog_timer.setInterval(30_000)
+        self._windows_hotkey_watchdog_timer.timeout.connect(
+            self._windows_hotkey_watchdog)
 
         self._socket_running = False
         self._socket_thread: threading.Thread | None = None
@@ -339,6 +481,10 @@ class HotkeyManager(QObject, QAbstractNativeEventFilter):
         self._xinput_controller_buttons: set[str] = set()
         self._raw_input_widget = None
         self._raw_input_registered = False
+        self._raw_keyboard_registered = False
+        self._windows_raw_hotkey_actions: dict[str, tuple[int, int]] = {}
+        self._raw_keyboard_modifiers = 0
+        self._raw_keyboard_down: set[int] = set()
         self._raw_device_names = {}
         self._raw_hid_reports = {}
         self._raw_controller_buttons: set[str] = set()
@@ -478,32 +624,19 @@ class HotkeyManager(QObject, QAbstractNativeEventFilter):
         # Tear down the old binding first so changing a shortcut cannot leave
         # both keys registered and trigger the action twice.
         old_key = self.hotkeys.get(action)
-        if old_key and old_key in self._registered_hotkeys:
-            try:
-                keyboard.remove_hotkey(old_key)
-                self._registered_hotkeys.remove(old_key)
-            except Exception:
-                pass
+        self._unregister_keyboard_action(action, old_key)
         
-        # Update hotkey
+        # Validate the new Windows chord before persisting it. RegisterHotKey
+        # gives us an authoritative collision result; if another app owns the
+        # chord, restore the old working binding instead of saving a dead one.
         self.hotkeys[action] = key
-        self._save_hotkeys()
+        registered = self._register_action(action)
+        if sys.platform == 'win32' and not registered:
+            self.hotkeys[action] = old_key
+            self._register_action(action)
+            return False
 
-        # Register new hotkey
-        if action == 'save_clip':
-            self._register_save_clip()
-        elif action == 'save_extended_clip':
-            self._register_save_extended_clip()
-        elif action == 'save_screenshot':
-            self._register_save_screenshot()
-        elif action == 'start_recording':
-            self._register_start_recording()
-        elif action == 'stop_recording':
-            self._register_stop_recording()
-        elif action == 'confirm_game_detection':
-            self._register_confirm_game_detection()
-        elif action == 'dismiss_game_detection':
-            self._register_dismiss_game_detection()
+        self._save_hotkeys()
 
         self._apply_compositor_config()
         return True
@@ -520,20 +653,20 @@ class HotkeyManager(QObject, QAbstractNativeEventFilter):
     def set_controller_hotkey(self, action: str, key: str) -> bool:
         return self.set_hotkey(action, key, device='controller')
     
-    def _register_keyboard_hotkey(self, key: str, signal):
-        """Register one hotkey via the keyboard library. Silent on Linux if it
-        fails — the socket server is the primary hotkey path on Linux/Wayland."""
+    def _register_keyboard_hotkey(self, key: str, signal, *, action: str = '') -> bool:
+        """Register one keyboard shortcut on the platform's reliable path."""
         if not key:
-            return
+            return True
+        if sys.platform == 'win32':
+            return self._register_windows_hotkey(action, key)
         try:
             keyboard.add_hotkey(key, lambda: signal.emit())
             if key not in self._registered_hotkeys:
                 self._registered_hotkeys.append(key)
+            return True
         except Exception as e:
             self._keyboard_failed = True
             if sys.platform != 'linux':
-                # On Windows the keyboard lib is the ONLY hotkey path —
-                # a silent failure means hotkeys just don't work. Surface it.
                 print(f"Failed to register hotkey {key}: {e}")
                 self.error_occurred.emit(
                     'HOTKEY REGISTRATION FAILED',
@@ -541,48 +674,148 @@ class HotkeyManager(QObject, QAbstractNativeEventFilter):
                     'app. Pick a different key in Hotkey settings.',
                     'warning',
                 )
+            return False
+
+    def _register_windows_hotkey(self, action: str, key: str) -> bool:
+        """Register one chord against an always-alive hidden native window."""
+        if _USER32 is None or action not in _WINDOWS_HOTKEY_IDS:
+            self._keyboard_failed = True
+            self._windows_failed_actions.add(action)
+            return False
+        target = self._ensure_windows_message_target()
+        if target is None:
+            self._keyboard_failed = True
+            self._windows_failed_actions.add(action)
+            self.error_occurred.emit(
+                'HOTKEY REGISTRATION FAILED',
+                'Windows could not create the background hotkey target.',
+                'warning',
+            )
+            return False
+        try:
+            modifiers, virtual_key = windows_hotkey_parts(key)
+        except ValueError as exc:
+            self._keyboard_failed = True
+            self._windows_failed_actions.add(action)
+            print(f'[Hotkey] Unsupported Windows binding {key!r}: {exc}')
+            self.error_occurred.emit(
+                'HOTKEY REGISTRATION FAILED',
+                f'"{key}" is not supported as a Windows global shortcut.',
+                'warning',
+            )
+            return False
+
+        hotkey_id = _WINDOWS_HOTKEY_IDS[action]
+        self._unregister_windows_hotkey(action)
+        ctypes.set_last_error(0)
+        registered = bool(_USER32.RegisterHotKey(
+            ctypes.c_void_p(int(target.winId())), hotkey_id,
+            modifiers, virtual_key))
+        if not registered:
+            error_code = ctypes.get_last_error()
+            # Microsoft reserves F12 from RegisterHotKey for debuggers. Keep a
+            # saved F12 binding working through the same hidden HWND using Raw
+            # Input, never by reviving the fragile low-level keyboard hook.
+            if (virtual_key == 0x7B
+                    and self._register_windows_raw_hotkey(
+                        action, key, modifiers, virtual_key)):
+                return True
+            self._keyboard_failed = True
+            self._windows_failed_actions.add(action)
+            print('[Hotkey] Native registration failed '
+                  f'action={action} key={key!r} WinError={error_code}')
+            detail = (
+                f'Could not register "{key}" — another app may already own it. '
+                'Pick a different key in Hotkey settings.'
+            )
+            self.error_occurred.emit(
+                'HOTKEY REGISTRATION FAILED', detail, 'warning')
+            return False
+
+        self._windows_hotkey_actions[hotkey_id] = action
+        self._windows_hotkey_combos[action] = key
+        self._windows_failed_actions.discard(action)
+        print(f'[Hotkey] Registered native Windows hotkey {key} -> {action}')
+        return True
+
+    def _register_windows_raw_hotkey(
+            self, action: str, key: str, modifiers: int,
+            virtual_key: int) -> bool:
+        if not self._ensure_raw_keyboard_input():
+            return False
+        self._windows_raw_hotkey_actions[action] = (
+            modifiers & ~MOD_NOREPEAT, virtual_key)
+        self._windows_hotkey_combos[action] = key
+        self._windows_failed_actions.discard(action)
+        print(f'[Hotkey] Registered Windows Raw Input fallback {key} -> {action}')
+        return True
+
+    def _register_action(self, action: str) -> bool:
+        registrations = {
+            'save_clip': self._register_save_clip,
+            'save_extended_clip': self._register_save_extended_clip,
+            'save_screenshot': self._register_save_screenshot,
+            'start_recording': self._register_start_recording,
+            'stop_recording': self._register_stop_recording,
+            'confirm_game_detection': self._register_confirm_game_detection,
+            'dismiss_game_detection': self._register_dismiss_game_detection,
+        }
+        register = registrations.get(action)
+        if register is None:
+            return False
+        return bool(register())
 
     def _register_save_clip(self):
-        self._register_keyboard_hotkey(
-            self.hotkeys['save_clip'], self.save_clip_triggered)
+        return self._register_keyboard_hotkey(
+            self.hotkeys['save_clip'], self.save_clip_triggered,
+            action='save_clip')
 
     def _register_save_extended_clip(self):
-        self._register_keyboard_hotkey(
-            self.hotkeys['save_extended_clip'], self.save_extended_clip_triggered)
+        return self._register_keyboard_hotkey(
+            self.hotkeys['save_extended_clip'], self.save_extended_clip_triggered,
+            action='save_extended_clip')
 
     def _register_save_screenshot(self):
-        self._register_keyboard_hotkey(
-            self.hotkeys['save_screenshot'], self.save_screenshot_triggered)
+        return self._register_keyboard_hotkey(
+            self.hotkeys['save_screenshot'], self.save_screenshot_triggered,
+            action='save_screenshot')
 
     def _register_start_recording(self):
-        self._register_keyboard_hotkey(
-            self.hotkeys['start_recording'], self.start_recording_triggered)
+        return self._register_keyboard_hotkey(
+            self.hotkeys['start_recording'], self.start_recording_triggered,
+            action='start_recording')
 
     def _register_stop_recording(self):
-        self._register_keyboard_hotkey(
-            self.hotkeys['stop_recording'], self.stop_recording_triggered)
+        return self._register_keyboard_hotkey(
+            self.hotkeys['stop_recording'], self.stop_recording_triggered,
+            action='stop_recording')
 
     def _register_confirm_game_detection(self):
-        self._register_keyboard_hotkey(
+        return self._register_keyboard_hotkey(
             self.hotkeys['confirm_game_detection'],
-            self.confirm_game_detection_triggered)
+            self.confirm_game_detection_triggered,
+            action='confirm_game_detection')
 
     def _register_dismiss_game_detection(self):
-        self._register_keyboard_hotkey(
+        return self._register_keyboard_hotkey(
             self.hotkeys['dismiss_game_detection'],
-            self.dismiss_game_detection_triggered)
+            self.dismiss_game_detection_triggered,
+            action='dismiss_game_detection')
 
     def register_all(self):
         """Register all hotkeys"""
         self._unregister_keyboard_hotkeys()
         self._keyboard_failed = False
-        self._register_save_clip()
-        self._register_save_extended_clip()
-        self._register_save_screenshot()
-        self._register_start_recording()
-        self._register_stop_recording()
-        self._register_confirm_game_detection()
-        self._register_dismiss_game_detection()
+        if sys.platform == 'win32':
+            self._windows_failed_actions.clear()
+        for action in _HOTKEY_ACTIONS:
+            self._register_action(action)
+        if sys.platform == 'win32' and self._input_capture_depth == 0:
+            self._windows_hotkey_watchdog_timer.start()
+            expected = sum(bool(self.hotkeys.get(action))
+                           for action in _HOTKEY_ACTIONS)
+            print('[Hotkey] Native Windows registrations '
+                  f'{len(self._windows_hotkey_combos)}/{expected}')
         self._start_socket_server()
         self._apply_compositor_config()
         self._ensure_controller_polling()
@@ -591,6 +824,7 @@ class HotkeyManager(QObject, QAbstractNativeEventFilter):
     def begin_input_capture(self):
         """Pause dispatch while a selector records a new keyboard/controller chord."""
         if self._input_capture_depth == 0:
+            self._windows_hotkey_watchdog_timer.stop()
             self._unregister_keyboard_hotkeys()
             self._controller_active_actions.clear()
             self._ensure_controller_polling(force=True)
@@ -628,21 +862,119 @@ class HotkeyManager(QObject, QAbstractNativeEventFilter):
             names.append('Win')
         return names
 
+    def _ensure_windows_message_target(self):
+        """Create an invisible HWND that remains alive while the app is in tray."""
+        if sys.platform != 'win32' or _USER32 is None:
+            return None
+        try:
+            from PySide6.QtWidgets import QApplication, QWidget
+            app = QApplication.instance()
+            if app is None:
+                return None
+            if self._raw_input_widget is None:
+                class _WindowsMessageTarget(QWidget):
+                    def __init__(self, dispatcher):
+                        super().__init__()
+                        self._dispatcher = dispatcher
+
+                    def nativeEvent(self, event_type, message):
+                        return self._dispatcher.nativeEventFilter(
+                            event_type, message)
+
+                widget = _WindowsMessageTarget(self)
+                widget.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+                widget.setWindowTitle('FTHR Background Input')
+                widget.resize(1, 1)
+                widget.hide()
+                self._raw_input_widget = widget
+            # winId() forces native handle creation without showing the window.
+            native_window = int(self._raw_input_widget.winId())
+            if (_WTSAPI32 is not None
+                    and not self._session_notifications_registered):
+                self._session_notifications_registered = bool(
+                    _WTSAPI32.WTSRegisterSessionNotification(
+                        ctypes.c_void_p(native_window),
+                        NOTIFY_FOR_THIS_SESSION))
+                if not self._session_notifications_registered:
+                    print('[Hotkey] Session-unlock notification registration '
+                          f'failed WinError={ctypes.get_last_error()}')
+            return self._raw_input_widget
+        except Exception as exc:
+            print(f'[Hotkey] Native message target unavailable: {exc}')
+            return None
+
+    def _schedule_windows_hotkey_refresh(
+            self, reason: str, *, delay_ms: int = 750) -> None:
+        """Debounce recovery after resume/unlock while Windows settles devices."""
+        if sys.platform != 'win32' or self._input_capture_depth:
+            return
+        if self._windows_refresh_pending:
+            return
+        self._windows_refresh_pending = True
+
+        def _refresh():
+            self._windows_refresh_pending = False
+            if self._input_capture_depth:
+                return
+            print(f'[Hotkey] Refreshing native registrations after {reason}')
+            self._unregister_keyboard_hotkeys()
+            self._keyboard_failed = False
+            self._windows_failed_actions.clear()
+            for action in _HOTKEY_ACTIONS:
+                self._register_action(action)
+
+        QTimer.singleShot(max(0, int(delay_ms)), _refresh)
+
+    def _windows_hotkey_watchdog(self) -> None:
+        """Repair lost bookkeeping or a recreated hidden HWND.
+
+        RegisterHotKey is owned by Windows rather than a fragile callback hook,
+        so it has no separate hook thread to probe. The invariant we can verify
+        is that every configured action is attached to the current native HWND.
+        """
+        if sys.platform != 'win32' or self._input_capture_depth:
+            return
+        expected = {
+            action: self.hotkeys[action]
+            for action in _HOTKEY_ACTIONS
+            if (self.hotkeys.get(action)
+                and action not in self._windows_failed_actions)
+        }
+        if expected != self._windows_hotkey_combos:
+            self._schedule_windows_hotkey_refresh(
+                'hotkey watchdog mismatch', delay_ms=0)
+
     def nativeEventFilter(self, _event_type, message):
-        """Receive raw HID reports for controllers that do not expose XInput."""
-        if sys.platform != 'win32' or not self._raw_input_registered:
+        """Dispatch Windows hotkeys and receive optional raw controller input."""
+        if sys.platform != 'win32':
             return False, 0
         try:
             native_message = _MSG.from_address(int(message))
         except Exception:
             # Qt may pass a non-address message on a platform plugin we do not own.
             return False, 0
-        if native_message.message == WM_INPUT:
+        if native_message.message == WM_HOTKEY:
+            hotkey_id = int(native_message.wParam)
+            action = self._windows_hotkey_actions.get(hotkey_id)
+            if action:
+                key = self._windows_hotkey_combos.get(action, '?')
+                print(f'[Hotkey] Received native Windows hotkey {key} -> {action}')
+                self._emit_action(action, source='keyboard')
+        elif native_message.message == WM_POWERBROADCAST:
+            if int(native_message.wParam) in (
+                    PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC):
+                self._schedule_windows_hotkey_refresh('system resume')
+        elif native_message.message == WM_WTSSESSION_CHANGE:
+            if int(native_message.wParam) == WTS_SESSION_UNLOCK:
+                self._schedule_windows_hotkey_refresh('session unlock')
+        elif (native_message.message == WM_INPUT
+              and (self._raw_input_registered
+                   or self._raw_keyboard_registered)):
             self._handle_raw_input(native_message.lParam)
         return False, 0
 
-    def _emit_action(self, action: str):
-        """Emit an action once when a controller chord is first completed."""
+    def _emit_action(self, action: str, *, source: str = 'controller'):
+        """Emit an action once when a registered chord is completed."""
         now = time.monotonic()
         if now - getattr(self, '_last_emit_at', {}).get(action, 0.0) < 0.35:
             return
@@ -660,6 +992,7 @@ class HotkeyManager(QObject, QAbstractNativeEventFilter):
         }
         signal = signals.get(action)
         if signal:
+            print(f'[Hotkey] Dispatching {source} action={action}')
             signal.emit()
 
     def _has_controller_bindings(self) -> bool:
@@ -695,17 +1028,10 @@ class HotkeyManager(QObject, QAbstractNativeEventFilter):
         if self._raw_input_registered:
             return True
         try:
-            from PySide6.QtWidgets import QApplication, QWidget
-            if QApplication.instance() is None:
+            target = self._ensure_windows_message_target()
+            if target is None:
                 return False
-            if self._raw_input_widget is None:
-                widget = QWidget()
-                widget.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
-                widget.setWindowTitle('FTHR Raw Controller Input')
-                widget.resize(1, 1)
-                widget.hide()
-                self._raw_input_widget = widget
-            native_window = int(self._raw_input_widget.winId())
+            native_window = int(target.winId())
             devices = (_RAWINPUTDEVICE * len(RAW_GAME_CONTROLLER_USAGES))()
             for index, (usage_page, usage) in enumerate(RAW_GAME_CONTROLLER_USAGES):
                 devices[index].usUsagePage = usage_page
@@ -717,12 +1043,40 @@ class HotkeyManager(QObject, QAbstractNativeEventFilter):
                     ctypes.sizeof(_RAWINPUTDEVICE)):
                 print(f'Raw controller input registration failed, WinError={ctypes.get_last_error()}')
                 return False
-            QCoreApplication.instance().installNativeEventFilter(self)
             self._raw_input_registered = True
             print('Registered raw controller input fallback')
             return True
         except Exception as exc:
             print(f'Raw controller input unavailable: {exc}')
+            return False
+
+    def _ensure_raw_keyboard_input(self) -> bool:
+        """Register Raw Input only for keys Windows reserves from WM_HOTKEY."""
+        if sys.platform != 'win32' or _USER32 is None:
+            return False
+        if self._raw_keyboard_registered:
+            return True
+        try:
+            target = self._ensure_windows_message_target()
+            if target is None:
+                return False
+            usage_page, usage = RAW_KEYBOARD_USAGE
+            device = _RAWINPUTDEVICE()
+            device.usUsagePage = usage_page
+            device.usUsage = usage
+            device.dwFlags = RIDEV_INPUTSINK | RIDEV_DEVNOTIFY
+            device.hwndTarget = int(target.winId())
+            if not _USER32.RegisterRawInputDevices(
+                    ctypes.byref(device), 1,
+                    ctypes.sizeof(_RAWINPUTDEVICE)):
+                print('[Hotkey] Raw keyboard input registration failed '
+                      f'WinError={ctypes.get_last_error()}')
+                return False
+            self._raw_keyboard_registered = True
+            print('[Hotkey] Registered Raw Input for reserved Windows keys')
+            return True
+        except Exception as exc:
+            print(f'[Hotkey] Raw keyboard input unavailable: {exc}')
             return False
 
     def _handle_raw_input(self, raw_handle):
@@ -740,6 +1094,13 @@ class HotkeyManager(QObject, QAbstractNativeEventFilter):
             return
         raw = buffer.raw[:size.value]
         header = _RAWINPUTHEADER.from_buffer_copy(raw[:header_size])
+        if header.dwType == RIM_TYPEKEYBOARD:
+            keyboard_size = ctypes.sizeof(_RAWKEYBOARD)
+            if len(raw) >= header_size + keyboard_size:
+                keyboard_data = _RAWKEYBOARD.from_buffer_copy(
+                    raw[header_size:header_size + keyboard_size])
+                self._process_raw_keyboard_input(keyboard_data)
+            return
         if header.dwType != RIM_TYPEHID or len(raw) < header_size + 8:
             return
         report_size = ctypes.c_uint.from_buffer_copy(raw, header_size).value
@@ -753,6 +1114,31 @@ class HotkeyManager(QObject, QAbstractNativeEventFilter):
             end = start + report_size
             if end <= len(raw):
                 self._process_raw_hid_report(device_key, raw[start:end])
+
+    def _process_raw_keyboard_input(self, keyboard_data: _RAWKEYBOARD) -> None:
+        virtual_key = int(keyboard_data.VKey)
+        is_break = bool(int(keyboard_data.Flags) & RI_KEY_BREAK)
+        modifier = _WINDOWS_MODIFIER_VIRTUAL_KEYS.get(virtual_key)
+        if modifier:
+            if is_break:
+                self._raw_keyboard_modifiers &= ~modifier
+            else:
+                self._raw_keyboard_modifiers |= modifier
+            return
+        if is_break:
+            self._raw_keyboard_down.discard(virtual_key)
+            return
+        if virtual_key in self._raw_keyboard_down:
+            return
+        self._raw_keyboard_down.add(virtual_key)
+        for action, (required_modifiers, required_key) in tuple(
+                self._windows_raw_hotkey_actions.items()):
+            if (required_key == virtual_key
+                    and required_modifiers == self._raw_keyboard_modifiers):
+                key = self._windows_hotkey_combos.get(action, '?')
+                print(f'[Hotkey] Received Windows Raw Input hotkey '
+                      f'{key} -> {action}')
+                self._emit_action(action, source='keyboard')
 
     def _raw_device_key(self, device_handle) -> str:
         handle = int(device_handle or 0) & _POINTER_MASK
@@ -1041,8 +1427,8 @@ class HotkeyManager(QObject, QAbstractNativeEventFilter):
 
     def _start_socket_server(self):
         """Listen on the private hotkey socket for compositor bind commands."""
-        # Unix-socket path is Linux-only. On Windows the keyboard library is
-        # the one and only hotkey path — starting this would raise
+        # Unix-socket path is Linux-only. Windows uses its native message path;
+        # starting this there would raise
         # AttributeError (no AF_UNIX) and flash a bogus error banner.
         if sys.platform == 'win32' or not hasattr(socket, 'AF_UNIX'):
             return
@@ -1155,17 +1541,53 @@ class HotkeyManager(QObject, QAbstractNativeEventFilter):
         self._socket_thread = threading.Thread(target=_serve, daemon=True, name='fthr-hotkey-socket')
         self._socket_thread.start()
 
-    def _unregister_keyboard_hotkeys(self):
-        """Remove only process-wide keyboard registrations, retaining sockets."""
-        for key in self._registered_hotkeys:
+    def _unregister_windows_hotkey(self, action: str) -> None:
+        hotkey_id = _WINDOWS_HOTKEY_IDS.get(action)
+        actions = getattr(self, '_windows_hotkey_actions', {})
+        target = getattr(self, '_raw_input_widget', None)
+        if (hotkey_id is not None and hotkey_id in actions
+                and _USER32 is not None and target is not None):
+            try:
+                _USER32.UnregisterHotKey(
+                    ctypes.c_void_p(int(target.winId())), hotkey_id)
+            except Exception as exc:
+                print(f'[Hotkey] Native unregister failed action={action}: {exc}')
+        if hotkey_id is not None:
+            actions.pop(hotkey_id, None)
+        getattr(self, '_windows_raw_hotkey_actions', {}).pop(action, None)
+        getattr(self, '_windows_hotkey_combos', {}).pop(action, None)
+
+    def _unregister_keyboard_action(self, action: str, key: str | None) -> None:
+        if sys.platform == 'win32':
+            self._unregister_windows_hotkey(action)
+            return
+        registered = getattr(self, '_registered_hotkeys', [])
+        if key and key in registered:
             try:
                 keyboard.remove_hotkey(key)
-            except Exception:
-                pass
+                registered.remove(key)
+            except Exception as exc:
+                print(f'[Hotkey] Fallback unregister failed key={key}: {exc}')
+
+    def _unregister_keyboard_hotkeys(self):
+        """Remove only process-wide keyboard registrations, retaining sockets."""
+        if sys.platform == 'win32':
+            for action in tuple(getattr(
+                    self, '_windows_hotkey_combos', {}).keys()):
+                self._unregister_windows_hotkey(action)
+            self._raw_keyboard_modifiers = 0
+            self._raw_keyboard_down.clear()
+            return
+        for key in getattr(self, '_registered_hotkeys', []):
+            try:
+                keyboard.remove_hotkey(key)
+            except Exception as exc:
+                print(f'[Hotkey] Fallback unregister failed key={key}: {exc}')
         self._registered_hotkeys.clear()
 
     def unregister_all(self):
         """Unregister keyboard and controller hotkeys."""
+        self._windows_hotkey_watchdog_timer.stop()
         self._unregister_keyboard_hotkeys()
         self._stop_controller_polling()
 
@@ -1175,11 +1597,24 @@ class HotkeyManager(QObject, QAbstractNativeEventFilter):
         self._socket_running = False
         if self._socket_thread:
             self._socket_thread.join(timeout=2.0)
+        target = getattr(self, '_raw_input_widget', None)
+        if (target is not None and _WTSAPI32 is not None
+                and self._session_notifications_registered):
+            try:
+                _WTSAPI32.WTSUnRegisterSessionNotification(
+                    ctypes.c_void_p(int(target.winId())))
+            except Exception as exc:
+                print(f'[Hotkey] Session notification cleanup failed: {exc}')
+            self._session_notifications_registered = False
+        if target is not None:
+            target.close()
+            target.deleteLater()
+            self._raw_input_widget = None
 
 
 # The dropdown options in settings. Not exhaustive on purpose — these are the
-# combos that (a) don't collide with common game binds and (b) actually work
-# cross-platform with the `keyboard` lib. Add more at your own peril.
+# combos that (a) don't collide with common game binds and (b) map cleanly to
+# platform-global shortcuts. Add more at your own peril.
 AVAILABLE_KEYS = [
     'F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12',
     'ctrl+shift+s', 'ctrl+shift+c', 'ctrl+shift+x',

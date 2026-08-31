@@ -260,6 +260,36 @@ def software_video_args(bitrate_kbps: int = 16000,
     return ['-c:v', enc, '-b:v', f'{bitrate_kbps}k', *color_args]
 
 
+def postprocess_video_args(active_codec: object = '',
+                           bitrate_kbps: int = 16000,
+                           ffmpeg: Optional[str] = None) -> list[str]:
+    """Return fast H.264 args when the native recorder has a usable GPU.
+
+    Visual overlays require decoding and re-encoding the saved clip. When the
+    native engine reports an H.264 hardware encoder, using that same FFmpeg
+    backend avoids making the post-process fall back to the much slower
+    OpenH264 path. Unknown, unavailable, and non-H.264 codecs retain the
+    reviewed software fallback.
+    """
+    encoder = str(active_codec or '').strip().lower()
+    hardware_encoders = {
+        'h264_nvenc', 'h264_amf', 'h264_qsv', 'h264_mf',
+    }
+    if encoder not in hardware_encoders:
+        return software_video_args(bitrate_kbps, ffmpeg)
+
+    args = [
+        '-c:v', encoder,
+        '-b:v', f'{max(2500, int(bitrate_kbps))}k',
+        '-pix_fmt', 'yuv420p',
+    ]
+    if encoder == 'h264_nvenc':
+        # P1 is NVENC's fastest preset; low-latency tuning is appropriate for
+        # a short-lived clip finalizer and does not alter the source capture.
+        args.extend(['-preset', 'p1', '-tune', 'll'])
+    return [*args, *_sdr_color_args()]
+
+
 def maximum_quality_video_args(ffmpeg: Optional[str] = None) -> list[str]:
     """Return the highest-quality video arguments for editor exports.
 

@@ -66,6 +66,27 @@ def test_portrait_thumbnail_is_fitted_without_distortion(qapp, tmp_path: Path) -
     assert abs(rendered.width() / rendered.height() - 900 / 1600) < 0.01
 
 
+def test_editor_open_uses_source_thumbnail_not_card_scaled_pixmap(
+    qapp, tmp_path: Path
+) -> None:
+    from PySide6.QtCore import QRect
+    from PySide6.QtGui import QPixmap
+
+    source = tmp_path / 'clip.mp4'
+    source.write_bytes(b'placeholder')
+    card = clip_grid.ClipThumbnail(str(source), is_video=True, card_width=320)
+    card._thumbnail_ready = True
+    card._thumb_pixmap = QPixmap(640, 360)
+    card.thumb_label.setPixmap(QPixmap(320, 180))
+
+    opened: list[tuple[str, QPixmap, QRect]] = []
+    card.opened.connect(lambda path, pixmap, rect: opened.append((path, pixmap, rect)))
+    card._emit_opened()
+
+    assert len(opened) == 1
+    assert opened[0][1].size() == card._thumb_pixmap.size()
+
+
 def test_uploaded_card_copy_and_open_link_actions(qapp, tmp_path: Path, monkeypatch) -> None:
     source = tmp_path / 'uploaded.png'
     source.write_bytes(b'not-decoded-in-this-test')

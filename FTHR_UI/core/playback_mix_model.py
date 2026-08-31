@@ -28,6 +28,10 @@ class ProbedAudioStream:
     container_index: int
     audio_index: int
     title: str | None = None
+    # Capture-owned container marker. ``combined`` means the source streams
+    # have already been mixed into one recorded track, so only MASTER remains
+    # editable in the clip editor.
+    audio_mode: str | None = None
 
 
 @dataclass(frozen=True)
@@ -135,15 +139,20 @@ def build_playback_sources(
 
     A hash-bound FTHR manifest is the only source of semantic identities.
     Imported and legacy media use real stream titles, or generic track names.
-    A current Windows 10 FTHR clip has ``Default Mix`` plus ``Microphone`` and
-    both remain editable because the manifest describes Default Mix as system
+    A separated FTHR clip has ``Default Mix`` plus ``Microphone`` and both
+    remain editable because the manifest describes Default Mix as system
     loopback only. Once application stems exist, ``Default Mix`` becomes the
     hidden base of a reversible delta mix. An app slider then applies
     ``base + (gain - 1) * app_stem`` so changing one application cannot change
-    another and unattributed system sounds remain intact.
+    another and unattributed system sounds remain intact. A combined capture
+    is identified by its container marker and deliberately exposes no source
+    sliders, even if an old sidecar is still present.
     """
 
     by_container = {stream.container_index: stream for stream in streams}
+    audio_mode = next((stream.audio_mode for stream in streams
+                       if stream.audio_mode in {'combined', 'separated'}), None)
+    combined_capture = audio_mode == 'combined'
     if manifest:
         entries = sorted(manifest.get('sources', ()),
                          key=lambda entry: int(entry.get('stream_index', -1)))
@@ -171,7 +180,7 @@ def build_playback_sources(
                 available=stream is not None,
                 mix_role=('base' if compatibility_base else
                           'delta' if application_delta else 'direct'),
-                editable=not compatibility_base,
+                editable=not compatibility_base and not combined_capture,
                 persistent_identity=(str(entry.get('persistent_identity'))
                                      if entry.get('persistent_identity') else None),
             ))
@@ -185,6 +194,7 @@ def build_playback_sources(
             source_type='track',
             container_index=stream.container_index,
             audio_index=stream.audio_index,
+            editable=not combined_capture,
         )
         for stream in streams
     ))

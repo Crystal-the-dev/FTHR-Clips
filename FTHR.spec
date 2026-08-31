@@ -60,11 +60,14 @@ VSVersionInfo(
 # an independently rebuilt playback bridge is never silently packaged as an
 # older DLL from the solution output directory.
 _ENGINE_CANDIDATES = [
+    ROOT / 'FTHRcapture' / 'FTHRclips' / 'x64' / 'CFRReleaseFinal' / 'FTHRclips.exe',
+    ROOT / 'FTHRcapture' / 'FTHRclips' / 'x64' / 'CFRRelease' / 'FTHRclips.exe',
     ROOT / 'FTHRcapture' / 'x64' / 'Release' / 'FTHRClips.exe',
     ROOT / 'FTHRcapture' / 'FTHRclips' / 'x64' / 'Release' / 'FTHRclips.exe',
 ]
-ENGINE_EXE = next((path for path in _ENGINE_CANDIDATES if path.exists()),
-                  _ENGINE_CANDIDATES[0])
+_existing_engines = [path for path in _ENGINE_CANDIDATES if path.is_file()]
+ENGINE_EXE = (max(_existing_engines, key=lambda path: path.stat().st_mtime)
+              if _existing_engines else _ENGINE_CANDIDATES[0])
 PLAYBACK_MIXER = (
     ROOT / 'FTHRcapture' / 'x64' / 'Release' / 'FTHRPlaybackMixer.dll')
 

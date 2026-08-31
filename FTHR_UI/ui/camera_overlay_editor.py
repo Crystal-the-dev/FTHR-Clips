@@ -15,6 +15,7 @@ from core.camera_overlay import (
     DEFAULT_OVERLAY_RECT,
     clamp_overlay_rect,
 )
+from core.third_party_keyboard import DEFAULT_KEYBOARD_OVERLAY_RECT
 from ui.style import Colors, Fonts
 
 
@@ -360,6 +361,8 @@ class UnifiedOverlayPreview(OverlayPlacementEditor):
         }
         self._camera_pixmap = QPixmap()
         self._camera_enabled = False
+        self._keyboard_pixmap = QPixmap()
+        self._keyboard_enabled = False
         self._image_layers: list[dict] = []
         self._selected_image = -1
         self._gesture_kind = None
@@ -374,6 +377,8 @@ class UnifiedOverlayPreview(OverlayPlacementEditor):
         rects = rects if isinstance(rects, dict) else {}
         self._rects['camera'] = clamp_overlay_rect(
             rects.get('camera'), DEFAULT_OVERLAY_RECT)
+        self._rects['keyboard'] = clamp_overlay_rect(
+            rects.get('keyboard'), DEFAULT_KEYBOARD_OVERLAY_RECT)
         for index, layer in enumerate(self._image_layers):
             key = f'image:{index}'
             fallback = layer['rect']
@@ -382,7 +387,15 @@ class UnifiedOverlayPreview(OverlayPlacementEditor):
 
     def set_image_layers(self, layers) -> None:
         self._image_layers = []
-        retained = {'camera': self._rects.get('camera', DEFAULT_OVERLAY_RECT)}
+        retained = {
+            'camera': self._rects.get('camera', DEFAULT_OVERLAY_RECT),
+        }
+        # Keep compatibility with callers that use this widget only for
+        # camera/images. The keyboard layer is opt-in through set_rects(), as
+        # the settings page does when the Windows source is available.
+        if 'keyboard' in self._rects:
+            retained['keyboard'] = self._rects.get(
+                'keyboard', DEFAULT_KEYBOARD_OVERLAY_RECT)
         for index, layer in enumerate(layers or []):
             if not isinstance(layer, dict):
                 continue
@@ -413,6 +426,8 @@ class UnifiedOverlayPreview(OverlayPlacementEditor):
     def set_overlay_enabled(self, kind: str, enabled: bool) -> None:
         if kind == 'camera':
             self._camera_enabled = bool(enabled)
+        elif kind == 'keyboard':
+            self._keyboard_enabled = bool(enabled)
         elif kind == 'image':
             for layer in self._image_layers:
                 layer['enabled'] = bool(enabled)
@@ -420,6 +435,11 @@ class UnifiedOverlayPreview(OverlayPlacementEditor):
 
     def set_camera_pixmap(self, pixmap: QPixmap) -> None:
         self._camera_pixmap = (
+            QPixmap(pixmap) if pixmap and not pixmap.isNull() else QPixmap())
+        self.update()
+
+    def set_keyboard_pixmap(self, pixmap: QPixmap) -> None:
+        self._keyboard_pixmap = (
             QPixmap(pixmap) if pixmap and not pixmap.isNull() else QPixmap())
         self.update()
 
@@ -438,7 +458,8 @@ class UnifiedOverlayPreview(OverlayPlacementEditor):
 
     def _hit_order(self) -> list[str]:
         images = [f'image:{index}' for index in range(len(self._image_layers))]
-        return ['camera', *reversed(images)]
+        keyboard = ['keyboard'] if 'keyboard' in self._rects else []
+        return ['camera', *keyboard, *reversed(images)]
 
     def _set_cursor_for(self, point: QPointF) -> None:
         for kind in self._hit_order():
@@ -492,7 +513,9 @@ class UnifiedOverlayPreview(OverlayPlacementEditor):
                 rect['h'] += dy
             default = (
                 DEFAULT_OVERLAY_RECT if self._gesture_kind == 'camera'
-                else DEFAULT_IMAGE_OVERLAY_RECT)
+                else (DEFAULT_KEYBOARD_OVERLAY_RECT
+                      if self._gesture_kind == 'keyboard'
+                      else DEFAULT_IMAGE_OVERLAY_RECT))
             self._rects[self._gesture_kind] = clamp_overlay_rect(rect, default)
             self.update()
             event.accept()
@@ -518,6 +541,8 @@ class UnifiedOverlayPreview(OverlayPlacementEditor):
         for index, layer in enumerate(self._image_layers):
             self._draw_image_layer(
                 painter, index, layer, self._pixel_rect_for(f'image:{index}'))
+        if 'keyboard' in self._rects:
+            self._draw_keyboard(painter, self._pixel_rect_for('keyboard'))
         self._draw_camera(painter, self._pixel_rect_for('camera'))
         painter.end()
 
@@ -558,6 +583,22 @@ class UnifiedOverlayPreview(OverlayPlacementEditor):
                 Qt.AlignmentFlag.AlignCenter, 'CAMERA PREVIEW')
         self._draw_overlay_header(
             painter, box, 'CAMERA', self._camera_enabled)
+
+    def _draw_keyboard(self, painter: QPainter, box: QRectF) -> None:
+        content = box.adjusted(2, 22, -2, -2)
+        if not self._keyboard_pixmap.isNull():
+            self._draw_fit_pixmap(painter, content, self._keyboard_pixmap)
+        else:
+            tint = QColor(Colors.ACCENT)
+            tint.setAlpha(22 if self._keyboard_enabled else 10)
+            painter.fillRect(content, tint)
+            painter.setPen(QColor(Colors.TEXT_DIM))
+            painter.setFont(_overlay_font(8))
+            painter.drawText(
+                content.adjusted(8, 4, -8, -8),
+                Qt.AlignmentFlag.AlignCenter, 'KEYBOARD PREVIEW')
+        self._draw_overlay_header(
+            painter, box, 'KEYBOARD', self._keyboard_enabled)
 
 
 class CameraOverlayEditor(OverlayPlacementEditor):

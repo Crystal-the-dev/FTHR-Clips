@@ -382,7 +382,9 @@ bool CaptureEngine::SaveClip(const std::string& path, uint32_t duration_sec,
         encoder_.GetHeight(),
         encoder_.GetCodecID(),
         shm,
-        error_message
+        error_message,
+        cfg_.separate_audio_enabled,
+        cfg_.bitrate_kbps
     );
 }
 

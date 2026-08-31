@@ -150,6 +150,14 @@ It verifies the Microsoft VC++ redistributable, the bundle licence manifest,
 and the Windows lifecycle contract before invoking Inno Setup. Output:
 `Output\FTHRClips-Setup-1.0.0-alpha-x64.exe` for the current version.
 
+The frameless, app-style setup starts with a required Privacy Policy checkbox
+linking to `https://policies.fthrclips.com`, then presents the application and
+clip-library folders together on one screen. The optional desktop shortcut
+remains unchecked by default and is not added to the compact UI. Stock Windows
+welcome, directory, ready, and finish pages are hidden. The selected clip
+directory is seeded into the current user's `.fthr/settings.json` without
+removing an existing clip library.
+
 For a publishable artifact, provide the operator-owned signing command and
 require a valid signature; no certificate belongs in this repository:
 

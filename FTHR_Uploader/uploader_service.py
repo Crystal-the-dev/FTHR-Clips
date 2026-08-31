@@ -30,6 +30,7 @@ CATBOX_LEGAL_VERSION = 'catbox-legal-2021-03-06'
 LUSTFUL_LEGAL_VERSION = 'lustful-legal-2026-07-27'
 HARDWARE_POLICY_VERSION = 'lustful-2026-07-27-hwid-v1'
 _NETWORK_ACTIONS = {'register', 'login', 'test_connection', 'upload'}
+_CUSTOM_PROVIDER = 'custom'
 
 
 def _sha256(path: Path) -> str:
@@ -78,7 +79,11 @@ def _provider(settings: dict[str, Any], request: dict[str, Any]) -> str:
     config = request.get('config') if isinstance(request.get('config'), dict) else {}
     provider = str(config.get(
         'upload_provider', settings.get('upload_provider', 'catbox'))).lower()
-    return 'lustful' if provider == 'fthr' else provider
+    if provider == 'fthr':
+        return 'lustful'
+    if provider in {'own_server', 'your_server'}:
+        return _CUSTOM_PROVIDER
+    return provider
 
 
 def _require_provider_consent(
@@ -89,8 +94,10 @@ def _require_provider_consent(
         if settings.get('catbox_legal_accepted_version') != CATBOX_LEGAL_VERSION:
             raise PermissionError('Accept Catbox’s legal policies in FTHR Clips first.')
         return
+    if provider == _CUSTOM_PROVIDER:
+        return
     if provider != 'lustful':
-        raise ValueError('Only Catbox and Lustful are supported.')
+        raise ValueError('Only Catbox, Lustful, and your server are supported.')
     if settings.get('lustful_legal_accepted_version') != LUSTFUL_LEGAL_VERSION:
         raise PermissionError('Accept Lustful’s Terms and Privacy Policy first.')
     if settings.get('lustful_hardware_policy_accepted_version') != HARDWARE_POLICY_VERSION:

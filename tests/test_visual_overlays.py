@@ -223,3 +223,55 @@ def test_multiple_image_overlays_are_burned_in_one_pass(tmp_path):
     assert red_layer[2] > red_layer[1]
     assert green_layer[1] > green_layer[2]
     assert not host.warnings
+
+
+def test_keyboard_overlay_is_streamed_into_a_real_video(tmp_path):
+    from main import MainWindow
+
+    clip = tmp_path / 'keyboard-base.mp4'
+    writer = cv2.VideoWriter(
+        str(clip), cv2.VideoWriter_fourcc(*'mp4v'), 20, (320, 180))
+    assert writer.isOpened()
+    for _ in range(20):
+        writer.write(np.full((180, 320, 3), (180, 20, 10), dtype=np.uint8))
+    writer.release()
+
+    class _KeyboardCapture:
+        @staticmethod
+        def iter_segment_rgba(
+                _end, _duration, target_size, _color, _intensity, output_fps):
+            width, height = target_size
+            frame = np.zeros((height, width, 4), dtype=np.uint8)
+            frame[:, :] = (255, 20, 10, 255)
+            for _ in range(output_fps):
+                yield frame
+
+    class _Host:
+        settings_manager = {
+            'third_party_keyboard': {
+                'enabled': True,
+                'hwnd': 42,
+                'rect': {'x': .30, 'y': .65, 'w': .40, 'h': .25},
+            },
+        }
+        _keyboard_overlay_capture = _KeyboardCapture()
+        _clip_dimensions = staticmethod(MainWindow._clip_dimensions)
+        warnings = []
+
+        def _record_finalization_warning(self, _clip_path, message):
+            self.warnings.append(message)
+
+    host = _Host()
+    MainWindow._apply_keyboard_overlay(
+        host, str(clip), get_ffmpeg_exe(), 100.0, 1)
+
+    capture = cv2.VideoCapture(str(clip))
+    assert capture.isOpened()
+    ok, frame = capture.read()
+    capture.release()
+    assert ok
+    background = frame[25, 25]
+    keyboard_pixel = frame[135, 160]
+    assert background[0] > background[2]
+    assert keyboard_pixel[2] > keyboard_pixel[0]
+    assert not host.warnings

@@ -19,7 +19,7 @@ from core import ffmpeg_tools  # noqa: E402
 from core.ffmpeg_tools import (  # noqa: E402
     FFmpegUnavailable, get_ffmpeg_exe, reset_cache,
     maximum_quality_video_args,
-    size_constrained_video_args, software_video_args,
+    postprocess_video_args, size_constrained_video_args, software_video_args,
 )
 
 
@@ -96,6 +96,22 @@ def test_software_transcodes_preserve_sdr_bt709_range(monkeypatch):
     assert args[args.index('-color_trc') + 1] == 'bt709'
     assert args[args.index('-bsf:v') + 1].startswith(
         'h264_metadata=video_full_range_flag=0')
+
+
+def test_postprocess_uses_active_nvenc_for_speed():
+    args = postprocess_video_args('h264_nvenc', ffmpeg='dummy')
+
+    assert args[args.index('-c:v') + 1] == 'h264_nvenc'
+    assert args[args.index('-preset') + 1] == 'p1'
+    assert args[args.index('-tune') + 1] == 'll'
+
+
+def test_postprocess_keeps_software_fallback(monkeypatch):
+    monkeypatch.setattr(ffmpeg_tools, '_probe_encoders', lambda _ff: 'libopenh264')
+
+    args = postprocess_video_args('', ffmpeg='dummy')
+
+    assert args[args.index('-c:v') + 1] == 'libopenh264'
 
 
 def test_size_constrained_args_replace_quality_only_rate_control(monkeypatch):

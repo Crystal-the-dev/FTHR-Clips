@@ -36,6 +36,7 @@
 //   argv[17] encoder_pref   0=Auto, 1=NVIDIA, 2=AMD, 3=Intel, 4=Software.
 //   argv[18] crop_enabled   1 applies argv[19..22] before encoder input.
 //   argv[19..22] crop_x, crop_y, crop_width, crop_height normalized to source.
+//   argv[23] audio_mode     0 = combined (default), 1 = separated tracks.
 //
 // Threading:
 //   This file runs entirely on the main thread.
@@ -198,7 +199,9 @@ static void PrintConfig(const fthr::CaptureConfig& cfg) {
     std::cout << "  Audio        : "
               << (cfg.audio_enabled ? "Enabled" : "Disabled (user setting)")
               << std::endl;
-    std::cout << "  Audio tracks : System mix + microphone" << std::endl;
+    std::cout << "  Audio mode   : "
+              << (cfg.separate_audio_enabled ? "Separated tracks" : "Combined")
+              << std::endl;
     if (cfg.audio_enabled) {
         std::cout << "  Microphone   : "
                   << (cfg.microphone_endpoint_id.empty() ? "Default microphone"
@@ -278,6 +281,7 @@ int main(int argc, char* argv[]) {
     config.encoder_preset = std::clamp<uint32_t>(
         ParseArgU32(argc, argv, 12, 4), 1, 7);
     config.multiband_enabled = false;
+    config.separate_audio_enabled = ParseArgU32(argc, argv, 23, 0) != 0;
     config.audio_enabled = (ParseArgU32(argc, argv, 14, 1) != 0);
     config.microphone_endpoint_id = ParseArgUtf8(argc, argv, 15);
     config.microphone_gain_percent = std::min<uint32_t>(

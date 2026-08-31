@@ -77,6 +77,8 @@
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
+#include <libavutil/dict.h>
+#include <libavutil/mathematics.h>
 #include <libavutil/opt.h>
 #include <libavutil/imgutils.h>
 }
@@ -258,6 +260,7 @@ namespace fthr {
         , target_height_(0)
         , bitrate_kbps_(16000)
         , scaling_mode_(0)
+        , separate_audio_enabled_(false)
         , monitor_resolver_(monitor_topology_source_)
         , nvenc_active_(false)
         , nvidia_device_(false)
@@ -304,6 +307,7 @@ namespace fthr {
         target_height_ = config.target_height;
         bitrate_kbps_ = config.bitrate_kbps;
         scaling_mode_ = (config.scaling_mode == CaptureConfig::ScalingModeEnum::FIT) ? 1u : 0u;
+        separate_audio_enabled_ = config.separate_audio_enabled;
         monitor_device_path_ = monitor::NormalizeMonitorDevicePath(
             config.monitor_device_path);
         capture_loop_iterations_.store(0);
@@ -1124,6 +1128,7 @@ namespace fthr {
             task.enc_width = (target_width_ > 0) ? target_width_ : crop_width_;
             task.enc_height = (target_height_ > 0) ? target_height_ : crop_height_;
             task.fps = fps_;
+            task.separate_audio_enabled = separate_audio_enabled_;
             task.shared_memory = shared_memory;
             task.task_id = next_task_id_.fetch_add(1);
 
@@ -1247,6 +1252,7 @@ namespace fthr {
         task.fps = fps_;
         task.bitrate_kbps = bitrate_kbps_;
         task.scaling_mode = scaling_mode_;
+        task.separate_audio_enabled = separate_audio_enabled_;
         task.shared_memory = shared_memory;
         task.task_id = next_task_id_.fetch_add(1);
 
@@ -1585,8 +1591,6 @@ namespace fthr {
             }
         }
 
-        const size_t usable_count = snap.packets.size() - keyframe_start;
-
         // ------------------------------------------------------------------
         // Step C: Compute PTS normalization offset.
         //
@@ -1607,11 +1611,11 @@ namespace fthr {
 
         const int64_t pts_offset = snap.presentation_start_pts;
 
+        const size_t usable_count = snap.packets.size() - keyframe_start;
+
         // Trimmed video clip duration in seconds.
-        // Uses the PTS span of the packets that will actually be written
-        // (visible start = pts_offset, newest = back().pts), divided by fps to
-        // convert from PTS ticks to seconds. This is used by both the
-        // duration-fallback alignment path and the diagnostic output.
+        // Keep the source wall-clock span. A sparse capture must never be
+        // shortened by converting its packet count directly into duration.
         const int64_t newest_video_pts     = snap.packets.back().pts;
         const int64_t video_clip_pts_span  = newest_video_pts - pts_offset;
         const double video_clip_duration_s =
@@ -1806,10 +1810,7 @@ namespace fthr {
         // High-resolution MP4 stream timebase; packet timestamps are rescaled
         // from the encoder-provided time base below.
         video_stream->time_base = AVRational{ 1, 90000 };
-        video_stream->avg_frame_rate = AVRational{
-            video_config.frame_rate.numerator,
-            video_config.frame_rate.denominator};
-        video_stream->r_frame_rate = video_stream->avg_frame_rate;
+        ApplyConfiguredVideoMetadata(fmt_ctx, video_stream, video_config);
 
         // Copy the codec's decoder configuration record (avcC/hvcC/av1C).
         if (!video_config.codec_extradata.empty()) {
@@ -1997,6 +1998,17 @@ namespace fthr {
             }
         }
 
+        // The native publication is source-preserving. Combined mode is
+        // collapsed by the UI after the file is committed; this marker keeps
+        // an interrupted/failing finalization truthful about the current MP4
+        // topology so the editor never invents a single-track interpretation.
+        const bool native_audio_is_separated = task.separate_audio_enabled
+            || mux_audio_tracks.size() > 1;
+        av_dict_set(&fmt_ctx->metadata, "comment",
+            native_audio_is_separated
+                ? "fthr-audio-mode=separated"
+                : "fthr-audio-mode=combined", 0);
+
         // ------------------------------------------------------------------
         // Step 3: Open file + write header
         // ------------------------------------------------------------------
@@ -2017,7 +2029,10 @@ namespace fthr {
             return false;
         }
 
-        ret = avformat_write_header(fmt_ctx, nullptr);
+        AVDictionary* output_options = nullptr;
+        av_dict_set(&output_options, "movflags", "use_metadata_tags", 0);
+        ret = avformat_write_header(fmt_ctx, &output_options);
+        av_dict_free(&output_options);
         if (ret < 0) {
             std::cerr << "[MuxEncodedClip] avformat_write_header failed: " << ret << std::endl;
             avio_closep(&fmt_ctx->pb);
@@ -2152,7 +2167,7 @@ namespace fthr {
             av_pkt->stream_index = video_stream->index;
             av_pkt->flags = pkt.is_keyframe ? AV_PKT_FLAG_KEY : 0;
 
-            // Log first 3 packets before rescaling
+            // Log first 3 packets before rescaling.
             if (video_packet_count < 3) {
                 std::cout << "[VPkt #" << video_packet_count << " BEFORE rescale] "
                     << "PTS=" << av_pkt->pts
@@ -2162,9 +2177,7 @@ namespace fthr {
                     << std::endl;
             }
 
-            // Rescale from 1/fps to video stream timebase (1/90000)
             av_packet_rescale_ts(av_pkt, encode_tb, video_stream->time_base);
-
             if (video_packet_count < 3) {
                 std::cout << "[VPkt #" << video_packet_count << " AFTER rescale]  "
                     << "PTS=" << av_pkt->pts

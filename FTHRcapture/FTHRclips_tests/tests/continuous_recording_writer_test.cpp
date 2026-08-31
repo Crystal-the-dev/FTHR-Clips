@@ -16,6 +16,8 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavutil/dict.h>
+#include <libavutil/mathematics.h>
 }
 
 namespace {
@@ -49,7 +51,11 @@ bool ReceivePackets(
     }
 }
 
-bool ProbeMedia(const std::filesystem::path& path, bool expect_audio) {
+bool ProbeMedia(
+    const std::filesystem::path& path,
+    bool expect_audio,
+    int expected_fps = 0,
+    int64_t expected_bitrate_bps = 0) {
     AVFormatContext* input = nullptr;
     if (avformat_open_input(&input, path.string().c_str(), nullptr, nullptr) < 0)
         return false;
@@ -60,27 +66,63 @@ bool ProbeMedia(const std::filesystem::path& path, bool expect_audio) {
         input, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0) : -1;
     const AVCodecParameters* video_parameters = video_index >= 0
         ? input->streams[video_index]->codecpar : nullptr;
+    const AVStream* video_stream = video_index >= 0
+        ? input->streams[video_index] : nullptr;
     const bool correct_sdr_color = video_parameters
         && video_parameters->color_range == AVCOL_RANGE_MPEG
         && video_parameters->color_primaries == AVCOL_PRI_BT709
         && video_parameters->color_trc == AVCOL_TRC_BT709
         && video_parameters->color_space == AVCOL_SPC_BT709;
+    const bool correct_declared_rate = !video_stream || expected_fps <= 0
+        || (video_stream->avg_frame_rate.num == expected_fps
+            && video_stream->avg_frame_rate.den == 1
+            && video_stream->r_frame_rate.num == expected_fps
+            && video_stream->r_frame_rate.den == 1);
+    const AVDictionaryEntry* configured_fps = expected_fps > 0
+        ? av_dict_get(input->metadata, "fthr_frame_rate", nullptr, 0)
+        : nullptr;
+    const AVDictionaryEntry* configured_bitrate = expected_bitrate_bps > 0
+        ? av_dict_get(input->metadata, "fthr_video_bitrate_bps", nullptr, 0)
+        : nullptr;
+    const bool correct_configured_metadata =
+        (expected_fps <= 0
+            || (configured_fps && std::string(configured_fps->value)
+                == std::to_string(expected_fps) + "/1"))
+        && (expected_bitrate_bps <= 0
+            || (configured_bitrate && std::string(configured_bitrate->value)
+                == std::to_string(expected_bitrate_bps)));
     bool read_video = false;
     bool read_audio = false;
+    bool constant_sample_timing = true;
+    int64_t previous_video_pts = AV_NOPTS_VALUE;
+    const int64_t expected_video_delta = expected_fps > 0 && video_stream
+        ? av_rescale_q(1, AVRational{1, expected_fps}, video_stream->time_base)
+        : 0;
     AVPacket* packet = av_packet_alloc();
     if (packet) {
         while (av_read_frame(input, packet) >= 0) {
-            if (packet->stream_index == video_index && packet->size > 0)
+            if (packet->stream_index == video_index && packet->size > 0) {
                 read_video = true;
+                if (expected_video_delta > 0
+                    && packet->pts != AV_NOPTS_VALUE) {
+                    if (previous_video_pts != AV_NOPTS_VALUE
+                        && packet->pts - previous_video_pts
+                            != expected_video_delta) {
+                        constant_sample_timing = false;
+                    }
+                    previous_video_pts = packet->pts;
+                }
+            }
             if (packet->stream_index == audio_index && packet->size > 0)
                 read_audio = true;
             av_packet_unref(packet);
-            if (read_video && (!expect_audio || read_audio)) break;
         }
         av_packet_free(&packet);
     }
     avformat_close_input(&input);
     return video_index >= 0 && read_video && correct_sdr_color
+        && correct_declared_rate && correct_configured_metadata
+        && constant_sample_timing
         && (!expect_audio || (audio_index >= 0 && read_audio));
 }
 
@@ -90,6 +132,26 @@ size_t CountBox(const std::vector<uint8_t>& bytes, const char name[4]) {
         if (std::equal(name, name + 4, bytes.begin() + index)) ++count;
     }
     return count;
+}
+
+bool HasBtrtBitrate(
+    const std::vector<uint8_t>& bytes, uint32_t expected_bitrate_bps) {
+    for (size_t index = 0; index + 16 <= bytes.size(); ++index) {
+        if (!std::equal("btrt", "btrt" + 4, bytes.begin() + index))
+            continue;
+        const auto read_u32 = [&bytes](size_t offset) {
+            return (static_cast<uint32_t>(bytes[offset]) << 24)
+                | (static_cast<uint32_t>(bytes[offset + 1]) << 16)
+                | (static_cast<uint32_t>(bytes[offset + 2]) << 8)
+                | static_cast<uint32_t>(bytes[offset + 3]);
+        };
+        const uint32_t max_bitrate = read_u32(index + 8);
+        const uint32_t average_bitrate = read_u32(index + 12);
+        if (max_bitrate == expected_bitrate_bps
+            && average_bitrate == expected_bitrate_bps)
+            return true;
+    }
+    return false;
 }
 
 std::filesystem::path MakeRecordingPath(const char* name) {
@@ -181,6 +243,10 @@ void FragmentedRecordingSurvivesAnUnfinishedCopy() {
                 frame->data[2] + row * frame->linesize[2],
                 frame->width / 2, static_cast<uint8_t>(128));
         }
+        // Submit the normal CFR encoder timeline. Real capture timing can be
+        // sparse; the UI finalizer repairs those gaps after the source-preserving
+        // writer closes, while this native test verifies the writer's ordinary
+        // configured-rate path.
         frame->pts = index;
         CheckRecording(avcodec_send_frame(encoder, frame) >= 0,
             "test frame submitted");
@@ -211,9 +277,9 @@ void FragmentedRecordingSurvivesAnUnfinishedCopy() {
     }
 
     CheckRecording(writer.Stop(), "normal recording close succeeds");
-    CheckRecording(ProbeMedia(output, true),
+    CheckRecording(ProbeMedia(output, true, kFps, 300'000),
         "normally closed video plus AAC recording is playable");
-    CheckRecording(ProbeMedia(interrupted, true),
+    CheckRecording(ProbeMedia(interrupted, true, kFps, 300'000),
         "video plus AAC recording copied before Stop is independently playable");
 
     std::ifstream file(output, std::ios::binary);
@@ -225,6 +291,8 @@ void FragmentedRecordingSurvivesAnUnfinishedCopy() {
         "recovery metadata is present at recording start");
     CheckRecording(CountBox(bytes, moof) >= 2,
         "recording contains multiple independent media fragments");
+    CheckRecording(HasBtrtBitrate(bytes, 300'000),
+        "MP4 track bitrate declaration matches the configured video bitrate");
 
     av_packet_free(&packet);
     av_frame_free(&frame);

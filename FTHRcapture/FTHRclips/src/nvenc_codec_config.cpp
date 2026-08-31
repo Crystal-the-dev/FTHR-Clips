@@ -75,6 +75,10 @@ bool ConfigureNvencCodec(
     if (!selection || fps == 0) return false;
 
     const uint32_t keyframe_interval = fps * 4;
+    // H.264/HEVC VUI timing is part of the encoded stream metadata. Publish
+    // the configured fixed rate explicitly so media-property readers do not
+    // have to infer it from irregular capture timestamps.
+    const uint32_t vui_time_scale = fps * 2;
     config.profileGUID = selection->profile_guid;
     config.frameIntervalP = 1;
     config.gopLength = keyframe_interval;
@@ -88,7 +92,9 @@ bool ConfigureNvencCodec(
         h264.enableVFR = 0;
         h264.outputPictureTimingSEI = 0;
         h264.outputBufferingPeriodSEI = 0;
-        h264.h264VUIParameters.timingInfoPresentFlag = 0;
+        h264.h264VUIParameters.timingInfoPresentFlag = 1;
+        h264.h264VUIParameters.numUnitInTicks = 1;
+        h264.h264VUIParameters.timeScale = vui_time_scale;
         h264.h264VUIParameters.videoSignalTypePresentFlag = 1;
         h264.h264VUIParameters.videoFormat =
             NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
@@ -111,7 +117,9 @@ bool ConfigureNvencCodec(
         hevc.level = NV_ENC_LEVEL_AUTOSELECT;
         hevc.outputPictureTimingSEI = 0;
         hevc.outputBufferingPeriodSEI = 0;
-        hevc.hevcVUIParameters.timingInfoPresentFlag = 0;
+        hevc.hevcVUIParameters.timingInfoPresentFlag = 1;
+        hevc.hevcVUIParameters.numUnitInTicks = 1;
+        hevc.hevcVUIParameters.timeScale = vui_time_scale;
         hevc.hevcVUIParameters.videoSignalTypePresentFlag = 1;
         hevc.hevcVUIParameters.videoFormat =
             NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
@@ -135,7 +143,7 @@ bool ConfigureNvencCodec(
         av1.chromaFormatIDC = 1;
         av1.level = NV_ENC_LEVEL_AV1_AUTOSELECT;
         av1.outputAnnexBFormat = 0;
-        av1.enableTimingInfo = 0;
+        av1.enableTimingInfo = 1;
         av1.enableDecoderModelInfo = 0;
         // ISO BMFF AV1 requires the sequence header on every keyframe. This
         // matches the pinned FFmpeg NVENC wrapper and lets movenc filter the

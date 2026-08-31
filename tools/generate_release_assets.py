@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Generate every FTHR-owned release asset without external media inputs.
+"""Generate FTHR-owned release art without external media inputs.
 
-The generator uses only simple geometric primitives, an original compact
-bitmap alphabet, and synthesized sine tones. It deliberately does not read an
-image, sound sample, system font, icon set, or other third-party creative
-asset. See ``licenses/FTHR-GENERATED-ASSETS.txt`` for the redistribution
-notice. The separately sourced Oswald font is not generated here.
+The generator uses only simple geometric primitives and an original compact
+bitmap alphabet. The UI logo, brand icon, action icons, and notification sounds
+are workspace-supplied source assets and are intentionally not regenerated here.
+See ``licenses/FTHR-GENERATED-ASSETS.txt`` for the redistribution notice. The
+separately sourced Oswald font is not generated here.
 """
 
 from __future__ import annotations
@@ -32,6 +32,8 @@ MUTED = (139, 149, 161, 255)
 ACCENT = (255, 75, 160, 255)
 GRID = (23, 29, 38, 255)
 PALETTE = (TRANSPARENT, BLACK, PANEL, WHITE, MUTED, ACCENT, GRID)
+INSTALLER_BLACK = (0, 0, 0, 255)
+INSTALLER_ACCENT = (0, 255, 170, 255)
 
 
 def _stored_zlib(data: bytes) -> bytes:
@@ -228,7 +230,7 @@ GLYPHS = {
 }
 
 
-def draw_mark(size: int, background=TRANSPARENT) -> Canvas:
+def draw_mark(size: int, background=TRANSPARENT, accent=ACCENT) -> Canvas:
     canvas = Canvas(size, size, background)
     unit = size / 16
     thick = max(2, round(unit * 1.15))
@@ -246,7 +248,7 @@ def draw_mark(size: int, background=TRANSPARENT) -> Canvas:
         (round(unit * 11.8), round(unit * 8.0)),
         (round(unit * 6.3), round(unit * 11.2)),
         (round(unit * 7.7), round(unit * 8.0)),
-    ], ACCENT)
+    ], accent)
     return canvas
 
 
@@ -339,15 +341,11 @@ def blit(target: Canvas, source: Canvas, x0: int, y0: int) -> None:
 
 
 def installer_banner(width: int, height: int) -> Canvas:
-    c = Canvas(width, height, BLACK)
-    c.rect(width - 2, 0, width, height, ACCENT)
+    c = Canvas(width, height, INSTALLER_BLACK)
+    c.rect(width - 2, 0, width, height, INSTALLER_ACCENT)
     mark_size = min(width - 28, 112)
-    mark = draw_mark(mark_size)
+    mark = draw_mark(mark_size, accent=INSTALLER_ACCENT)
     blit(c, mark, (width - mark_size) // 2, max(8, height // 7))
-    if height >= 200:
-        c.text(15, height - 96, 'FTHR', 4, WHITE)
-        c.text(15, height - 60, 'CLIPS', 4, WHITE)
-        c.text(15, height - 24, '1.0 ALPHA', 2, MUTED)
     return c
 
 
@@ -386,54 +384,37 @@ def sound(notes: list[tuple[float, float]], gap: float = 0.025) -> bytes:
 
 def generated_files() -> dict[Path, bytes]:
     logo = draw_mark(512).png()
-    icons = {
-        ROOT / 'FTHR_UI' / 'assets' / 'icons' / name: draw_icon(name).png()
-        for name in (
-            'clip.png', 'close.png', 'dropdown.png', 'home.png',
-            'maximize.png', 'minimize.png', 'pause.png', 'personalize.png',
-            'play.png', 'refresh.png', 'settings(general).png', 'sound.png',
-            'shutdown.png', 'updates.png', 'visuals.png',
-        )
-    }
-    sounds = {
-        ROOT / 'FTHR_UI' / 'assets' / 'sounds' / 'clip_captured.wav':
-            sound([(659.25, 0.13), (880.00, 0.20)]),
-        ROOT / 'FTHR_UI' / 'assets' / 'sounds' / 'error.wav':
-            sound([(329.63, 0.18), (220.00, 0.28)], 0.015),
-        ROOT / 'FTHR_UI' / 'assets' / 'sounds' / 'screenshot_saved.wav':
-            sound([(1174.66, 0.09), (1760.00, 0.14)], 0.012),
-        ROOT / 'FTHR_UI' / 'assets' / 'sounds' / 'startup.wav':
-            sound([(440.00, 0.10), (659.25, 0.15)], 0.012),
-        ROOT / 'FTHR_UI' / 'assets' / 'sounds' / 'upload_successful.wav':
-            sound([(659.25, 0.09), (987.77, 0.15)], 0.012),
-        ROOT / 'FTHR_UI' / 'assets' / 'sounds' / 'upload_failed.wav':
-            sound([(392.00, 0.12), (261.63, 0.18)], 0.015),
-    }
     files = {
         ROOT / '.github' / 'social_preview.png': social_preview().png(),
         ROOT / 'AppDir' / 'fthr-clips.png': logo,
-        ROOT / 'FTHR_UI' / 'assets' / 'fthr_logo.png': logo,
-        ROOT / 'FTHR_UI' / 'assets' / 'fthr_logo.ico': ico(
-            [draw_mark(size, BLACK) for size in (16, 32, 48, 256)]),
-        ROOT / 'FTHR_UI' / 'assets' / 'favicon.ico': ico(
-            [draw_mark(size, BLACK) for size in (16, 32, 48, 256)]),
         ROOT / 'installer_assets' / 'wizard_banner.bmp':
             installer_banner(164, 314).bmp(),
         ROOT / 'installer_assets' / 'wizard_small.bmp':
             installer_banner(55, 58).bmp(),
     }
-    files.update(icons)
-    files.update(sounds)
     return files
+
+
+def installer_files() -> dict[Path, bytes]:
+    """Return only the installer artwork without touching other release art."""
+    return {
+        ROOT / 'installer_assets' / 'wizard_banner.bmp':
+            installer_banner(164, 314).bmp(),
+        ROOT / 'installer_assets' / 'wizard_small.bmp':
+            installer_banner(55, 58).bmp(),
+    }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument('--check', action='store_true',
                         help='fail if committed generated files differ')
+    parser.add_argument('--installer-only', action='store_true',
+                        help='generate/check only the Windows installer artwork')
     args = parser.parse_args()
     mismatches = []
-    for path, expected in generated_files().items():
+    expected_files = installer_files() if args.installer_only else generated_files()
+    for path, expected in expected_files.items():
         relative = path.relative_to(ROOT)
         if args.check:
             actual = path.read_bytes() if path.is_file() else None
@@ -449,7 +430,7 @@ def main() -> int:
             print(f'generated asset mismatch: {path}', file=sys.stderr)
         return 1
     if args.check:
-        print(f'{len(generated_files())} generated assets match version '
+        print(f'{len(expected_files)} generated assets match version '
               f'{GENERATOR_VERSION}')
     return 0
 

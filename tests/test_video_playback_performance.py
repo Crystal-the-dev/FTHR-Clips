@@ -75,6 +75,18 @@ def test_playback_has_one_ui_loop_and_filmstrip_is_idle_only(
     viewer._teardown_player()
 
 
+def test_playing_button_uses_contrasting_pause_icon(
+        monkeypatch, qtbot, tmp_path):
+    viewer = _viewer(monkeypatch, qtbot, str(tmp_path / 'clip.mp4'))
+
+    viewer._on_state_changed(QMediaPlayer.PlaybackState.PlayingState)
+
+    assert viewer.play_btn.isChecked()
+    assert viewer.play_btn.icon().cacheKey() == viewer._pause_active_icon.cacheKey()
+    assert viewer.play_btn.icon().cacheKey() != viewer._pause_icon.cacheKey()
+    viewer._teardown_player()
+
+
 def test_resume_guard_hides_transient_backend_position_reset():
     viewer = SimpleNamespace(
         _resume_anchor_ms=8_000,

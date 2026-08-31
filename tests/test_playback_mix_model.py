@@ -59,6 +59,23 @@ def test_current_windows_default_mix_and_microphone_are_both_editable():
     assert source_display_name(sources[0]) == 'System Audio'
 
 
+def test_combined_capture_hides_all_source_sliders_even_with_a_legacy_manifest():
+    sources = build_playback_sources(
+        _manifest((1, 'system', 'Default Mix'), (2, 'microphone', 'Microphone')),
+        (_stream(1), ProbedAudioStream(2, 1, 'Microphone', 'combined')),
+    )
+    assert len(sources) == 2
+    assert not any(source.editable for source in sources)
+
+
+def test_separated_capture_keeps_system_and_microphone_sliders_editable():
+    sources = build_playback_sources(
+        _manifest((1, 'system', 'Default Mix'), (2, 'microphone', 'Microphone')),
+        (_stream(1), ProbedAudioStream(2, 1, 'Microphone', 'separated')),
+    )
+    assert all(source.editable for source in sources)
+
+
 def test_rich_app_stems_exclude_only_compatibility_default_mix():
     sources = build_playback_sources(
         _manifest((1, 'system', 'Default Mix'), (2, 'application', 'VALORANT'),
@@ -625,7 +642,8 @@ def test_last_source_unmute_uses_same_immediate_audio_restart(qtbot):
 def test_probe_uses_actual_container_indexes_and_titles(monkeypatch):
     class Result:
         returncode = 0
-        stdout = json.dumps({'streams': [
+        stdout = json.dumps({'format': {'tags': {'comment': 'fthr-audio-mode=COMBINED'}},
+                             'streams': [
             {'index': 0, 'codec_type': 'video'},
             {'index': 2, 'codec_type': 'audio', 'tags': {'title': 'System'}},
             {'index': 5, 'codec_type': 'audio', 'tags': {'handler_name': 'Mic'}},
@@ -636,6 +654,7 @@ def test_probe_uses_actual_container_indexes_and_titles(monkeypatch):
     streams = probe_audio_streams('clip.mp4')
     assert [(stream.container_index, stream.audio_index, stream.title) for stream in streams] == [
         (2, 0, 'System'), (5, 1, 'Mic')]
+    assert {stream.audio_mode for stream in streams} == {'combined'}
 
 
 def test_in_process_bridge_decodes_mixes_mutes_and_seeks_real_media(tmp_path):

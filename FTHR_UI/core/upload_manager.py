@@ -74,6 +74,8 @@ _DEFAULT_SETTINGS: dict[str, Any] = {
     'upload_enabled': False,
     'upload_provider': 'catbox',
     'catbox_userhash': '',
+    'upload_server_url': '',
+    'upload_auth_header': '',
     'upload_mode': 'manual',
     'upload_interval_value': 5,
     'upload_interval_unit': 'minutes',
@@ -522,7 +524,11 @@ class UploadManager(QObject):
                     self._settings[key] = value
                 changed = True
         if changed:
-            self._settings['upload_provider'] = 'catbox'
+            # The pre-extension uploader used these fields for a generic
+            # endpoint. Keep an existing custom setup selected after migration
+            # instead of silently falling back to Catbox.
+            self._settings['upload_provider'] = (
+                'custom' if self._settings.get('upload_server_url') else 'catbox')
             self._core_settings.save_settings()
         if _LEGACY_HISTORY_FILE.is_file() and not _HISTORY_FILE.exists():
             _HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)

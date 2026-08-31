@@ -96,7 +96,11 @@ namespace fthr {
         VideoCodec video_codec = VideoCodec::H264;
         EncoderPreference encoder_preference = EncoderPreference::Auto;
         uint32_t encoder_preset = 4;
+        // Retired multiband ABI field remains available for old callers.
         bool multiband_enabled = false;
+        // 0 = the UI publishes one combined system + microphone stream;
+        // 1 = retain individual source streams in the finished MP4.
+        bool separate_audio_enabled = false;
 
         // Capture mode — set at startup, requires engine restart to change.
         enum class CaptureModeEnum : uint32_t { DESKTOP = 0, WINDOW = 1 };
@@ -331,6 +335,7 @@ namespace fthr {
         uint32_t target_height_;
         uint32_t bitrate_kbps_;
         uint32_t scaling_mode_;   // 0 = stretch, 1 = fit/letterbox
+        bool separate_audio_enabled_;
         std::wstring monitor_device_path_;
         monitor::WindowsMonitorTopologySource monitor_topology_source_;
         monitor::MonitorResolver monitor_resolver_;

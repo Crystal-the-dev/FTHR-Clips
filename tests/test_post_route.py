@@ -13,6 +13,7 @@ import itertools
 import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -66,17 +67,16 @@ def test_audio_disabled_disables_both_mux_routes():
             'audio off must not select an audio mux route')
 
 
-def test_plain_clip_is_ready_immediately():
-    """No mux, nothing to apply — the upload must not be made to wait on a
-    worker that will not rewrite anything."""
+def test_plain_clip_waits_for_cfr_validation():
+    """Even a plain clip waits until its physical sample timing is verified."""
     route, has_async = select_post_route(
         audio_on=False, multiband_enabled=False, mic_running=False,
         watermark=False, manual_crop=False, camera=False)
     assert route == 'finalize'
-    assert has_async is False
+    assert has_async is True
 
 
-@pytest.mark.parametrize('flag', ['manual_crop', 'camera'])
+@pytest.mark.parametrize('flag', ['manual_crop', 'camera', 'keyboard'])
 def test_finalize_defers_upload_when_it_will_rewrite_the_file(flag):
     kwargs = dict(audio_on=False, multiband_enabled=False, mic_running=False,
                   watermark=False, manual_crop=False, camera=False)
@@ -87,13 +87,49 @@ def test_finalize_defers_upload_when_it_will_rewrite_the_file(flag):
         f'{flag} rewrites the clip — the upload must wait for clip_ready')
 
 
+def test_keyboard_only_finalization_starts_the_completion_worker():
+    class _Settings:
+        def get(self, key, default=None):
+            if key == 'third_party_keyboard':
+                return {'enabled': True, 'hwnd': 42}
+            return default
+
+    scheduled = []
+    worker = object()
+    host = SimpleNamespace(
+        settings_manager=_Settings(),
+        _allow_completed_clip_pipeline=lambda _path, _ready=None: True,
+        _finalize_clip_worker=worker,
+        _spawn_mux_thread=lambda target, args: scheduled.append((target, args)),
+    )
+
+    MainWindow._finalize_clip(
+        host, 'keyboard-only.mp4', 30, 100.0, threading.Event(), None)
+
+    assert len(scheduled) == 1
+    assert scheduled[0][0] is worker
+
+
+def test_keyboard_compositor_cannot_deadlock_on_an_unread_error_pipe():
+    source = Path(__file__).resolve().parent.parent / 'FTHR_UI' / 'main.py'
+    text = source.read_text(encoding='utf-8', errors='replace')
+    body = text[
+        text.index('def _apply_keyboard_overlay'):
+        text.index('def _apply_camera_overlay')
+    ]
+
+    assert 'stderr=subprocess.PIPE' not in body
+    assert 'TemporaryFile()' in body
+    assert 'FTHR-KeyboardCompositorFeed' in body
+
+
 def test_export_watermark_does_not_rewrite_source_clip():
     route, has_async = select_post_route(
         audio_on=False, multiband_enabled=False, mic_running=False,
         watermark=True, manual_crop=False, camera=False)
 
     assert route == 'finalize'
-    assert has_async is False
+    assert has_async is True
 
 
 def test_mux_routes_always_defer_the_upload():
@@ -104,12 +140,28 @@ def test_mux_routes_always_defer_the_upload():
     assert has_async is True
 
 
+def test_native_combined_audio_defers_for_the_audio_collapse_pass():
+    route, has_async = select_post_route(
+        audio_on=True, multiband_enabled=False, mic_running=False,
+        watermark=False, manual_crop=False, camera=False,
+        audio_capture_mode='combined', native_audio=True)
+    assert (route, has_async) == ('mic', True)
+
+
+def test_native_separated_audio_still_schedules_cfr_finalization():
+    route, has_async = select_post_route(
+        audio_on=True, multiband_enabled=False, mic_running=False,
+        watermark=False, manual_crop=False, camera=False,
+        audio_capture_mode='separated', native_audio=True)
+    assert (route, has_async) == ('finalize', True)
+
+
 def test_retired_multiband_request_creates_no_post_mix_work():
     route, has_async = select_post_route(
         audio_on=True, multiband_enabled=True, mic_running=False,
         watermark=False, manual_crop=False, camera=False)
     assert route == 'finalize'
-    assert has_async is False
+    assert has_async is True
 
 
 def test_completion_handler_dispatches_one_route_only():

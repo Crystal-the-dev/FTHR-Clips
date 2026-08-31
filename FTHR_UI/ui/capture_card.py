@@ -128,6 +128,13 @@ def _play_sound(path: Path, volume: int = 100) -> None:
             _SOUND_PLAYBACK = None
 
 
+def _notification_sounds_enabled() -> bool:
+    try:
+        return bool(SettingsManager().get('notification_sounds_enabled', True))
+    except Exception:
+        return True
+
+
 # ---------------------------------------------------------------------------
 # CaptureCard widget
 # ---------------------------------------------------------------------------
@@ -261,6 +268,8 @@ class CaptureCard(QWidget):
             hold_duration_ms=hold_duration_ms)
 
     def play_startup(self) -> None:
+        if not _notification_sounds_enabled():
+            return
         key = 'startup'
         try:
             volume = int(SettingsManager().get(
@@ -357,7 +366,7 @@ class CaptureCard(QWidget):
         except Exception:
             pass
 
-        if sound_key is not None:
+        if sound_key is not None and _notification_sounds_enabled():
             try:
                 volume = int(SettingsManager().get(
                     _SOUND_VOLUME_KEYS[sound_key], 100))

@@ -96,6 +96,43 @@ def test_lustful_uses_documented_headers_and_file_field(tmp_path, monkeypatch):
     assert info['file_id'] == 7
 
 
+def test_custom_server_uses_configured_url_auth_and_clip_field(tmp_path, monkeypatch):
+    clip = tmp_path / 'clip.mp4'
+    clip.write_bytes(b'clip-data')
+    captured = {}
+
+    def multipart(url, fields, file_field, file_path, headers, **kwargs):
+        captured.update({
+            'url': url,
+            'fields': fields,
+            'file_field': file_field,
+            'file_path': file_path,
+            'headers': headers,
+            'kwargs': kwargs,
+        })
+        return 201, b'{"url":"https://clips.example/123"}'
+
+    monkeypatch.setattr(upload_runtime, '_multipart_post', multipart)
+    monkeypatch.setattr(upload_runtime, 'HISTORY_FILE', tmp_path / 'history.json')
+    runtime = upload_runtime.UploadRuntime({
+        'upload_provider': 'custom',
+        'upload_server_url': 'http://localhost:8080/upload',
+        'upload_auth_header': 'Bearer test-token',
+        'upload_auto_delete': False,
+    })
+
+    ok, message, info = runtime.upload(str(clip))
+
+    assert ok, message
+    assert captured['url'] == 'http://localhost:8080/upload'
+    assert captured['fields'] == {}
+    assert captured['file_field'] == 'clip'
+    assert captured['file_path'] == clip
+    assert captured['headers'] == {'Authorization': 'Bearer test-token'}
+    assert captured['kwargs'] == {'require_https': False}
+    assert info['url'] == 'https://clips.example/123'
+
+
 def test_register_does_not_fall_back_to_verify_on_conflict(monkeypatch):
     calls: list[str] = []
 
@@ -142,3 +179,7 @@ def test_provider_actions_require_versioned_consent():
         assert 'Hardware Identity' in str(exc)
     else:
         raise AssertionError('Lustful action accepted a missing hardware capability')
+
+
+def test_custom_provider_does_not_require_third_party_consent():
+    uploader_service._require_provider_consent('custom', {}, {})

@@ -6,6 +6,8 @@
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
+#include <libavutil/dict.h>
+#include <libavutil/mathematics.h>
 #include <libavutil/opt.h>
 #include <libavutil/channel_layout.h>
 #include <libswresample/swresample.h>
@@ -19,6 +21,28 @@ namespace fthr {
 
 static void set_shm_bytes(SharedMemoryLayout* shm, uint64_t bytes) {
     if (shm) shm->bytes_written = bytes;
+}
+
+static void apply_configured_video_metadata(
+    AVFormatContext* format_context,
+    AVStream* stream, uint32_t fps, uint32_t bitrate_kbps) {
+    if (!stream || !stream->codecpar) return;
+
+    stream->avg_frame_rate = AVRational{static_cast<int>(fps), 1};
+    stream->r_frame_rate = stream->avg_frame_rate;
+    if (bitrate_kbps > 0) {
+        stream->codecpar->bit_rate =
+            static_cast<int64_t>(bitrate_kbps) * 1000;
+    }
+
+    if (!format_context) return;
+    const std::string rate = std::to_string(fps) + "/1";
+    av_dict_set(&format_context->metadata, "fthr_frame_rate", rate.c_str(), 0);
+    av_dict_set_int(
+        &format_context->metadata,
+        "fthr_video_bitrate_bps",
+        static_cast<int64_t>(bitrate_kbps) * 1000,
+        0);
 }
 
 // ---------------------------------------------------------------------------
@@ -38,7 +62,9 @@ static bool write_clip_to_temporary_file(
     uint32_t                         height,
     AVCodecID                        video_codec_id,
     SharedMemoryLayout*              shm,
-    std::string&                     error_message
+    std::string&                     error_message,
+    bool                             separate_audio,
+    uint32_t                         bitrate_kbps
 ) {
     if (video_packets.empty()) {
         std::cerr << "[SaveClip] No video packets to write" << std::endl;
@@ -59,6 +85,9 @@ static bool write_clip_to_temporary_file(
         return false;
     }
     fmt_ctx->avoid_negative_ts = AVFMT_AVOID_NEG_TS_DISABLED;
+    av_dict_set(&fmt_ctx->metadata, "comment",
+                separate_audio ? "fthr-audio-mode=separated"
+                                : "fthr-audio-mode=combined", 0);
 
     // -------------------------------------------------------------------------
     // Video stream
@@ -78,6 +107,12 @@ static bool write_clip_to_temporary_file(
     vpar->width        = static_cast<int>(width);
     vpar->height       = static_cast<int>(height);
     vpar->format       = AV_PIX_FMT_YUV420P;
+    vpar->color_range  = AVCOL_RANGE_MPEG;
+    vpar->color_primaries = AVCOL_PRI_BT709;
+    vpar->color_trc    = AVCOL_TRC_BT709;
+    vpar->color_space  = AVCOL_SPC_BT709;
+    vpar->chroma_location = AVCHROMA_LOC_LEFT;
+    apply_configured_video_metadata(fmt_ctx, vid_stream, fps, bitrate_kbps);
 
     if (!extradata.empty()) {
         vpar->extradata = static_cast<uint8_t*>(
@@ -192,7 +227,11 @@ skip_audio_setup:
         }
     }
 
-    if (avformat_write_header(fmt_ctx, nullptr) < 0) {
+    AVDictionary* output_options = nullptr;
+    av_dict_set(&output_options, "movflags", "use_metadata_tags", 0);
+    const int header_error = avformat_write_header(fmt_ctx, &output_options);
+    av_dict_free(&output_options);
+    if (header_error < 0) {
         std::cerr << "[SaveClip] avformat_write_header failed" << std::endl;
         error_message = "Failed to write the MP4 header for the temporary clip: " + path;
         ok = false;
@@ -206,15 +245,14 @@ skip_audio_setup:
         // The physical keyframe may precede the visible replay boundary.
         // Preserve its negative PTS so MP4 can hide decoder pre-roll with an
         // edit list while presenting the requested interval from t=0.
-        const int64_t pts_offset = presentation_start_pts;
-
         uint64_t bytes_out = 0;
         for (const auto& ep : video_packets) {
+            if (ep.data.empty()) continue;
             AVPacket* pkt = av_packet_alloc();
             pkt->data = const_cast<uint8_t*>(ep.data.data());
             pkt->size = static_cast<int>(ep.data.size());
-            pkt->pts  = ep.pts - pts_offset;
-            pkt->dts  = ep.dts - pts_offset;
+            pkt->pts  = ep.pts - presentation_start_pts;
+            pkt->dts  = ep.dts - presentation_start_pts;
             pkt->duration = 1;
             pkt->stream_index = vid_stream->index;
             if (ep.is_keyframe) pkt->flags |= AV_PKT_FLAG_KEY;
@@ -384,7 +422,9 @@ bool save_clip_to_file(
     uint32_t                         height,
     AVCodecID                        video_codec_id,
     SharedMemoryLayout*              shm,
-    std::string*                     error_message
+    std::string*                     error_message,
+    bool                             separate_audio,
+    uint32_t                         bitrate_kbps
 ) {
     const auto result = transactional_save::Run(
         path,
@@ -402,7 +442,9 @@ bool save_clip_to_file(
                 height,
                 video_codec_id,
                 shm,
-                writer_error);
+                writer_error,
+                separate_audio,
+                bitrate_kbps);
         });
 
     if (result.cleanup_error) {

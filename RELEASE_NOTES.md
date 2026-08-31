@@ -16,8 +16,9 @@ yet approved for public distribution.
 - Selected-monitor screenshots, crop editing, tray/background operation, and
   persistent autostart settings.
 - Clip-backed overlay previews plus camera, image, and mouse-click burn-ins with
-  draggable placement and per-input visibility. Keyboard visualization is
-  marked as coming soon; clip-saving keyboard hotkeys remain available.
+  draggable placement and per-input visibility. Windows third-party keyboard
+  windows (Noboard/NohBoard-style) can be sampled live with an on-preview
+  chroma-key picker, adjustable key intensity, and timestamped clip overlay.
 - Settings combo boxes open as simple below-field dropdowns, and Customize
   sections expand or collapse immediately without height animations.
 - Audio settings expose persistent per-event notification volumes again.

@@ -212,3 +212,21 @@ def test_only_selected_provider_support_bar_is_visible(qapp):
     assert widget.catbox_donate_btn.isHidden()
     assert not widget.lustful_donate_btn.isHidden()
     assert 'background: #f4d43a' in widget.lustful_donate_btn.styleSheet()
+
+
+def test_custom_provider_exposes_and_saves_server_connection_fields(qapp):
+    manager = _Manager()
+    widget = upload_ui.UploadSettingsWidget(manager)
+
+    widget.provider_combo.setCurrentIndex(
+        widget.provider_combo.findData('custom'))
+    widget.server_url_edit.setText('clips.example/upload')
+    widget.server_auth_edit.setText('Bearer test-token')
+    widget._on_save()
+
+    assert not widget.custom_panel.isHidden()
+    assert widget.catbox_panel.isHidden()
+    assert widget.lustful_panel.isHidden()
+    assert manager.values['upload_provider'] == 'custom'
+    assert manager.values['upload_server_url'] == 'https://clips.example/upload'
+    assert manager.values['upload_auth_header'] == 'Bearer test-token'

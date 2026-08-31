@@ -15,11 +15,13 @@
 #endif
 
 #include "video_encoder.h"
+#include "encoded_video_config_ffmpeg.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libswscale/swscale.h>
+#include <libavutil/dict.h>
 #include <libavutil/opt.h>
 #include <libavutil/imgutils.h>
 }
@@ -30,6 +32,7 @@ extern "C" {
 #include <windows.h>
 #include <iostream>
 #include <cstring>
+#include <string>
 
 namespace fthr {
 
@@ -346,6 +349,16 @@ namespace fthr {
 
         // Set stream time base
         video_stream_->time_base = codec_ctx_->time_base;
+        const EncodedVideoConfig metadata_config{
+            VideoCodec::H264,
+            config.enc_width > 0 ? config.enc_width : config.src_width,
+            config.enc_height > 0 ? config.enc_height : config.src_height,
+            {static_cast<int32_t>(config.fps), 1},
+            {1, static_cast<int32_t>(config.fps)},
+            config.bitrate_kbps,
+        };
+        ApplyConfiguredVideoMetadata(
+            format_ctx_, video_stream_, metadata_config);
 
         // Allocate frame
         frame_ = av_frame_alloc();
@@ -442,7 +455,10 @@ namespace fthr {
         }
 
         // Write stream header
-        ret = avformat_write_header(format_ctx_, nullptr);
+        AVDictionary* output_options = nullptr;
+        av_dict_set(&output_options, "movflags", "use_metadata_tags", 0);
+        ret = avformat_write_header(format_ctx_, &output_options);
+        av_dict_free(&output_options);
         if (ret < 0) {
             std::cerr << "[VideoEncoder] avformat_write_header failed: " << ret << std::endl;
             return false;
@@ -477,6 +493,18 @@ namespace fthr {
 
         if (!sws_ctx_) {
             std::cerr << "[VideoEncoder] sws_getContext failed" << std::endl;
+            return false;
+        }
+
+        // Desktop capture is full-range BGRA, while the encoded SDR contract
+        // is studio-range BT.709 YUV.  libswscale's defaults vary by build and
+        // input/output format, so make both the matrix and range conversion
+        // explicit instead of allowing a backend-dependent brightness shift.
+        const int* bt709 = sws_getCoefficients(SWS_CS_ITU709);
+        if (!bt709 || sws_setColorspaceDetails(
+                sws_ctx_, bt709, 1, bt709, 0, 0, 1 << 16, 1 << 16) < 0) {
+            std::cerr << "[VideoEncoder] Failed to configure explicit full-range "
+                         "BGRA -> studio-range BT.709 conversion" << std::endl;
             return false;
         }
 

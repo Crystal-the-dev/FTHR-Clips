@@ -48,6 +48,7 @@ int main(int argc, char* argv[]) {
     //   [15] microphone ID  (reserved; Windows only)
     //   [16] mic gain       (reserved; Windows only)
     //   [17] encoder_pref   (0=auto, 1=NVIDIA, 2=AMD, 3=Intel, 4=software)
+    //   [23] audio_mode     (0=combined default, 1=separated tracks)
 
     fthr::CaptureConfig cfg{};
     cfg.fps            = (argc > 1) ? arg_u32(argv, 1, 60)     : 60;
@@ -66,6 +67,7 @@ int main(int argc, char* argv[]) {
     if (cfg.preset < 1) cfg.preset = 1;
     if (cfg.preset > 7) cfg.preset = 7;
     cfg.multiband_enabled = false;
+    cfg.separate_audio_enabled = (argc > 23) && (arg_u32(argv, 23, 0) != 0);
     cfg.audio_enabled = !((argc > 14) && (arg_u32(argv, 14, 1) == 0));
     cfg.encoder_pref = static_cast<fthr::EncoderPref>(
         (argc > 17) ? std::min<uint32_t>(arg_u32(argv, 17, 0), 4) : 0);

@@ -107,6 +107,44 @@ def check_source(report: Report) -> None:
             'upgrades retain the previous app directory')
     require(report, source, 'UsePreviousGroup=yes',
             'upgrades retain the previous Start Menu group')
+    require(report, source, 'DisableWelcomePage=yes',
+            'the policy acknowledgement is the first interactive page')
+    require(report, source, 'DisableFinishedPage=yes',
+            'the stock Windows finish page is replaced by the branded close page')
+    require(report, source, 'WizardForm.BorderStyle := bsNone;',
+            'the installer uses the app-style frameless popup shell')
+    require(report, source, 'SetupIconFile=FTHR_UI\\assets\\favicon.ico',
+            'the installer uses the supplied application favicon')
+    require(report, source, 'Source: "FTHR_UI\\assets\\icons\\close.png"',
+            'the popup close control uses the existing application icon')
+    require(report, source, 'policies.fthrclips.com',
+            'installer links to the hosted Privacy Policy')
+    require(report, source, "ConsentCheck.Checked := False",
+            'policy acknowledgement defaults to unchecked')
+    require(report, source, 'procedure CreateLocationPage;',
+            'installer presents install and clip locations together')
+    require(report, source, "InstallLabel.Caption := 'INSTALL FOLDER';",
+            'installer exposes the application install folder')
+    require(report, source, "ClipLabel.Caption := 'CLIP FOLDER';",
+            'installer exposes the separate clip-library folder')
+    require(report, source, 'function UserProfileDirectory: String;',
+            'installer derives the per-user profile path with supported constants')
+    require(report, source, "ExpandConstant('{userappdata}')",
+            'installer uses a supported AppData constant')
+    if "ExpandConstant('{userprofile}')" in source:
+        report.fail('installer uses unsupported {userprofile} constant')
+    else:
+        report.ok('installer has no unsupported {userprofile} constant')
+    require(report, source, 'clips_directory',
+            'selected clip-library directory is handed to the app settings')
+    require(report, source, 'CreateFinishPage',
+            'installer has a branded completion page')
+    if re.search(r'(?m)^Wizard(?:Image|SmallImage)File=', source):
+        report.fail('installer still embeds unrelated wizard banner artwork')
+    else:
+        report.ok('installer embeds no unrelated wizard banner artwork')
+    require(report, source, 'Source: "FTHR_UI\\assets\\fonts\\Oswald-Bold.ttf"',
+            'installer carries the application display font')
     require(report, source, 'OutputBaseFilename=FTHRClips-Setup-{#MyAppVersion}-x64',
             'installer artifact filename carries the product version')
     numeric = '.'.join(str(part) for part in windows_file_version())

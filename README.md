@@ -39,6 +39,7 @@ It runs as a tray icon. You forget it's there until you need it.
 | **Audio** | System-output and microphone tracks; Windows 11 per-app stems are code-ready but still require hardware qualification |
 | **Post-processing** | Watermark overlay |
 | **Post-processing** | Webcam overlay (picture-in-picture) |
+| **Post-processing** | Windows third-party keyboard window overlay with live chroma-key color picking and intensity control |
 | **Game detection** | Auto-detects game window, prompts to switch capture focus |
 | **Settings** | Presets — save/load/delete full configuration snapshots |
 | **Clip browser** | Thumbnail grid, linked-folder protection, trim editor and transactional export |

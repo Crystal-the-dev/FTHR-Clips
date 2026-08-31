@@ -31,6 +31,7 @@ _PROVIDER_LIMIT_BYTES = {
     'lustful': 100 * 1024 * 1024,
     'catbox': 200 * 1024 * 1024,
 }
+_CUSTOM_PROVIDER = 'custom'
 
 
 class UploadRuntime:
@@ -46,12 +47,12 @@ class UploadRuntime:
         if not path.is_file():
             return False, 'File no longer exists.', {}
         provider = self._provider()
-        limit = _PROVIDER_LIMIT_BYTES[provider]
+        limit = _PROVIDER_LIMIT_BYTES.get(provider)
         try:
             actual = path.stat().st_size
         except OSError as exc:
             return False, f'File size could not be checked: {exc}', {}
-        if actual > limit:
+        if limit is not None and actual > limit:
             return False, (
                 f'{provider.title()} accepts files up to {limit // (1024 * 1024)} MB; '
                 f'this file is {actual / (1024 * 1024):.1f} MB. '
@@ -63,6 +64,8 @@ class UploadRuntime:
                     self._upload_catbox(path)
                     if provider == 'catbox'
                     else self._upload_lustful(path)
+                    if provider == 'lustful'
+                    else self._upload_custom(path)
                 )
                 entry = {
                     'status': 'ok',
@@ -97,6 +100,8 @@ class UploadRuntime:
                 return False, 'This Lustful account is registered to a different PC.'
             data = self._lustful_client().verify(str(credentials['account_id']), hardware_id)
             return True, f'Lustful connected ({data.get("role", "user")}).'
+        if provider == _CUSTOM_PROVIDER:
+            return self._test_custom_connection()
         request = urllib.request.Request(CATBOX_URL, method='HEAD')
         try:
             with urllib.request.urlopen(request, timeout=10) as response:
@@ -110,8 +115,10 @@ class UploadRuntime:
         provider = str(self.settings.get('upload_provider', 'catbox')).lower()
         if provider == 'fthr':
             provider = 'lustful'
-        if provider not in {'catbox', 'lustful'}:
-            raise ValueError('Only Catbox and Lustful are supported.')
+        if provider in {'own_server', 'your_server'}:
+            provider = _CUSTOM_PROVIDER
+        if provider not in {'catbox', 'lustful', _CUSTOM_PROVIDER}:
+            raise ValueError('Only Catbox, Lustful, and your server are supported.')
         return provider
 
     def _hardware_id(self) -> str:
@@ -173,6 +180,59 @@ class UploadRuntime:
             'favorite': False,
         }
 
+    def _upload_custom(self, path: Path) -> dict[str, Any]:
+        """Upload to the user-selected endpoint using the FTHR multipart contract."""
+
+        url = _custom_server_url(self.settings)
+        status, raw = _multipart_post(
+            url,
+            {},
+            'clip',
+            path,
+            headers=_custom_server_headers(self.settings),
+            require_https=False,
+        )
+        text = raw.decode('utf-8', errors='replace').strip()
+        if not 200 <= status < 300:
+            raise RuntimeError(text or f'Your server returned HTTP {status}.')
+
+        # Custom endpoints commonly return either a bare URL or a small JSON
+        # object. Preserve the useful response in history without requiring
+        # one particular server framework.
+        response_url = ''
+        try:
+            data = json.loads(text)
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            response_url = str(data.get('url') or data.get('raw_url') or '').strip()
+        elif text.startswith(('http://', 'https://')):
+            response_url = text
+        result = {
+            'url': response_url,
+            'raw_url': response_url,
+            'response': text[:4096],
+            'favorite': False,
+        }
+        return result
+
+    def _test_custom_connection(self) -> tuple[bool, str]:
+        url = _custom_server_url(self.settings)
+        request = urllib.request.Request(
+            url,
+            method='HEAD',
+            headers=_custom_server_headers(self.settings),
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return True, f'Your server reachable (HTTP {response.status}).'
+        except urllib.error.HTTPError as exc:
+            # A 401/404/405 still proves the endpoint is reachable. The upload
+            # request will report the endpoint's actual response if it fails.
+            return True, f'Your server reachable (HTTP {exc.code}).'
+        except Exception as exc:
+            return False, f'Could not reach your server: {exc}'
+
     def _record_success(self, path: str, entry: dict[str, Any]) -> None:
         try:
             history = json.loads(HISTORY_FILE.read_text(encoding='utf-8'))
@@ -192,9 +252,14 @@ def _multipart_post(
         fields: dict[str, str],
         file_field: str,
         file_path: Path,
-        headers: dict[str, str]) -> tuple[int, bytes]:
+        headers: dict[str, str],
+        *,
+        require_https: bool = True) -> tuple[int, bytes]:
     parsed = urllib.parse.urlparse(url)
-    if parsed.scheme != 'https' or not parsed.hostname:
+    scheme = parsed.scheme.lower()
+    if scheme not in {'http', 'https'} or not parsed.hostname:
+        raise ValueError('Your server URL must use http:// or https://.')
+    if require_https and scheme != 'https':
         raise ValueError('Uploader provider URL must use HTTPS.')
     parts: list[bytes] = []
     for name, value in fields.items():
@@ -214,7 +279,10 @@ def _multipart_post(
     request_path = parsed.path or '/'
     if parsed.query:
         request_path += '?' + parsed.query
-    connection = http.client.HTTPSConnection(parsed.hostname, parsed.port, timeout=120)
+    connection_class = (
+        http.client.HTTPSConnection if scheme == 'https'
+        else http.client.HTTPConnection)
+    connection = connection_class(parsed.hostname, parsed.port, timeout=120)
     try:
         connection.putrequest('POST', request_path)
         connection.putheader(
@@ -235,3 +303,22 @@ def _multipart_post(
         return int(response.status), response.read()
     finally:
         connection.close()
+
+
+def _custom_server_url(settings: dict[str, Any]) -> str:
+    value = str(settings.get('upload_server_url', '') or '').strip()
+    if value and not value.lower().startswith(('http://', 'https://')):
+        value = f'https://{value}'
+    if not value:
+        raise ValueError('Set a server URL before connecting to your server.')
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme.lower() not in {'http', 'https'} or not parsed.hostname:
+        raise ValueError('Your server URL must use http:// or https://.')
+    return value
+
+
+def _custom_server_headers(settings: dict[str, Any]) -> dict[str, str]:
+    auth = str(settings.get('upload_auth_header', '') or '').strip()
+    if any(character in auth for character in '\r\n'):
+        raise ValueError('The authorization header contains an invalid line break.')
+    return {'Authorization': auth} if auth else {}

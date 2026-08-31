@@ -9,6 +9,23 @@ from enum import Enum, auto
 NORMAL_CLIP_VALUES = (5, 10, 15, 30, 45, 60, 90, 120, 180, 240, 300)
 EXTENDED_CLIP_VALUES = (30, 45, 60, 90, 120, 180, 240, 300)
 FPS_VALUES = (30, 60, 90, 120, 144, 165, 180, 240)
+AUDIO_CAPTURE_MODE_COMBINED = 'combined'
+AUDIO_CAPTURE_MODE_SEPARATED = 'separated'
+AUDIO_CAPTURE_MODES = (
+    AUDIO_CAPTURE_MODE_COMBINED,
+    AUDIO_CAPTURE_MODE_SEPARATED,
+)
+
+
+def normalize_audio_capture_mode(value: object) -> str:
+    """Return the only two persisted audio-capture modes we support.
+
+    Settings are user-editable JSON, so unknown values fail closed to the
+    default combined mode instead of accidentally exposing a partial mixer.
+    """
+    return (AUDIO_CAPTURE_MODE_SEPARATED
+            if str(value).strip().lower() == AUDIO_CAPTURE_MODE_SEPARATED
+            else AUDIO_CAPTURE_MODE_COMBINED)
 
 
 def _validate_int(value: int, *, name: str, minimum: int, maximum: int) -> int:
@@ -45,6 +62,10 @@ class CaptureConfig:
     audio_enabled: bool
     encoder: str = 'auto'
     multiband_enabled: bool = False
+    # ``multiband_enabled`` is a retired ABI compatibility field. This new
+    # flag controls whether the saved MP4 keeps system and microphone audio as
+    # separate streams; combined audio is the default.
+    separate_audio_enabled: bool = False
     microphone_endpoint_id: str = ''
     normal_clip_seconds: int = 30
     extended_clip_seconds: int = 60

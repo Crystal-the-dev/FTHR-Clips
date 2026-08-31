@@ -285,7 +285,13 @@ void NativeNvencLowLatencyConfigurationIsCodecSpecific() {
     Check(av1.encodeCodecConfig.av1Config.disableSeqHdr == 0
               && av1.encodeCodecConfig.av1Config.repeatSeqHdr == 1,
           "AV1 repeats its sequence header on MP4 keyframes");
+    Check(av1.encodeCodecConfig.av1Config.enableTimingInfo == 1,
+          "AV1 publishes the configured frame-rate timing");
     const auto& h264_vui = h264.encodeCodecConfig.h264Config.h264VUIParameters;
+    Check(h264_vui.timingInfoPresentFlag == 1
+              && h264_vui.numUnitInTicks == 1
+              && h264_vui.timeScale == 120,
+          "H.264 publishes the configured fixed frame rate in VUI timing");
     Check(h264_vui.videoSignalTypePresentFlag == 1
               && h264_vui.videoFullRangeFlag == 0
               && h264_vui.colourDescriptionPresentFlag == 1
@@ -295,6 +301,10 @@ void NativeNvencLowLatencyConfigurationIsCodecSpecific() {
               && h264_vui.colourMatrix == NV_ENC_VUI_MATRIX_COEFFS_BT709,
           "H.264 explicitly signals studio-range BT.709 SDR");
     const auto& hevc_vui = hevc.encodeCodecConfig.hevcConfig.hevcVUIParameters;
+    Check(hevc_vui.timingInfoPresentFlag == 1
+              && hevc_vui.numUnitInTicks == 1
+              && hevc_vui.timeScale == 120,
+          "HEVC publishes the configured fixed frame rate in VUI timing");
     Check(hevc_vui.videoSignalTypePresentFlag == 1
               && hevc_vui.videoFullRangeFlag == 0
               && hevc_vui.colourDescriptionPresentFlag == 1

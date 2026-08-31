@@ -29,7 +29,9 @@ bool save_clip_to_file(
     uint32_t                         height,
     AVCodecID                        video_codec_id,
     SharedMemoryLayout*              shm,
-    std::string*                     error_message
+    std::string*                     error_message,
+    bool                             separate_audio = false,
+    uint32_t                         bitrate_kbps = 16000
 );
 
 } // namespace fthr

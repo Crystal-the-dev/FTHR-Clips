@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -8,7 +9,9 @@ from core.media_metadata import (
     format_bitrate,
     format_fps,
     parse_ffprobe_video_metadata,
+    probe_video_cfr,
 )
+from core import media_metadata
 
 
 def _payload(*, avg: str, real: str = '60/1', video_bitrate='6000000',
@@ -66,6 +69,22 @@ def test_vfr_uses_average_rate_instead_of_codec_real_rate():
     assert format_fps(metadata.average_fps) == '29.97 FPS'
 
 
+def test_fthr_configured_metadata_overrides_packet_derived_values():
+    document = json.loads(_payload(
+        avg='30000/1001', real='60/1', video_bitrate='6000000'))
+    document['format']['tags'] = {
+        'fthr_frame_rate': '144/1',
+        'fthr_video_bitrate_bps': '25000000',
+    }
+
+    metadata = parse_ffprobe_video_metadata(document)
+
+    assert metadata is not None
+    assert metadata.average_fps == 144.0
+    assert metadata.fps_source == 'fthr_frame_rate'
+    assert metadata.video_bitrate_bps == 25_000_000
+
+
 def test_missing_average_rate_falls_back_to_valid_real_rate():
     metadata = parse_ffprobe_video_metadata(_payload(avg='0/0', real='25/1'))
 
@@ -101,3 +120,35 @@ def test_total_bitrate_file_size_fallback_remains_explicitly_total():
 def test_invalid_or_video_less_documents_fail_gracefully():
     assert parse_ffprobe_video_metadata('{') is None
     assert parse_ffprobe_video_metadata({'streams': []}) is None
+
+
+@pytest.mark.parametrize(('durations', 'expected'), (
+    (['0.016667', '0.016667', '0.016667'], True),
+    (['0.016667', '0.033333', '0.016667'], False),
+))
+def test_probe_video_cfr_checks_physical_sample_durations(
+        monkeypatch, durations, expected):
+    monkeypatch.setattr(media_metadata, 'get_ffprobe_exe', lambda: 'ffprobe')
+    monkeypatch.setattr(
+        media_metadata.subprocess, 'run',
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({
+                'packets': [{'duration_time': value} for value in durations],
+            }),
+        ),
+    )
+
+    assert probe_video_cfr('clip.mp4', 60.0) is expected
+
+
+def test_probe_video_cfr_treats_malformed_probe_output_as_inconclusive(
+        monkeypatch):
+    monkeypatch.setattr(media_metadata, 'get_ffprobe_exe', lambda: 'ffprobe')
+    monkeypatch.setattr(
+        media_metadata.subprocess, 'run',
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stdout='not-json'),
+    )
+
+    assert probe_video_cfr('clip.mp4', 60.0) is None

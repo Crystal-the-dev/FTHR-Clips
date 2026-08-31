@@ -103,7 +103,7 @@ def _theme_rgba(value: str, alpha: int) -> str:
     return f'rgba({color.red()},{color.green()},{color.blue()},{alpha})'
 
 
-def _load_themed_icon(filename: str, size: int) -> QIcon:
+def _load_themed_icon(filename: str, size: int, tint: str | None = None) -> QIcon:
     """Resolve a viewer control icon through the shared theme registry."""
     theme = ThemeManager()
     custom = theme.get_custom_icon_path(filename)
@@ -111,14 +111,15 @@ def _load_themed_icon(filename: str, size: int) -> QIcon:
     pixmap = QPixmap(str(path)) if path.exists() else QPixmap()
     if pixmap.isNull():
         return QIcon()
-    if custom is None:
+    if custom is None or tint is not None:
         tinted = QPixmap(pixmap.size())
         tinted.fill(Qt.GlobalColor.transparent)
         painter = QPainter(tinted)
         painter.drawPixmap(0, 0, pixmap)
         painter.setCompositionMode(
             QPainter.CompositionMode.CompositionMode_SourceIn)
-        painter.fillRect(tinted.rect(), QColor(theme.get_icon_tint(filename)))
+        painter.fillRect(
+            tinted.rect(), QColor(tint or theme.get_icon_tint(filename)))
         painter.end()
         pixmap = tinted
     return QIcon(pixmap.scaled(
@@ -1495,34 +1496,25 @@ class LiveVideoPreview(CropPreviewOverlay):
     @staticmethod
     def _normalize_decoded_video_range(
             image: QImage, color_range: QVideoFrameFormat.ColorRange) -> QImage:
-        """Expand Windows limited-range BGRA exactly once for QPainter.
+        """Return the decoded frame as stable, display-ready RGB.
 
-        The Windows media backend reports ``ColorRange_Video`` while
-        ``QVideoFrame.toImage()`` retains legal 16..235 RGB codes. Once the
-        frame metadata is detached, drawing those codes directly gives the
-        editor a visibly different range from FFmpeg and external players.
+        ``QVideoFrame.toImage()`` has already converted the frame's source
+        YUV range into RGB.  ``color_range`` describes that source surface;
+        it must not be applied again to the resulting ``QImage``.  Expanding
+        RGB values here when the surface reports ``ColorRange_Video`` clips
+        highlights and makes the preview visibly brighter than the same clip
+        in FFmpeg or an external player.
+
+        Keep the range argument for compatibility with integrations that call
+        this helper directly, but deliberately do not reinterpret the pixels.
+        Converting to one detached RGB format also avoids backend-specific
+        QImage formats leaking into the painter path.
         """
 
-        if (sys.platform != 'win32'
-                or color_range
-                != QVideoFrameFormat.ColorRange.ColorRange_Video):
+        del color_range
+        if image.isNull():
             return image
-        rgb = image.convertToFormat(QImage.Format.Format_RGB888)
-        height, width = rgb.height(), rgb.width()
-        if width <= 0 or height <= 0:
-            return image
-        stride = rgb.bytesPerLine()
-        pixels = np.frombuffer(
-            rgb.constBits(), dtype=np.uint8, count=stride * height,
-        ).reshape((height, stride))[:, :width * 3].reshape((height, width, 3))
-        expanded = cv2.addWeighted(
-            pixels, 255.0 / 219.0, pixels, 0.0,
-            -16.0 * 255.0 / 219.0)
-        expanded = np.ascontiguousarray(expanded)
-        return QImage(
-            expanded.data, width, height, expanded.strides[0],
-            QImage.Format.Format_RGB888,
-        ).copy()
+        return image.convertToFormat(QImage.Format.Format_RGB888).copy()
 
     def _video_display_rect(self) -> QRect:
         vw, vh = self.width(), self.height()
@@ -3591,11 +3583,13 @@ class ClipViewer(QDialog):
         self.play_btn.clicked.connect(self._toggle_play)
         self._play_icon = _load_themed_icon('play.png', 16)
         self._pause_icon = _load_themed_icon('pause.png', 16)
-        if not self._play_icon.isNull():
-            self.play_btn.setIcon(self._play_icon)
-            self.play_btn.setIconSize(QSize(16, 16))
-        else:
-            self.play_btn.setText('▶  PLAY')
+        # The checked button uses the teal accent as its background. Keep a
+        # dark pause glyph for that state; a teal glyph on a teal button made
+        # the pause control look like an empty rectangle.
+        self._play_active_icon = _load_themed_icon('play.png', 16, Colors.BG)
+        self._pause_active_icon = _load_themed_icon('pause.png', 16, Colors.BG)
+        self.play_btn.setIconSize(QSize(16, 16))
+        self._set_playback_button_visual(False)
         ctrl_lay.addWidget(self.play_btn)
 
         self.time_label = QLabel(f'0:00 / {self._fmt(self.duration_ms)}')
@@ -3629,7 +3623,7 @@ class ClipViewer(QDialog):
 
         trim_hdr = QHBoxLayout()
         trim_hdr.setSpacing(8)
-        trim_lbl = QLabel('TIMELINE  ·  CLICK TO SEEK  ·  RIGHT-CLICK TO EDIT')
+        trim_lbl = QLabel('TIMELINE')
         trim_lbl.setObjectName('trimLabel')
         trim_hdr.addWidget(trim_lbl)
         trim_hdr.addStretch()
@@ -3799,12 +3793,6 @@ class ClipViewer(QDialog):
         self.preserve_pitch_toggle.toggled.connect(
             self._on_preserve_pitch_toggled)
         spb.addWidget(self.preserve_pitch_toggle)
-
-        self.pitch_mode_hint = QLabel()
-        self.pitch_mode_hint.setObjectName('pitchHint')
-        self.pitch_mode_hint.setWordWrap(True)
-        self._update_pitch_hint()
-        spb.addWidget(self.pitch_mode_hint)
 
         speed_body.addLayout(spb)
         sb_outer.addWidget(speed_panel)
@@ -4879,11 +4867,7 @@ class ClipViewer(QDialog):
                 self.play_btn.blockSignals(True)
                 self.play_btn.setChecked(False)
                 self.play_btn.blockSignals(False)
-                if not self._play_icon.isNull():
-                    self.play_btn.setIcon(self._play_icon)
-                    self.play_btn.setText('')
-                else:
-                    self.play_btn.setText('▶  PLAY')
+                self._set_playback_button_visual(False)
                 return
             if want_play and not self._playback_ready:
                 self._play_when_ready = True
@@ -4891,7 +4875,7 @@ class ClipViewer(QDialog):
                 self.play_btn.blockSignals(True)
                 self.play_btn.setChecked(True)
                 self.play_btn.blockSignals(False)
-                self.play_btn.setText('PREPARING…')
+                self._set_playback_button_visual(None)
                 return
             try:
                 if want_play:
@@ -4929,20 +4913,25 @@ class ClipViewer(QDialog):
             self.play_btn.blockSignals(True)
             self.play_btn.setChecked(want_play)
             self.play_btn.blockSignals(False)
-            if want_play:
-                if not self._pause_icon.isNull():
-                    self.play_btn.setIcon(self._pause_icon)
-                    self.play_btn.setText('')
-                else:
-                    self.play_btn.setText('⏸  PAUSE')
-            else:
-                if not self._play_icon.isNull():
-                    self.play_btn.setIcon(self._play_icon)
-                    self.play_btn.setText('')
-                else:
-                    self.play_btn.setText('▶  PLAY')
+            self._set_playback_button_visual(want_play)
         finally:
             self._play_pause_busy = False
+
+    def _set_playback_button_visual(self, playing: bool | None) -> None:
+        """Keep the icon/text legible against the button's checked state."""
+
+        if playing is None:
+            self.play_btn.setIcon(QIcon())
+            self.play_btn.setText('PREPARING…')
+            return
+        icon = (self._pause_active_icon if playing else self._play_icon)
+        label = '⏸  PAUSE' if playing else '▶  PLAY'
+        if icon.isNull():
+            self.play_btn.setIcon(QIcon())
+            self.play_btn.setText(label)
+        else:
+            self.play_btn.setIcon(icon)
+            self.play_btn.setText('')
 
     def _on_state_changed(self, state):
         if self._closing:
@@ -4961,11 +4950,7 @@ class ClipViewer(QDialog):
             self.play_btn.blockSignals(True)
             self.play_btn.setChecked(True)
             self.play_btn.blockSignals(False)
-            if not self._pause_icon.isNull():
-                self.play_btn.setIcon(self._pause_icon)
-                self.play_btn.setText('')
-            else:
-                self.play_btn.setText('⏸  PAUSE')
+            self._set_playback_button_visual(True)
         else:
             self._ph_timer.stop()
             self._update_playhead()
@@ -4975,11 +4960,7 @@ class ClipViewer(QDialog):
             self.play_btn.blockSignals(True)
             self.play_btn.setChecked(False)
             self.play_btn.blockSignals(False)
-            if not self._play_icon.isNull():
-                self.play_btn.setIcon(self._play_icon)
-                self.play_btn.setText('')
-            else:
-                self.play_btn.setText('▶  PLAY')
+            self._set_playback_button_visual(False)
             # A rapid pause/resume should only touch the already-open player.
             # Give the user a generous idle window before preparing any late
             # audio mixer or opening OpenCV's second decoder for the filmstrip.

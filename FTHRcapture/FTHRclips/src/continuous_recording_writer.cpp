@@ -90,10 +90,8 @@ bool ContinuousRecordingWriter::Start(
     video_stream_->codecpar->format = AV_PIX_FMT_YUV420P;
     ApplySdrBt709ColorMetadata(video_stream_->codecpar);
     video_stream_->time_base = AVRational{1, 90000};
-    video_stream_->avg_frame_rate = AVRational{
-        video_config_.frame_rate.numerator,
-        video_config_.frame_rate.denominator};
-    video_stream_->r_frame_rate = video_stream_->avg_frame_rate;
+    ApplyConfiguredVideoMetadata(
+        format_context_, video_stream_, video_config_);
     if (!CopyExtradata(
             video_stream_->codecpar, video_config_.codec_extradata)) {
         Fail("Could not copy the recording video decoder configuration.");
@@ -145,7 +143,7 @@ bool ContinuousRecordingWriter::Start(
     av_dict_set(
         &options,
         "movflags",
-        "empty_moov+frag_custom+default_base_moof+omit_tfhd_offset",
+        "empty_moov+frag_custom+default_base_moof+omit_tfhd_offset+use_metadata_tags",
         0);
     av_dict_set(&options, "flush_packets", "1", 0);
     const int header_error = avformat_write_header(format_context_, &options);
@@ -326,6 +324,8 @@ bool ContinuousRecordingWriter::WritePacket(const QueuedPacket& packet) {
     std::memcpy(output->data, packet.data.data(), packet.data.size());
 
     if (packet.kind == PacketKind::Video) {
+        // Preserve the capture clock. Delayed or missing capture frames must
+        // create a longer interval, not make the surviving frames play faster.
         output->pts = packet.pts - first_video_pts_;
         output->dts = output->pts;
         output->duration = packet.duration;

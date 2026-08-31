@@ -850,7 +850,12 @@ class ClipThumbnail(QFrame):
     def _emit_opened(self):
         if not (self.is_video and self.ready):
             return
-        px = self.thumb_label.pixmap() or QPixmap()
+        # Pass the cached source thumbnail to the editor, not the pixmap that
+        # has already been fitted to this card.  The latter is intentionally
+        # display-sized and can be much smaller than the editor preview, so it
+        # made the clip look soft until QMediaPlayer delivered its first frame
+        # (and remained soft while the editor was paused before that happened).
+        px = self._thumb_pixmap if not self._thumb_pixmap.isNull() else QPixmap()
         global_rect = QRect(self.mapToGlobal(QPoint(0, 0)), self.size())
         self.opened.emit(self.file_path, px, global_rect)
 
@@ -1103,6 +1108,8 @@ class ClipGrid(QWidget):
 
         self._filter = 'all'
         self._sort = 'newest'
+        self._background_paused = False
+        self._background_refresh_pending = False
         self._in_transition = False
         self._transition_anim = None
         # Keep transition workers (and, critically, their signal objects) alive
@@ -1128,8 +1135,9 @@ class ClipGrid(QWidget):
         self._resize_timer.timeout.connect(self._on_resize_settled)
 
         self.refresh_timer = QTimer()
+        self.refresh_timer.setInterval(30000)
         self.refresh_timer.timeout.connect(self._load_clips)
-        self.refresh_timer.start(30000)
+        self.refresh_timer.start()
 
     def is_linked_import(self, path: str) -> bool:
         target = os.path.normcase(os.path.realpath(path))
@@ -1249,7 +1257,37 @@ class ClipGrid(QWidget):
             self._relayout_grids()
 
     def _on_dir_changed(self, path: str):
+        if self._background_paused:
+            self._background_refresh_pending = True
+            return
         self._debounce_timer.start(500)
+
+    def set_background_paused(self, paused: bool) -> None:
+        """Suspend library scans while the containing app is in background.
+
+        Capture/save completion can still invalidate the library through
+        ``force_refresh``. While paused that work is coalesced into one refresh
+        when the UI becomes active again.
+        """
+        paused = bool(paused)
+        if paused == self._background_paused:
+            return
+        self._background_paused = paused
+        if paused:
+            # Drop queued decodes immediately. At most the two already-running
+            # workers finish; the next foreground refresh reuses any cache they
+            # produced and rebuilds the remaining queue.
+            self._background_refresh_pending = True
+            self._thread_pool.clear()
+            self.refresh_timer.stop()
+            self._debounce_timer.stop()
+            return
+
+        self.refresh_timer.start()
+        if self._background_refresh_pending:
+            self._background_refresh_pending = False
+            self._known_files = None
+            self._load_clips()
 
     # ── UI ───────────────────────────────────────────────────────────────
 
@@ -1539,6 +1577,9 @@ class ClipGrid(QWidget):
     # ── Build the date-grouped layout ───────────────────────────────────
 
     def _load_clips(self):
+        if self._background_paused:
+            self._background_refresh_pending = True
+            return
         if self._in_transition:
             return
         if not os.path.isdir(self.clips_dir):
@@ -1783,6 +1824,9 @@ class ClipGrid(QWidget):
 
     def force_refresh(self):
         """Clear the file cache and immediately reload — called when import folders change."""
+        if self._background_paused:
+            self._background_refresh_pending = True
+            return
         self._known_files = set()
         self._load_clips()
 
@@ -1799,7 +1843,7 @@ class ClipGrid(QWidget):
             if self._filter == 'screenshots':
                 self._no_clips_lbl.setText('NO SCREENSHOTS YET')
                 hotkeys = self._sm.get('hotkeys', {}) if self._sm else {}
-                screenshot_key = hotkeys.get('save_screenshot', 'F11')
+                screenshot_key = hotkeys.get('save_screenshot', 'F12')
                 detail = f'PRESS {screenshot_key} TO TAKE A SCREENSHOT'
             elif self._filter == 'clips':
                 self._no_clips_lbl.setText('NO CLIPS YET')

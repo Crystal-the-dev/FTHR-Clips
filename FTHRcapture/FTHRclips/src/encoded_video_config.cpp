@@ -1,6 +1,13 @@
 #include "encoded_video_config.h"
 #include "encoded_video_config_ffmpeg.h"
 
+extern "C" {
+#include <libavformat/avformat.h>
+#include <libavutil/dict.h>
+}
+
+#include <string>
+
 namespace fthr {
 
 const char* VideoCodecName(VideoCodec codec) noexcept {
@@ -62,6 +69,39 @@ void ApplySdrBt709ColorMetadata(AVCodecParameters* parameters) noexcept {
     parameters->color_trc = AVCOL_TRC_BT709;
     parameters->color_space = AVCOL_SPC_BT709;
     parameters->chroma_location = AVCHROMA_LOC_LEFT;
+}
+
+void ApplyConfiguredVideoMetadata(
+    AVFormatContext* format_context,
+    AVStream* stream,
+    const EncodedVideoConfig& config) noexcept {
+    if (!stream || !stream->codecpar) return;
+
+    const AVRational frame_rate = {
+        config.frame_rate.numerator,
+        config.frame_rate.denominator};
+    stream->avg_frame_rate = frame_rate;
+    stream->r_frame_rate = frame_rate;
+
+    if (config.bitrate_kbps > 0) {
+        stream->codecpar->bit_rate =
+            static_cast<int64_t>(config.bitrate_kbps) * 1000;
+    }
+
+    // MP4 does not reliably retain arbitrary stream tags. Store the values as
+    // global mdta entries instead; the muxer writes these when
+    // "use_metadata_tags" is enabled, and they survive later audio/remux or
+    // overlay passes.
+    if (!format_context) return;
+    const std::string rate = std::to_string(config.frame_rate.numerator)
+        + "/" + std::to_string(config.frame_rate.denominator);
+    av_dict_set(
+        &format_context->metadata, "fthr_frame_rate", rate.c_str(), 0);
+    av_dict_set_int(
+        &format_context->metadata,
+        "fthr_video_bitrate_bps",
+        static_cast<int64_t>(config.bitrate_kbps) * 1000,
+        0);
 }
 
 } // namespace fthr

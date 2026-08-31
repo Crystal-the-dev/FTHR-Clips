@@ -65,7 +65,7 @@ class SettingsManager:
             'hotkeys': {
                 'save_clip': 'F9',
                 'save_extended_clip': 'F10',
-                'save_screenshot': 'F11'
+                'save_screenshot': 'F12'
             },
             'quick_crop': None,      # dict {x,y,w,h,src_w,src_h} or None
             # Stable native endpoint ID on Windows. The friendly name remains
@@ -103,6 +103,7 @@ class SettingsManager:
             'sound_volume_startup':     100,
             'sound_volume_upload_successful': 100,
             'sound_volume_upload_failed': 100,
+            'notification_sounds_enabled': True,
             'notification_monitor': 'auto',  # 'auto' = highest refresh rate, or screen name e.g. 'DP-3'
             # Bottom-bar notifications are reserved for capture/save/upload
             # failures. Keep them enabled by default, but let users mute the
@@ -119,6 +120,10 @@ class SettingsManager:
             'encoder_pref':   'auto',   # auto | nvenc | amf | qsv | software
             'codec_pref':     'auto',   # 'auto' | 'h264' | 'hevc' | 'av1'
             'encoder_preset': 4,        # 1–7
+            # Suspend presentation-only polling and previews while the app is
+            # hidden, minimized, or not the active desktop application. Core
+            # capture/save services and notification cards/sounds stay live.
+            'pause_ui_in_background': True,
             # Clip editor preview. When disabled, visual edits are retained
             # for export but the editor keeps showing the source frame.
             'clip_editor_live_preview': True,
@@ -135,6 +140,10 @@ class SettingsManager:
             'target_hwnd':            0,
             'target_window_name':     '',
             'audio_capture_enabled':   True,
+            # Combined system + microphone audio is the simple, portable
+            # default. Separated streams are an explicit opt-in because they
+            # require a multi-track editor/export path.
+            'audio_capture_mode':      'combined',
             # Visual notification card. Sound cues remain active when this
             # is disabled because they are handled by the same sound-only
             # helper process.
@@ -158,6 +167,19 @@ class SettingsManager:
             # Ordered image layers. The singular keys above remain as a
             # compatibility mirror for older themes/settings builds.
             'image_overlays': [],
+            # Windows-only external keyboard visualizer. The nested object is
+            # deliberately separate from the retired keyboard_overlay_* keys
+            # used by the shelved bitmap-input prototype.
+            'third_party_keyboard': {
+                'enabled': False,
+                'hwnd': 0,
+                'window_name': '',
+                'color': '#00ff00',
+                'intensity': 58,
+                'rect': {
+                    'x': 0.30, 'y': 0.70, 'w': 0.40, 'h': 0.25,
+                },
+            },
             # Empty means the bundled desktop screenshot is used. A user
             # selected image is stored here so the preview remains portable
             # and can be reset to the standard background at any time.
