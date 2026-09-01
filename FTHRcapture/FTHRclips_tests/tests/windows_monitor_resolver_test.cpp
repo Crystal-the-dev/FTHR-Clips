@@ -1,5 +1,6 @@
 #include "windows_monitor_resolver.h"
 #include "windows_native_error.h"
+#include "windows_dxgi_recovery.h"
 #include "encoded_ring_buffer.h"
 #include "encoded_video_config.h"
 #include "encoded_video_config_ffmpeg.h"
@@ -234,6 +235,237 @@ void NativeError4551PreservesWin32AndHresultIdentity() {
     Check(runtime_json.find("\"native_error_hex\":\"0x887A0026\"")
               != std::string::npos,
           "DXGI runtime diagnostic preserves DXGI_ERROR_ACCESS_LOST");
+    const std::string release_json = fthr::diagnostics::HResultFailureJson(
+        "IDXGIOutputDuplication::ReleaseFrame", DXGI_ERROR_ACCESS_LOST);
+    Check(release_json.find("IDXGIOutputDuplication::ReleaseFrame")
+              != std::string::npos,
+          "ReleaseFrame access loss preserves its exact failing API call");
+}
+
+struct FakeDxgiResource {
+    int* releases = nullptr;
+
+    unsigned long Release() {
+        ++*releases;
+        return 0;
+    }
+};
+
+struct FakeDxgiDuplication {
+    int* releases = nullptr;
+    HRESULT result = S_OK;
+
+    HRESULT ReleaseFrame() {
+        ++*releases;
+        return result;
+    }
+};
+
+void DxgiFrameLeaseReleasesExactlyOnce() {
+    int resource_releases = 0;
+    int frame_releases = 0;
+    FakeDxgiResource resource{&resource_releases};
+    FakeDxgiDuplication duplication{&frame_releases};
+
+    {
+        fthr::dxgi::FrameLease<FakeDxgiResource, FakeDxgiDuplication> lease(
+            &resource, &duplication);
+        Check(lease.owns_frame(), "successful acquire owns one DXGI frame");
+        lease.ReleaseResource();
+        lease.ReleaseResource();
+        Check(resource_releases == 1,
+              "DXGI frame resource is released exactly once");
+        Check(lease.ReleaseFrame() == S_OK,
+              "owned DXGI frame can be released explicitly");
+        lease.ReleaseFrame();
+    }
+
+    Check(resource_releases == 1,
+          "frame lease destructor does not double release resource");
+    Check(frame_releases == 1,
+          "frame lease destructor does not double ReleaseFrame");
+
+    int lost_releases = 0;
+    FakeDxgiDuplication lost{&lost_releases, DXGI_ERROR_ACCESS_LOST};
+    {
+        fthr::dxgi::FrameLease<FakeDxgiResource, FakeDxgiDuplication> lease(
+            nullptr, &lost);
+        Check(lease.ReleaseFrame() == DXGI_ERROR_ACCESS_LOST,
+              "ReleaseFrame access loss is returned to the recovery owner");
+    }
+    Check(lost_releases == 1,
+          "failed ReleaseFrame remains an exact-once ownership transition");
+}
+
+void DxgiFrameMetadataAndTextureContractsRejectFalseFrames() {
+    Check(!fthr::dxgi::HasNewDesktopImage(0),
+          "pointer-only update is not a newly presented desktop image");
+    Check(fthr::dxgi::HasNewDesktopImage(42),
+          "positive presentation QPC identifies a new desktop image");
+
+    const fthr::dxgi::TextureContract expected{1920, 1080, 87, 1};
+    Check(fthr::dxgi::IsCompatibleTexture(
+              expected, {1920, 1080, 87, 1}),
+          "matching dimensions, format and sample count are accepted");
+    Check(!fthr::dxgi::IsCompatibleTexture(
+              expected, {2560, 1440, 87, 1}),
+          "unexpected capture dimensions are rejected");
+    Check(!fthr::dxgi::IsCompatibleTexture(
+              expected, {1920, 1080, 28, 1}),
+          "unexpected capture pixel format is rejected");
+    Check(!fthr::dxgi::IsCompatibleTexture(
+              expected, {1920, 1080, 87, 4}),
+          "multisampled capture input is rejected");
+    Check(fthr::dxgi::IsValidBgraRowPitch(1920, 8192),
+          "padded BGRA row pitch is accepted");
+    Check(!fthr::dxgi::IsValidBgraRowPitch(1920, 4096),
+          "undersized BGRA row pitch is rejected");
+
+    using Boundary = fthr::dxgi::PipelineStallBoundary;
+    Check(fthr::dxgi::ClassifyPipelineStall(true, false, false)
+              == Boundary::CaptureNoFrames,
+          "capture with no source frames is classified at acquisition");
+    Check(fthr::dxgi::ClassifyPipelineStall(true, true, false)
+              == Boundary::CaptureFrameStalled,
+          "capture progress that later stops is a capture-frame stall");
+    Check(fthr::dxgi::ClassifyPipelineStall(false, true, false)
+              == Boundary::EncoderSubmitFailed,
+          "no recent encoder submission is an encoder-submit failure");
+    Check(fthr::dxgi::ClassifyPipelineStall(false, true, true)
+              == Boundary::EncoderOutputStalled,
+          "recent submissions without packets are encoder-output stalls");
+    Check(std::string(fthr::dxgi::PipelineStallCode(
+              Boundary::EncoderOutputStalled)) == "ENCODER_OUTPUT_STALLED",
+          "encoder-output stall keeps its stable diagnostic taxonomy");
+    Check(!fthr::dxgi::IsFatalDuplicationRecreateFailure(E_ACCESSDENIED),
+          "secure-desktop access denial remains bounded-retryable");
+    Check(fthr::dxgi::IsFatalDuplicationRecreateFailure(
+              DXGI_ERROR_DEVICE_REMOVED),
+          "removed D3D11 device cannot reuse the live encoder generation");
+}
+
+fthr::dxgi::RecoveryIdentity RecoveryIdentity(
+    const wchar_t* path, AdapterLuid luid,
+    uint32_t width = 1920, uint32_t height = 1080) {
+    return {path, luid, width, height};
+}
+
+void DxgiRecoveryEligibilityRequiresSameCaptureContract() {
+    const auto active = RecoveryIdentity(L"PATH-A", {7, 0});
+    fthr::dxgi::RecoveryObservation observation;
+    observation.running = true;
+    observation.monitor_resolved = true;
+    observation.current = RecoveryIdentity(L"path-a", {7, 0});
+    observation.device_removed_reason = S_OK;
+
+    Check(fthr::dxgi::EvaluateRecovery(active, observation)
+              == fthr::dxgi::RecoveryDecision::RecreateDuplication,
+          "same monitor, adapter, dimensions and device permit local recovery");
+
+    observation.running = false;
+    Check(fthr::dxgi::EvaluateRecovery(active, observation)
+              == fthr::dxgi::RecoveryDecision::StopRequested,
+          "shutdown cancels DXGI recovery");
+    observation.running = true;
+
+    observation.monitor_resolved = false;
+    Check(fthr::dxgi::EvaluateRecovery(active, observation)
+              == fthr::dxgi::RecoveryDecision::MonitorUnavailable,
+          "missing selected monitor fails recovery without redirecting output");
+    observation.monitor_resolved = true;
+
+    observation.current = RecoveryIdentity(L"PATH-B", {7, 0});
+    Check(fthr::dxgi::EvaluateRecovery(active, observation)
+              == fthr::dxgi::RecoveryDecision::MonitorIdentityChanged,
+          "recovery never migrates to a different persistent monitor");
+
+    observation.current = RecoveryIdentity(L"PATH-A", {8, 0});
+    Check(fthr::dxgi::EvaluateRecovery(active, observation)
+              == fthr::dxgi::RecoveryDecision::AdapterChanged,
+          "recovery rejects a selected monitor that moved to another adapter");
+
+    observation.current = RecoveryIdentity(L"PATH-A", {7, 0}, 2560, 1440);
+    Check(fthr::dxgi::EvaluateRecovery(active, observation)
+              == fthr::dxgi::RecoveryDecision::DimensionsChanged,
+          "recovery rejects dimensions incompatible with the live encoder");
+
+    observation.current = active;
+    observation.device_removed_reason = DXGI_ERROR_DEVICE_REMOVED;
+    Check(fthr::dxgi::EvaluateRecovery(active, observation)
+              == fthr::dxgi::RecoveryDecision::DeviceRemoved,
+          "device removal cannot reuse the live encoder device");
+}
+
+void DxgiRecoveryRunnerIsBoundedAndInterruptible() {
+    std::vector<uint32_t> delays;
+    int attempts = 0;
+    const auto recovered = fthr::dxgi::RunBoundedRecovery(
+        [] { return true; },
+        [&delays](uint32_t delay_ms) {
+            delays.push_back(delay_ms);
+            return true;
+        },
+        [&attempts](uint32_t) {
+            ++attempts;
+            return attempts == 3
+                ? fthr::dxgi::RecoveryAttemptResult::Recovered
+                : fthr::dxgi::RecoveryAttemptResult::RetryableFailure;
+        });
+    Check(recovered.outcome == fthr::dxgi::RecoveryOutcome::Recovered
+              && recovered.attempts == 3,
+          "controlled ACCESS_LOST injection recovers on the third attempt");
+    Check(delays == std::vector<uint32_t>({0, 100, 250}),
+          "DXGI recovery uses the reviewed bounded backoff sequence");
+
+    const auto exhausted = fthr::dxgi::RunBoundedRecovery(
+        [] { return true; },
+        [](uint32_t) { return true; },
+        [](uint32_t) {
+            return fthr::dxgi::RecoveryAttemptResult::RetryableFailure;
+        });
+    Check(exhausted.outcome == fthr::dxgi::RecoveryOutcome::AttemptsExhausted
+              && exhausted.attempts == fthr::dxgi::kMaxRecoveryAttempts,
+          "persistent duplication failure exhausts a finite retry budget");
+
+    int stopped_attempts = 0;
+    const auto stopped = fthr::dxgi::RunBoundedRecovery(
+        [&stopped_attempts] { return stopped_attempts == 0; },
+        [](uint32_t) { return true; },
+        [&stopped_attempts](uint32_t) {
+            ++stopped_attempts;
+            return fthr::dxgi::RecoveryAttemptResult::RetryableFailure;
+        });
+    Check(stopped.outcome == fthr::dxgi::RecoveryOutcome::StopRequested
+              && stopped.attempts == 1,
+          "shutdown interrupts recovery before another duplication attempt");
+}
+
+void TenDxgiRecoveryCyclesDoNotAccumulateOwnedFrames() {
+    int resource_releases = 0;
+    int frame_releases = 0;
+    int recoveries = 0;
+
+    for (int cycle = 0; cycle < 10; ++cycle) {
+        FakeDxgiResource resource{&resource_releases};
+        FakeDxgiDuplication duplication{&frame_releases};
+        {
+            fthr::dxgi::FrameLease<FakeDxgiResource, FakeDxgiDuplication> lease(
+                &resource, &duplication);
+        }
+        const auto result = fthr::dxgi::RunBoundedRecovery(
+            [] { return true; },
+            [](uint32_t) { return true; },
+            [](uint32_t) {
+                return fthr::dxgi::RecoveryAttemptResult::Recovered;
+            });
+        if (result.outcome == fthr::dxgi::RecoveryOutcome::Recovered) {
+            ++recoveries;
+        }
+    }
+
+    Check(recoveries == 10, "ten injected ACCESS_LOST incidents recover");
+    Check(resource_releases == 10 && frame_releases == 10,
+          "ten recovery cycles leave no accumulated frame ownership");
 }
 
 EncodedVideoConfig VideoConfig(VideoCodec codec) {
@@ -512,6 +744,11 @@ int main() {
     NoFallbackToPrimary();
     NoFallbackToOutputZero();
     NativeError4551PreservesWin32AndHresultIdentity();
+    DxgiFrameLeaseReleasesExactlyOnce();
+    DxgiFrameMetadataAndTextureContractsRejectFalseFrames();
+    DxgiRecoveryEligibilityRequiresSameCaptureContract();
+    DxgiRecoveryRunnerIsBoundedAndInterruptible();
+    TenDxgiRecoveryCyclesDoNotAccumulateOwnedFrames();
     NativeNvencCodecSelectionCoversNvidiaMatrix();
     UnsupportedNvencCodecIsRejected();
     NativeNvencLowLatencyConfigurationIsCodecSpecific();

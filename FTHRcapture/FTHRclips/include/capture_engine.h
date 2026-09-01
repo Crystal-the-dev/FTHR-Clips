@@ -71,6 +71,7 @@
 #include "audio_ring_buffer.h"   // AudioRingBuffer (raw float32 PCM)
 #include "shared_memory.h"       // typed v4 capture-health flags
 #include "windows_capture_border_policy.h"
+#include "windows_dxgi_recovery.h"
 #include "windows_monitor_resolver.h"
 
 
@@ -253,6 +254,15 @@ namespace fthr {
         void ShutdownWGC();
         bool InitializeD3D11();           // DXGI fallback for the resolved adapter/output
         void ShutdownD3D11();
+        bool RecoverDxgiDuplication(
+            const char* api_call, HRESULT trigger);
+        dxgi::RecoveryAttemptResult TryRecreateDxgiDuplication(
+            uint32_t attempt, std::string& detail);
+        bool WaitForDxgiRecoveryBackoff(uint32_t delay_ms) const;
+        bool ValidateCaptureTexture(
+            ID3D11Texture2D* texture, const char* backend_name);
+        bool ValidateMappedCaptureRowPitch(
+            uint32_t row_pitch, const char* backend_name);
         void SampleContentBGRA(const uint8_t* data, uint32_t stride,
             uint32_t width, uint32_t height, uint64_t produced_frame);
         void SampleContentTexture(ID3D11Texture2D* texture, uint64_t produced_frame);
@@ -424,6 +434,7 @@ namespace fthr {
         std::atomic<uint64_t> capture_acquire_successes_{0};
         std::atomic<uint64_t> capture_timeouts_{0};
         std::atomic<uint64_t> capture_frames_released_{0};
+        std::atomic<uint64_t> pointer_only_frames_{0};
         std::atomic<uint64_t> source_textures_received_{0};
         std::atomic<uint64_t> conversion_submissions_{0};
         std::atomic<uint64_t> conversion_completions_{0};
@@ -433,6 +444,9 @@ namespace fthr {
         std::atomic<int32_t> last_capture_hresult_{0};
         std::atomic<uint32_t> capture_health_flags_{CAPTURE_HEALTH_NONE};
         std::atomic<uint32_t> capture_generation_{0};
+        std::atomic<uint32_t> capture_restart_count_{0};
+        std::atomic<uint32_t> capture_recovery_attempts_{0};
+        std::atomic<uint32_t> capture_recovery_failures_{0};
         std::atomic<uint32_t> content_sample_sequence_{0};
         std::atomic<uint32_t> content_suspicious_streak_{0};
         std::atomic<float> content_luma_mean_{0.0f};

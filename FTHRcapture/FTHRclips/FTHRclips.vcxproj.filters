@@ -78,6 +78,9 @@
     <ClInclude Include="include\windows_monitor_resolver.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="include\windows_dxgi_recovery.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="include\windows_process_loopback_audio_provider.h">
       <Filter>Header Files</Filter>
     </ClInclude>

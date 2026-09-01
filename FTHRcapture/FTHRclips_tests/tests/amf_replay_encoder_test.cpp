@@ -210,6 +210,10 @@ void MissingEncodersFailHonestly() {
 void InitializationFailuresPropagate() {
     CheckAmf(InitializeWithFailure(VideoCodec::H264, "encoder open failed"),
         "encoder open failure propagates");
+    CheckAmf(InitializeWithFailure(VideoCodec::HEVC, "hevc_amf open failed"),
+        "HEVC encoder initialization failure propagates");
+    CheckAmf(InitializeWithFailure(VideoCodec::AV1, "AV1 unavailable on adapter"),
+        "AV1 hardware capability failure propagates");
     CheckAmf(InitializeWithFailure(VideoCodec::H264, "D3D11 hw context failed"),
         "D3D11 hw context failure propagates");
     ID3D11Device* warp_device = nullptr;

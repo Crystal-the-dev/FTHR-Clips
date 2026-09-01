@@ -46,6 +46,7 @@
     <ClInclude Include="include\save_clip_task.h" />
     <ClInclude Include="include\shared_memory.h" />
     <ClInclude Include="include\video_encoder.h" />
+    <ClInclude Include="include\windows_dxgi_recovery.h" />
     <ClInclude Include="include\windows_monitor_resolver.h" />
     <ClInclude Include="..\..\FTHRcapture_common\transactional_save.h" />
   </ItemGroup>

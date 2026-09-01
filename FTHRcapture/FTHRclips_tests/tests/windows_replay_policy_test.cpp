@@ -80,6 +80,12 @@ void CaptureAdapterCannotBeStolenByAnotherVendor() {
     CheckPolicy(!unknown.allowed
             && unknown.error == ReplayStartupError::CaptureAdapterUnsupported,
         "unknown capture adapter refuses startup instead of enumerating vendors");
+    const auto amd_on_nvidia = fthr::SelectWindowsReplayPolicy(
+        EncoderVendor::Nvidia, EncoderPreference::Amd, VideoCodec::H264);
+    CheckPolicy(!amd_on_nvidia.allowed
+            && amd_on_nvidia.error
+                == ReplayStartupError::CrossAdapterPathUnavailable,
+        "requested AMF adapter cannot consume another adapter's monitor texture");
 }
 
 void ExplicitNvidiaSelectionEnablesQualifiedHybridPath() {

@@ -62,6 +62,7 @@
 #include "clip_audio_manifest.h"
 #include "transactional_save.h"
 #include "windows_capture_border_policy.h"
+#include "windows_dxgi_recovery.h"
 #include "windows_native_error.h"
 #include "replay_interval.h"
 #include "frame_rate_scheduler.h"
@@ -505,6 +506,7 @@ namespace fthr {
         capture_acquire_successes_.store(0);
         capture_timeouts_.store(0);
         capture_frames_released_.store(0);
+        pointer_only_frames_.store(0);
         source_textures_received_.store(0);
         conversion_submissions_.store(0);
         conversion_completions_.store(0);
@@ -512,6 +514,9 @@ namespace fthr {
         video_ring_insertions_.store(0);
         capture_thread_stage_.store(0);
         last_capture_hresult_.store(0);
+        capture_restart_count_.store(0);
+        capture_recovery_attempts_.store(0);
+        capture_recovery_failures_.store(0);
 
         std::cout << "[CaptureEngine] Initializing..." << std::endl;
         std::cout << "  FPS        : " << fps_ << std::endl;
@@ -1187,7 +1192,8 @@ namespace fthr {
         uint64_t previous_acquire_attempts = 0;
         uint64_t previous_acquired = 0;
         uint64_t previous_submissions = 0;
-        auto last_progress = clock::now();
+        auto last_output_progress = clock::now();
+        auto last_stall_progress = last_output_progress;
         auto last_acquire_progress = clock::now();
         auto last_acquired_progress = clock::now();
         auto last_submission_progress = clock::now();
@@ -1196,6 +1202,18 @@ namespace fthr {
 
         while (running_.load(std::memory_order_relaxed)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            if ((capture_health_flags_.load(std::memory_order_relaxed)
+                    & CAPTURE_HEALTH_RECOVERING) != 0) {
+                // The capture thread owns DXGI recovery. The watchdog must not
+                // cancel its bounded backoff or diagnose the intentional gap
+                // as a second, unrelated pipeline stall.
+                const auto recovering_now = clock::now();
+                last_stall_progress = recovering_now;
+                last_acquire_progress = recovering_now;
+                last_acquired_progress = recovering_now;
+                last_submission_progress = recovering_now;
+                continue;
+            }
             const uint64_t packets = video_packets_produced_.load(
                 std::memory_order_relaxed);
             const uint64_t acquire_attempts = capture_acquire_attempts_.load(
@@ -1224,7 +1242,8 @@ namespace fthr {
                 const auto submission_age = std::chrono::duration_cast<
                     std::chrono::milliseconds>(now - last_submission_progress).count();
                 const auto output_age = std::chrono::duration_cast<
-                    std::chrono::milliseconds>(now - last_progress).count();
+                    std::chrono::milliseconds>(
+                        now - last_output_progress).count();
                 std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"capture\","
                           << "\"event\":\"capture_health_snapshot\","
                           << "\"frames_acquired\":" << acquired << ','
@@ -1234,6 +1253,8 @@ namespace fthr {
                           << content_suspicious_streak_.load() << ','
                           << "\"duplicate_frame_observations\":"
                           << "\"unavailable:not_measured\","
+                          << "\"pointer_only_frames\":"
+                          << pointer_only_frames_.load() << ','
                           << "\"encoder_submissions\":" << submissions << ','
                           << "\"encoded_packets\":" << packets << ','
                           << "\"last_acquired_age_ms\":" << acquired_age << ','
@@ -1241,8 +1262,11 @@ namespace fthr {
                           << submission_age << ','
                           << "\"last_encoded_output_age_ms\":" << output_age << ','
                           << "\"capture_restart_count\":"
-                          << (capture_generation_.load() > 0
-                              ? capture_generation_.load() - 1 : 0) << ','
+                          << capture_restart_count_.load() << ','
+                          << "\"capture_recovery_attempts\":"
+                          << capture_recovery_attempts_.load() << ','
+                          << "\"capture_recovery_failures\":"
+                          << capture_recovery_failures_.load() << ','
                           << "\"encoder_restart_count\":0}"
                           << std::endl;
 
@@ -1309,12 +1333,16 @@ namespace fthr {
             }
             if (packets != previous_packets) {
                 previous_packets = packets;
-                last_progress = now;
+                last_output_progress = now;
+                last_stall_progress = now;
                 snapshot_emitted = false;
                 continue;
             }
-            if (packets == 0 || snapshot_emitted
-                || now - last_progress <= std::chrono::seconds(2)) {
+            const bool awaiting_first_packet = packets == 0;
+            const auto stall_limit = awaiting_first_packet
+                ? std::chrono::seconds(8)
+                : std::chrono::seconds(2);
+            if (snapshot_emitted || now - last_stall_progress <= stall_limit) {
                 continue;
             }
 
@@ -1322,7 +1350,8 @@ namespace fthr {
                 ? replay_encoder_->GetDiagnostics()
                 : ReplayEncoderDiagnostics{};
             const bool dxgi_is_alive_but_desktop_is_static =
-                static_cast<HRESULT>(last_capture_hresult_.load(
+                !awaiting_first_packet
+                && static_cast<HRESULT>(last_capture_hresult_.load(
                     std::memory_order_relaxed)) == DXGI_ERROR_WAIT_TIMEOUT
                 && now - last_acquire_progress < std::chrono::seconds(1)
                 && encoder.pending_resources == 0
@@ -1333,7 +1362,7 @@ namespace fthr {
                 // Desktop Duplication reports only changed frames. Repeated
                 // WAIT_TIMEOUT with a live acquire loop and an empty encoder
                 // is expected and must not be diagnosed as a replay stall.
-                last_progress = now;
+                last_stall_progress = now;
                 continue;
             }
             const HRESULT removed_reason = device_
@@ -1387,14 +1416,14 @@ namespace fthr {
             const bool encoder_received_recent_submission =
                 submissions > 0
                 && now - last_submission_progress <= std::chrono::seconds(2);
-            const char* diagnostic_code = capture_stalled
-                ? (acquired == 0 ? "CAPTURE_NO_FRAMES"
-                                 : "CAPTURE_FRAME_STALLED")
-                : (encoder_received_recent_submission
-                    ? "ENCODER_OUTPUT_STALLED" : "ENCODER_SUBMIT_FAILED");
+            const auto stall_boundary = dxgi::ClassifyPipelineStall(
+                capture_stalled, acquired > 0,
+                encoder_received_recent_submission);
+            const char* diagnostic_code = dxgi::PipelineStallCode(
+                stall_boundary);
             std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"capture\","
                       << "\"event\":\"pipeline_stall_detected\","
-                      << "\"state\":\"STALLED\",\"error_code\":\""
+                      << "\"state\":\"FAILED\",\"error_code\":\""
                       << diagnostic_code << "\","
                       << "\"frames_acquired\":" << acquired << ','
                       << "\"encoder_submissions\":" << submissions << ','
@@ -1404,6 +1433,12 @@ namespace fthr {
                       << "\"encoder_drain_stage\":" << encoder.drain_stage << "}"
                       << std::endl;
             snapshot_emitted = true;
+            SetCaptureFailure(std::string(diagnostic_code)
+                + ": the replay pipeline stopped making bounded progress");
+            ClearReplayForRecovery();
+            capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
+            running_.store(false);
+            break;
         }
     }
 
@@ -3026,6 +3061,340 @@ namespace fthr {
         capture_health_flags_.fetch_and(~CAPTURE_HEALTH_CONTENT_SUSPECT);
     }
 
+    bool CaptureEngine::WaitForDxgiRecoveryBackoff(
+        uint32_t delay_ms) const {
+        uint32_t remaining = delay_ms;
+        while (remaining > 0) {
+            if (!running_.load(std::memory_order_relaxed)) return false;
+            const uint32_t slice = std::min<uint32_t>(remaining, 10);
+            std::this_thread::sleep_for(std::chrono::milliseconds(slice));
+            remaining -= slice;
+        }
+        return running_.load(std::memory_order_relaxed);
+    }
+
+    dxgi::RecoveryAttemptResult CaptureEngine::TryRecreateDxgiDuplication(
+        uint32_t attempt, std::string& detail) {
+        if (!running_.load(std::memory_order_relaxed)) {
+            detail = "shutdown requested";
+            return dxgi::RecoveryAttemptResult::StopRequested;
+        }
+        if (!device_ || !capture_device_adapter_luid_available_) {
+            detail = "live capture device identity is unavailable";
+            return dxgi::RecoveryAttemptResult::FatalFailure;
+        }
+
+        const HRESULT removed_reason = device_->GetDeviceRemovedReason();
+        if (removed_reason != S_OK) {
+            detail = diagnostics::FormatHResultFailure(
+                "ID3D11Device::GetDeviceRemovedReason", removed_reason);
+            return dxgi::RecoveryAttemptResult::FatalFailure;
+        }
+
+        const auto current_monitor = monitor_resolver_.Resolve(
+            monitor_device_path_);
+        if (!current_monitor.ok()) {
+            detail = std::string(monitor::ToString(current_monitor.error))
+                + ": " + current_monitor.diagnostic;
+            return dxgi::RecoveryAttemptResult::RetryableFailure;
+        }
+
+        IDXGIFactory1* factory = nullptr;
+        IDXGIAdapter1* adapter = nullptr;
+        IDXGIOutput* output = nullptr;
+        IDXGIOutput1* output1 = nullptr;
+        IDXGIOutputDuplication* candidate = nullptr;
+        const auto cleanup = [&] {
+            if (candidate) { candidate->Release(); candidate = nullptr; }
+            if (output1) { output1->Release(); output1 = nullptr; }
+            if (output) { output->Release(); output = nullptr; }
+            if (adapter) { adapter->Release(); adapter = nullptr; }
+            if (factory) { factory->Release(); factory = nullptr; }
+        };
+
+        HRESULT hr = CreateDXGIFactory1(
+            __uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory));
+        if (FAILED(hr) || !factory) {
+            detail = diagnostics::FormatHResultFailure(
+                "CreateDXGIFactory1(recovery)", hr);
+            cleanup();
+            return dxgi::RecoveryAttemptResult::FatalFailure;
+        }
+
+        monitor::DxgiOutputIdentity output_identity;
+        std::string output_diagnostic;
+        if (!monitor::OpenSelectedDxgiOutput(
+                factory, current_monitor.monitor, &adapter, &output,
+                &output_identity, output_diagnostic)) {
+            detail = output_diagnostic.empty()
+                ? "selected monitor output is temporarily unavailable"
+                : output_diagnostic;
+            cleanup();
+            return dxgi::RecoveryAttemptResult::RetryableFailure;
+        }
+
+        DXGI_OUTPUT_DESC output_desc{};
+        hr = output->GetDesc(&output_desc);
+        if (FAILED(hr)) {
+            detail = diagnostics::FormatHResultFailure(
+                "IDXGIOutput::GetDesc(recovery)", hr);
+            cleanup();
+            return dxgi::RecoveryAttemptResult::RetryableFailure;
+        }
+        const uint32_t current_width = static_cast<uint32_t>(
+            output_desc.DesktopCoordinates.right
+            - output_desc.DesktopCoordinates.left);
+        const uint32_t current_height = static_cast<uint32_t>(
+            output_desc.DesktopCoordinates.bottom
+            - output_desc.DesktopCoordinates.top);
+
+        const dxgi::RecoveryIdentity active_identity{
+            monitor_device_path_, capture_device_adapter_luid_, width_, height_};
+        const dxgi::RecoveryObservation observation{
+            running_.load(std::memory_order_relaxed),
+            true,
+            {current_monitor.monitor.monitor_device_path,
+             current_monitor.monitor.adapter_luid,
+             current_width,
+             current_height},
+            removed_reason};
+        const auto decision = dxgi::EvaluateRecovery(
+            active_identity, observation);
+        if (decision != dxgi::RecoveryDecision::RecreateDuplication) {
+            detail = std::string("recovery contract rejected: ")
+                + dxgi::RecoveryDecisionName(decision);
+            cleanup();
+            return decision == dxgi::RecoveryDecision::StopRequested
+                ? dxgi::RecoveryAttemptResult::StopRequested
+                : decision == dxgi::RecoveryDecision::MonitorUnavailable
+                    ? dxgi::RecoveryAttemptResult::RetryableFailure
+                    : dxgi::RecoveryAttemptResult::FatalFailure;
+        }
+
+        DXGI_ADAPTER_DESC1 adapter_desc{};
+        hr = adapter->GetDesc1(&adapter_desc);
+        if (FAILED(hr)) {
+            detail = diagnostics::FormatHResultFailure(
+                "IDXGIAdapter1::GetDesc1(recovery)", hr);
+            cleanup();
+            return dxgi::RecoveryAttemptResult::RetryableFailure;
+        }
+        const monitor::AdapterLuid reopened_luid{
+            adapter_desc.AdapterLuid.LowPart,
+            adapter_desc.AdapterLuid.HighPart};
+        if (reopened_luid != capture_device_adapter_luid_) {
+            detail = "reopened output adapter LUID differs from capture device";
+            cleanup();
+            return dxgi::RecoveryAttemptResult::FatalFailure;
+        }
+
+        hr = output->QueryInterface(
+            __uuidof(IDXGIOutput1), reinterpret_cast<void**>(&output1));
+        if (FAILED(hr) || !output1) {
+            detail = diagnostics::FormatHResultFailure(
+                "IDXGIOutput::QueryInterface(IDXGIOutput1,recovery)", hr);
+            cleanup();
+            return dxgi::RecoveryAttemptResult::RetryableFailure;
+        }
+
+        hr = output1->DuplicateOutput(device_, &candidate);
+        if (FAILED(hr) || !candidate) {
+            detail = diagnostics::FormatHResultFailure(
+                "IDXGIOutput1::DuplicateOutput(recovery)", hr);
+            const bool fatal = dxgi::IsFatalDuplicationRecreateFailure(hr);
+            cleanup();
+            return fatal
+                ? dxgi::RecoveryAttemptResult::FatalFailure
+                : dxgi::RecoveryAttemptResult::RetryableFailure;
+        }
+        if (!running_.load(std::memory_order_relaxed)) {
+            detail = "shutdown requested after duplication recreation";
+            cleanup();
+            return dxgi::RecoveryAttemptResult::StopRequested;
+        }
+
+        duplication_ = candidate;
+        candidate = nullptr;
+        resolved_monitor_ = current_monitor.monitor;
+        resolved_dxgi_output_ = output_identity;
+        detail = "duplication recreated on attempt " + std::to_string(attempt);
+        cleanup();
+        return dxgi::RecoveryAttemptResult::Recovered;
+    }
+
+    bool CaptureEngine::RecoverDxgiDuplication(
+        const char* api_call, HRESULT trigger) {
+        capture_health_flags_.store(CAPTURE_HEALTH_RECOVERING);
+        std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"capture\","
+                  << "\"event\":\"recovery_started\","
+                  << "\"state\":\"RECOVERING\","
+                  << "\"error_code\":\"CAPTURE_DXGI_RUNTIME_FAILED\","
+                  << "\"native_failure\":"
+                  << diagnostics::HResultFailureJson(
+                         api_call, trigger)
+                  << ",\"monitor_id\":\""
+                  << diagnostics::JsonEscape(diagnostics::WideToUtf8(
+                         monitor_device_path_)) << "\","
+                  << "\"capture_device_luid\":"
+                  << (capture_device_adapter_luid_available_
+                      ? AdapterLuidJson(capture_device_adapter_luid_)
+                      : "\"unavailable:not_resolved\"") << "}"
+                  << std::endl;
+
+        // Any outstanding frame has already been released by the caller. The
+        // invalid interface must be released before DuplicateOutput is tried.
+        if (duplication_) {
+            duplication_->Release();
+            duplication_ = nullptr;
+        }
+
+        std::string last_detail;
+        const auto result = dxgi::RunBoundedRecovery(
+            [this] {
+                return running_.load(std::memory_order_relaxed);
+            },
+            [this](uint32_t delay_ms) {
+                return WaitForDxgiRecoveryBackoff(delay_ms);
+            },
+            [this, &last_detail](uint32_t attempt) {
+                const auto attempt_result = TryRecreateDxgiDuplication(
+                    attempt, last_detail);
+                if (attempt_result != dxgi::RecoveryAttemptResult::Recovered) {
+                    std::cout << "FTHR_DIAGNOSTIC_EVENT {"
+                              << "\"subsystem\":\"capture\","
+                              << "\"event\":\"recovery_attempt_failed\","
+                              << "\"attempt\":" << attempt << ','
+                              << "\"detail\":\""
+                              << diagnostics::JsonEscape(last_detail)
+                              << "\"}" << std::endl;
+                }
+                return attempt_result;
+            });
+        capture_recovery_attempts_.fetch_add(
+            result.attempts, std::memory_order_relaxed);
+
+        if (result.outcome == dxgi::RecoveryOutcome::Recovered) {
+            const uint32_t restart = capture_restart_count_.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+            last_capture_hresult_.store(S_OK, std::memory_order_relaxed);
+            capture_health_flags_.store(CAPTURE_HEALTH_ACTIVE);
+            std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"capture\","
+                      << "\"event\":\"recovery_completed\","
+                      << "\"state\":\"ACTIVE\","
+                      << "\"attempts\":" << result.attempts << ','
+                      << "\"capture_restart_count\":" << restart << ','
+                      << "\"encoder_restart_count\":0,"
+                      << "\"stream_generation_preserved\":true,"
+                      << "\"replay_ring_preserved\":true,"
+                      << "\"monitor_id\":\""
+                      << diagnostics::JsonEscape(diagnostics::WideToUtf8(
+                             monitor_device_path_)) << "\","
+                      << "\"dxgi_output\":{\"index\":"
+                      << resolved_dxgi_output_.output_index << "},"
+                      << "\"capture_device_luid\":"
+                      << AdapterLuidJson(capture_device_adapter_luid_) << "}"
+                      << std::endl;
+            return true;
+        }
+
+        if (result.outcome == dxgi::RecoveryOutcome::StopRequested) {
+            return false;
+        }
+
+        capture_recovery_failures_.fetch_add(1, std::memory_order_relaxed);
+        ClearReplayForRecovery();
+        capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
+        SetCaptureFailure(last_detail.empty()
+            ? "DXGI duplication recovery failed without backend detail"
+            : last_detail);
+        std::cerr << "[CaptureThread] DXGI recovery failed: "
+                  << dxgi::RecoveryOutcomeName(result.outcome)
+                  << " attempts=" << result.attempts
+                  << " detail=" << last_capture_failure_detail_ << std::endl;
+        std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"capture\","
+                  << "\"event\":\"recovery_failed\",\"state\":\"FAILED\","
+                  << "\"error_code\":\"CAPTURE_DXGI_RUNTIME_FAILED\","
+                  << "\"outcome\":\""
+                  << dxgi::RecoveryOutcomeName(result.outcome) << "\","
+                  << "\"attempts\":" << result.attempts << ','
+                  << "\"detail\":\""
+                  << diagnostics::JsonEscape(last_capture_failure_detail_)
+                  << "\",\"native_failure\":"
+                  << diagnostics::HResultFailureJson(
+                         api_call, trigger)
+                  << "}" << std::endl;
+        return false;
+    }
+
+    bool CaptureEngine::ValidateCaptureTexture(
+        ID3D11Texture2D* texture, const char* backend_name) {
+        if (!texture) {
+            SetCaptureFailure("capture backend returned a null D3D11 texture");
+            return false;
+        }
+        D3D11_TEXTURE2D_DESC description{};
+        texture->GetDesc(&description);
+        const dxgi::TextureContract expected{
+            width_, height_,
+            static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM), 1};
+        const dxgi::TextureContract actual{
+            description.Width, description.Height,
+            static_cast<uint32_t>(description.Format),
+            description.SampleDesc.Count};
+        const bool valid = dxgi::IsCompatibleTexture(expected, actual);
+        if (valid) return true;
+
+        std::ostringstream failure;
+        failure << "capture texture contract mismatch expected="
+                << width_ << 'x' << height_
+                << "/BGRA8/sample1 actual="
+                << description.Width << 'x' << description.Height
+                << "/format" << static_cast<uint32_t>(description.Format)
+                << "/sample" << description.SampleDesc.Count;
+        SetCaptureFailure(failure.str());
+        std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"capture\","
+                  << "\"event\":\"texture_contract_rejected\","
+                  << "\"state\":\"FAILED\",\"error_code\":\""
+                  << (backend_name && std::strcmp(backend_name, "WGC") == 0
+                      ? "CAPTURE_WGC_RUNTIME_FAILED"
+                      : "CAPTURE_DXGI_RUNTIME_FAILED") << "\","
+                  << "\"backend\":\""
+                  << diagnostics::JsonEscape(
+                         backend_name ? backend_name : "unknown") << "\","
+                  << "\"expected_width\":" << width_ << ','
+                  << "\"expected_height\":" << height_ << ','
+                  << "\"actual_width\":" << description.Width << ','
+                  << "\"actual_height\":" << description.Height << ','
+                  << "\"actual_format\":"
+                  << static_cast<uint32_t>(description.Format) << ','
+                  << "\"actual_sample_count\":"
+                  << description.SampleDesc.Count << "}" << std::endl;
+        return false;
+    }
+
+    bool CaptureEngine::ValidateMappedCaptureRowPitch(
+        uint32_t row_pitch, const char* backend_name) {
+        if (dxgi::IsValidBgraRowPitch(width_, row_pitch)) return true;
+        std::ostringstream failure;
+        failure << "capture row pitch is smaller than BGRA frame width: "
+                << row_pitch << " < " << (static_cast<uint64_t>(width_) * 4u);
+        SetCaptureFailure(failure.str());
+        std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"capture\","
+                  << "\"event\":\"texture_contract_rejected\","
+                  << "\"state\":\"FAILED\",\"error_code\":\""
+                  << (backend_name && std::strcmp(backend_name, "WGC") == 0
+                      ? "CAPTURE_WGC_RUNTIME_FAILED"
+                      : "CAPTURE_DXGI_RUNTIME_FAILED") << "\","
+                  << "\"backend\":\""
+                  << diagnostics::JsonEscape(
+                         backend_name ? backend_name : "unknown") << "\","
+                  << "\"expected_minimum_row_pitch\":"
+                  << (static_cast<uint64_t>(width_) * 4u) << ','
+                  << "\"actual_row_pitch\":" << row_pitch << "}"
+                  << std::endl;
+        return false;
+    }
+
 
     // ===========================================================================
     // CaptureThread
@@ -3073,6 +3442,13 @@ namespace fthr {
 
             capture_thread_stage_.store(1, std::memory_order_relaxed);
             capture_acquire_attempts_.fetch_add(1, std::memory_order_relaxed);
+            if (!duplication_) {
+                SetCaptureFailure(
+                    "DXGI duplication is unavailable outside recovery");
+                capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
+                running_.store(false);
+                break;
+            }
             HRESULT hr = duplication_->AcquireNextFrame(33, &info, &resource);
             last_capture_hresult_.store(
                 static_cast<int32_t>(hr), std::memory_order_relaxed);
@@ -3084,37 +3460,12 @@ namespace fthr {
             }
 
             if (hr == DXGI_ERROR_ACCESS_LOST) {
-                // A new D3D11 device cannot be substituted under the live native
-                // NVENC session: its registered textures belong to the old device.
-                // Fail this generation and let the existing UI recovery policy
-                // restart the process, which re-resolves the same persistent path
-                // and initializes capture + encoder atomically.
-                ClearReplayForRecovery();
-                const bool same_mapping = monitor_resolver_.IsCurrent(
-                    resolved_monitor_);
-                std::cerr << "[CaptureThread] "
-                          << monitor::ToString(same_mapping
-                              ? monitor::MonitorResolveError::OutputResolutionFailed
-                              : monitor::MonitorResolveError::MonitorTopologyChanged)
-                          << ": DXGI access lost; a fresh capture generation is required"
-                          << std::endl;
-                std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"capture\","
-                          << "\"event\":\"runtime_failed\",\"state\":\"FAILED\","
-                          << "\"error_code\":\"CAPTURE_DXGI_RUNTIME_FAILED\","
-                          << "\"native_failure\":"
-                          << diagnostics::HResultFailureJson(
-                                 "IDXGIOutputDuplication::AcquireNextFrame", hr)
-                          << ",\"monitor_id\":\""
-                          << diagnostics::JsonEscape(diagnostics::WideToUtf8(
-                                 monitor_device_path_)) << "\","
-                          << "\"dxgi_output\":{\"index\":"
-                          << resolved_dxgi_output_.output_index << "},"
-                          << "\"capture_device_luid\":"
-                          << (capture_device_adapter_luid_available_
-                              ? AdapterLuidJson(capture_device_adapter_luid_)
-                              : "\"unavailable:not_resolved\"") << "}"
-                          << std::endl;
-                capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
+                capture_thread_stage_.store(0, std::memory_order_relaxed);
+                if (RecoverDxgiDuplication(
+                        "IDXGIOutputDuplication::AcquireNextFrame", hr)) {
+                    consecutive_acquire_errors = 0;
+                    continue;
+                }
                 running_.store(false);
                 break;
             }
@@ -3145,6 +3496,61 @@ namespace fthr {
             consecutive_acquire_errors = 0;
             capture_acquire_successes_.fetch_add(1, std::memory_order_relaxed);
             capture_thread_stage_.store(2, std::memory_order_relaxed);
+            dxgi::FrameLease<IDXGIResource, IDXGIOutputDuplication> frame(
+                resource, duplication_);
+            const auto finish_frame = [this, &frame]() {
+                frame.ReleaseResource();
+                const bool owned = frame.owns_frame();
+                const HRESULT release = frame.ReleaseFrame();
+                if (owned) {
+                    capture_frames_released_.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+                if (release == DXGI_ERROR_ACCESS_LOST) {
+                    capture_thread_stage_.store(0, std::memory_order_relaxed);
+                    return RecoverDxgiDuplication(
+                        "IDXGIOutputDuplication::ReleaseFrame", release);
+                }
+                if (FAILED(release)) {
+                    SetCaptureFailure(diagnostics::FormatHResultFailure(
+                        "IDXGIOutputDuplication::ReleaseFrame", release));
+                    std::cout << "FTHR_DIAGNOSTIC_EVENT {"
+                              << "\"subsystem\":\"capture\","
+                              << "\"event\":\"runtime_failed\","
+                              << "\"state\":\"FAILED\","
+                              << "\"error_code\":\"CAPTURE_DXGI_RUNTIME_FAILED\","
+                              << "\"native_failure\":"
+                              << diagnostics::HResultFailureJson(
+                                     "IDXGIOutputDuplication::ReleaseFrame",
+                                     release) << "}" << std::endl;
+                    ClearReplayForRecovery();
+                    capture_health_flags_.store(
+                        CAPTURE_HEALTH_BACKEND_FAILED);
+                    running_.store(false);
+                    return false;
+                }
+                return true;
+            };
+
+            if (!resource) {
+                SetCaptureFailure(
+                    "AcquireNextFrame succeeded without a desktop resource");
+                finish_frame();
+                capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
+                running_.store(false);
+                break;
+            }
+
+            // Pointer-only updates carry no newly presented desktop image.
+            // Encoding the returned old surface as a new frame creates a false
+            // freeze and introduces a zero presentation timestamp.
+            if (!dxgi::HasNewDesktopImage(info.LastPresentTime.QuadPart)) {
+                pointer_only_frames_.fetch_add(1, std::memory_order_relaxed);
+                frames_dropped_.fetch_add(1, std::memory_order_relaxed);
+                capture_thread_stage_.store(0, std::memory_order_relaxed);
+                if (!finish_frame()) break;
+                continue;
+            }
 
             // Frame rate limiting BEFORE QueryInterface.
             // At high game FPS (e.g. 300fps, 60fps target) most frames are dropped.
@@ -3154,24 +3560,29 @@ namespace fthr {
             LARGE_INTEGER now;
             QueryPerformanceCounter(&now);
             if (!frame_scheduler.ShouldCapture(now.QuadPart)) {
-                resource->Release();
-                duplication_->ReleaseFrame();
-                capture_frames_released_.fetch_add(1, std::memory_order_relaxed);
                 capture_thread_stage_.store(0, std::memory_order_relaxed);
                 frames_dropped_.fetch_add(1, std::memory_order_relaxed);
+                if (!finish_frame()) break;
                 continue;
             }
 
             ID3D11Texture2D* tex = nullptr;
-            hr = resource->QueryInterface(__uuidof(ID3D11Texture2D),
+            hr = frame.resource()->QueryInterface(__uuidof(ID3D11Texture2D),
                 reinterpret_cast<void**>(&tex));
-            resource->Release();
+            frame.ReleaseResource();
 
-            if (FAILED(hr)) {
-                duplication_->ReleaseFrame();
-                capture_frames_released_.fetch_add(1, std::memory_order_relaxed);
+            if (FAILED(hr) || !tex) {
                 capture_thread_stage_.store(0, std::memory_order_relaxed);
+                if (!finish_frame()) break;
                 continue;
+            }
+            if (!ValidateCaptureTexture(tex, "DXGI")) {
+                tex->Release();
+                finish_frame();
+                ClearReplayForRecovery();
+                capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
+                running_.store(false);
+                break;
             }
             source_textures_received_.fetch_add(1, std::memory_order_relaxed);
             capture_thread_stage_.store(3, std::memory_order_relaxed);
@@ -3193,10 +3604,9 @@ namespace fthr {
                     info.LastPresentTime.QuadPart,
                     frames_captured_.load(std::memory_order_relaxed) + 1);
                 tex->Release();
-                duplication_->ReleaseFrame();
-                capture_frames_released_.fetch_add(1, std::memory_order_relaxed);
+                const bool frame_finished = finish_frame();
                 capture_thread_stage_.store(0, std::memory_order_relaxed);
-                if (!encoded) break;
+                if (!encoded || !frame_finished) break;
             }
             else if (nvenc_active_ && replay_encoder_cpu_input_) {
                 // ----------------------------------------------------------
@@ -3213,8 +3623,6 @@ namespace fthr {
                 // ----------------------------------------------------------
                 context_->CopyResource(staging_texture_, tex);
                 tex->Release();
-                duplication_->ReleaseFrame();
-                capture_frames_released_.fetch_add(1, std::memory_order_relaxed);
                 capture_thread_stage_.store(4, std::memory_order_relaxed);
 
                 D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -3222,7 +3630,17 @@ namespace fthr {
                 if (FAILED(hr)) {
                     std::cerr << "[CaptureThread] Texture map failed (Optimus): 0x"
                         << std::hex << hr << std::dec << std::endl;
+                    capture_thread_stage_.store(0, std::memory_order_relaxed);
+                    if (!finish_frame()) break;
                     continue;
+                }
+                if (!ValidateMappedCaptureRowPitch(mapped.RowPitch, "DXGI")) {
+                    context_->Unmap(staging_texture_, 0);
+                    finish_frame();
+                    ClearReplayForRecovery();
+                    capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
+                    running_.store(false);
+                    break;
                 }
 
                 SampleContentBGRA(
@@ -3247,10 +3665,12 @@ namespace fthr {
                 context_->Unmap(staging_texture_, 0);
                 conversion_submissions_.fetch_add(1, std::memory_order_relaxed);
                 conversion_completions_.fetch_add(1, std::memory_order_relaxed);
+                const bool frame_finished = finish_frame();
                 if (!encoded) {
                     FailReplayEncoder("hybrid NVENC CPU-input submission");
                     break;
                 }
+                if (!frame_finished) break;
             }
             else {
                 // ----------------------------------------------------------
@@ -3258,8 +3678,6 @@ namespace fthr {
                 // ----------------------------------------------------------
                 context_->CopyResource(staging_texture_, tex);
                 tex->Release();
-                duplication_->ReleaseFrame();
-                capture_frames_released_.fetch_add(1, std::memory_order_relaxed);
                 capture_thread_stage_.store(4, std::memory_order_relaxed);
 
                 D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -3267,7 +3685,17 @@ namespace fthr {
                 if (FAILED(hr)) {
                     std::cerr << "[CaptureThread] Texture map failed: 0x"
                         << std::hex << hr << std::dec << std::endl;
+                    capture_thread_stage_.store(0, std::memory_order_relaxed);
+                    if (!finish_frame()) break;
                     continue;
+                }
+                if (!ValidateMappedCaptureRowPitch(mapped.RowPitch, "DXGI")) {
+                    context_->Unmap(staging_texture_, 0);
+                    finish_frame();
+                    ClearReplayForRecovery();
+                    capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
+                    running_.store(false);
+                    break;
                 }
 
                 const uint8_t* full_src = static_cast<const uint8_t*>(mapped.pData);
@@ -3298,6 +3726,7 @@ namespace fthr {
                 size_t prev = ring_count_.load(std::memory_order_relaxed);
                 if (prev < max_frames_)
                     ring_count_.fetch_add(1, std::memory_order_relaxed);
+                if (!finish_frame()) break;
             }
 
             uint64_t fc = frames_captured_.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -3974,16 +4403,22 @@ namespace fthr {
 
             if (!running_.load(std::memory_order_relaxed)) break;
             if (monitor_source_invalidated_.load(std::memory_order_acquire)) {
+                const char* source_kind = wgc_state_->monitor_item
+                    ? "monitor" : "window";
                 std::cerr << "[CaptureThread/WGC] "
                           << monitor::ToString(
                                  monitor::MonitorResolveError::MonitorDisconnected)
-                          << ": selected monitor capture item closed" << std::endl;
+                          << ": selected " << source_kind
+                          << " capture item closed" << std::endl;
                 std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"capture\","
                           << "\"event\":\"runtime_failed\",\"state\":\"FAILED\","
                           << "\"error_code\":\"CAPTURE_WGC_RUNTIME_FAILED\","
                           << "\"api_call\":\"GraphicsCaptureItem::Closed\","
-                          << "\"detail\":\"selected monitor capture item closed\"}"
+                          << "\"source_kind\":\"" << source_kind << "\","
+                          << "\"detail\":\"selected capture item closed\"}"
                           << std::endl;
+                SetCaptureFailure(std::string("selected WGC ") + source_kind
+                    + " capture item closed");
                 capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
                 ClearReplayForRecovery();
                 running_.store(false);
@@ -4002,28 +4437,32 @@ namespace fthr {
                 auto frame = wgc_state_->frame_pool.TryGetNextFrame();
                 if (!frame) continue;
 
-                if (wgc_state_->monitor_item) {
-                    current_frame_api = "Direct3D11CaptureFrame::ContentSize";
-                    const auto content_size = frame.ContentSize();
-                    if (content_size.Width != static_cast<int32_t>(width_)
-                        || content_size.Height != static_cast<int32_t>(height_)) {
-                        std::cerr << "[CaptureThread/WGC] "
-                                  << monitor::ToString(
-                                         monitor::MonitorResolveError::MonitorTopologyChanged)
-                                  << ": selected monitor dimensions changed" << std::endl;
-                        std::cout << "FTHR_DIAGNOSTIC_EVENT {"
-                                  << "\"subsystem\":\"capture\","
-                                  << "\"event\":\"runtime_failed\","
-                                  << "\"state\":\"FAILED\","
-                                  << "\"error_code\":\"CAPTURE_WGC_RUNTIME_FAILED\","
-                                  << "\"api_call\":\"Direct3D11CaptureFrame::ContentSize\","
-                                  << "\"detail\":\"selected monitor dimensions changed\"}"
-                                  << std::endl;
-                        capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
-                        ClearReplayForRecovery();
-                        running_.store(false);
-                        break;
-                    }
+                current_frame_api = "Direct3D11CaptureFrame::ContentSize";
+                const auto content_size = frame.ContentSize();
+                if (content_size.Width != static_cast<int32_t>(width_)
+                    || content_size.Height != static_cast<int32_t>(height_)) {
+                    const char* source_kind = wgc_state_->monitor_item
+                        ? "monitor" : "window";
+                    std::cerr << "[CaptureThread/WGC] capture " << source_kind
+                              << " dimensions changed" << std::endl;
+                    std::cout << "FTHR_DIAGNOSTIC_EVENT {"
+                              << "\"subsystem\":\"capture\","
+                              << "\"event\":\"runtime_failed\","
+                              << "\"state\":\"FAILED\","
+                              << "\"error_code\":\"CAPTURE_WGC_RUNTIME_FAILED\","
+                              << "\"api_call\":\"Direct3D11CaptureFrame::ContentSize\","
+                              << "\"source_kind\":\"" << source_kind << "\","
+                              << "\"expected_width\":" << width_ << ','
+                              << "\"expected_height\":" << height_ << ','
+                              << "\"actual_width\":" << content_size.Width << ','
+                              << "\"actual_height\":" << content_size.Height << "}"
+                              << std::endl;
+                    SetCaptureFailure(std::string("WGC ") + source_kind
+                        + " dimensions changed; a fresh capture generation is required");
+                    capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
+                    ClearReplayForRecovery();
+                    running_.store(false);
+                    break;
                 }
 
                 // QPC frame rate limiter — frame already consumed above, so the
@@ -4073,6 +4512,12 @@ namespace fthr {
                 current_frame_api =
                     "IDirect3DDxgiInterfaceAccess::GetInterface(ID3D11Texture2D)";
                 winrt::check_hresult(interop->GetInterface(IID_PPV_ARGS(tex.put())));
+                if (!ValidateCaptureTexture(tex.get(), "WGC")) {
+                    ClearReplayForRecovery();
+                    capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
+                    running_.store(false);
+                    break;
+                }
                 source_textures_received_.fetch_add(
                     1, std::memory_order_relaxed);
 
@@ -4104,6 +4549,13 @@ namespace fthr {
                         std::cerr << "[CaptureThread/WGC] Texture map failed (Optimus): 0x"
                                   << std::hex << hr << std::dec << std::endl;
                         continue;
+                    }
+                    if (!ValidateMappedCaptureRowPitch(mapped.RowPitch, "WGC")) {
+                        context_->Unmap(staging_texture_, 0);
+                        ClearReplayForRecovery();
+                        capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
+                        running_.store(false);
+                        break;
                     }
 
                     SampleContentBGRA(
@@ -4142,6 +4594,13 @@ namespace fthr {
                         std::cerr << "[CaptureThread/WGC] Texture map failed: 0x"
                                   << std::hex << hr << std::dec << std::endl;
                         continue;
+                    }
+                    if (!ValidateMappedCaptureRowPitch(mapped.RowPitch, "WGC")) {
+                        context_->Unmap(staging_texture_, 0);
+                        ClearReplayForRecovery();
+                        capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
+                        running_.store(false);
+                        break;
                     }
 
                     const uint8_t* full_src = static_cast<const uint8_t*>(mapped.pData);
@@ -4299,6 +4758,15 @@ namespace fthr {
                 hwnd,
                 winrt::guid_of<winrt::Windows::Graphics::Capture::GraphicsCaptureItem>(),
                 winrt::put_abi(wgc_state_->item)));
+            current_api = "GraphicsCaptureItem::Closed(add handler)";
+            monitor_source_invalidated_.store(false, std::memory_order_release);
+            wgc_state_->item_closed_token = wgc_state_->item.Closed(
+                [this](auto&, auto&) {
+                    monitor_source_invalidated_.store(
+                        true, std::memory_order_release);
+                    wgc_frame_cv_.notify_one();
+                });
+            wgc_state_->item_closed_registered = true;
 
             // 5. Get captured dimensions from the item (= window content size)
             current_api = "GraphicsCaptureItem::Size";
