@@ -118,6 +118,21 @@ namespace fthr {
         uint64_t GetTimelineOriginQpc100ns() const {
             return timeline_origin_qpc_100ns_.load(std::memory_order_acquire);
         }
+        uint32_t GetRequestedSampleRate() const { return requested_sample_rate_; }
+        uint32_t GetRequestedChannels() const { return requested_channels_; }
+        const std::string& GetFriendlyName() const { return friendly_name_; }
+        uint64_t GetPacketCount() const {
+            return packet_count_.load(std::memory_order_relaxed);
+        }
+        uint64_t GetDiscontinuityCount() const {
+            return discontinuity_count_.load(std::memory_order_relaxed);
+        }
+        uint64_t GetFirstPacketQpc100ns() const {
+            return first_packet_qpc_100ns_.load(std::memory_order_acquire);
+        }
+        uint64_t GetLastPacketQpc100ns() const {
+            return last_packet_qpc_100ns_.load(std::memory_order_acquire);
+        }
 
 
     private:
@@ -171,6 +186,9 @@ namespace fthr {
         // -----------------------------------------------------------------------
         uint32_t sample_rate_;
         uint32_t channels_;
+        uint32_t requested_sample_rate_ = 48000;
+        uint32_t requested_channels_ = 2;
+        std::string friendly_name_ = "unavailable:not_resolved";
 
         // -----------------------------------------------------------------------
         // Thread state
@@ -179,6 +197,10 @@ namespace fthr {
         std::atomic<bool> running_{ false };
         std::atomic<bool> device_lost_{ false };
         std::atomic<uint64_t> timeline_origin_qpc_100ns_{ 0 };
+        std::atomic<uint64_t> packet_count_{ 0 };
+        std::atomic<uint64_t> discontinuity_count_{ 0 };
+        std::atomic<uint64_t> first_packet_qpc_100ns_{ 0 };
+        std::atomic<uint64_t> last_packet_qpc_100ns_{ 0 };
 
         // Stored from the last Initialize() call so recovery can re-open the same
         // device (or fall back to default if empty).

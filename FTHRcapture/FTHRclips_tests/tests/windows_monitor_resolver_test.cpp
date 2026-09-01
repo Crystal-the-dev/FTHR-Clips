@@ -222,6 +222,18 @@ void NativeError4551PreservesWin32AndHresultIdentity() {
     Check(hresult.find("\"native_error_hex\":\"0x800711C7\"")
               != std::string::npos,
           "HRESULT diagnostic preserves the full native HRESULT");
+
+    const std::string runtime_json = fthr::diagnostics::HResultFailureJson(
+        "IDXGIOutputDuplication::AcquireNextFrame", DXGI_ERROR_ACCESS_LOST);
+    Check(!runtime_json.empty() && runtime_json.front() == '{'
+              && runtime_json.back() == '}',
+          "runtime HRESULT diagnostic is an embeddable JSON object");
+    Check(runtime_json.find("IDXGIOutputDuplication::AcquireNextFrame")
+              != std::string::npos,
+          "DXGI runtime diagnostic preserves the exact failing API call");
+    Check(runtime_json.find("\"native_error_hex\":\"0x887A0026\"")
+              != std::string::npos,
+          "DXGI runtime diagnostic preserves DXGI_ERROR_ACCESS_LOST");
 }
 
 EncodedVideoConfig VideoConfig(VideoCodec codec) {

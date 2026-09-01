@@ -190,6 +190,7 @@ namespace fthr {
                 char buf[256] = {};
                 WideCharToMultiByte(CP_UTF8, 0, name.pwszVal, -1,
                     buf, sizeof(buf) - 1, nullptr, nullptr);
+                friendly_name_ = buf;
                 std::cout << "[AudioCapture] Capture device: " << buf << std::endl;
             }
             PropVariantClear(&name);
@@ -273,6 +274,14 @@ namespace fthr {
         const AudioCaptureConfig& config) {
         ring_      = ring;
         device_id_ = config.device_id;
+        requested_sample_rate_ = config.preferred_sample_rate;
+        requested_channels_ = config.preferred_channels;
+        friendly_name_ = device_id_.empty()
+            ? "Default Render Endpoint" : "Explicit Render Endpoint";
+        packet_count_.store(0, std::memory_order_relaxed);
+        discontinuity_count_.store(0, std::memory_order_relaxed);
+        first_packet_qpc_100ns_.store(0, std::memory_order_relaxed);
+        last_packet_qpc_100ns_.store(0, std::memory_order_relaxed);
 
         std::cout << "[AudioCapture] Initializing WASAPI loopback..." << std::endl;
 
@@ -496,6 +505,16 @@ namespace fthr {
                             (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0 || !data;
                         const uint64_t packet_qpc = qpc_position != 0
                             ? qpc_position : CurrentAudioTimeline100ns();
+                        packet_count_.fetch_add(1, std::memory_order_relaxed);
+                        if ((flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0) {
+                            discontinuity_count_.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        uint64_t no_packet = 0;
+                        first_packet_qpc_100ns_.compare_exchange_strong(
+                            no_packet, packet_qpc, std::memory_order_release,
+                            std::memory_order_relaxed);
+                        last_packet_qpc_100ns_.store(
+                            packet_qpc, std::memory_order_release);
                         fill_silence_until(packet_qpc);
 
                         // A packet that arrived while we were maintaining a

@@ -40,6 +40,13 @@ from core.export_profiles import (
 )
 from core.capture_card_watermark import capture_card_watermark_filters
 from core.theme_manager import ThemeManager
+from core.field_diagnostics import (
+    DiagnosticError,
+    bounded_tail,
+    emit_event,
+    playback_instance_created,
+    playback_instance_destroyed,
+)
 from pathlib import Path
 from datetime import datetime
 
@@ -2288,6 +2295,8 @@ class ShareModeDialog(QDialog):
         super().__init__(parent,
                          Qt.WindowType.FramelessWindowHint |
                          Qt.WindowType.Tool)
+        self._diagnostic_started_at = time.monotonic()
+        emit_event('export', 'requested', state='REQUESTED', kind='share')
         self._sm = settings_manager
         self._preset_manager = ExportPresetManager()
         self.setFixedSize(300, 224)
@@ -2697,9 +2706,14 @@ class ShareWindow(QDialog):
         return ffmpeg_mix_filter(self._playback_sources, states, self._master_volume)
 
     def _export_worker(self):
+        emit_event('export', 'preparing', state='PREPARING', kind='share')
         try:
             ffmpeg = get_ffmpeg_exe()
         except FFmpegUnavailable as e:
+            emit_event(
+                'export', 'init_failed', state='FAILED',
+                error=DiagnosticError.EXPORT_INIT_FAILED,
+                kind='share', detail=str(e))
             self._export_sig.emit(False, str(e))
             self.export_error.emit(
                 'FFMPEG NOT FOUND',
@@ -2718,6 +2732,10 @@ class ShareWindow(QDialog):
             # An uncaught error here kills the worker thread silently and the
             # window sits on 'EXPORTING…' forever.
             self._export_sig.emit(False, f'Cannot create {share_dir}: {e}')
+            emit_event(
+                'export', 'init_failed', state='FAILED',
+                error=DiagnosticError.EXPORT_INIT_FAILED,
+                kind='share', detail=f'{type(e).__name__}: {e}')
             return
         from datetime import datetime as _dt
         ts        = _dt.now().strftime('%H-%M-%S')
@@ -2811,6 +2829,9 @@ class ShareWindow(QDialog):
 
         self._pending_export_out = staged
         try:
+            emit_event('export', 'process_started', state='PROCESS_STARTED',
+                       kind='share', executable='ffmpeg')
+            emit_event('export', 'encoding', state='ENCODING', kind='share')
             self._proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -2819,6 +2840,7 @@ class ShareWindow(QDialog):
             _, stderr = self._proc.communicate()
             if self._cancelled:
                 discard_staged_output(staged)
+                emit_event('export', 'cancelled', state='CANCELLED', kind='share')
                 return
             if self._proc.returncode == 0:
                 if (self._export_preset is not None
@@ -2834,17 +2856,38 @@ class ShareWindow(QDialog):
                     return
                 commit_staged_output(staged, out)
                 self._pending_export_out = None
+                emit_event(
+                    'export', 'completed', state='COMPLETED', kind='share',
+                    elapsed_ms=round(
+                        (time.monotonic() - self._diagnostic_started_at) * 1000),
+                    exit_code=self._proc.returncode,
+                    output_exists=os.path.isfile(out),
+                    output_size_bytes=(os.path.getsize(out)
+                                       if os.path.isfile(out) else 0))
                 self._export_sig.emit(True, out)
             else:
                 err  = stderr.decode(errors='replace').strip()
                 last = next((l for l in reversed(err.splitlines()) if l.strip()), err[:120])
                 discard_staged_output(staged)
                 self._pending_export_out = None
+                emit_event(
+                    'export', 'process_failed', state='FAILED', kind='share',
+                    error=DiagnosticError.EXPORT_PROCESS_FAILED,
+                    elapsed_ms=round(
+                        (time.monotonic() - self._diagnostic_started_at) * 1000),
+                    exit_code=self._proc.returncode,
+                    stderr_tail=bounded_tail(err, 8192))
                 self._export_sig.emit(False, last)
         except Exception as e:
             discard_staged_output(staged)
             self._pending_export_out = None
             if not self._cancelled:
+                emit_event(
+                    'export', 'process_failed', state='FAILED', kind='share',
+                    error=DiagnosticError.EXPORT_PROCESS_FAILED,
+                    elapsed_ms=round(
+                        (time.monotonic() - self._diagnostic_started_at) * 1000),
+                    detail=f'{type(e).__name__}: {e}')
                 self._export_sig.emit(False, str(e))
 
     def _on_export_plan(self, summary: str):
@@ -2925,7 +2968,11 @@ class ShareWindow(QDialog):
 
     def closeEvent(self, event):
         self._cancelled = True
-        if self._proc and self._proc.poll() is None:
+        process_active = bool(self._proc and self._proc.poll() is None)
+        emit_event(
+            'export', 'close_requested',
+            state='CANCELLED' if process_active else 'CLOSED', kind='share')
+        if process_active:
             self._proc.terminate()
             try:
                 self._proc.wait(timeout=2)
@@ -3349,6 +3396,9 @@ class ClipViewer(QDialog):
         self._audio_tracks: tuple[tuple[str, int], ...] = ()
         self._audio_mixer: FFmpegPlaybackController | None = None
         self._audio_mixer_live = False
+        self._diagnostic_player_counted = False
+        self._playback_requested_at = 0.0
+        self._export_diagnostic_started_at = 0.0
 
         self.setWindowTitle(f'FTHR — {Path(clip_path).name}')
         self.setWindowFlags(
@@ -3430,6 +3480,12 @@ class ClipViewer(QDialog):
         self._audio_prepare_deadline.timeout.connect(
             self._on_audio_preparation_timeout)
         self._audio_prepare_deadline.start()
+
+        self._playback_stall_timer = QTimer(self)
+        self._playback_stall_timer.setSingleShot(True)
+        self._playback_stall_timer.setInterval(15000)
+        self._playback_stall_timer.timeout.connect(
+            self._on_playback_diagnostic_stall)
 
         if self._metadata_probe_pending:
             QTimer.singleShot(0, self._start_metadata_probe)
@@ -4006,6 +4062,8 @@ class ClipViewer(QDialog):
 
         # ── Media player ──────────────────────────────────────────────────────
         self.player = QMediaPlayer(self)
+        playback_instance_created()
+        self._diagnostic_player_counted = True
         self.audio_output = QAudioOutput(self)
         self.audio_output.setVolume(self._master_volume / 100.0)
         self.player.setAudioOutput(self.audio_output)
@@ -4050,9 +4108,14 @@ class ClipViewer(QDialog):
         if self._closing:
             return
         try:
+            emit_event('playback', 'media_requested', state='PREPARING')
             self.player.setSource(QUrl.fromLocalFile(self.clip_path))
         except Exception as e:
             print(f'[ClipViewer] setSource failed: {e}')
+            emit_event(
+                'playback', 'media_request_failed', state='FAILED',
+                error=DiagnosticError.PLAYBACK_INIT_FAILED,
+                detail=f'{type(e).__name__}: {e}')
 
     def _on_media_status_changed(self, status):
         if self._closing:
@@ -4062,18 +4125,31 @@ class ClipViewer(QDialog):
                 QMediaPlayer.MediaStatus.BufferedMedia,
                 QMediaPlayer.MediaStatus.BufferingMedia):
             self._media_ready = True
+            emit_event('playback', 'decoder_initialized', state='READY',
+                       media_status=getattr(status, 'name', str(status)))
             self._update_playback_readiness()
         elif status == QMediaPlayer.MediaStatus.StalledMedia:
             self._playback_status_lbl.setText('BUFFERING…')
+            emit_event(
+                'playback', 'backend_stalled', state='STALLED',
+                error=DiagnosticError.PLAYBACK_STALLED)
         elif status == QMediaPlayer.MediaStatus.InvalidMedia:
             self._play_when_ready = False
             self._playback_status_lbl.setText('CLIP UNAVAILABLE')
+            emit_event(
+                'playback', 'decoder_failed', state='FAILED',
+                error=DiagnosticError.PLAYBACK_DECODER_FAILED)
+        elif status == QMediaPlayer.MediaStatus.EndOfMedia:
+            emit_event('playback', 'end_of_media', state='STOPPED')
 
     def _on_audio_preparation_timeout(self):
         if self._closing or self._audio_preparation_ready:
             return
         self._audio_prepare_timed_out = True
         self._audio_preparation_ready = True
+        emit_event(
+            'playback', 'audio_preparation_timeout', state='DEGRADED',
+            error=DiagnosticError.AUDIO_OUTPUT_INIT_FAILED)
         self._update_playback_readiness()
 
     def _update_playback_readiness(self):
@@ -4085,12 +4161,29 @@ class ClipViewer(QDialog):
             self._playback_status_lbl.setText('PREPARING CLIP…')
             return
         self._audio_prepare_deadline.stop()
+        self._playback_stall_timer.stop()
         self._playback_status_lbl.setText('READY')
+        emit_event(
+            'playback', 'player_ready', state='READY',
+            elapsed_ms=(round((time.monotonic() - self._playback_requested_at) * 1000)
+                        if self._playback_requested_at else None),
+            audio_prepare_timed_out=self._audio_prepare_timed_out)
         self._schedule_timeline_thumbnails()
         QTimer.singleShot(900, self._clear_ready_status)
         if self._play_when_ready:
             self._play_when_ready = False
             QTimer.singleShot(0, self._toggle_play)
+
+    def _on_playback_diagnostic_stall(self):
+        if self._closing or self._playback_ready or not self._play_when_ready:
+            return
+        emit_event(
+            'playback', 'readiness_stalled', state='STALLED',
+            error=DiagnosticError.PLAYBACK_STALLED,
+            elapsed_ms=round(
+                (time.monotonic() - self._playback_requested_at) * 1000),
+            media_ready=self._media_ready,
+            audio_ready=self._audio_preparation_ready)
 
     def _clear_ready_status(self):
         if (not self._closing and self._playback_ready
@@ -4871,6 +4964,11 @@ class ClipViewer(QDialog):
                 return
             if want_play and not self._playback_ready:
                 self._play_when_ready = True
+                self._playback_requested_at = time.monotonic()
+                self._playback_stall_timer.start()
+                emit_event('playback', 'play_requested', state='PLAY_QUEUED',
+                           media_ready=self._media_ready,
+                           audio_ready=self._audio_preparation_ready)
                 self._playback_status_lbl.setText('PREPARING · PLAY QUEUED')
                 self.play_btn.blockSignals(True)
                 self.play_btn.setChecked(True)
@@ -4879,6 +4977,8 @@ class ClipViewer(QDialog):
                 return
             try:
                 if want_play:
+                    self._playback_requested_at = time.monotonic()
+                    emit_event('playback', 'play_requested', state='REQUESTED')
                     self._timeline_prepare_timer.stop()
                     self.trim_slider.cancel_thumbnail_loading()
                     position = self.player.position()
@@ -4900,6 +5000,7 @@ class ClipViewer(QDialog):
                             self.player.setPosition(next_range[0])
                     self.player.play()
                 else:
+                    emit_event('playback', 'pause_requested', state='REQUESTED')
                     self._resume_anchor_ms = None
                     self._last_stable_position_ms = max(
                         0, int(self.player.position()))
@@ -4939,6 +5040,12 @@ class ClipViewer(QDialog):
         # Keep the button visually consistent with whatever the player ends up
         # doing — including auto-stop at end of clip.
         if state == QMediaPlayer.PlaybackState.PlayingState:
+            self._playback_stall_timer.stop()
+            emit_event(
+                'playback', 'playing', state='PLAYING',
+                elapsed_ms=(round(
+                    (time.monotonic() - self._playback_requested_at) * 1000)
+                    if self._playback_requested_at else None))
             self._timeline_prepare_timer.stop()
             self.trim_slider.cancel_thumbnail_loading()
             if not self._ph_timer.isActive():
@@ -4952,6 +5059,12 @@ class ClipViewer(QDialog):
             self.play_btn.blockSignals(False)
             self._set_playback_button_visual(True)
         else:
+            emit_event(
+                'playback',
+                ('paused' if state == QMediaPlayer.PlaybackState.PausedState
+                 else 'stopped'),
+                state=('PAUSED' if state == QMediaPlayer.PlaybackState.PausedState
+                       else 'STOPPED'))
             self._ph_timer.stop()
             self._update_playhead()
             if self._audio_mixer is not None:
@@ -5025,6 +5138,7 @@ class ClipViewer(QDialog):
             return
         target = self._pending_seek_ms
         self._pending_seek_ms = None
+        emit_event('playback', 'seek', target_ms=target)
         if self._audio_mixer is not None:
             self._audio_mixer.seek(target)
         try:
@@ -5044,6 +5158,10 @@ class ClipViewer(QDialog):
         except Exception:
             err_str = '(unknown)'
         print(f'[ClipViewer] media player error: {err_str}')
+        emit_event(
+            'playback', 'backend_error', state='FAILED',
+            error=DiagnosticError.PLAYBACK_DECODER_FAILED,
+            detail=err_str)
         if not self._closing:
             self._play_when_ready = False
             self._playback_status_lbl.setText('PLAYBACK ERROR')
@@ -5152,10 +5270,19 @@ class ClipViewer(QDialog):
             return
         if error:
             print(f'[ClipViewer] audio source probe failed: {error}')
+            emit_event(
+                'playback', 'audio_probe_failed', state='DEGRADED',
+                error=DiagnosticError.AUDIO_OUTPUT_INIT_FAILED,
+                detail=error)
             self._audio_preparation_ready = True
             self._update_playback_readiness()
             return
         self._playback_sources = tuple(sources)
+        emit_event(
+            'playback', 'audio_sources_discovered',
+            source_count=len(self._playback_sources),
+            available_source_count=sum(
+                1 for source in self._playback_sources if source.available))
         self._audio_tracks = tuple(
             (source.source_id, source.audio_index)
             for source in self._playback_sources
@@ -5179,6 +5306,8 @@ class ClipViewer(QDialog):
                 self._native_audio_source_id = (
                     available[0].source_id if available[0].editable else None)
                 self._audio_preparation_ready = True
+                emit_event('playback', 'audio_initialized', state='READY',
+                           backend='qt-container')
                 self._apply_container_audio_volume()
                 self._update_playback_readiness()
         elif available:
@@ -5192,6 +5321,8 @@ class ClipViewer(QDialog):
         else:
             self._native_audio_source_id = None
             self._audio_preparation_ready = True
+            emit_event('playback', 'audio_initialized', state='READY',
+                       backend='qt-container', source_count=0)
             self._apply_container_audio_volume()
             self._update_playback_readiness()
         self._refresh_audio_mix_panel()
@@ -5223,6 +5354,10 @@ class ClipViewer(QDialog):
             self._audio_mixer.start()
         except PlaybackError as mixer_error:
             print(f'[ClipViewer] custom audio mixer unavailable: {mixer_error}')
+            emit_event(
+                'playback', 'audio_init_failed', state='DEGRADED',
+                error=DiagnosticError.AUDIO_OUTPUT_INIT_FAILED,
+                backend='ffmpeg-qtaudiosink', detail=str(mixer_error))
             self._audio_mixer = None
             self._audio_preparation_ready = True
             self._apply_container_audio_volume()
@@ -5233,6 +5368,8 @@ class ClipViewer(QDialog):
             return
         self._audio_mixer_live = ready
         if ready and self._audio_mixer is not None:
+            emit_event('playback', 'audio_initialized', state='READY',
+                       backend='ffmpeg-qtaudiosink')
             # Switch only after the custom path has proven it can decode. This
             # prevents a missed/failed readiness signal from stranding Qt at 0.
             if (self.player.playbackState()
@@ -5244,12 +5381,20 @@ class ClipViewer(QDialog):
             self._refresh_audio_mix_panel()
             return
         print(f'[ClipViewer] custom audio mixer failed to start: {detail}')
+        emit_event(
+            'playback', 'audio_init_failed', state='DEGRADED',
+            error=DiagnosticError.AUDIO_OUTPUT_INIT_FAILED,
+            backend='ffmpeg-qtaudiosink', detail=detail)
         self._fall_back_to_container_audio()
 
     def _on_audio_mixer_failed(self, detail: str):
         if self._closing:
             return
         print(f'[ClipViewer] custom audio mixer error: {detail}')
+        emit_event(
+            'playback', 'audio_failed', state='FAILED',
+            error=DiagnosticError.AUDIO_OUTPUT_INIT_FAILED,
+            backend='ffmpeg-qtaudiosink', detail=detail)
         self._fall_back_to_container_audio()
 
     def _fall_back_to_container_audio(self):
@@ -5530,6 +5675,8 @@ class ClipViewer(QDialog):
         ))
 
     def _export_clip(self):
+        self._export_diagnostic_started_at = time.monotonic()
+        emit_event('export', 'requested', state='REQUESTED')
         segments = self._kept_segments_seconds()
         if not segments:
             self.export_error.emit(
@@ -5550,6 +5697,9 @@ class ClipViewer(QDialog):
 
         self.export_btn.setText('EXPORTING...')
         self.export_btn.setEnabled(False)
+        emit_event('export', 'preparing', state='PREPARING',
+                   segment_count=len(segments),
+                   kept_duration_seconds=round(kept_duration, 3))
 
         export_dir = clips_directory_from(self.sm) / 'Exported'
         try:
@@ -5564,6 +5714,10 @@ class ClipViewer(QDialog):
                 f'Cannot create export folder: {e}',
                 'error',
             )
+            emit_event(
+                'export', 'init_failed', state='FAILED',
+                error=DiagnosticError.EXPORT_INIT_FAILED,
+                detail=f'{type(e).__name__}: {e}')
             return
         from datetime import datetime as _dt
         ts = _dt.now().strftime('%H-%M-%S')
@@ -5771,9 +5925,15 @@ class ClipViewer(QDialog):
                        segments: list[tuple[float, float]] | None = None,
                        effects: dict | None = None,
                        stretch_ratio: float = 1.0):
+        diagnostic_started_at = getattr(
+            self, '_export_diagnostic_started_at', time.monotonic())
         try:
             ffmpeg = get_ffmpeg_exe()
         except FFmpegUnavailable as e:
+            emit_event(
+                'export', 'init_failed', state='FAILED',
+                error=DiagnosticError.EXPORT_INIT_FAILED,
+                detail=str(e))
             self._export_done.emit(False, str(e))
             self.export_error.emit(
                 'FFMPEG NOT FOUND',
@@ -5799,20 +5959,64 @@ class ClipViewer(QDialog):
         )
 
         try:
-            _run_export_process(cmd, check=True, capture_output=True,
-                                timeout=600, **_NO_WINDOW)
+            emit_event('export', 'process_started', state='PROCESS_STARTED',
+                       executable='ffmpeg')
+            emit_event('export', 'encoding', state='ENCODING')
+            completed = _run_export_process(
+                cmd, check=True, capture_output=True, timeout=600, **_NO_WINDOW)
+            exit_code = getattr(completed, 'returncode', 0)
+            emit_event('export', 'finalizing', state='FINALIZING',
+                       exit_code=exit_code)
             commit_staged_output(staged, out)
+            output_size = os.path.getsize(out) if os.path.isfile(out) else 0
+            emit_event(
+                'export', 'completed', state='COMPLETED',
+                elapsed_ms=round(
+                    (time.monotonic() - diagnostic_started_at) * 1000),
+                exit_code=exit_code,
+                output_exists=os.path.isfile(out),
+                output_size_bytes=output_size)
             self._export_done.emit(True, out)
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as error:
             discard_staged_output(staged)
+            emit_event(
+                'export', 'stalled', state='FAILED',
+                error=DiagnosticError.EXPORT_STALLED,
+                elapsed_ms=round(
+                    (time.monotonic() - diagnostic_started_at) * 1000),
+                timeout_seconds=error.timeout,
+                stderr_tail=bounded_tail(
+                    error.stderr.decode(errors='replace')
+                    if isinstance(error.stderr, bytes) else str(error.stderr or ''),
+                    8192))
             self._export_done.emit(False, 'Export timed out after 10 minutes')
         except subprocess.CalledProcessError as e:
             discard_staged_output(staged)
-            err  = e.stderr.decode(errors='replace').strip()
+            err = (e.stderr.decode(errors='replace')
+                   if isinstance(e.stderr, bytes) else str(e.stderr or '')).strip()
             last = next((l for l in reversed(err.splitlines()) if l.strip()), err[:120])
+            emit_event(
+                'export', 'process_failed', state='FAILED',
+                error=DiagnosticError.EXPORT_PROCESS_FAILED,
+                elapsed_ms=round(
+                    (time.monotonic() - diagnostic_started_at) * 1000),
+                exit_code=e.returncode,
+                stderr_tail=bounded_tail(err, 8192),
+                output_exists=os.path.isfile(out),
+                output_size_bytes=(os.path.getsize(out)
+                                   if os.path.isfile(out) else 0))
             self._export_done.emit(False, last)
         except Exception as e:
             discard_staged_output(staged)
+            emit_event(
+                'export', 'process_failed', state='FAILED',
+                error=DiagnosticError.EXPORT_PROCESS_FAILED,
+                elapsed_ms=round(
+                    (time.monotonic() - diagnostic_started_at) * 1000),
+                detail=f'{type(e).__name__}: {e}',
+                output_exists=os.path.isfile(out),
+                output_size_bytes=(os.path.getsize(out)
+                                   if os.path.isfile(out) else 0))
             self._export_done.emit(False, str(e))
 
     def _on_export_done(self, success: bool, msg: str):
@@ -5995,6 +6199,7 @@ class ClipViewer(QDialog):
         if self._teardown_complete:
             return
         self._teardown_complete = True
+        emit_event('playback', 'close_requested', state='CLOSING')
         self._closing = True
         self._prepare_cancel.set()
         self._play_when_ready = False
@@ -6005,6 +6210,12 @@ class ClipViewer(QDialog):
         try:
             self._audio_prepare_deadline.stop()
         except Exception:
+            pass
+        try:
+            self._playback_stall_timer.stop()
+        except Exception:
+            # A partially constructed viewer may close before the diagnostic
+            # timer exists; the remaining teardown must still run.
             pass
         try:
             self.trim_slider.cancel_thumbnail_loading()
@@ -6072,6 +6283,9 @@ class ClipViewer(QDialog):
             self.audio_output.setMuted(True)
         except (RuntimeError, TypeError):
             pass
+        if self._diagnostic_player_counted:
+            self._diagnostic_player_counted = False
+            playback_instance_destroyed()
 
     # =========================================================================
     # Window drag / native resize (matches MainWindow)

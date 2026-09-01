@@ -201,6 +201,9 @@ struct WindowsMicrophoneAudioProvider::Impl {
     std::atomic<bool> failed{false};
     std::atomic<uint64_t> timeline_origin_100ns{0};
     std::atomic<uint64_t> last_packet_qpc_100ns{0};
+    std::atomic<uint64_t> packet_count{0};
+    std::atomic<uint64_t> discontinuity_count{0};
+    std::atomic<uint64_t> first_packet_qpc_100ns{0};
     mutable std::mutex state_mutex;
     std::string error;
     WindowsMicrophoneRuntimeInfo info;
@@ -339,6 +342,10 @@ struct WindowsMicrophoneAudioProvider::Impl {
                           uint32_t input_frames, uint64_t qpc_100ns, bool silent) {
         if (!session || input_frames == 0) return true;
         if (qpc_100ns == 0) qpc_100ns = CurrentAudioTimeline100ns();
+        uint64_t no_packet = 0;
+        first_packet_qpc_100ns.compare_exchange_strong(
+            no_packet, qpc_100ns, std::memory_order_release,
+            std::memory_order_relaxed);
         if (!EnsureEncoder(qpc_100ns)) return false;
         const auto adjustment = drift.Observe(qpc_100ns, submitted_frames);
         if (adjustment.sample_delta != 0 && adjustment.compensation_distance_samples > 0
@@ -407,6 +414,10 @@ struct WindowsMicrophoneAudioProvider::Impl {
                 hr = session->capture_client->GetBuffer(&data, &frames, &flags,
                     &device_position, &qpc_100ns);
                 if (FAILED(hr)) return hr;
+                packet_count.fetch_add(1, std::memory_order_relaxed);
+                if ((flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0) {
+                    discontinuity_count.fetch_add(1, std::memory_order_relaxed);
+                }
                 const bool converted = ConvertAndSubmit(session, data, frames, qpc_100ns,
                     (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0);
                 const HRESULT release = session->capture_client->ReleaseBuffer(frames);
@@ -487,6 +498,13 @@ WindowsMicrophoneRuntimeInfo WindowsMicrophoneAudioProvider::runtime_info() cons
     std::lock_guard<std::mutex> lock(impl_->state_mutex);
     WindowsMicrophoneRuntimeInfo info = impl_->info;
     info.failed = impl_->failed.load(std::memory_order_acquire);
+    info.packet_count = impl_->packet_count.load(std::memory_order_relaxed);
+    info.discontinuity_count = impl_->discontinuity_count.load(
+        std::memory_order_relaxed);
+    info.first_packet_qpc_100ns = impl_->first_packet_qpc_100ns.load(
+        std::memory_order_acquire);
+    info.last_packet_qpc_100ns = impl_->last_packet_qpc_100ns.load(
+        std::memory_order_acquire);
     return info;
 }
 

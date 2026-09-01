@@ -111,7 +111,7 @@ inline std::string FormatWin32Failure(const char* api_call, DWORD error) {
     return text.str();
 }
 
-inline std::string FormatHResultFailure(const char* api_call, HRESULT result) {
+inline std::string HResultFailureJson(const char* api_call, HRESULT result) {
     const uint32_t raw = static_cast<uint32_t>(result);
     const bool from_win32 = HRESULT_FACILITY(result) == FACILITY_WIN32;
     const DWORD win32_error = from_win32 ? HRESULT_CODE(result) : 0;
@@ -120,7 +120,7 @@ inline std::string FormatHResultFailure(const char* api_call, HRESULT result) {
     const std::string message = WindowsSystemMessage(
         from_win32 ? win32_error : raw);
     std::ostringstream text;
-    text << "native_failure={\"api_call\":\""
+    text << "{\"api_call\":\""
          << JsonEscape(api_call ? api_call : "unknown")
          << "\",\"error_domain\":\"hresult\""
          << ",\"native_error_signed\":" << static_cast<int32_t>(raw)
@@ -137,6 +137,10 @@ inline std::string FormatHResultFailure(const char* api_call, HRESULT result) {
     else text << "null";
     text << '}';
     return text.str();
+}
+
+inline std::string FormatHResultFailure(const char* api_call, HRESULT result) {
+    return "native_failure=" + HResultFailureJson(api_call, result);
 }
 
 } // namespace fthr::diagnostics

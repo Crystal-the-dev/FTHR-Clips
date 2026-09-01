@@ -51,6 +51,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <iostream>
 #include <Windows.h>
 
@@ -223,6 +224,26 @@ int main(int argc, char* argv[]) {
         return ListMicrophones();
     }
     std::cout << "FTHR Capture Engine starting..." << std::endl;
+    char diagnostic_session[64] = {};
+    const DWORD diagnostic_length = GetEnvironmentVariableA(
+        "FTHR_DIAGNOSTIC_SESSION_ID", diagnostic_session,
+        static_cast<DWORD>(sizeof(diagnostic_session)));
+    std::string safe_session;
+    if (diagnostic_length > 0 && diagnostic_length < sizeof(diagnostic_session)) {
+        for (DWORD index = 0; index < diagnostic_length; ++index) {
+            const char character = diagnostic_session[index];
+            if ((character >= '0' && character <= '9')
+                || (character >= 'a' && character <= 'f')
+                || (character >= 'A' && character <= 'F')
+                || character == '-') {
+                safe_session.push_back(character);
+            }
+        }
+    }
+    std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"engine\","
+              << "\"event\":\"session_correlated\",\"session_id\":\""
+              << (safe_session.empty() ? "unavailable:not_provided" : safe_session)
+              << "\"}" << std::endl;
 
     // ------------------------------------------------------------------
     // 1. Parse command-line arguments into CaptureConfig

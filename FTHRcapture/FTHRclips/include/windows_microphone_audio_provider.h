@@ -57,6 +57,10 @@ struct WindowsMicrophoneRuntimeInfo {
     AudioSourceFormat input_format;
     bool failed = false;
     int64_t max_observed_drift_samples = 0;
+    uint64_t packet_count = 0;
+    uint64_t discontinuity_count = 0;
+    uint64_t first_packet_qpc_100ns = 0;
+    uint64_t last_packet_qpc_100ns = 0;
 };
 
 class WindowsMicrophoneAudioProvider {

@@ -16,6 +16,7 @@ import os
 import shutil
 import tempfile
 import threading
+from dataclasses import asdict
 from pathlib import Path
 from datetime import datetime
 _NO_WINDOW = {'creationflags': subprocess.CREATE_NO_WINDOW} if sys.platform == 'win32' else {}
@@ -151,6 +152,16 @@ from core.capture_health import (
 )
 from core.error_codes import APP_FAILURE_CODE_BY_TITLE, format_error_title
 from core.diagnostics import get_logger
+from core.field_diagnostics import (
+    DiagnosticError,
+    EngineLogCapture,
+    build_adapter_chain,
+    emit_event,
+    end_diagnostic_session,
+    get_diagnostic_session,
+    qt_display_snapshot,
+    start_diagnostic_session,
+)
 from core.engine_startup_diagnostics import (
     EngineLaunchContext,
     extract_startup_failure,
@@ -3156,6 +3167,12 @@ class MainWindow(QMainWindow):
         self._screenshot_capture_paths = None
         self._screenshot_save_worker = None
         self._lifecycle_log = get_logger('lifecycle')
+        self._diagnostics = get_diagnostic_session()
+        self._last_capture_health_event_at = 0.0
+        self._last_capture_health_error = None
+        self._save_diagnostic_started_at = 0.0
+        self._clip_diagnostic_started_by_path: dict[str, float] = {}
+        self._diagnostic_engine_start_count = 0
 
         # -- Frameless window --
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
@@ -3555,6 +3572,41 @@ class MainWindow(QMainWindow):
         if not enabled and hasattr(self, 'error_bar'):
             self.error_bar.clear()
 
+    def _export_diagnostic_report(self) -> None:
+        """Let the user explicitly create a bounded offline support bundle."""
+        session = self._diagnostics or get_diagnostic_session()
+        if session is None:
+            FthrMessageDialog.warning(
+                self, 'Diagnostic report unavailable',
+                'This FTHR session did not initialize diagnostics. Restart FTHR '
+                'and reproduce the problem before exporting a report.')
+            return
+        timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+        suggested = (Path.home() / 'Desktop' /
+                     f'FTHR-Clips-Diagnostics-{timestamp}-{session.short_id}.zip')
+        output, _filter = QFileDialog.getSaveFileName(
+            self, 'Export Diagnostic Report', str(suggested),
+            'ZIP archive (*.zip)')
+        if not output:
+            emit_event('diagnostics', 'report_export_cancelled', state='CANCELLED')
+            return
+        try:
+            exported = session.export_zip(
+                Path(output), displays=qt_display_snapshot(QApplication.instance()))
+        except Exception as error:
+            emit_event(
+                'diagnostics', 'report_export_failed', state='FAILED',
+                detail=f'{type(error).__name__}: {error}')
+            FthrMessageDialog.warning(
+                self, 'Diagnostic export failed',
+                'FTHR could not create the report. Choose another writable '
+                f'folder and try again.\n\n{type(error).__name__}: {error}')
+            return
+        FthrMessageDialog.information(
+            self, 'Diagnostic report exported',
+            f'The privacy-redacted report was saved to:\n\n{exported}\n\n'
+            'Send this ZIP with your alpha bug report.')
+
     def _current_capture_source_label(self) -> str:
         if self.settings_manager.get('capture_mode', 'desktop') != 'window':
             return 'Desktop'
@@ -3843,6 +3895,8 @@ class MainWindow(QMainWindow):
             self._on_upload_connection_failed)
         self._settings_page_widget.close_to_tray_changed.connect(
             self._on_close_to_tray_changed)
+        self._settings_page_widget.diagnostic_export_requested.connect(
+            self._export_diagnostic_report)
         self._settings_page_widget.encoder_config_changed.connect(
             self._on_encoder_config_changed)
         self._settings_page_widget.audio_capture_changed.connect(
@@ -4957,6 +5011,35 @@ class MainWindow(QMainWindow):
     # Engine lifecycle
     # =======================================================================
 
+    @staticmethod
+    def _diagnostic_capture_config(config: CaptureConfig) -> dict:
+        """Serialize requested/actual settings without inventing native facts."""
+        values = asdict(config)
+        return {
+            'monitor': values['monitor'] or 'unavailable:not_configured',
+            'capture_backend': 'auto',
+            'codec': values['codec'],
+            'capture_resolution': {
+                'width': values['width'], 'height': values['height'],
+            },
+            'output_resolution': {
+                'width': values['width'], 'height': values['height'],
+            },
+            'fps': values['fps'],
+            'bitrate_kbps': values['bitrate_kbps'],
+            'replay_duration_seconds': values['buffer_seconds'],
+            'normal_clip_seconds': values['normal_clip_seconds'],
+            'extended_clip_seconds': values['extended_clip_seconds'],
+            'encoder_backend': values['encoder'],
+            'encoder_adapter': 'auto',
+            'audio_enabled': values['audio_enabled'],
+            'separate_audio_enabled': values['separate_audio_enabled'],
+            'microphone_endpoint': (
+                values['microphone_endpoint_id'] or 'system-default'),
+            'scaling': values['scaling'],
+            'crop_enabled': values['crop_enabled'],
+        }
+
     def connect_to_engine(self) -> bool:
         max_retries = 10
         for attempt in range(1, max_retries + 1):
@@ -4977,14 +5060,39 @@ class MainWindow(QMainWindow):
         return False
 
     def start_engine(self) -> bool:
+        self._diagnostic_engine_start_count += 1
+        capture_restart_count = max(
+            0, self._diagnostic_engine_start_count - 1)
         launch_config = self._requested_capture_config()
         self._capture_config.request(launch_config)
         self._capture_config.begin_apply()
+        requested_diagnostics = self._diagnostic_capture_config(launch_config)
+        if self._diagnostics is not None:
+            self._diagnostics.update_summary(
+                'requested_configuration', requested_diagnostics)
+            self._diagnostics.update_summary(
+                'adapter_topology',
+                build_adapter_chain(
+                    None, unavailable_reason='engine_process_not_started'))
+        emit_event('engine', 'start_requested', state='REQUESTED',
+                   requested_configuration=requested_diagnostics,
+                   engine_process_start_count=self._diagnostic_engine_start_count,
+                   capture_restart_count=capture_restart_count)
+        if self._diagnostics is not None:
+            self._diagnostics.merge_summary(
+                'health',
+                engine_process_start_count=self._diagnostic_engine_start_count,
+                capture_restart_count=capture_restart_count)
         if not self.engine_path or not self.engine_path.exists():
             print("Engine executable not found.")
             self._set_status('NO ENGINE', status_warning_qss())
             QTimer.singleShot(500, self._warn_no_engine)
             self._capture_config.fail('engine executable not found')
+            emit_event(
+                'engine', 'start_failed', state='FAILED',
+                error=DiagnosticError.ENGINE_START_FAILED,
+                api_call='engine_executable_discovery',
+                detail='engine executable not found')
             self._restart_pending = False
             self._set_capture_apply_state(False)
             return False
@@ -5067,11 +5175,23 @@ class MainWindow(QMainWindow):
             self._capture_health.reset(preserve_recovery_budget=True)
             popen_options = dict(_NO_WINDOW)
             self._close_engine_startup_output()
-            self._engine_startup_output = tempfile.TemporaryFile(
-                mode='w+', encoding='utf-8', errors='replace')
+            engine_log_path = (
+                self._diagnostics.engine_log_path if self._diagnostics is not None
+                else Path.home() / '.fthr' / 'logs' / 'engine.log')
+            self._engine_startup_output = EngineLogCapture(
+                engine_log_path, self._diagnostics)
+            engine_environment = os.environ.copy()
+            if self._diagnostics is not None:
+                engine_environment['FTHR_DIAGNOSTIC_SESSION_ID'] = (
+                    self._diagnostics.session_id)
             popen_options.update(
-                stdout=self._engine_startup_output,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                bufsize=1,
+                env=engine_environment,
             )
             try:
                 self.engine_process = subprocess.Popen(
@@ -5092,6 +5212,7 @@ class MainWindow(QMainWindow):
                      audio_mode_arg],
                     **popen_options
                 )
+                self._engine_startup_output.attach(self.engine_process.stdout)
             except OSError as error:
                 failure = format_engine_launch_failure(
                     error,
@@ -5106,6 +5227,49 @@ class MainWindow(QMainWindow):
                               else 'subprocess.Popen'),
                 )
                 print(f'FTHR_STARTUP_ERROR: {failure.code}: {failure.detail}')
+                native_value = getattr(error, 'winerror', None)
+                if native_value is None:
+                    native_value = getattr(error, 'errno', None)
+                native_signed = (int(native_value)
+                                 if native_value is not None else None)
+                native_unsigned = (native_signed & 0xFFFFFFFF
+                                   if native_signed is not None else None)
+                emit_event(
+                    'engine', 'start_failed', state='FAILED',
+                    error=DiagnosticError.ENGINE_START_FAILED,
+                    compatibility_error='Error 001',
+                    native_failure={
+                        'api_call': ('CreateProcessW' if sys.platform == 'win32'
+                                     else 'subprocess.Popen'),
+                        'native_error_signed': native_signed,
+                        'native_error_unsigned': native_unsigned,
+                        'native_error_hex': (
+                            f'0x{native_unsigned:08X}'
+                            if native_unsigned is not None else None),
+                        'win32_error_decimal': (
+                            native_signed if getattr(error, 'winerror', None)
+                            is not None else None),
+                        'symbolic_error': (
+                            'ERROR_SYSTEM_INTEGRITY_POLICY_VIOLATION'
+                            if getattr(error, 'winerror', None) == 4551 else None),
+                        'system_message': str(error),
+                    },
+                    startup_context={
+                        'selected_monitor_id': (
+                            engine_monitor_arg or 'unavailable:not_configured'),
+                        'dxgi_output': 'unavailable:engine_process_not_started',
+                        'owning_adapter_luid': (
+                            'unavailable:engine_process_not_started'),
+                        'capture_device_adapter_luid': (
+                            'unavailable:engine_process_not_started'),
+                        'encoder_adapter_luid': (
+                            'unavailable:engine_process_not_started'),
+                        'capture_backend': (
+                            'unavailable:engine_process_not_started'),
+                        'encoder_backend': (
+                            'unavailable:engine_process_not_started'),
+                        'codec': launch_config.codec,
+                    })
                 self.stop_engine()
                 self._set_status('ERROR', status_warning_qss())
                 self.push_error(
@@ -5139,7 +5303,6 @@ class MainWindow(QMainWindow):
                         startup_warnings = extract_startup_warnings(startup_output)
                         if startup_output.strip():
                             print(startup_output.rstrip())
-                        self._close_engine_startup_output()
                         def _on_connected(
                                 startup_warnings=startup_warnings):
                             # Connection proves IPC only. Promote requested to
@@ -5156,6 +5319,9 @@ class MainWindow(QMainWindow):
                                 QTimer.singleShot(
                                     0, self._settings_page_widget._populate_mic_devices)
                             QTimer.singleShot(2000, self._check_hardware_encoding_status)
+                            emit_event(
+                                'engine', 'handshake_completed', state='CONNECTED',
+                                capture_generation=_my_gen)
                             for warning in startup_warnings:
                                 warning_action = (
                                     ('EDIT GAME CROP', self._toggle_game_detection)
@@ -5183,6 +5349,15 @@ class MainWindow(QMainWindow):
                 failure = extract_startup_failure(startup_output)
                 print(f"Engine did not respond — {failure.code}: "
                       f"{failure.detail}")
+                emit_event(
+                    'engine', 'handshake_timeout', state='FAILED',
+                    error=DiagnosticError.ENGINE_HANDSHAKE_TIMEOUT,
+                    compatibility_error='Error 001',
+                    startup_failure={
+                        'code': failure.code,
+                        'title': failure.title,
+                        'detail': failure.detail,
+                    })
                 def _on_failed():
                     self.stop_engine()
                     self._capture_config.fail(failure.detail)
@@ -5205,6 +5380,11 @@ class MainWindow(QMainWindow):
             return True
         except Exception as e:
             print(f"Engine start error: {e}")
+            emit_event(
+                'engine', 'start_failed', state='FAILED',
+                error=DiagnosticError.ENGINE_START_FAILED,
+                compatibility_error='Error 001',
+                detail=f'{type(e).__name__}: {e}')
             self.stop_engine()
             self._set_status('ERROR', status_warning_qss())
             self.push_error(
@@ -5219,22 +5399,20 @@ class MainWindow(QMainWindow):
             return False
 
     def _read_engine_startup_output(self) -> str:
-        stream = self._engine_startup_output
-        if stream is None:
+        capture = self._engine_startup_output
+        if capture is None:
             return ''
         try:
-            stream.flush()
-            stream.seek(0)
-            return stream.read()
-        except (OSError, ValueError):
+            return capture.startup_text()
+        except (OSError, ValueError, AttributeError):
             return ''
 
     def _close_engine_startup_output(self):
-        stream = self._engine_startup_output
+        capture = self._engine_startup_output
         self._engine_startup_output = None
-        if stream is not None:
+        if capture is not None:
             try:
-                stream.close()
+                capture.close()
             except OSError:
                 # The diagnostic stream may already be closed by shutdown.
                 pass
@@ -5261,6 +5439,9 @@ class MainWindow(QMainWindow):
                         print('[Lifecycle] Engine could not be reaped before exit')
             print('[Lifecycle] EngineStopped '
                   f'graceful={graceful_requested} code={process.returncode}')
+            emit_event(
+                'engine', 'stopped', state='STOPPED',
+                graceful=graceful_requested, exit_code=process.returncode)
             self.engine_process = None
         if self.bridge:
             self.bridge.shutdown()
@@ -5955,6 +6136,11 @@ class MainWindow(QMainWindow):
             return
 
         print(f"Saving clip: {output_path.name}  ({duration_seconds}s)")
+        self._save_diagnostic_started_at = time.monotonic()
+        emit_event(
+            'clip_save', 'save_requested', state='REQUESTED',
+            requested_duration_seconds=duration_seconds,
+            capture_mode=capture_mode)
 
         # Capture the mic-window timestamp before requesting the save so the
         # post-mux thread can pull the matching mic segment from the ring.
@@ -5998,6 +6184,12 @@ class MainWindow(QMainWindow):
             self._pump_save_responses()
 
             if not self.bridge.save_clip(str(output_path), duration_seconds):
+                emit_event(
+                    'clip_save', 'command_rejected', state='FAILED',
+                    error=DiagnosticError.CLIP_SAVE_FAILED,
+                    elapsed_ms=round(
+                        (time.monotonic() - self._save_diagnostic_started_at) * 1000),
+                    detail='capture engine did not accept the save command')
                 self.capture_card.show_error()
                 self.push_error(
                     'CLIP SAVE FAILED',
@@ -6026,12 +6218,26 @@ class MainWindow(QMainWindow):
                       'the operation already in flight')
                 return
 
+            self._clip_diagnostic_started_by_path[
+                os.path.normcase(os.path.abspath(str(output_path)))] = (
+                    self._save_diagnostic_started_at)
+
             self._show_clip_captured_feedback(duration_seconds)
+            emit_event(
+                'clip_save', 'command_submitted', state='SUBMITTED',
+                elapsed_ms=round(
+                    (time.monotonic() - self._save_diagnostic_started_at) * 1000))
             self._set_status('SAVING', status_idle_qss())
             self._save_poll_timer.start()
 
         except Exception as e:
             print(f"Save error: {e}")
+            emit_event(
+                'clip_save', 'save_failed', state='FAILED',
+                error=DiagnosticError.CLIP_SAVE_FAILED,
+                elapsed_ms=round(
+                    (time.monotonic() - self._save_diagnostic_started_at) * 1000),
+                detail=f'{type(e).__name__}: {e}')
             self.capture_card.show_error()
             self.push_error(
                 'CLIP SAVE FAILED',
@@ -6116,6 +6322,10 @@ class MainWindow(QMainWindow):
         if outcome.kind is OutcomeKind.ACCEPTED:
             # Engine has the job. Still not saved — no grid, no upload.
             self._set_status('SAVING', status_idle_qss())
+            emit_event(
+                'clip_save', 'engine_accepted', state='PROCESSING',
+                operation_id=op.op_id,
+                elapsed_ms=round(op.ack_latency_ms or 0))
             return
 
         if outcome.kind is OutcomeKind.TIMEOUT_NOTICE:
@@ -6123,9 +6333,20 @@ class MainWindow(QMainWindow):
             # watching, and do not emit a failure the late result would then
             # contradict.
             self._set_status('SAVE SLOW…', status_warning_qss())
+            emit_event(
+                'clip_save', 'save_slow', state='STALLED',
+                operation_id=op.op_id,
+                elapsed_ms=round((time.monotonic() - op.requested_at) * 1000))
             return
 
         if outcome.kind is OutcomeKind.FAILED:
+            emit_event(
+                'clip_save', 'save_failed', state='FAILED',
+                error=DiagnosticError.CLIP_SAVE_FAILED,
+                operation_id=op.op_id,
+                elapsed_ms=round(op.total_latency_ms or
+                                 (time.monotonic() - op.requested_at) * 1000),
+                detail=outcome.detail or 'native clip save failed')
             self.capture_card.show_error()
             self._set_status('SAVE FAILED', status_warning_qss())
             QTimer.singleShot(3000, self._update_status)
@@ -6140,6 +6361,12 @@ class MainWindow(QMainWindow):
             return
 
         if outcome.kind is OutcomeKind.COMPLETED:
+            emit_event(
+                'clip_save', 'mux_completed', state='WRITTEN',
+                operation_id=op.op_id,
+                elapsed_ms=round(op.total_latency_ms or
+                                 (time.monotonic() - op.requested_at) * 1000),
+                late=outcome.late)
             self._on_clip_written(op, late=outcome.late)
 
     def _on_clip_written(self, op, late: bool = False):
@@ -6221,6 +6448,12 @@ class MainWindow(QMainWindow):
                           and audio_enabled
                           and audio_mode == AUDIO_CAPTURE_MODE_COMBINED),
         )
+        emit_event(
+            'clip_save', 'post_processing_planned', state='FINALIZING',
+            route=route, asynchronous=has_async_mux,
+            audio_mode=audio_mode,
+            elapsed_ms=round(
+                (time.monotonic() - op.requested_at) * 1000))
 
         # Notify the upload manager and get the clip-ready event.
         # The event is set immediately if there's no mux pending; otherwise the
@@ -6282,7 +6515,12 @@ class MainWindow(QMainWindow):
         if key in self._published_final_clips:
             return
         self._published_final_clips.add(key)
+        metadata_started = time.monotonic()
         if not self._clip_readiness.can_access(clip_path):
+            emit_event(
+                'clip_save', 'finalization_failed', state='FAILED',
+                error=DiagnosticError.CLIP_FINALIZE_FAILED,
+                detail='final clip file is unavailable')
             self._set_status('FINALIZATION FAILED', status_warning_qss())
             self.push_error(
                 'CLIP FINALIZATION FAILED',
@@ -6293,11 +6531,32 @@ class MainWindow(QMainWindow):
             return
 
         warnings = self._clip_readiness.warnings(clip_path)
+        metadata_elapsed_ms = round(
+            (time.monotonic() - metadata_started) * 1000)
+        emit_event(
+            'clip_save', 'metadata_validation_completed',
+            elapsed_ms=metadata_elapsed_ms, warning_count=len(warnings))
         print(f'Clip ready: {os.path.basename(clip_path)}')
+        ui_notification_started = time.monotonic()
         self.clip_saved.emit(clip_path)
+        ui_notification_ms = round(
+            (time.monotonic() - ui_notification_started) * 1000)
+        library_started = time.monotonic()
         if hasattr(self, 'clip_grid'):
             self.clip_grid._known_files = None
             self.clip_grid._load_clips()
+        started = getattr(
+            self, '_clip_diagnostic_started_by_path', {}).pop(key, None)
+        emit_event(
+            'clip_save', 'finalization_completed', state='COMPLETED',
+            requested_duration_seconds=duration_seconds,
+            elapsed_ms=(round((time.monotonic() - started) * 1000)
+                        if started is not None else None),
+            library_refresh_ms=round(
+                (time.monotonic() - library_started) * 1000),
+            metadata_validation_ms=metadata_elapsed_ms,
+            ui_notification_ms=ui_notification_ms,
+            warning_count=len(warnings))
         if warnings:
             self._set_status('SAVED WITH WARNING', status_warning_qss())
             self.push_error(
@@ -7418,6 +7677,7 @@ class MainWindow(QMainWindow):
     def _finalize_clip_worker(self, clip_path: str, duration_seconds: int,
                                clip_end_time: float = 0.0, clip_ready=None,
                                crop_profile=None):
+        finalization_started = time.monotonic()
         try:
             try:
                 ffmpeg = get_ffmpeg_exe()
@@ -7427,6 +7687,7 @@ class MainWindow(QMainWindow):
                     clip_path, 'Optional processing was skipped because FFmpeg is unavailable.')
                 return
             deadline = time.monotonic() + max(duration_seconds * 2, 15)
+            stabilization_started = time.monotonic()
             last_size = -1
             while time.monotonic() < deadline:
                 try:
@@ -7443,13 +7704,38 @@ class MainWindow(QMainWindow):
                 print('[Finalize] Clip did not stabilize — skipping optional processing')
                 self._record_finalization_warning(
                     clip_path, 'Optional processing was skipped because the clip did not stabilize.')
+                emit_event(
+                    'clip_save', 'file_stabilization_timeout', state='STALLED',
+                    error=DiagnosticError.CLIP_FINALIZE_FAILED,
+                    elapsed_ms=round(
+                        (time.monotonic() - stabilization_started) * 1000))
                 return
+            emit_event(
+                'clip_save', 'file_stabilized', state='FINALIZING',
+                elapsed_ms=round(
+                    (time.monotonic() - stabilization_started) * 1000))
+            stage_started = time.monotonic()
             self._apply_crop(clip_path, ffmpeg, crop_profile)
+            emit_event('clip_save', 'crop_stage_completed',
+                       elapsed_ms=round((time.monotonic() - stage_started) * 1000))
+            stage_started = time.monotonic()
             self._apply_image_overlay(clip_path, ffmpeg)
+            emit_event('clip_save', 'image_overlay_stage_completed',
+                       elapsed_ms=round((time.monotonic() - stage_started) * 1000))
+            stage_started = time.monotonic()
             self._apply_keyboard_overlay(
                 clip_path, ffmpeg, clip_end_time, duration_seconds)
+            emit_event('clip_save', 'keyboard_overlay_stage_completed',
+                       elapsed_ms=round((time.monotonic() - stage_started) * 1000))
+            stage_started = time.monotonic()
             self._apply_camera_overlay(clip_path, ffmpeg, clip_end_time, duration_seconds)
+            emit_event('clip_save', 'camera_overlay_stage_completed',
+                       elapsed_ms=round((time.monotonic() - stage_started) * 1000))
         finally:
+            emit_event(
+                'clip_save', 'optional_finalization_worker_completed',
+                elapsed_ms=round(
+                    (time.monotonic() - finalization_started) * 1000))
             if clip_ready is not None:
                 clip_ready.set()
 
@@ -7478,6 +7764,11 @@ class MainWindow(QMainWindow):
             self._capture_health_snapshot = self._capture_health.observe(
                 connected=False, frame_count=0, engine_flags=0)
             self._set_status('ENGINE STOPPED', status_warning_qss())
+            emit_event(
+                'engine', 'process_exited', state='FAILED',
+                error=DiagnosticError.ENGINE_START_FAILED,
+                exit_code=code,
+                unexpected=True)
             self.push_error(
                 'ENGINE STOPPED',
                 f'The capture engine exited unexpectedly (code {code}). '
@@ -7557,6 +7848,31 @@ class MainWindow(QMainWindow):
                     self._pending_launch_config = None
                     self._pending_launch_generation = None
                     self._set_capture_apply_state(False)
+                    actual = {
+                        'actual_codec': codec or pending_config.codec,
+                        'capture_generation': status.get(
+                            'capture_generation', 0),
+                    }
+                    if pending_config.width and pending_config.height:
+                        actual.update({
+                            'capture_dimensions': {
+                                'width': pending_config.width,
+                                'height': pending_config.height,
+                            },
+                            'encoder_dimensions': {
+                                'width': pending_config.width,
+                                'height': pending_config.height,
+                            },
+                        })
+                    if self._diagnostics is not None:
+                        self._diagnostics.merge_summary(
+                            'actual_configuration', **actual)
+                        actual = self._diagnostics.summary().get(
+                            'actual_configuration', actual)
+                    emit_event(
+                        'capture', 'configuration_activated', state='ACTIVE',
+                        actual_configuration=actual,
+                        capture_generation=status.get('capture_generation', 0))
                     if self._manual_record_state == 'preparing':
                         QTimer.singleShot(
                             0, self._continue_prepared_manual_recording)
@@ -7572,6 +7888,23 @@ class MainWindow(QMainWindow):
                         self._fail_manual_recording(
                             'The recording quality profile did not become healthy.')
             if snapshot.changed:
+                diagnostic_error = None
+                if snapshot.state is CaptureHealthState.STALLED:
+                    diagnostic_error = DiagnosticError.CAPTURE_FRAME_STALLED
+                emit_event(
+                    'capture', 'health_transition',
+                    state=snapshot.state.value.upper(),
+                    error=diagnostic_error,
+                    previous_state=snapshot.previous_state.value.upper(),
+                    reason=snapshot.reason,
+                    frames_acquired=frames,
+                    capture_generation=status.get('capture_generation', 0),
+                    content_sample_sequence=status.get(
+                        'content_sample_sequence', 0),
+                    suspicious_content_streak=status.get(
+                        'content_suspicious_streak', 0),
+                    luma_mean=status.get('content_luma_mean', 0.0),
+                    luma_variance=status.get('content_luma_variance', 0.0))
                 if snapshot.state is CaptureHealthState.FAILED:
                     self.push_error(
                         'CAPTURE FAILED',
@@ -7591,6 +7924,25 @@ class MainWindow(QMainWindow):
                     status.get('content_luma_mean', 0.0),
                     status.get('content_luma_variance', 0.0),
                 )
+
+            now = time.monotonic()
+            if now - self._last_capture_health_event_at >= 10.0:
+                self._last_capture_health_event_at = now
+                health = {
+                    'state': snapshot.state.value.upper(),
+                    'frames_acquired': frames,
+                    'capture_generation': status.get('capture_generation', 0),
+                    'capture_restart_count': max(
+                        0, self._diagnostic_engine_start_count - 1),
+                    'capture_health_flags': status.get('capture_health_flags', 0),
+                    'content_sample_sequence': status.get(
+                        'content_sample_sequence', 0),
+                    'suspicious_content_streak': status.get(
+                        'content_suspicious_streak', 0),
+                }
+                if self._diagnostics is not None:
+                    self._diagnostics.update_summary('capture_health', health)
+                emit_event('capture', 'health_snapshot', **health)
 
             state_text = {
                 CaptureHealthState.INITIALIZING: 'STARTING CAPTURE',
@@ -8313,6 +8665,7 @@ class _SettingsPage(QWidget):
     capture_card_changed      = Signal(bool)
     background_ui_pause_changed = Signal(bool)
     encoder_capabilities_ready = Signal(object)
+    diagnostic_export_requested = Signal()
 
     def _init_autostart_checkbox(self):
         from core.windows_autostart import is_packaged_launch, read_enabled
@@ -8591,6 +8944,28 @@ class _SettingsPage(QWidget):
         from ui.export_presets_widget import ExportPresetsWidget
         self.export_presets_widget = ExportPresetsWidget(parent=page)
         layout.addWidget(self.export_presets_widget)
+
+        # -- Troubleshooting --
+        layout.addSpacing(24)
+        layout.addWidget(_flat_section_header('Troubleshooting'))
+        layout.addSpacing(10)
+        diagnostic_hint = QLabel(
+            'After reproducing an alpha bug, export a privacy-redacted report '
+            'containing bounded hardware, capture, audio, playback, export, and '
+            'library diagnostics. Nothing is uploaded automatically.')
+        diagnostic_hint.setWordWrap(True)
+        diagnostic_hint.setStyleSheet(
+            label_body(Colors.TEXT_MUTED, Fonts.SIZE_BODY))
+        layout.addWidget(diagnostic_hint)
+        layout.addSpacing(8)
+        self.export_diagnostic_btn = QPushButton('EXPORT DIAGNOSTIC REPORT')
+        self.export_diagnostic_btn.setStyleSheet(button_outline_qss())
+        self.export_diagnostic_btn.setCursor(
+            QCursor(Qt.CursorShape.PointingHandCursor))
+        self.export_diagnostic_btn.clicked.connect(
+            self.diagnostic_export_requested.emit)
+        layout.addWidget(self.export_diagnostic_btn, 0,
+                         Qt.AlignmentFlag.AlignLeft)
 
         # Focus pause has no Windows replay implementation. Do not expose a
         # control that would route through the unrelated legacy record toggle.
@@ -11552,6 +11927,8 @@ def main():
         )
         return 1
 
+    diagnostic_session = start_diagnostic_session(APP_VERSION)
+    diagnostic_session.collect_hardware_async()
     configure_qt_for_linux_ui()
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
@@ -11581,9 +11958,12 @@ def main():
     try:
         return app.exec()
     finally:
-        window._perform_full_shutdown()
-        activation_server.stop()
-        instance_guard.release()
+        try:
+            window._perform_full_shutdown()
+            activation_server.stop()
+            instance_guard.release()
+        finally:
+            end_diagnostic_session(clean=True)
 
 
 if __name__ == '__main__':

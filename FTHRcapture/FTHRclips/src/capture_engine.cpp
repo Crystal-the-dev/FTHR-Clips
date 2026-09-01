@@ -411,6 +411,56 @@ namespace fthr {
         detail += BuildStartupDiagnosticContext();
         last_startup_error_code_ = code;
         last_startup_error_ = std::move(detail);
+        const char* diagnostic_error = "ENGINE_START_FAILED";
+        switch (code) {
+        case ReplayStartupError::CaptureAdapterUnsupported:
+            if (startup_capture_backend_ == "WGC_MONITOR"
+                || startup_capture_backend_ == "WGC_WINDOW") {
+                diagnostic_error = "CAPTURE_WGC_INIT_FAILED";
+            } else if (startup_capture_backend_ == "DXGI_OUTPUT_DUPLICATION"
+                       && (last_startup_error_.find("CreateDXGIFactory")
+                               != std::string::npos
+                           || last_startup_error_.find("D3D11CreateDevice")
+                               != std::string::npos
+                           || last_startup_error_.find("DuplicateOutput")
+                               != std::string::npos
+                           || last_startup_error_.find("QueryInterface")
+                               != std::string::npos)) {
+                diagnostic_error = "CAPTURE_DXGI_INIT_FAILED";
+            } else {
+                diagnostic_error = "CAPTURE_OUTPUT_OPEN_FAILED";
+            }
+            break;
+        case ReplayStartupError::CrossAdapterPathUnavailable:
+            diagnostic_error = "ENCODER_ADAPTER_MISMATCH";
+            break;
+        case ReplayStartupError::EncoderInitFailed:
+            if (startup_encoder_backend_ == "native-nvenc") {
+                diagnostic_error = "ENCODER_NVENC_INIT_FAILED";
+            } else if (startup_encoder_backend_ == "ffmpeg-amf") {
+                diagnostic_error = "ENCODER_AMF_INIT_FAILED";
+            } else if (startup_encoder_backend_ == "ffmpeg-qsv") {
+                diagnostic_error = "ENCODER_QSV_INIT_FAILED";
+            } else {
+                diagnostic_error = "ENCODER_INIT_FAILED";
+            }
+            break;
+        case ReplayStartupError::RequestedCodecUnsupported:
+        case ReplayStartupError::HardwareEncoderUnavailable:
+        case ReplayStartupError::ReplayCapacityLimited:
+            diagnostic_error = "ENCODER_INIT_FAILED";
+            break;
+        case ReplayStartupError::None:
+            break;
+        }
+        std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"engine\","
+                  << "\"event\":\"startup_failed\",\"state\":\"FAILED\","
+                  << "\"error_code\":\"" << diagnostic_error << "\","
+                  << "\"native_startup_code\":\""
+                  << ReplayStartupErrorName(code) << "\","
+                  << "\"detail\":\""
+                  << diagnostics::JsonEscape(last_startup_error_) << "\"}"
+                  << std::endl;
         std::cerr << "FTHR_STARTUP_ERROR: "
                   << ReplayStartupErrorName(code) << ": "
                   << last_startup_error_ << std::endl;
@@ -502,6 +552,18 @@ namespace fthr {
         // ------------------------------------------------------------------
         target_hwnd_ = config.target_hwnd;
         focus_gated_ = false;
+        const auto report_wgc_fallback = [this](
+            const char* from_backend, const char* to_backend) {
+            std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"capture\","
+                      << "\"event\":\"backend_fallback\","
+                      << "\"state\":\"DEGRADED\","
+                      << "\"error_code\":\"CAPTURE_WGC_INIT_FAILED\","
+                      << "\"from_backend\":\"" << from_backend << "\","
+                      << "\"to_backend\":\"" << to_backend << "\","
+                      << "\"detail\":\""
+                      << diagnostics::JsonEscape(last_capture_failure_detail_)
+                      << "\"}" << std::endl;
+        };
 
         if (config.capture_mode == CaptureConfig::CaptureModeEnum::WINDOW
             && target_hwnd_ != 0
@@ -512,6 +574,7 @@ namespace fthr {
             wgc_active_ = true;
             focus_gated_ = true;
             if (!InitializeWGC()) {
+                report_wgc_fallback("WGC_MONITOR", "DXGI_OUTPUT_DUPLICATION");
                 std::cerr << "[CaptureEngine] WGC unavailable — "
                           << "falling back to DXGI desktop capture" << std::endl;
                 wgc_active_ = false;
@@ -532,10 +595,13 @@ namespace fthr {
                       << std::hex << target_hwnd_ << std::dec << std::endl;
             wgc_active_ = true;
             if (!InitializeWindowCapture()) {
+                report_wgc_fallback("WGC_WINDOW", "WGC_MONITOR");
                 std::cerr << "[CaptureEngine] Window capture init failed — "
                           << "falling back to WGC monitor capture" << std::endl;
                 target_hwnd_ = 0;
                 if (!InitializeWGC()) {
+                    report_wgc_fallback(
+                        "WGC_MONITOR", "DXGI_OUTPUT_DUPLICATION");
                     std::cerr << "[CaptureEngine] WGC unavailable — falling back to DXGI" << std::endl;
                     wgc_active_ = false;
                     if (!InitializeD3D11()) {
@@ -552,6 +618,7 @@ namespace fthr {
             std::cout << "[CaptureEngine] Mode: Desktop Capture (WGC monitor)" << std::endl;
             wgc_active_ = true;
             if (!InitializeWGC()) {
+                report_wgc_fallback("WGC_MONITOR", "DXGI_OUTPUT_DUPLICATION");
                 std::cerr << "[CaptureEngine] WGC unavailable — falling back to DXGI" << std::endl;
                 wgc_active_ = false;
                 if (!InitializeD3D11()) {
@@ -884,8 +951,19 @@ namespace fthr {
                 microphone_audio_source_ = std::make_unique<WindowsMicrophoneAudioProvider>(
                     std::move(microphone_config));
                 if (!microphone_audio_source_->Start()) {
+                    const std::string microphone_error =
+                        microphone_audio_source_->last_error();
                     std::cerr << "[CaptureEngine] Native microphone provider did not start: "
-                        << microphone_audio_source_->last_error() << std::endl;
+                        << microphone_error << std::endl;
+                    std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"audio\","
+                              << "\"event\":\"microphone_initialized\","
+                              << "\"state\":\"FAILED\","
+                              << "\"error_code\":\"AUDIO_MIC_INIT_FAILED\","
+                              << "\"endpoint\":"
+                              << "\"unavailable:provider_start_failed\","
+                              << "\"detail\":\""
+                              << diagnostics::JsonEscape(microphone_error)
+                              << "\"}" << std::endl;
                     microphone_audio_source_.reset();
                 } else {
                     std::cout << "[CaptureEngine] Native microphone provider starting ("
@@ -904,6 +982,86 @@ namespace fthr {
 
         if (!audio_active_) {
             std::cout << "[CaptureEngine] Running in video-only mode." << std::endl;
+        }
+
+        std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"capture\","
+                  << "\"event\":\"adapter_topology_resolved\","
+                  << "\"monitor_id\":\""
+                  << diagnostics::JsonEscape(diagnostics::WideToUtf8(
+                         monitor_device_path_)) << "\","
+                  << "\"windows_display\":\""
+                  << diagnostics::JsonEscape(diagnostics::WideToUtf8(
+                         resolved_dxgi_output_.source_gdi_name)) << "\","
+                  << "\"dxgi_output\":";
+        if (resolved_dxgi_output_.output_index != UINT32_MAX) {
+            std::cout << "{\"index\":" << resolved_dxgi_output_.output_index << "},";
+        } else {
+            std::cout << "\"unavailable:not_resolved\",";
+        }
+        std::cout
+                  << "\"monitor_adapter\":\""
+                  << diagnostics::JsonEscape(EncoderVendorName(
+                         selection.capture_vendor)) << "\","
+                  << "\"monitor_adapter_luid\":"
+                  << AdapterLuidJson(resolved_monitor_.adapter_luid) << ','
+                  << "\"capture_d3d11_device\":\"selected-monitor-adapter\","
+                  << "\"capture_device_luid\":"
+                  << (capture_device_adapter_luid_available_
+                      ? AdapterLuidJson(capture_device_adapter_luid_)
+                      : "\"unavailable:not_resolved\"") << ','
+                  << "\"encoder_adapter\":\""
+                  << diagnostics::JsonEscape(EncoderVendorName(
+                         selection.encoder_vendor)) << "\","
+                  << "\"encoder_adapter_luid\":"
+                  << (encoder_adapter_luid_available_
+                      ? AdapterLuidJson(encoder_adapter_luid_)
+                      : "\"unavailable:not_resolved\"") << ','
+                  << "\"capture_backend\":\""
+                  << diagnostics::JsonEscape(startup_capture_backend_) << "\","
+                  << "\"encoder_backend\":\""
+                  << diagnostics::JsonEscape(startup_encoder_backend_) << "\","
+                  << "\"codec\":\""
+                  << diagnostics::JsonEscape(startup_codec_) << "\","
+                  << "\"capture_width\":" << width_ << ','
+                  << "\"capture_height\":" << height_ << ','
+                  << "\"encoder_width\":"
+                  << (target_width_ == 0 ? crop_width_ : target_width_) << ','
+                  << "\"encoder_height\":"
+                  << (target_height_ == 0 ? crop_height_ : target_height_) << "}"
+                  << std::endl;
+
+        if (config.audio_enabled) {
+            std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"audio\","
+                      << "\"event\":\"system_audio_initialized\","
+                      << "\"state\":\"" << (audio_active_ ? "READY" : "FAILED")
+                      << "\",\"error_code\":"
+                      << (audio_active_ ? "null" : "\"AUDIO_OUTPUT_INIT_FAILED\"")
+                      << ",\"endpoint\":\""
+                      << diagnostics::JsonEscape(audio_capture_.GetFriendlyName())
+                      << "\",\"requested_sample_rate\":"
+                      << audio_capture_.GetRequestedSampleRate()
+                      << ",\"actual_sample_rate\":" << audio_capture_.GetSampleRate()
+                      << ",\"requested_channels\":"
+                      << audio_capture_.GetRequestedChannels()
+                      << ",\"actual_channels\":" << audio_capture_.GetChannels()
+                      << ",\"sample_format\":"
+                      << (audio_active_ ? "\"float32\""
+                                        : "\"unavailable:initialization_failed\"")
+                      << "}"
+                      << std::endl;
+            if (microphone_audio_source_) {
+                const auto microphone_info = microphone_audio_source_->runtime_info();
+                std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"audio\","
+                          << "\"event\":\"microphone_initialized\","
+                          << "\"state\":\"STARTING\",\"endpoint\":\""
+                          << diagnostics::JsonEscape(
+                                 microphone_info.active_display_name.empty()
+                                     ? "unavailable:provider_starting"
+                                     : microphone_info.active_display_name)
+                          << "\",\"requested_sample_rate\":48000,"
+                          << "\"requested_channels\":2}"
+                          << std::endl;
+            }
         }
 
         // Start video capture and save-clip threads.
@@ -1027,8 +1185,13 @@ namespace fthr {
         using clock = std::chrono::steady_clock;
         uint64_t previous_packets = 0;
         uint64_t previous_acquire_attempts = 0;
+        uint64_t previous_acquired = 0;
+        uint64_t previous_submissions = 0;
         auto last_progress = clock::now();
         auto last_acquire_progress = clock::now();
+        auto last_acquired_progress = clock::now();
+        auto last_submission_progress = clock::now();
+        auto last_health_snapshot = clock::now();
         bool snapshot_emitted = false;
 
         while (running_.load(std::memory_order_relaxed)) {
@@ -1037,10 +1200,112 @@ namespace fthr {
                 std::memory_order_relaxed);
             const uint64_t acquire_attempts = capture_acquire_attempts_.load(
                 std::memory_order_relaxed);
+            const uint64_t acquired = source_textures_received_.load(
+                std::memory_order_relaxed);
+            const uint64_t submissions = frames_captured_.load(
+                std::memory_order_relaxed);
             const auto now = clock::now();
             if (acquire_attempts != previous_acquire_attempts) {
                 previous_acquire_attempts = acquire_attempts;
                 last_acquire_progress = now;
+            }
+            if (acquired != previous_acquired) {
+                previous_acquired = acquired;
+                last_acquired_progress = now;
+            }
+            if (submissions != previous_submissions) {
+                previous_submissions = submissions;
+                last_submission_progress = now;
+            }
+            if (now - last_health_snapshot >= std::chrono::seconds(10)) {
+                last_health_snapshot = now;
+                const auto acquired_age = std::chrono::duration_cast<
+                    std::chrono::milliseconds>(now - last_acquired_progress).count();
+                const auto submission_age = std::chrono::duration_cast<
+                    std::chrono::milliseconds>(now - last_submission_progress).count();
+                const auto output_age = std::chrono::duration_cast<
+                    std::chrono::milliseconds>(now - last_progress).count();
+                std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"capture\","
+                          << "\"event\":\"capture_health_snapshot\","
+                          << "\"frames_acquired\":" << acquired << ','
+                          << "\"frames_submitted\":" << submissions << ','
+                          << "\"frames_dropped\":" << frames_dropped_.load() << ','
+                          << "\"stale_frame_observations\":"
+                          << content_suspicious_streak_.load() << ','
+                          << "\"duplicate_frame_observations\":"
+                          << "\"unavailable:not_measured\","
+                          << "\"encoder_submissions\":" << submissions << ','
+                          << "\"encoded_packets\":" << packets << ','
+                          << "\"last_acquired_age_ms\":" << acquired_age << ','
+                          << "\"last_encoder_submission_age_ms\":"
+                          << submission_age << ','
+                          << "\"last_encoded_output_age_ms\":" << output_age << ','
+                          << "\"capture_restart_count\":"
+                          << (capture_generation_.load() > 0
+                              ? capture_generation_.load() - 1 : 0) << ','
+                          << "\"encoder_restart_count\":0}"
+                          << std::endl;
+
+                if (audio_active_) {
+                    std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"audio\","
+                              << "\"event\":\"audio_health_snapshot\","
+                              << "\"source\":\"system_audio\","
+                              << "\"packet_count\":"
+                              << audio_capture_.GetPacketCount() << ','
+                              << "\"discontinuity_count\":"
+                              << audio_capture_.GetDiscontinuityCount() << ','
+                              << "\"underrun_count\":"
+                              << "\"unavailable:not_exposed_by_wasapi_capture\","
+                              << "\"first_packet_timestamp_100ns\":"
+                              << audio_capture_.GetFirstPacketQpc100ns() << ','
+                              << "\"last_packet_timestamp_100ns\":"
+                              << audio_capture_.GetLastPacketQpc100ns() << "}"
+                              << std::endl;
+                }
+                if (microphone_audio_source_) {
+                    const auto microphone = microphone_audio_source_->runtime_info();
+                    std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"audio\","
+                              << "\"event\":\"audio_health_snapshot\","
+                              << "\"source\":\"microphone\","
+                              << "\"state\":\""
+                              << (microphone.failed ? "FAILED"
+                                  : (microphone.packet_count == 0
+                                      ? "NO_PACKETS" : "ACTIVE")) << "\","
+                              << "\"error_code\":"
+                              << (microphone.failed
+                                  ? "\"AUDIO_MIC_INIT_FAILED\""
+                                  : (microphone.packet_count == 0
+                                      ? "\"AUDIO_NO_PACKETS\"" : "null")) << ','
+                              << "\"endpoint\":\""
+                              << diagnostics::JsonEscape(
+                                     microphone.active_display_name.empty()
+                                         ? "unavailable:provider_starting"
+                                         : microphone.active_display_name) << "\","
+                              << "\"requested_sample_rate\":48000,"
+                              << "\"actual_sample_rate\":"
+                              << microphone.input_format.sample_rate << ','
+                              << "\"requested_channels\":2,"
+                              << "\"actual_channels\":"
+                              << microphone.input_format.channels << ','
+                              << "\"sample_format\":\""
+                              << diagnostics::JsonEscape(
+                                     microphone.input_format.sample_format)
+                              << "\","
+                              << "\"packet_count\":" << microphone.packet_count << ','
+                              << "\"discontinuity_count\":"
+                              << microphone.discontinuity_count << ','
+                              << "\"underrun_count\":"
+                              << "\"unavailable:not_exposed_by_wasapi_capture\","
+                              << "\"first_packet_timestamp_100ns\":"
+                              << microphone.first_packet_qpc_100ns << ','
+                              << "\"last_packet_timestamp_100ns\":"
+                              << microphone.last_packet_qpc_100ns << ','
+                              << "\"max_drift_samples\":"
+                              << microphone.max_observed_drift_samples << ','
+                              << "\"failed\":"
+                              << (microphone.failed ? "true" : "false") << "}"
+                              << std::endl;
+                }
             }
             if (packets != previous_packets) {
                 previous_packets = packets;
@@ -1117,6 +1382,27 @@ namespace fthr {
                 << " registered=" << encoder.registered_resources
                 << " nvenc_status=" << encoder.last_nvenc_status
                 << std::endl;
+            const bool capture_stalled =
+                now - last_acquired_progress > std::chrono::seconds(2);
+            const bool encoder_received_recent_submission =
+                submissions > 0
+                && now - last_submission_progress <= std::chrono::seconds(2);
+            const char* diagnostic_code = capture_stalled
+                ? (acquired == 0 ? "CAPTURE_NO_FRAMES"
+                                 : "CAPTURE_FRAME_STALLED")
+                : (encoder_received_recent_submission
+                    ? "ENCODER_OUTPUT_STALLED" : "ENCODER_SUBMIT_FAILED");
+            std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"capture\","
+                      << "\"event\":\"pipeline_stall_detected\","
+                      << "\"state\":\"STALLED\",\"error_code\":\""
+                      << diagnostic_code << "\","
+                      << "\"frames_acquired\":" << acquired << ','
+                      << "\"encoder_submissions\":" << submissions << ','
+                      << "\"encoded_packets\":" << packets << ','
+                      << "\"capture_stage\":" << capture_thread_stage_.load() << ','
+                      << "\"encoder_submit_stage\":" << encoder.submit_stage << ','
+                      << "\"encoder_drain_stage\":" << encoder.drain_stage << "}"
+                      << std::endl;
             snapshot_emitted = true;
         }
     }
@@ -1232,6 +1518,8 @@ namespace fthr {
     bool CaptureEngine::SaveClip(const wchar_t* path, uint32_t duration_seconds,
         SharedMemoryLayout* shared_memory) {
 
+        const auto save_request_started = std::chrono::steady_clock::now();
+
         const uint32_t health = capture_health_flags_.load();
         if (!running_.load() ||
             (health & (CAPTURE_HEALTH_BACKEND_FAILED |
@@ -1270,6 +1558,12 @@ namespace fthr {
 
             if (snapshot.packets.empty()) {
                 std::cerr << "[SaveClip] Encoded ring buffer empty - nothing to save" << std::endl;
+                std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"clip_save\","
+                          << "\"event\":\"ring_selection_failed\","
+                          << "\"state\":\"FAILED\","
+                          << "\"error_code\":\"CLIP_SAVE_FAILED\","
+                          << "\"packet_count\":0}"
+                          << std::endl;
                 return false;
             }
 
@@ -1358,7 +1652,26 @@ namespace fthr {
                 std::cerr << "[SaveClip] Audio device lost - saving clip without audio" << std::endl;
             }
 
+            const uint32_t diagnostic_task_id = task.task_id;
+            const size_t diagnostic_video_packets =
+                task.encoded_snapshot.packets.size();
+            const size_t diagnostic_audio_tracks =
+                task.encoded_audio_tracks.size();
             save_clip_queue_.Push(std::move(task));
+            const auto selection_ms = std::chrono::duration_cast<
+                std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - save_request_started).count();
+            std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"clip_save\","
+                      << "\"event\":\"ring_selection_completed\","
+                      << "\"state\":\"QUEUED\","
+                      << "\"task_id\":" << diagnostic_task_id << ','
+                      << "\"requested_duration_seconds\":" << duration_seconds << ','
+                      << "\"video_packet_count\":"
+                      << diagnostic_video_packets << ','
+                      << "\"audio_track_count\":"
+                      << diagnostic_audio_tracks << ','
+                      << "\"elapsed_ms\":" << selection_ms << "}"
+                      << std::endl;
             std::wcout << L"[SaveClip] Encoded task queued: " << path << std::endl;
             return true;
         }
@@ -1576,6 +1889,24 @@ namespace fthr {
 
     bool CaptureEngine::MuxEncodedClip(
         const SaveClipTask& task, const std::wstring& output_path) {
+        struct MuxDiagnosticSpan {
+            uint32_t task_id;
+            std::chrono::steady_clock::time_point started;
+            bool success = false;
+            ~MuxDiagnosticSpan() {
+                const auto elapsed = std::chrono::duration_cast<
+                    std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - started).count();
+                std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"clip_save\","
+                          << "\"event\":\"native_mux_completed\","
+                          << "\"state\":\"" << (success ? "COMPLETED" : "FAILED")
+                          << "\",\"error_code\":"
+                          << (success ? "null" : "\"CLIP_SAVE_FAILED\"") << ','
+                          << "\"task_id\":" << task_id << ','
+                          << "\"elapsed_ms\":" << elapsed << "}"
+                          << std::endl;
+            }
+        } mux_diagnostic{task.task_id, std::chrono::steady_clock::now()};
         const auto& snap = task.encoded_snapshot;
         const auto& video_config = snap.video_config;
 
@@ -2450,6 +2781,7 @@ namespace fthr {
             << L" (" << video_packet_count << L" video, "
             << audio_packet_count << L" audio, "
             << actual_duration_s << L"s)" << std::endl;
+        mux_diagnostic.success = true;
         return true;
     }
 
@@ -2766,6 +3098,22 @@ namespace fthr {
                               : monitor::MonitorResolveError::MonitorTopologyChanged)
                           << ": DXGI access lost; a fresh capture generation is required"
                           << std::endl;
+                std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"capture\","
+                          << "\"event\":\"runtime_failed\",\"state\":\"FAILED\","
+                          << "\"error_code\":\"CAPTURE_DXGI_RUNTIME_FAILED\","
+                          << "\"native_failure\":"
+                          << diagnostics::HResultFailureJson(
+                                 "IDXGIOutputDuplication::AcquireNextFrame", hr)
+                          << ",\"monitor_id\":\""
+                          << diagnostics::JsonEscape(diagnostics::WideToUtf8(
+                                 monitor_device_path_)) << "\","
+                          << "\"dxgi_output\":{\"index\":"
+                          << resolved_dxgi_output_.output_index << "},"
+                          << "\"capture_device_luid\":"
+                          << (capture_device_adapter_luid_available_
+                              ? AdapterLuidJson(capture_device_adapter_luid_)
+                              : "\"unavailable:not_resolved\"") << "}"
+                          << std::endl;
                 capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
                 running_.store(false);
                 break;
@@ -2776,6 +3124,16 @@ namespace fthr {
                     << std::hex << hr << std::dec << std::endl;
                 if (++consecutive_acquire_errors >= 100) {
                     std::cerr << "[CaptureThread] Too many consecutive acquisition errors"
+                              << std::endl;
+                    std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"capture\","
+                              << "\"event\":\"runtime_failed\","
+                              << "\"state\":\"FAILED\","
+                              << "\"error_code\":\"CAPTURE_DXGI_RUNTIME_FAILED\","
+                              << "\"native_failure\":"
+                              << diagnostics::HResultFailureJson(
+                                     "IDXGIOutputDuplication::AcquireNextFrame", hr)
+                              << ",\"consecutive_failures\":"
+                              << consecutive_acquire_errors << "}"
                               << std::endl;
                     capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
                     running_.store(false);
@@ -3137,12 +3495,27 @@ namespace fthr {
         ClearReplayForRecovery();
         capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
         running_.store(false);
+        const std::string detail = replay_encoder_
+            ? replay_encoder_->GetLastError() : std::string{};
         std::cerr << "[CaptureEngine] " << operation << " failed";
-        if (replay_encoder_) {
-            const std::string detail = replay_encoder_->GetLastError();
-            if (!detail.empty()) std::cerr << ": " << detail;
-        }
+        if (!detail.empty()) std::cerr << ": " << detail;
         std::cerr << "; a fresh capture generation is required" << std::endl;
+        std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"encoder\","
+                  << "\"event\":\"runtime_failed\",\"state\":\"FAILED\","
+                  << "\"error_code\":\"ENCODER_SUBMIT_FAILED\","
+                  << "\"operation\":\""
+                  << diagnostics::JsonEscape(operation ? operation : "unknown")
+                  << "\",\"detail\":\""
+                  << diagnostics::JsonEscape(
+                         detail.empty() ? "unavailable:no_backend_detail" : detail)
+                  << "\",\"encoder_backend\":\""
+                  << diagnostics::JsonEscape(startup_encoder_backend_) << "\","
+                  << "\"codec\":\"" << diagnostics::JsonEscape(startup_codec_)
+                  << "\",\"encoder_adapter_luid\":"
+                  << (encoder_adapter_luid_available_
+                      ? AdapterLuidJson(encoder_adapter_luid_)
+                      : "\"unavailable:not_resolved\"") << "}"
+                  << std::endl;
     }
 
 
@@ -3605,12 +3978,20 @@ namespace fthr {
                           << monitor::ToString(
                                  monitor::MonitorResolveError::MonitorDisconnected)
                           << ": selected monitor capture item closed" << std::endl;
+                std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"capture\","
+                          << "\"event\":\"runtime_failed\",\"state\":\"FAILED\","
+                          << "\"error_code\":\"CAPTURE_WGC_RUNTIME_FAILED\","
+                          << "\"api_call\":\"GraphicsCaptureItem::Closed\","
+                          << "\"detail\":\"selected monitor capture item closed\"}"
+                          << std::endl;
                 capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
                 ClearReplayForRecovery();
                 running_.store(false);
                 break;
             }
 
+            const char* current_frame_api =
+                "Direct3D11CaptureFramePool::TryGetNextFrame";
             try {
                 // Consume the frame FIRST to return the buffer slot to the pool.
                 // WGC's Direct3D11CaptureFramePool has only 2 slots — if we
@@ -3622,6 +4003,7 @@ namespace fthr {
                 if (!frame) continue;
 
                 if (wgc_state_->monitor_item) {
+                    current_frame_api = "Direct3D11CaptureFrame::ContentSize";
                     const auto content_size = frame.ContentSize();
                     if (content_size.Width != static_cast<int32_t>(width_)
                         || content_size.Height != static_cast<int32_t>(height_)) {
@@ -3629,6 +4011,14 @@ namespace fthr {
                                   << monitor::ToString(
                                          monitor::MonitorResolveError::MonitorTopologyChanged)
                                   << ": selected monitor dimensions changed" << std::endl;
+                        std::cout << "FTHR_DIAGNOSTIC_EVENT {"
+                                  << "\"subsystem\":\"capture\","
+                                  << "\"event\":\"runtime_failed\","
+                                  << "\"state\":\"FAILED\","
+                                  << "\"error_code\":\"CAPTURE_WGC_RUNTIME_FAILED\","
+                                  << "\"api_call\":\"Direct3D11CaptureFrame::ContentSize\","
+                                  << "\"detail\":\"selected monitor dimensions changed\"}"
+                                  << std::endl;
                         capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
                         ClearReplayForRecovery();
                         running_.store(false);
@@ -3665,6 +4055,7 @@ namespace fthr {
             capture_health_flags_.fetch_or(CAPTURE_HEALTH_ACTIVE);
 
                 // Extract ID3D11Texture2D from the WGC surface
+                current_frame_api = "Direct3D11CaptureFrame::Surface";
                 auto surface = frame.Surface();
 
                 // IDirect3DDxgiInterfaceAccess is a COM interface in
@@ -3672,12 +4063,18 @@ namespace fthr {
                 // type, so winrt::as<>() cannot be used. QueryInterface directly.
                 using DxgiAccess = Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess;
                 winrt::com_ptr<DxgiAccess> interop;
+                current_frame_api =
+                    "IDirect3DSurface::QueryInterface(IDirect3DDxgiInterfaceAccess)";
                 winrt::check_hresult(
                     reinterpret_cast<IUnknown*>(winrt::get_abi(surface))->QueryInterface(
                         __uuidof(DxgiAccess), reinterpret_cast<void**>(interop.put())));
 
                 winrt::com_ptr<ID3D11Texture2D> tex;
+                current_frame_api =
+                    "IDirect3DDxgiInterfaceAccess::GetInterface(ID3D11Texture2D)";
                 winrt::check_hresult(interop->GetInterface(IID_PPV_ARGS(tex.put())));
+                source_textures_received_.fetch_add(
+                    1, std::memory_order_relaxed);
 
                 if (nvenc_active_ && !replay_encoder_cpu_input_) {
                     // ----------------------------------------------------------
@@ -3782,6 +4179,16 @@ namespace fthr {
                           << std::hex << e.code().value << std::dec << std::endl;
                 if (++consecutive_frame_errors >= 30) {
                     std::cerr << "[CaptureThread/WGC] Too many consecutive frame errors"
+                              << std::endl;
+                    std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"capture\","
+                              << "\"event\":\"runtime_failed\","
+                              << "\"state\":\"FAILED\","
+                              << "\"error_code\":\"CAPTURE_WGC_RUNTIME_FAILED\","
+                              << "\"native_failure\":"
+                              << diagnostics::HResultFailureJson(
+                                     current_frame_api, e.code().value)
+                              << ",\"consecutive_failures\":"
+                              << consecutive_frame_errors << "}"
                               << std::endl;
                     capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
                     running_.store(false);

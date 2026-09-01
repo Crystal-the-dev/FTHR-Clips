@@ -17,6 +17,7 @@ import sys
 import subprocess
 from core import linux_tools
 import hashlib
+import time
 from pathlib import Path
 import cv2
 from datetime import datetime
@@ -43,6 +44,9 @@ from core.clip_files import (
 from core.library_ownership import MediaOwnership, classify_media_path
 from core.media_metadata import probe_video_metadata
 from core.settings_manager import clips_directory_from
+from core.field_diagnostics import (
+    DiagnosticError, emit_event, get_diagnostic_session, process_memory_bytes,
+)
 from ui.style import WheelSafeComboBox, paint_dropdown_arrow
 
 
@@ -261,6 +265,7 @@ def _clip_title_from_filename(file_path: str) -> str:
 
 class _ThumbnailSignals(QObject):
     finished = Signal(str, str, int)  # file_path, cache_path, duration_sec
+    diagnostic_finished = Signal(int, int, bool)  # total_ms, metadata_ms, cache_hit
 
 
 class _ThumbnailWorker(QRunnable):
@@ -272,74 +277,86 @@ class _ThumbnailWorker(QRunnable):
         self.signals = _ThumbnailSignals()
 
     def run(self):
-        if not is_completed_video_path(self.file_path):
-            self.signals.finished.emit(self.file_path, '', 0)
-            return
-        cache_path = _get_cached_thumb_path(self.file_path)
-        dur_path   = _get_cached_duration_path(cache_path)
+        started = time.monotonic()
+        metadata_ms = 0
+        cache_hit = False
+        try:
+            if not is_completed_video_path(self.file_path):
+                self.signals.finished.emit(self.file_path, '', 0)
+                return
+            cache_path = _get_cached_thumb_path(self.file_path)
+            dur_path   = _get_cached_duration_path(cache_path)
 
-        # Cache hit: image AND duration sidecar both exist.
-        # This skips opening the video file entirely (cv2.VideoCapture +
-        # FFmpeg demux is the expensive part — typically 20-100ms per file).
-        if os.path.exists(cache_path) and os.path.exists(dur_path):
-            duration = _read_cached_duration(dur_path)
-            self.signals.finished.emit(self.file_path, cache_path, duration)
-            return
+            # Cache hit: image AND duration sidecar both exist.
+            # This skips opening the video file entirely (cv2.VideoCapture +
+            # FFmpeg demux is the expensive part — typically 20-100ms per file).
+            if os.path.exists(cache_path) and os.path.exists(dur_path):
+                cache_hit = True
+                duration = _read_cached_duration(dur_path)
+                self.signals.finished.emit(self.file_path, cache_path, duration)
+                return
 
-        cap = cv2.VideoCapture(self.file_path)
-        if not cap.isOpened():
-            self.signals.finished.emit(self.file_path, '', 0)
-            return
+            cap = cv2.VideoCapture(self.file_path)
+            if not cap.isOpened():
+                self.signals.finished.emit(self.file_path, '', 0)
+                return
 
-        ret, frame = cap.read()
-        decoder_fps = cap.get(cv2.CAP_PROP_FPS)
-        frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-        width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        decoder_duration = frames / decoder_fps if decoder_fps > 0 else 0.0
-        cap.release()
+            ret, frame = cap.read()
+            decoder_fps = cap.get(cv2.CAP_PROP_FPS)
+            frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            decoder_duration = frames / decoder_fps if decoder_fps > 0 else 0.0
+            cap.release()
 
-        probed = probe_video_metadata(self.file_path)
-        duration = (probed.duration_seconds
-                    if probed and probed.duration_seconds is not None
-                    else decoder_duration)
-        width = probed.width if probed and probed.width else width
-        height = probed.height if probed and probed.height else height
-        # Never persist CAP_PROP_FPS as factual media metadata. It is commonly
-        # reconstructed from approximate frame counts/timestamps.
-        fps = probed.average_fps if probed and probed.average_fps else 0.0
-        video_bitrate = (
-            probed.video_bitrate_bps if probed and probed.video_bitrate_bps else 0)
-        total_bitrate = (
-            probed.total_bitrate_bps if probed and probed.total_bitrate_bps else 0)
+            metadata_started = time.monotonic()
+            probed = probe_video_metadata(self.file_path)
+            metadata_ms = round((time.monotonic() - metadata_started) * 1000)
+            duration = (probed.duration_seconds
+                        if probed and probed.duration_seconds is not None
+                        else decoder_duration)
+            width = probed.width if probed and probed.width else width
+            height = probed.height if probed and probed.height else height
+            # Never persist CAP_PROP_FPS as factual media metadata. It is commonly
+            # reconstructed from approximate frame counts/timestamps.
+            fps = probed.average_fps if probed and probed.average_fps else 0.0
+            video_bitrate = (
+                probed.video_bitrate_bps if probed and probed.video_bitrate_bps else 0)
+            total_bitrate = (
+                probed.total_bitrate_bps if probed and probed.total_bitrate_bps else 0)
 
-        if not ret or frame is None:
-            self.signals.finished.emit(self.file_path, '', int(duration))
-            return
+            if not ret or frame is None:
+                self.signals.finished.emit(self.file_path, '', int(duration))
+                return
 
-        os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
-        if not os.path.exists(cache_path):
-            # Cache the real aspect ratio. The old forced 320×180 resize baked
-            # distortion into portrait, ultrawide, and cropped thumbnails even
-            # before Qt displayed them.
-            source_h, source_w = frame.shape[:2]
-            scale = min(1.0, 640 / max(source_w, 1), 360 / max(source_h, 1))
-            if scale < 1.0:
-                thumb = cv2.resize(
-                    frame,
-                    (max(1, int(source_w * scale)), max(1, int(source_h * scale))),
-                    interpolation=cv2.INTER_AREA)
-            else:
-                thumb = frame
-            cv2.imwrite(cache_path, thumb, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        # Persist full metadata so ClipViewer can skip its own cv2.VideoCapture
-        # on subsequent opens — this is what removes the first-launch lag for
-        # clips that already appear on the grid.
-        _write_cached_duration(
-            dur_path, duration, width, height, fps,
-            video_bitrate, total_bitrate)
-        self.signals.finished.emit(
-            self.file_path, cache_path, int(duration))
+            os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
+            if not os.path.exists(cache_path):
+                # Cache the real aspect ratio. The old forced 320×180 resize baked
+                # distortion into portrait, ultrawide, and cropped thumbnails even
+                # before Qt displayed them.
+                source_h, source_w = frame.shape[:2]
+                scale = min(1.0, 640 / max(source_w, 1), 360 / max(source_h, 1))
+                if scale < 1.0:
+                    thumb = cv2.resize(
+                        frame,
+                        (max(1, int(source_w * scale)),
+                         max(1, int(source_h * scale))),
+                        interpolation=cv2.INTER_AREA)
+                else:
+                    thumb = frame
+                cv2.imwrite(cache_path, thumb, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            # Persist full metadata so ClipViewer can skip its own cv2.VideoCapture
+            # on subsequent opens — this is what removes the first-launch lag for
+            # clips that already appear on the grid.
+            _write_cached_duration(
+                dur_path, duration, width, height, fps,
+                video_bitrate, total_bitrate)
+            self.signals.finished.emit(
+                self.file_path, cache_path, int(duration))
+        finally:
+            self.signals.diagnostic_finished.emit(
+                round((time.monotonic() - started) * 1000),
+                metadata_ms, cache_hit)
 
 
 class _FileCollectSignals(QObject):
@@ -1115,6 +1132,13 @@ class ClipGrid(QWidget):
         # Keep transition workers (and, critically, their signal objects) alive
         # until the queued completion callback has run on the GUI thread.
         self._transition_workers: dict[int, _FileCollectWorker] = {}
+        self._diagnostic_scan_started: dict[int, float] = {}
+        self._thumbnail_jobs_submitted = 0
+        self._thumbnail_jobs_completed = 0
+        self._thumbnail_diagnostics_completed = 0
+        self._thumbnail_total_elapsed_ms = 0
+        self._metadata_total_elapsed_ms = 0
+        self._thumbnail_cache_hits = 0
 
         # Watcher must exist before _load_clips() runs
         self._watcher = QFileSystemWatcher()
@@ -1457,9 +1481,26 @@ class ClipGrid(QWidget):
             import_dirs = self._sm.get('imported_clip_folders', []) if self._sm else []
             worker = _FileCollectWorker(self.clips_dir, import_dirs, self._filter, self._sort)
             self._transition_workers[seq] = worker
+            self._diagnostic_scan_started[seq] = time.monotonic()
+            emit_event(
+                'library', 'scan_started', state='SCANNING',
+                scan_kind='filter_transition', filter=self._filter,
+                active_workers=len(self._transition_workers))
 
             def _on_done(raw, pairs, imported, subdirs):
                 self._transition_workers.pop(seq, None)
+                started = self._diagnostic_scan_started.pop(seq, None)
+                emit_event(
+                    'library', 'scan_completed', state='COMPLETED',
+                    scan_kind='filter_transition',
+                    candidate_video_count=sum(
+                        1 for path in raw if is_completed_video_path(path)),
+                    candidate_media_count=len(raw),
+                    imported_media_count=len(imported),
+                    elapsed_ms=(round((time.monotonic() - started) * 1000)
+                                if started is not None else None),
+                    active_workers=len(self._transition_workers),
+                    process_memory_bytes=process_memory_bytes())
                 if self._transition_seq == seq:
                     self._on_files_collected_for_transition(raw, pairs, imported, subdirs)
 
@@ -1589,7 +1630,37 @@ class ClipGrid(QWidget):
             self._show_empty(True)
             return
 
-        current_files = self._collect_media_files()
+        scan_started = time.monotonic()
+        emit_event('library', 'scan_started', state='SCANNING',
+                   scan_kind='foreground_refresh')
+        try:
+            current_files = self._collect_media_files()
+        except Exception as error:
+            emit_event(
+                'library', 'scan_failed', state='FAILED',
+                error=DiagnosticError.LIBRARY_SCAN_FAILED,
+                scan_kind='foreground_refresh',
+                elapsed_ms=round((time.monotonic() - scan_started) * 1000),
+                detail=f'{type(error).__name__}: {error}')
+            raise
+
+        scan_summary = {
+            'scan_kind': 'foreground_refresh',
+            'candidate_media_count': len(current_files),
+            'candidate_video_count': sum(
+                1 for path in current_files if is_completed_video_path(path)),
+            'imported_media_count': len(self._imported_files),
+            'elapsed_ms': round((time.monotonic() - scan_started) * 1000),
+            'thumbnail_widget_cache_entries': len(self._thumb_widgets),
+            'metadata_cache_entries': len(self._thumb_widgets),
+            'active_thumbnail_workers': self._thread_pool.activeThreadCount(),
+            'active_scan_workers': self._scan_thread_pool.activeThreadCount(),
+            'process_memory_bytes': process_memory_bytes(),
+        }
+        emit_event('library', 'scan_completed', state='COMPLETED', **scan_summary)
+        session = get_diagnostic_session()
+        if session is not None:
+            session.update_summary('library', scan_summary)
 
         if current_files == self._known_files:
             return
@@ -1744,6 +1815,9 @@ class ClipGrid(QWidget):
             if is_video and ready:
                 worker = _ThumbnailWorker(fp)
                 worker.signals.finished.connect(self._on_thumb_ready)
+                worker.signals.diagnostic_finished.connect(
+                    self._on_thumb_diagnostic)
+                self._thumbnail_jobs_submitted += 1
                 self._thread_pool.start(worker)
 
         for col, width in enumerate(widths):
@@ -1861,6 +1935,28 @@ class ClipGrid(QWidget):
         self._load_clips()
 
     def _on_thumb_ready(self, file_path: str, cache_path: str, duration: int):
+        self._thumbnail_jobs_completed += 1
         widget = self._thumb_widgets.get(file_path)
         if widget:
             widget.set_video_thumbnail(cache_path, duration)
+
+    def _on_thumb_diagnostic(
+            self, elapsed_ms: int, metadata_ms: int, cache_hit: bool):
+        self._thumbnail_diagnostics_completed += 1
+        self._thumbnail_total_elapsed_ms += max(0, int(elapsed_ms))
+        self._metadata_total_elapsed_ms += max(0, int(metadata_ms))
+        self._thumbnail_cache_hits += int(bool(cache_hit))
+        if (self._thumbnail_diagnostics_completed == self._thumbnail_jobs_submitted
+                or self._thumbnail_diagnostics_completed % 25 == 0):
+            emit_event(
+                'library', 'thumbnail_health_snapshot',
+                metadata_jobs=self._thumbnail_jobs_submitted,
+                thumbnail_jobs=self._thumbnail_jobs_submitted,
+                completed_thumbnail_jobs=self._thumbnail_jobs_completed,
+                completed_diagnostic_jobs=self._thumbnail_diagnostics_completed,
+                total_thumbnail_elapsed_ms=self._thumbnail_total_elapsed_ms,
+                total_metadata_probe_elapsed_ms=self._metadata_total_elapsed_ms,
+                thumbnail_cache_hits=self._thumbnail_cache_hits,
+                active_workers=self._thread_pool.activeThreadCount(),
+                cache_entry_count=len(self._thumb_widgets),
+                process_memory_bytes=process_memory_bytes())
