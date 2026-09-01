@@ -5,25 +5,52 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/build_output"
 APPDIR="$BUILD_DIR/AppDir"
 
+# Prefer the project-local Linux venv when present so packaging runs in the same
+# environment that installed PyInstaller/PySide6. This avoids stale Windows or
+# global-user installs being picked up out of context.
+VENV_PY="$SCRIPT_DIR/.venv-linux/bin/python"
+if [ -x "$VENV_PY" ]; then
+    export PATH="$SCRIPT_DIR/.venv-linux/bin:$HOME/.local/bin:$PATH"
+    PYTHON_BIN="$VENV_PY"
+else
+    PYTHON_BIN="$(command -v python3 || true)"
+    if [ -z "$PYTHON_BIN" ]; then
+        echo "ERROR: python3 not found in PATH." >&2
+        exit 1
+    fi
+    export PATH="$HOME/.local/bin:$PATH"
+fi
+
 # Product version comes from FTHR_UI/version.py — the single source of truth.
 # Never hardcode it here; tools/verify_version_consistency.py enforces that.
-APP_VERSION="$(python3 -c "import sys; sys.path.insert(0, '$SCRIPT_DIR/FTHR_UI'); import version; print(version.__version__)")"
+APP_VERSION="$("$PYTHON_BIN" -c "import sys; sys.path.insert(0, '$SCRIPT_DIR/FTHR_UI'); import version; print(version.__version__)")"
 
 echo "=== FTHR Clips — Linux AppImage Builder ==="
 echo "Version: $APP_VERSION"
-echo "Python: $(python3 --version)"
+echo "Python: $("$PYTHON_BIN" --version)"
 echo "GCC:    $(gcc --version | head -1)"
 echo ""
 
 # ── 1. Check requirements ──────────────────────────────────────────────────
 echo ">>> Checking dependencies..."
-for cmd in cmake gcc pkg-config python3 wayland-scanner curl pyinstaller; do
+for cmd in cmake gcc pkg-config wayland-scanner curl readelf file; do
     command -v "$cmd" >/dev/null 2>&1 || {
         echo "ERROR: '$cmd' not found."
-        [[ "$cmd" == "pyinstaller" ]] && echo "  Install: pip install pyinstaller --break-system-packages"
         exit 1
     }
 done
+# The project Python binary comes from the active venv if present; use it for
+# all Python-dependent operations below, including version checks and the
+# Redist/licence validation helpers.
+command -v "$PYTHON_BIN" >/dev/null 2>&1 || {
+    echo "ERROR: configured Python interpreter missing: $PYTHON_BIN"
+    exit 1
+}
+"$PYTHON_BIN" -m PyInstaller --version >/dev/null 2>&1 || {
+    echo "ERROR: PyInstaller is missing from $PYTHON_BIN" >&2
+    echo "  Install it in the active Linux venv: python -m pip install pyinstaller" >&2
+    exit 1
+}
 
 pkg-config --exists libavcodec libpulse-simple wayland-client || {
     echo "ERROR: Missing C++ build deps (ffmpeg / pulseaudio / wayland)."
@@ -42,7 +69,7 @@ pkg-config --exists libavcodec libpulse-simple wayland-client || {
 _missing_py=()
 _missing_sys=()
 for _m in PySide6 keyboard cv2 numpy sounddevice; do
-    _err="$(python3 -c "import $_m" 2>&1)" && continue
+    _err="$("$PYTHON_BIN" -c "import $_m" 2>&1)" && continue
     case "$_err" in
         *PortAudio*)          _missing_sys+=("$_m: PortAudio runtime library") ;;
         *libGL*|*libEGL*|*libxkb*|*libxcb*)
@@ -74,7 +101,7 @@ echo "    All dependencies found."
 FFMPEG_ROOT="$SCRIPT_DIR/FTHRcapture_linux/third_party/ffmpeg"
 echo ""
 echo ">>> Ensuring the pinned LGPL FFmpeg is present..."
-if ! python3 "$SCRIPT_DIR/tools/fetch_third_party.py" --ffmpeg-linux; then
+if ! "$PYTHON_BIN" "$SCRIPT_DIR/tools/fetch_third_party.py" --ffmpeg-linux; then
     echo "ERROR: could not obtain the pinned LGPL FFmpeg."
     echo "  Without it the engine would link the distribution's GPL build and"
     echo "  the licence gate would refuse to package the result (AUDIT-014)."
@@ -86,13 +113,17 @@ echo ""
 echo ">>> Building Linux capture engine (against the pinned LGPL FFmpeg)..."
 cd "$SCRIPT_DIR/FTHRcapture_linux"
 rm -rf build
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DFTHR_FFMPEG_ROOT="$FFMPEG_ROOT"     | grep -E "FFmpeg|error" || true
-cmake --build build -j"$(nproc)" 2>&1 | grep -E "^\[|error:" || true
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DFTHR_FFMPEG_ROOT="$FFMPEG_ROOT"
+cmake --build build -j"$(nproc)"
 [ -x build/FTHRclips ] || { echo "ERROR: engine build produced no binary."; exit 1; }
 [ -f build/libFTHRPlaybackMixer.so ] || {
     echo "ERROR: playback bridge build produced no library."; exit 1;
 }
 echo "    Engine built: FTHRcapture_linux/build/FTHRclips"
+
+echo ""
+echo ">>> Running Linux native tests..."
+ctest --test-dir build --output-on-failure
 
 # Prove the engine really links the pinned libraries before we package anything.
 echo ""
@@ -123,7 +154,7 @@ cd "$SCRIPT_DIR"
 # ── 3. Bundle with PyInstaller ─────────────────────────────────────────────
 echo ""
 echo ">>> Bundling Python app with PyInstaller..."
-pyinstaller FTHR_linux.spec --clean --noconfirm 2>&1 | grep -E "^(INFO|WARNING|ERROR|Building)" || true
+"$PYTHON_BIN" -m PyInstaller FTHR_linux.spec --clean --noconfirm
 
 PYINST_DIR="$SCRIPT_DIR/dist/FTHRClips"
 [[ -f "$PYINST_DIR/FTHRClips" ]] || { echo "ERROR: PyInstaller output missing."; exit 1; }
@@ -157,13 +188,20 @@ for mod in \
     _rm "libopencv_${mod}.so*"
 done
 
-# Qt Quick / QML / 3D — we use Qt Widgets only (~15 MB)
-_rm "libQt6Quick*.so*"
-_rm "libQt6Qml*.so*"
+# Qt Quick 2 and the small QML runtime are indirect dependencies of Qt's
+# FFmpeg multimedia backend even though the FTHR UI itself uses Widgets.
+# Removing them makes QMediaPlayer report "No QtMultimedia backends found".
+# Quick3D and the unrelated optional modules below remain unused.
 _rm "libQt6Quick3D*.so*"
 _rm "libQt6ShaderTools*.so*"
 _rm "libQt6Pdf*.so*"
 _rm "libQt6WebEngine*.so*"
+
+# PyInstaller's Qt hook can re-add the optional TIFF image plugin after the
+# spec-level TOC filter.  The pinned PySide6 wheel builds it against
+# libtiff.so.5, which is not part of the Ubuntu 24.04 baseline.  FTHR ships no
+# TIFF assets, so omit the unusable plugin deterministically from every build.
+_rm "libqtiff.so"
 _rm "libQt6Location*.so*"
 _rm "libQt6Positioning*.so*"
 _rm "libQt6VirtualKeyboard*.so*"
@@ -238,6 +276,53 @@ cp -r "$PYINST_DIR/." "$APPDIR/"
 cp "$SCRIPT_DIR/AppDir/fthr-clips.desktop" "$APPDIR/"
 cp "$SCRIPT_DIR/AppDir/fthr-clips.png"     "$APPDIR/"
 
+cat > "$APPDIR/AppRun" <<'APPRUN_EOF'
+#!/bin/sh
+HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
+if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+    export QT_QPA_PLATFORM="wayland"
+elif [ -n "${DISPLAY:-}" ]; then
+    export QT_QPA_PLATFORM="xcb"
+fi
+
+export PYTHONUNBUFFERED=1
+exec "$HERE/FTHRClips" "$@"
+APPRUN_EOF
+chmod +x "$APPDIR/AppRun"
+
+# Host metadata must never enter a Linux package. FTHR_linux.spec filters it at
+# collection time; this fail-closed check prevents a future copy rule from
+# silently reintroducing it.
+_metadata_junk="$(find "$APPDIR" -type f \( \
+    -iname 'desktop.ini' -o -iname 'thumbs.db' -o -iname 'ehthumbs.db' \
+    \) -print)"
+if [ -n "$_metadata_junk" ]; then
+    echo "ERROR: host-OS metadata entered AppDir:" >&2
+    printf '  %s\n' "$_metadata_junk" >&2
+    exit 1
+fi
+
+[ -x "$APPDIR/FTHRClips" ] || {
+    echo "ERROR: packaged application executable is missing: $APPDIR/FTHRClips" >&2
+    exit 1
+}
+[ -x "$APPDIR/AppRun" ] || {
+    echo "ERROR: AppRun is missing or not executable." >&2
+    exit 1
+}
+[ -f "$APPDIR/fthr-clips.desktop" ] || {
+    echo "ERROR: AppImage desktop entry is missing." >&2
+    exit 1
+}
+[ -f "$APPDIR/fthr-clips.png" ] || {
+    echo "ERROR: AppImage root icon is missing." >&2
+    exit 1
+}
+if command -v desktop-file-validate >/dev/null 2>&1; then
+    desktop-file-validate "$APPDIR/fthr-clips.desktop"
+fi
+
 # Licence paperwork (AUDIT-005/AUDIT-013). Bundled FFmpeg, PySide6, and Qt use
 # LGPL options and require local licence/notices plus the documented source
 # route; the user must not have to visit the repository to find them.
@@ -252,27 +337,12 @@ echo "    Licence files copied into AppDir."
 # choosing it. Fail the build rather than ship it.
 echo ""
 echo ">>> Verifying release licences..."
-if ! python3 "$SCRIPT_DIR/tools/verify_release_licenses.py" --appdir "$APPDIR"; then
+if ! "$PYTHON_BIN" "$SCRIPT_DIR/tools/verify_release_licenses.py" --appdir "$APPDIR"; then
     echo ""
     echo "ERROR: licence verification failed - refusing to build the AppImage."
     echo "  See THIRD_PARTY_NOTICES.md and tools/verify_release_licenses.py"
     exit 1
 fi
-
-cat > "$APPDIR/AppRun" << 'APPRUN_EOF'
-#!/bin/bash
-HERE="$(dirname "$(readlink -f "$0")")"
-
-if [ -n "$WAYLAND_DISPLAY" ]; then
-    export QT_QPA_PLATFORM="wayland"
-elif [ -n "$DISPLAY" ]; then
-    export QT_QPA_PLATFORM="xcb"
-fi
-
-export PYTHONUNBUFFERED=1
-exec "$HERE/FTHRClips" "$@"
-APPRUN_EOF
-chmod +x "$APPDIR/AppRun"
 
 # ── 7. Download appimagetool ──────────────────────────────────────────────
 APPIMAGETOOL="$BUILD_DIR/appimagetool-x86_64.AppImage"
@@ -287,15 +357,40 @@ fi
 # ── 8. Pack AppImage ──────────────────────────────────────────────────────
 echo ""
 echo ">>> Packing AppImage..."
-OUTPUT="$SCRIPT_DIR/FTHRClips-${APP_VERSION}-x86_64.AppImage"
-ARCH=x86_64 "$APPIMAGETOOL" "$APPDIR" "$OUTPUT" 2>&1 | grep -v "^Please consider\|appimage.github"
+OUTPUT="$BUILD_DIR/FTHRClips-${APP_VERSION}-x86_64.AppImage"
+LINUX_STAGE="$HOME/fthr-appimage-build"
+NATIVE_APPDIR="$LINUX_STAGE/AppDir"
+NATIVE_TOOL="$LINUX_STAGE/appimagetool-x86_64.AppImage"
+NATIVE_OUTPUT="$LINUX_STAGE/FTHR-Clips-Linux-x86_64.AppImage"
+
+# AppImage tooling is unreliable when its source tree lives on a Windows mount
+# whose path contains spaces. Keep the actual image construction on the native
+# Linux filesystem, then copy only the finished artifact back to build_output.
+[ "$LINUX_STAGE" = "$HOME/fthr-appimage-build" ] || {
+    echo "ERROR: refusing unexpected native staging path: $LINUX_STAGE" >&2
+    exit 1
+}
+mkdir -p "$LINUX_STAGE"
+rm -rf "$NATIVE_APPDIR"
+rm -f "$NATIVE_OUTPUT" "$OUTPUT"
+cp -a "$APPDIR" "$NATIVE_APPDIR"
+cp "$APPIMAGETOOL" "$NATIVE_TOOL"
+chmod +x "$NATIVE_TOOL" "$NATIVE_APPDIR/AppRun"
+
+ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 \
+    "$NATIVE_TOOL" "$NATIVE_APPDIR" "$NATIVE_OUTPUT"
+[ -f "$NATIVE_OUTPUT" ] || {
+    echo "ERROR: appimagetool reported success but produced no AppImage." >&2
+    exit 1
+}
+cp "$NATIVE_OUTPUT" "$OUTPUT"
 
 SIZE="$(du -sh "$OUTPUT" | cut -f1)"
 echo ""
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║              FTHR Clips Linux AppImage Ready                ║"
 echo "╠══════════════════════════════════════════════════════════════╣"
-printf "║  Output: %-52s║\n" "FTHRClips-${APP_VERSION}-x86_64.AppImage"
+printf "║  Output: %-52s║\n" "build_output/FTHRClips-${APP_VERSION}-x86_64.AppImage"
 printf "║  Size:   %-52s║\n" "$SIZE"
 echo "╠══════════════════════════════════════════════════════════════╣"
 echo "║  Linux-only — contains the Linux capture engine only.       ║"

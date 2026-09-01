@@ -1,51 +1,48 @@
 # FTHR Clips 1.0.0-alpha
 
-Pre-alpha release candidate for local qualification. This source state is not
-yet approved for public distribution.
+This is a local alpha build for qualification work. It is not approved for public release.
 
-## Included
+## What is in here
 
-- Background replay with transactional clip publication.
-- Windows WGC/DXGI capture with H.264, HEVC, and AV1 hardware paths.
-- Manual recording now reuses the active hardware video and AAC packet streams
-  in a bounded fragmented-MP4 writer. Completed keyframe fragments remain
-  playable after interruption, and Stop no longer performs a second software
-  encode, WAV-sidecar finalization, or whole-file FFmpeg remux.
-- System-output and microphone tracks with synchronized in-app playback.
-- Code-integrated Windows 11 per-app audio stems.
-- Selected-monitor screenshots, crop editing, tray/background operation, and
-  persistent autostart settings.
-- Clip-backed overlay previews plus camera, image, and mouse-click burn-ins with
-  draggable placement and per-input visibility. Windows third-party keyboard
-  windows (Noboard/NohBoard-style) can be sampled live with an on-preview
-  chroma-key picker, adjustable key intensity, and timestamped clip overlay.
-- Settings combo boxes open as simple below-field dropdowns, and Customize
-  sections expand or collapse immediately without height animations.
-- Audio settings expose persistent per-event notification volumes again.
-- Optional exports and shares open with an animated bottom-right Capture Card;
-  source clips remain untouched so trimmed videos always animate from time zero.
-- Typography offers Oswald as the sole built-in family plus portable TTF/OTF
-  imports, and the Source popup now fits tightly to its visible controls.
-- Windows installer and Linux AppImage build definitions with gated assets and
-  third-party licence notices.
+- Replay capture and transactional clip saving
+- Windows WGC/DXGI capture with H.264, HEVC and AV1 paths
+- Manual recording that keeps the active stream and writes a stable MP4 output
+- System audio and microphone tracks with in-app playback
+- Monitor screenshots, crop editing and background operation
+- Persistent autostart and settings
+- Overlay previews, webcam and click burn-ins
+- Installer and Linux AppImage build definitions with release checks in place
 
-## Qualification status
+## Current status
 
-- Windows 10 with same-adapter NVIDIA hardware is only partially qualified:
-  HEVC replay completed the latest run, while H.264 and AV1 capture stalled.
-  Screenshots, second-monitor HEVC replay, and background lifecycle were
-  exercised separately.
-- AMD and Intel encoder paths are automated-tested but hardware-unverified.
-- Windows 11 per-app stems and the official borderless-capture capability still
-  require a physical Windows 11 qualification run.
-- Linux builds and native tests pass in WSL2, but visible capture on a real
-  Wayland desktop, PipeWire per-app audio, and AppImage runtime remain unverified.
-- Local Windows artifacts are unsigned until a release operator supplies an
-  approved code-signing identity.
-- The public alpha remains blocked by NVIDIA H.264/AV1 stalls, HEVC editor
-  playback failure, a silent microphone stream in the latest physical run,
-  and missing physical/platform qualification.
+This build is still being validated, not distributed publicly.
 
-Linux hotkeys use an owner-only Unix socket and do not require root or membership
-in the `input` group. See `README.md`, `KNOWN_ISSUES.md`, and `BUILDING.md`
-before installing or distributing this build.
+- NVIDIA H.264/HEVC/AV1 stall fixes are integrated and covered by automated
+  lifecycle tests. A complete physical Windows qualification after those fixes
+  has **not** run yet.
+- HEVC editor playback and audible microphone content also require a new
+  physical run; earlier failures are not evidence that the current source is
+  fixed or still broken.
+- AMD and Intel paths are automated-tested but hardware-unverified.
+- Local Windows artifacts remain unsigned.
+- The Linux engine builds and all native CTests pass in WSL2. The AppImage also
+  passes construction, licence, and extraction checks there, but native
+  Wayland/X11 capture, audio, hotkeys, and multi-monitor behaviour remain
+  physically unverified.
+
+## Linux AppImage location
+
+The AppImage is not checked in to the repo. It is generated locally by running:
+
+```bash
+bash build_linux.sh
+```
+
+Then it lands in:
+
+```text
+build_output/FTHRClips-1.0.0-alpha-x86_64.AppImage
+```
+
+This path is a local build artifact. Passing the package gates does not make it
+a public-release-qualified or physically qualified Linux build.

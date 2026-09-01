@@ -152,6 +152,7 @@ endif()
 
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
     libavcodec libavformat libavutil libavdevice libswscale libswresample)
+pkg_check_modules(AVUTIL REQUIRED IMPORTED_TARGET libavutil)
 
 message(STATUS "FFmpeg libavcodec version : ${FFMPEG_libavcodec_VERSION}")
 message(STATUS "FFmpeg include dirs       : ${FFMPEG_INCLUDE_DIRS}")
@@ -187,6 +188,14 @@ if(FTHR_FFMPEG_BUNDLED)
         endif()
         list(APPEND FTHR_FFMPEG_LINK_LIBRARIES "${FTHR_${_lib}_LIBRARY}")
     endforeach()
+endif()
+
+if(BUILD_TESTING)
+    # encoded_video_config.cpp writes metadata through av_dict_set[_int].
+    # pthread alone happened to compile this cross-platform contract target,
+    # but cannot satisfy those libavutil symbols at link time on Linux.
+    target_link_libraries(fthr_windows_encoded_ring_duration_test PRIVATE
+        PkgConfig::AVUTIL)
 endif()
 
 pkg_check_modules(WAYLAND REQUIRED IMPORTED_TARGET
@@ -399,6 +408,11 @@ if(BUILD_TESTING)
             $<$<NOT:$<BOOL:${FTHR_FFMPEG_BUNDLED}>>:PkgConfig::FFMPEG>)
         target_compile_options(fthr_x11_frame_converter_test PRIVATE
             -Wall -Wextra -Wpedantic -UNDEBUG)
+        target_link_options(fthr_x11_frame_converter_test PRIVATE
+            "-Wl,--disable-new-dtags")
+        set_target_properties(fthr_x11_frame_converter_test PROPERTIES
+            BUILD_WITH_INSTALL_RPATH TRUE
+            INSTALL_RPATH "$ORIGIN/../third_party/ffmpeg/lib")
         add_test(NAME x11_frame_conversion
             COMMAND fthr_x11_frame_converter_test)
     endif()

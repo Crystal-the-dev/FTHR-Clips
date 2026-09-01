@@ -38,6 +38,7 @@ redist/
 /dist-uploader-toggle/
 /dist_old_gpl_*/
 /plugin-packages/
+/build_output/
 *.spec.bak
 
 # Visual Studio / MSBuild
@@ -91,6 +92,7 @@ __pycache__/
 *.egg-info/
 .eggs/
 .venv/
+/.venv-linux/
 venv/
 env/
 .pytest_cache/
@@ -163,6 +165,7 @@ credentials.json
 Thumbs.db
 ehthumbs.db
 Desktop.ini
+desktop.ini
 .DS_Store
 
 # ---------------------------------------------------------------------------

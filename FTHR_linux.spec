@@ -32,10 +32,23 @@ except ValueError as exc:
         f'the pinned wheel at {_PYSIDE_ROOT}') from exc
 _QT6_PLUGIN_DEST = Path('PySide6') / _QT6_PLUG_REL
 
+_SKIPPED_QT_PLUGINS = {
+    # The wheel plugin targets libtiff.so.5, which is not shipped by the wheel
+    # and is unavailable on the supported Ubuntu 24.04 build baseline. FTHR
+    # does not load TIFF assets, so carrying a plugin that cannot load is worse
+    # than omitting that optional format handler.
+    'libqtiff.so',
+}
+
+
 def _so(subdir):
     d = _QT6_PLUG / subdir
     dest = (_QT6_PLUGIN_DEST / subdir).as_posix()
-    return [(str(p), dest) for p in d.glob('*.so')] if d.exists() else []
+    return [
+        (str(p), dest)
+        for p in d.glob('*.so')
+        if p.name not in _SKIPPED_QT_PLUGINS
+    ] if d.exists() else []
 
 
 def _find_lib(soname):
@@ -66,6 +79,23 @@ def _find_lib(soname):
 
 
 _PORTAUDIO = _find_lib('libportaudio.so.2')
+
+_WINDOWS_METADATA_NAMES = {'desktop.ini', 'thumbs.db', 'ehthumbs.db'}
+
+
+def _asset_tree(source, destination):
+    """Collect an asset tree without host-OS metadata files."""
+    source = Path(source)
+    entries = []
+    for path in source.rglob('*'):
+        if not path.is_file():
+            continue
+        if path.name.casefold() in _WINDOWS_METADATA_NAMES:
+            continue
+        relative_parent = path.parent.relative_to(source)
+        target = (Path(destination) / relative_parent).as_posix()
+        entries.append((str(path), target))
+    return entries
 
 # ---------------------------------------------------------------------------
 # LGPL FFmpeg — AUDIT-014
@@ -133,9 +163,9 @@ a = Analysis(
         # shipped libraries against.
         (str(_FFMPEG_ROOT / 'LICENSE.txt'), 'licenses/ffmpeg'),
         (str(ROOT / 'tools' / 'ffmpeg_manifest_linux.json'), 'licenses/ffmpeg'),
-        (str(ASSETS_DIR / 'fonts'),          'assets/fonts'),
-        (str(ASSETS_DIR / 'icons'),          'assets/icons'),
-        (str(ASSETS_DIR / 'sounds'),         'assets/sounds'),
+        *_asset_tree(ASSETS_DIR / 'fonts',   'assets/fonts'),
+        *_asset_tree(ASSETS_DIR / 'icons',   'assets/icons'),
+        *_asset_tree(ASSETS_DIR / 'sounds',  'assets/sounds'),
     ],
     hiddenimports=[
         'PySide6.QtMultimedia',
@@ -166,7 +196,6 @@ a = Analysis(
         'core.ffmpeg_playback',
         'core.game_detector',
         'core.hotkey_manager',
-        'core.input_overlay',
         'core.mic_recorder',
         'core.presets_manager',
         'core.settings_manager',
@@ -212,9 +241,9 @@ a = Analysis(
 def _keep_reviewed_qt_runtime(entry):
     dest = str(entry[0]).replace('\\', '/').casefold()
     name = dest.rsplit('/', 1)[-1]
-    forbidden_prefixes = ('libqt6qml', 'libqt6quick',
-                          'libqt6virtualkeyboard')
-    return ('virtualkeyboard' not in dest
+    forbidden_prefixes = ('libqt6virtualkeyboard',)
+    return (name not in _SKIPPED_QT_PLUGINS
+            and 'virtualkeyboard' not in dest
             and not name.startswith(forbidden_prefixes))
 
 

@@ -6,7 +6,7 @@
   "license": "LGPL v3 or later",
   "platform": "linux64",
   "arch": "x86_64",
-  "retrieved": "2026-08-06",
+  "retrieved": "2026-09-01",
 
   "strategy": {
     "chosen": "B — pinned upstream LGPL binary distribution",
@@ -27,11 +27,11 @@
 
   "source": {
     "project": "BtbN/FFmpeg-Builds",
-    "release_tag": "autobuild-2026-08-06-13-39",
+    "release_tag": "autobuild-2026-07-31-14-10",
     "asset": "ffmpeg-n8.1.2-34-g9b6c8969e0-linux64-lgpl-shared-8.1.tar.xz",
-    "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-06-13-39/ffmpeg-n8.1.2-34-g9b6c8969e0-linux64-lgpl-shared-8.1.tar.xz",
-    "sha256": "621577f0e81df4e8f3d9287a20af3f97289b61b39a9d3f1f1e15a17cedacbd1e",
-    "size_bytes": 56827416
+    "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-31-14-10/ffmpeg-n8.1.2-34-g9b6c8969e0-linux64-lgpl-shared-8.1.tar.xz",
+    "sha256": "c882a80f06617149198a98a07a0880a7e881953ae9f9cb931f5be09a4f93caae",
+    "size_bytes": 56666944
   },
 
   "reproduce": "python tools/fetch_third_party.py --ffmpeg-linux",
@@ -125,13 +125,13 @@
   },
 
   "shipped_files_sha256": {
-    "libavcodec.so.62.28.102": "8887b00da45d4b9392a42339ae028e975bbf0ba53106d72bbfe0462cbab0bb94",
-    "libavdevice.so.62.3.102": "a2d59a69f34ee5f1d1d85bf5fb9af198aeee347aceec9b507e2e7eba8753e6f6",
-    "libavfilter.so.11.14.102": "89549d597d7db088cbd2f4e55a26831e1672c6ca9d43df74877493e3094d2a57",
-    "libavformat.so.62.12.102": "9d8cdb8ee6bdbe6234d27b2ef2454bb125c6f5ecb5bf8c4c94b2d44c89b9282e",
-    "libavutil.so.60.26.102": "d82151b1941acb9489b60bcefc628cc12bd3c2cf8cd8aad93b64ee205fcf4f9c",
-    "libswresample.so.6.3.102": "3b77454a078a369e9ff04533ce27d1324f64cca2b483ad27a57b1e2891b070fe",
-    "libswscale.so.9.5.102": "745775a13c0a92e3db36c46e69d3c0bb5344f897e2c47725db5efd8ecb8ee28b"
+    "libavcodec.so.62.28.102": "e764cb8e423b837b7c600f23cee7188e548b1451ec190b4691b95386ea870fc3",
+    "libavdevice.so.62.3.102": "e194f18571f675149dfa9d130df64e733b9af738008f3a34b4e3e807a9f8eee3",
+    "libavfilter.so.11.14.102": "00b7baabe290369eab0f3ba2c31ae9c9ca21c2b46f62ebc32b3136238a186ea4",
+    "libavformat.so.62.12.102": "fad88584a80c883b7c1d159b90b9e3b26a2df060de42099f709a75bb61dd7eda",
+    "libavutil.so.60.26.102": "19e62b5ed04178807b0489d7cff8aa69d8f9bf99429a0740f9b438220ed5d248",
+    "libswresample.so.6.3.102": "bb6e402d91995f38a80d650b0c166c44f0618f3611175eb3fca047d491dd337d",
+    "libswscale.so.9.5.102": "88c41a7e04a4a686ffb695480dd885b59f91044b9ed268ca287f1adc21d33815"
   },
 
   "additional_providers_note": "Three different FFmpeg builds end up inside the Linux bundle. Only the first is FTHR's choice; the other two arrive inside Python wheels and are used by those wheels alone. All three are LGPL. They are listed so the licence gate can verify them rather than silently accept whatever appears — an FFmpeg library in the artifact is an FFmpeg library being distributed, whether or not anything loads it.",
