@@ -1,6 +1,10 @@
+import json
+
 from core.engine_startup_diagnostics import (
+    EngineLaunchContext,
     extract_startup_failure,
     extract_startup_warnings,
+    format_engine_launch_failure,
 )
 
 
@@ -39,3 +43,57 @@ def test_extracts_linux_video_only_audio_warning():
     assert len(warnings) == 1
     assert warnings[0].code == 'DESKTOP_AUDIO_UNAVAILABLE'
     assert 'video-only' in warnings[0].detail
+
+
+def test_winerror_4551_launch_failure_preserves_native_call_and_context():
+    error = OSError(4551, 'blocked by Windows policy')
+    error.winerror = 4551
+
+    failure = format_engine_launch_failure(
+        error,
+        EngineLaunchContext(
+            selected_monitor_id=r'\\?\display#monitor-3090',
+            requested_capture_mode='desktop',
+            requested_encoder='nvenc',
+            codec='hevc',
+        ),
+    )
+    diagnostic = json.loads(failure.detail.split('diagnostic=', 1)[1])
+    native = diagnostic['native_failure']
+    context = diagnostic['startup_context']
+
+    assert failure.code == 'ENGINE_PROCESS_LAUNCH_FAILED'
+    assert native['api_call'] == 'CreateProcessW'
+    assert native['error_domain'] == 'win32'
+    assert native['native_error_signed'] == 4551
+    assert native['native_error_unsigned'] == 4551
+    assert native['native_error_hex'] == '0x000011C7'
+    assert native['win32_error_decimal'] == 4551
+    assert native['symbolic_error'] == 'ERROR_SYSTEM_INTEGRITY_POLICY_VIOLATION'
+    assert native['system_message']
+    assert context == {
+        'selected_monitor_id': r'\\?\display#monitor-3090',
+        'dxgi_output': 'unavailable:engine_process_not_started',
+        'owning_adapter_luid': 'unavailable:engine_process_not_started',
+        'capture_device_adapter_luid': 'unavailable:engine_process_not_started',
+        'encoder_adapter_luid': 'unavailable:engine_process_not_started',
+        'capture_backend': 'unavailable:engine_process_not_started',
+        'encoder_backend': 'unavailable:engine_process_not_started',
+        'codec': 'hevc',
+        'requested_capture_mode': 'desktop',
+        'requested_encoder': 'nvenc',
+    }
+
+
+def test_non_win32_launch_error_is_not_mislabeled_as_winerror():
+    error = OSError(13, 'permission denied')
+    failure = format_engine_launch_failure(
+        error,
+        EngineLaunchContext('', 'desktop', 'auto', 'h264'),
+        api_call='subprocess.Popen',
+    )
+    diagnostic = json.loads(failure.detail.split('diagnostic=', 1)[1])
+
+    assert diagnostic['native_failure']['error_domain'] == 'os_error'
+    assert diagnostic['native_failure']['win32_error_decimal'] is None
+    assert diagnostic['native_failure']['symbolic_error'] is None

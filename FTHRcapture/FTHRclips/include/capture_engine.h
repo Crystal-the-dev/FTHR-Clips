@@ -271,6 +271,8 @@ namespace fthr {
             int64_t present_qpc,
             uint64_t produced_frame);
         void FailReplayEncoder(const char* operation);
+        void SetCaptureFailure(std::string detail);
+        std::string BuildStartupDiagnosticContext() const;
         bool FailStartup(ReplayStartupError code, std::string detail);
 
         // -----------------------------------------------------------------------
@@ -340,6 +342,15 @@ namespace fthr {
         monitor::WindowsMonitorTopologySource monitor_topology_source_;
         monitor::MonitorResolver monitor_resolver_;
         monitor::MonitorTopologyEntry resolved_monitor_;
+        monitor::DxgiOutputIdentity resolved_dxgi_output_;
+        monitor::AdapterLuid capture_device_adapter_luid_{};
+        monitor::AdapterLuid encoder_adapter_luid_{};
+        bool capture_device_adapter_luid_available_ = false;
+        bool encoder_adapter_luid_available_ = false;
+        std::string startup_capture_backend_ = "unavailable:not_reached";
+        std::string startup_encoder_backend_ = "unavailable:not_reached";
+        std::string startup_codec_ = "unavailable:not_requested";
+        std::string last_capture_failure_detail_;
 
         // -----------------------------------------------------------------------
         // Compressed replay path. nvenc_active_ retains its legacy name because

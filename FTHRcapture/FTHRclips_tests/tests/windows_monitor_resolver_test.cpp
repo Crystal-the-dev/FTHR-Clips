@@ -1,4 +1,5 @@
 #include "windows_monitor_resolver.h"
+#include "windows_native_error.h"
 #include "encoded_ring_buffer.h"
 #include "encoded_video_config.h"
 #include "encoded_video_config_ffmpeg.h"
@@ -194,6 +195,33 @@ void NoFallbackToOutputZero() {
     const auto result = fthr::monitor::ResolveDxgiOutput(selected, outputs);
     Check(!result.ok() && result.output_index == UINT32_MAX,
           "resolver never returns output zero for missing selected output");
+}
+
+void NativeError4551PreservesWin32AndHresultIdentity() {
+    const std::string win32 = fthr::diagnostics::FormatWin32Failure(
+        "LoadLibraryA(nvEncodeAPI64.dll)", 4551);
+    Check(win32.find("LoadLibraryA(nvEncodeAPI64.dll)") != std::string::npos,
+          "Win32 diagnostic preserves the exact API call");
+    Check(win32.find("\"win32_error_decimal\":4551") != std::string::npos,
+          "Win32 diagnostic preserves decimal error 4551");
+    Check(win32.find("\"native_error_hex\":\"0x000011C7\"")
+              != std::string::npos,
+          "Win32 diagnostic preserves hexadecimal error 4551");
+    Check(win32.find("ERROR_SYSTEM_INTEGRITY_POLICY_VIOLATION")
+              != std::string::npos,
+          "Windows SDK symbolic name for 4551 is preserved");
+
+    const HRESULT result = HRESULT_FROM_WIN32(4551);
+    const std::string hresult = fthr::diagnostics::FormatHResultFailure(
+        "IGraphicsCaptureItemInterop::CreateForMonitor", result);
+    Check(hresult.find("IGraphicsCaptureItemInterop::CreateForMonitor")
+              != std::string::npos,
+          "HRESULT diagnostic preserves the exact API call");
+    Check(hresult.find("\"win32_error_decimal\":4551") != std::string::npos,
+          "HRESULT_FROM_WIN32 diagnostic preserves embedded Win32 4551");
+    Check(hresult.find("\"native_error_hex\":\"0x800711C7\"")
+              != std::string::npos,
+          "HRESULT diagnostic preserves the full native HRESULT");
 }
 
 EncodedVideoConfig VideoConfig(VideoCodec codec) {
@@ -471,6 +499,7 @@ int main() {
     StaleTransientMappingRejected();
     NoFallbackToPrimary();
     NoFallbackToOutputZero();
+    NativeError4551PreservesWin32AndHresultIdentity();
     NativeNvencCodecSelectionCoversNvidiaMatrix();
     UnsupportedNvencCodecIsRejected();
     NativeNvencLowLatencyConfigurationIsCodecSpecific();

@@ -3,6 +3,7 @@
 #endif
 
 #include "windows_monitor_resolver.h"
+#include "windows_native_error.h"
 
 #include <windows.h>
 #include <dxgi1_2.h>
@@ -21,16 +22,25 @@ struct MonitorHandleEntry {
     bool primary = false;
 };
 
+struct MonitorHandleCollection {
+    std::vector<MonitorHandleEntry> entries;
+    DWORD first_error = ERROR_SUCCESS;
+    bool failed = false;
+};
+
 BOOL CALLBACK CollectMonitorHandle(
     HMONITOR monitor, HDC, LPRECT, LPARAM context_value) {
-    auto* entries = reinterpret_cast<std::vector<MonitorHandleEntry>*>(context_value);
+    auto* collection = reinterpret_cast<MonitorHandleCollection*>(context_value);
     MONITORINFOEXW info{};
     info.cbSize = sizeof(info);
     if (GetMonitorInfoW(monitor, &info)) {
-        entries->push_back({
+        collection->entries.push_back({
             info.szDevice,
             reinterpret_cast<uintptr_t>(monitor),
             (info.dwFlags & MONITORINFOF_PRIMARY) != 0});
+    } else if (!collection->failed) {
+        collection->first_error = GetLastError();
+        collection->failed = true;
     }
     return TRUE;
 }
@@ -76,9 +86,8 @@ uint64_t TopologyGeneration(const std::vector<MonitorTopologyEntry>& entries) {
 }
 
 std::string Win32Diagnostic(const char* operation, LONG error) {
-    std::ostringstream text;
-    text << operation << " failed with Win32 error " << error;
-    return text.str();
+    return diagnostics::FormatWin32Failure(
+        operation, static_cast<DWORD>(error));
 }
 
 } // namespace
@@ -144,13 +153,19 @@ TopologyQueryResult WindowsMonitorTopologySource::QueryActiveTopology() {
     }
     paths.resize(path_count);
 
-    std::vector<MonitorHandleEntry> handles;
+    MonitorHandleCollection handle_collection;
     if (!EnumDisplayMonitors(
             nullptr, nullptr, CollectMonitorHandle,
-            reinterpret_cast<LPARAM>(&handles))) {
+            reinterpret_cast<LPARAM>(&handle_collection))) {
         return {MonitorResolveError::MonitorTopologyChanged, {},
                 Win32Diagnostic("EnumDisplayMonitors", GetLastError())};
     }
+    if (handle_collection.failed) {
+        return {MonitorResolveError::MonitorTopologyChanged, {},
+                Win32Diagnostic("GetMonitorInfoW",
+                                handle_collection.first_error)};
+    }
+    const auto& handles = handle_collection.entries;
 
     TopologyQueryResult result;
     for (const auto& path : paths) {
@@ -161,14 +176,28 @@ TopologyQueryResult WindowsMonitorTopologySource::QueryActiveTopology() {
         source_name.header.size = sizeof(source_name);
         source_name.header.adapterId = path.sourceInfo.adapterId;
         source_name.header.id = path.sourceInfo.id;
-        if (DisplayConfigGetDeviceInfo(&source_name.header) != ERROR_SUCCESS) continue;
+        const LONG source_status = DisplayConfigGetDeviceInfo(
+            &source_name.header);
+        if (source_status != ERROR_SUCCESS) {
+            return {MonitorResolveError::MonitorTopologyChanged, {},
+                    Win32Diagnostic(
+                        "DisplayConfigGetDeviceInfo(GET_SOURCE_NAME)",
+                        source_status)};
+        }
 
         DISPLAYCONFIG_TARGET_DEVICE_NAME target_name{};
         target_name.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
         target_name.header.size = sizeof(target_name);
         target_name.header.adapterId = path.targetInfo.adapterId;
         target_name.header.id = path.targetInfo.id;
-        if (DisplayConfigGetDeviceInfo(&target_name.header) != ERROR_SUCCESS) continue;
+        const LONG target_status = DisplayConfigGetDeviceInfo(
+            &target_name.header);
+        if (target_status != ERROR_SUCCESS) {
+            return {MonitorResolveError::MonitorTopologyChanged, {},
+                    Win32Diagnostic(
+                        "DisplayConfigGetDeviceInfo(GET_TARGET_NAME)",
+                        target_status)};
+        }
         if (target_name.monitorDevicePath[0] == L'\0') continue;
 
         MonitorTopologyEntry entry;
@@ -270,6 +299,7 @@ bool OpenSelectedDxgiOutput(
     const MonitorTopologyEntry& selected_monitor,
     IDXGIAdapter1** adapter,
     IDXGIOutput** output,
+    DxgiOutputIdentity* output_identity,
     std::string& diagnostic) {
     if (!factory || !adapter || !output) {
         diagnostic = "invalid DXGI output resolver arguments";
@@ -277,34 +307,61 @@ bool OpenSelectedDxgiOutput(
     }
     *adapter = nullptr;
     *output = nullptr;
+    if (output_identity) *output_identity = {};
 
-    IDXGIAdapter1* candidate_adapter = nullptr;
-    for (UINT adapter_index = 0;
-         factory->EnumAdapters1(adapter_index, &candidate_adapter) != DXGI_ERROR_NOT_FOUND;
-         ++adapter_index) {
+    for (UINT adapter_index = 0;; ++adapter_index) {
+        IDXGIAdapter1* candidate_adapter = nullptr;
+        const HRESULT adapter_status = factory->EnumAdapters1(
+            adapter_index, &candidate_adapter);
+        if (adapter_status == DXGI_ERROR_NOT_FOUND) break;
+        if (FAILED(adapter_status) || !candidate_adapter) {
+            diagnostic = diagnostics::FormatHResultFailure(
+                "IDXGIFactory1::EnumAdapters1", adapter_status);
+            return false;
+        }
         DXGI_ADAPTER_DESC1 adapter_desc{};
-        if (FAILED(candidate_adapter->GetDesc1(&adapter_desc))
-            || ToAdapterLuid(adapter_desc.AdapterLuid) != selected_monitor.adapter_luid) {
+        const HRESULT adapter_desc_status = candidate_adapter->GetDesc1(
+            &adapter_desc);
+        if (FAILED(adapter_desc_status)) {
+            diagnostic = diagnostics::FormatHResultFailure(
+                "IDXGIAdapter1::GetDesc1", adapter_desc_status);
             candidate_adapter->Release();
-            candidate_adapter = nullptr;
+            return false;
+        }
+        if (ToAdapterLuid(adapter_desc.AdapterLuid)
+                != selected_monitor.adapter_luid) {
+            candidate_adapter->Release();
             continue;
         }
 
         std::vector<DxgiOutputIdentity> identities;
-        IDXGIOutput* candidate_output = nullptr;
-        for (UINT output_index = 0;
-             candidate_adapter->EnumOutputs(output_index, &candidate_output) != DXGI_ERROR_NOT_FOUND;
-             ++output_index) {
-            DXGI_OUTPUT_DESC output_desc{};
-            if (SUCCEEDED(candidate_output->GetDesc(&output_desc))) {
-                identities.push_back({
-                    selected_monitor.adapter_luid,
-                    reinterpret_cast<uintptr_t>(output_desc.Monitor),
-                    output_desc.DeviceName,
-                    output_index});
+        for (UINT output_index = 0;; ++output_index) {
+            IDXGIOutput* candidate_output = nullptr;
+            const HRESULT output_status = candidate_adapter->EnumOutputs(
+                output_index, &candidate_output);
+            if (output_status == DXGI_ERROR_NOT_FOUND) break;
+            if (FAILED(output_status) || !candidate_output) {
+                diagnostic = diagnostics::FormatHResultFailure(
+                    "IDXGIAdapter1::EnumOutputs", output_status);
+                candidate_adapter->Release();
+                return false;
             }
+            DXGI_OUTPUT_DESC output_desc{};
+            const HRESULT output_desc_status = candidate_output->GetDesc(
+                &output_desc);
+            if (FAILED(output_desc_status)) {
+                diagnostic = diagnostics::FormatHResultFailure(
+                    "IDXGIOutput::GetDesc", output_desc_status);
+                candidate_output->Release();
+                candidate_adapter->Release();
+                return false;
+            }
+            identities.push_back({
+                selected_monitor.adapter_luid,
+                reinterpret_cast<uintptr_t>(output_desc.Monitor),
+                output_desc.DeviceName,
+                output_index});
             candidate_output->Release();
-            candidate_output = nullptr;
         }
 
         const auto resolved = ResolveDxgiOutput(selected_monitor, identities);
@@ -313,10 +370,22 @@ bool OpenSelectedDxgiOutput(
             candidate_adapter->Release();
             return false;
         }
-        if (FAILED(candidate_adapter->EnumOutputs(resolved.output_index, output))) {
-            diagnostic = "matching DXGI output disappeared during resolution";
+        const HRESULT reopen_status = candidate_adapter->EnumOutputs(
+            resolved.output_index, output);
+        if (FAILED(reopen_status) || !*output) {
+            diagnostic = diagnostics::FormatHResultFailure(
+                "IDXGIAdapter1::EnumOutputs(reopen selected output)",
+                reopen_status);
             candidate_adapter->Release();
             return false;
+        }
+        if (output_identity) {
+            const auto match = std::find_if(
+                identities.begin(), identities.end(),
+                [&resolved](const DxgiOutputIdentity& identity) {
+                    return identity.output_index == resolved.output_index;
+                });
+            if (match != identities.end()) *output_identity = *match;
         }
         *adapter = candidate_adapter;
         return true;

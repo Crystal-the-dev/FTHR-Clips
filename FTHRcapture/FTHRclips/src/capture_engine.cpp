@@ -62,6 +62,7 @@
 #include "clip_audio_manifest.h"
 #include "transactional_save.h"
 #include "windows_capture_border_policy.h"
+#include "windows_native_error.h"
 #include "replay_interval.h"
 #include "frame_rate_scheduler.h"
 #include <iostream>
@@ -103,18 +104,68 @@ namespace fthr {
 
     namespace {
 
+        std::string AdapterLuidJson(const monitor::AdapterLuid& luid) {
+            std::ostringstream value;
+            value << "{\"high_part\":" << luid.high_part
+                  << ",\"low_part\":" << luid.low_part << '}';
+            return value.str();
+        }
+
+        bool QueryD3D11DeviceAdapterLuid(
+            ID3D11Device* device,
+            monitor::AdapterLuid& luid,
+            std::string& diagnostic) {
+            if (!device) {
+                diagnostic = "D3D11 device is null";
+                return false;
+            }
+            IDXGIDevice* dxgi_device = nullptr;
+            HRESULT hr = device->QueryInterface(
+                __uuidof(IDXGIDevice),
+                reinterpret_cast<void**>(&dxgi_device));
+            if (FAILED(hr) || !dxgi_device) {
+                diagnostic = diagnostics::FormatHResultFailure(
+                    "ID3D11Device::QueryInterface(IDXGIDevice)", hr);
+                return false;
+            }
+            IDXGIAdapter* adapter = nullptr;
+            hr = dxgi_device->GetAdapter(&adapter);
+            dxgi_device->Release();
+            if (FAILED(hr) || !adapter) {
+                diagnostic = diagnostics::FormatHResultFailure(
+                    "IDXGIDevice::GetAdapter", hr);
+                return false;
+            }
+            DXGI_ADAPTER_DESC description{};
+            hr = adapter->GetDesc(&description);
+            adapter->Release();
+            if (FAILED(hr)) {
+                diagnostic = diagnostics::FormatHResultFailure(
+                    "IDXGIAdapter::GetDesc", hr);
+                return false;
+            }
+            luid = {description.AdapterLuid.LowPart,
+                    description.AdapterLuid.HighPart};
+            return true;
+        }
+
         bool CreateD3D11DeviceForVendor(
             EncoderVendor vendor,
             ID3D11Device** device,
-            ID3D11DeviceContext** context) {
+            ID3D11DeviceContext** context,
+            std::string& diagnostic) {
             if (!device || !context) return false;
             *device = nullptr;
             *context = nullptr;
 
             IDXGIFactory1* factory = nullptr;
-            if (FAILED(CreateDXGIFactory1(
-                    __uuidof(IDXGIFactory1),
-                    reinterpret_cast<void**>(&factory)))) {
+            const HRESULT factory_status = CreateDXGIFactory1(
+                __uuidof(IDXGIFactory1),
+                reinterpret_cast<void**>(&factory));
+            if (FAILED(factory_status) || !factory) {
+                diagnostic = diagnostics::FormatHResultFailure(
+                    "CreateDXGIFactory1(encoder adapter search)",
+                    factory_status);
                 return false;
             }
 
@@ -126,21 +177,43 @@ namespace fthr {
                 if (enumerated == DXGI_ERROR_NOT_FOUND) {
                     break;
                 }
-                if (FAILED(enumerated) || !adapter) continue;
+                if (FAILED(enumerated) || !adapter) {
+                    diagnostic = diagnostics::FormatHResultFailure(
+                        "IDXGIFactory1::EnumAdapters1(encoder adapter search)",
+                        enumerated);
+                    break;
+                }
                 DXGI_ADAPTER_DESC1 description{};
-                if (SUCCEEDED(adapter->GetDesc1(&description))
-                        && !(description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)
-                        && EncoderVendorFromPciVendorId(description.VendorId)
-                            == vendor) {
+                const HRESULT description_status = adapter->GetDesc1(
+                    &description);
+                if (FAILED(description_status)) {
+                    diagnostic = diagnostics::FormatHResultFailure(
+                        "IDXGIAdapter1::GetDesc1(encoder adapter search)",
+                        description_status);
+                    adapter->Release();
+                    break;
+                }
+                if (!(description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)
+                    && EncoderVendorFromPciVendorId(description.VendorId)
+                        == vendor) {
                     D3D_FEATURE_LEVEL feature_level{};
-                    created = SUCCEEDED(D3D11CreateDevice(
+                    const HRESULT device_status = D3D11CreateDevice(
                         adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
                         nullptr, 0, D3D11_SDK_VERSION,
-                        device, &feature_level, context));
+                        device, &feature_level, context);
+                    created = SUCCEEDED(device_status);
+                    if (!created) {
+                        diagnostic = diagnostics::FormatHResultFailure(
+                            "D3D11CreateDevice(encoder adapter)",
+                            device_status);
+                    }
                 }
                 adapter->Release();
             }
             factory->Release();
+            if (!created && diagnostic.empty()) {
+                diagnostic = "No matching hardware encoder adapter was found";
+            }
             return created;
         }
 
@@ -277,8 +350,65 @@ namespace fthr {
         Shutdown();
     }
 
+    void CaptureEngine::SetCaptureFailure(std::string detail) {
+        last_capture_failure_detail_ = std::move(detail);
+    }
+
+    std::string CaptureEngine::BuildStartupDiagnosticContext() const {
+        std::string selected_monitor = diagnostics::WideToUtf8(
+            monitor_device_path_);
+        if (selected_monitor.empty()) {
+            selected_monitor = "unavailable:not_configured";
+        }
+        std::ostringstream context;
+        context << "startup_context={\"selected_monitor_id\":\""
+                << diagnostics::JsonEscape(selected_monitor)
+                << "\",\"dxgi_output\":";
+        if (resolved_dxgi_output_.output_index != UINT32_MAX) {
+            context << "{\"index\":" << resolved_dxgi_output_.output_index
+                    << ",\"source_gdi_name\":\""
+                    << diagnostics::JsonEscape(diagnostics::WideToUtf8(
+                           resolved_dxgi_output_.source_gdi_name))
+                    << "\"}";
+        } else {
+            context << "\"unavailable:not_resolved\"";
+        }
+        context << ",\"owning_adapter_luid\":";
+        if (!resolved_monitor_.monitor_device_path.empty()) {
+            context << AdapterLuidJson(resolved_monitor_.adapter_luid);
+        } else {
+            context << "\"unavailable:not_resolved\"";
+        }
+        context << ",\"capture_device_adapter_luid\":";
+        if (capture_device_adapter_luid_available_) {
+            context << AdapterLuidJson(capture_device_adapter_luid_);
+        } else {
+            context << "\"unavailable:not_reached_or_resolved\"";
+        }
+        context << ",\"encoder_adapter_luid\":";
+        if (encoder_adapter_luid_available_) {
+            context << AdapterLuidJson(encoder_adapter_luid_);
+        } else {
+            context << "\"unavailable:not_reached_or_resolved\"";
+        }
+        context << ",\"capture_backend\":\""
+                << diagnostics::JsonEscape(startup_capture_backend_)
+                << "\",\"encoder_backend\":\""
+                << diagnostics::JsonEscape(startup_encoder_backend_)
+                << "\",\"codec\":\""
+                << diagnostics::JsonEscape(startup_codec_) << "\"}";
+        return context.str();
+    }
+
     bool CaptureEngine::FailStartup(
         ReplayStartupError code, std::string detail) {
+        if (!last_capture_failure_detail_.empty()
+            && detail.find(last_capture_failure_detail_) == std::string::npos) {
+            detail += " ";
+            detail += last_capture_failure_detail_;
+        }
+        detail += " ";
+        detail += BuildStartupDiagnosticContext();
         last_startup_error_code_ = code;
         last_startup_error_ = std::move(detail);
         std::cerr << "FTHR_STARTUP_ERROR: "
@@ -300,7 +430,17 @@ namespace fthr {
     bool CaptureEngine::Initialize(const CaptureConfig& config) {
         last_startup_error_code_ = ReplayStartupError::None;
         last_startup_error_.clear();
+        last_capture_failure_detail_.clear();
         active_replay_capability_ = {};
+        resolved_monitor_ = {};
+        resolved_dxgi_output_ = {};
+        capture_device_adapter_luid_ = {};
+        encoder_adapter_luid_ = {};
+        capture_device_adapter_luid_available_ = false;
+        encoder_adapter_luid_available_ = false;
+        startup_capture_backend_ = "unavailable:not_reached";
+        startup_encoder_backend_ = "unavailable:not_reached";
+        startup_codec_ = VideoCodecName(config.video_codec);
         fps_ = config.framerate;
         buffer_seconds_ = config.buffer_seconds;
         target_width_ = config.target_width;
@@ -429,6 +569,9 @@ namespace fthr {
         // capture source. Intel now stays on its selected D3D11 adapter for
         // QSV. Hybrid-GPU policy remains a separate qualification task.
         // ------------------------------------------------------------------
+        // Capture opened successfully. Do not attach a superseded WGC fallback
+        // error to a later encoder failure.
+        last_capture_failure_detail_.clear();
         ConfigureCrop(config);
         std::cout << "[CaptureEngine] Attempting hardware replay initialization "
                   << "for selected " << EncoderVendorName(capture_adapter_vendor_)
@@ -446,6 +589,7 @@ namespace fthr {
         const auto selection = SelectWindowsReplayPolicy(
             capture_adapter_vendor_, config.encoder_preference,
             config.video_codec);
+        startup_encoder_backend_ = ReplayEncoderBackendName(selection.backend);
         if (!selection.allowed) {
             return FailStartup(selection.error,
                 "The requested encoder is unavailable for the selected capture "
@@ -509,13 +653,15 @@ namespace fthr {
         ID3D11DeviceContext* encoder_context = context_;
         replay_encoder_cpu_input_ = !selection.same_adapter;
         if (replay_encoder_cpu_input_) {
+            std::string encoder_device_diagnostic;
             if (!CreateD3D11DeviceForVendor(
                     EncoderVendor::Nvidia,
-                    &nvenc_device_, &nvenc_context_)) {
+                    &nvenc_device_, &nvenc_context_,
+                    encoder_device_diagnostic)) {
                 return FailStartup(
                     ReplayStartupError::HardwareEncoderUnavailable,
                     "NVIDIA was selected, but a usable NVIDIA D3D11 device "
-                    "could not be created.");
+                    "could not be created. " + encoder_device_diagnostic);
             }
             if (!EnsureStagingTexture()) {
                 return FailStartup(
@@ -527,6 +673,13 @@ namespace fthr {
             encoder_context = nvenc_context_;
             std::cout << "[ReplayCapability] Explicit hybrid NVIDIA path: "
                       << "capture readback -> NVENC CPU input" << std::endl;
+        }
+        std::string encoder_luid_diagnostic;
+        encoder_adapter_luid_available_ = QueryD3D11DeviceAdapterLuid(
+            encoder_device, encoder_adapter_luid_, encoder_luid_diagnostic);
+        if (!encoder_adapter_luid_available_) {
+            std::cerr << "[ReplayCapability] Could not resolve encoder adapter LUID: "
+                      << encoder_luid_diagnostic << std::endl;
         }
         nvenc_active_ = replay_encoder_->Initialize(
             hw_cfg, encoder_device, encoder_context, packet_callback,
@@ -2999,6 +3152,7 @@ namespace fthr {
             std::cerr << '[' << backend_name << "] "
                       << monitor::ToString(result.error) << ": "
                       << result.diagnostic << std::endl;
+            SetCaptureFailure(result.diagnostic);
             return false;
         }
 
@@ -3035,9 +3189,10 @@ namespace fthr {
         HRESULT hr = CreateDXGIFactory1(
             __uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory));
         if (FAILED(hr)) {
-            std::cerr << '[' << backend_name
-                      << "] CreateDXGIFactory1 failed: 0x"
-                      << std::hex << hr << std::dec << std::endl;
+            const std::string failure = diagnostics::FormatHResultFailure(
+                "CreateDXGIFactory1", hr);
+            SetCaptureFailure(failure);
+            std::cerr << '[' << backend_name << "] " << failure << std::endl;
             return false;
         }
 
@@ -3045,26 +3200,40 @@ namespace fthr {
         std::string output_diagnostic;
         if (!monitor::OpenSelectedDxgiOutput(
                 factory, resolved_monitor_, &capture_adapter, selected_output,
+                &resolved_dxgi_output_,
                 output_diagnostic)) {
             std::cerr << '[' << backend_name << "] "
                       << monitor::ToString(
                              monitor::MonitorResolveError::OutputResolutionFailed)
                       << ": " << output_diagnostic << std::endl;
+            SetCaptureFailure(output_diagnostic);
             factory->Release();
             return false;
         }
 
         DXGI_ADAPTER_DESC1 capture_desc{};
-        capture_adapter->GetDesc1(&capture_desc);
+        hr = capture_adapter->GetDesc1(&capture_desc);
+        if (FAILED(hr)) {
+            const std::string failure = diagnostics::FormatHResultFailure(
+                "IDXGIAdapter1::GetDesc1(selected capture adapter)", hr);
+            SetCaptureFailure(failure);
+            std::cerr << '[' << backend_name << "] " << failure << std::endl;
+            (*selected_output)->Release();
+            *selected_output = nullptr;
+            capture_adapter->Release();
+            factory->Release();
+            return false;
+        }
         D3D_FEATURE_LEVEL feature_level{};
         hr = D3D11CreateDevice(
             capture_adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
             nullptr, 0, D3D11_SDK_VERSION,
             &device_, &feature_level, &context_);
         if (FAILED(hr)) {
-            std::cerr << '[' << backend_name
-                      << "] D3D11CreateDevice on selected monitor adapter failed: 0x"
-                      << std::hex << hr << std::dec << std::endl;
+            const std::string failure = diagnostics::FormatHResultFailure(
+                "D3D11CreateDevice(selected monitor adapter)", hr);
+            SetCaptureFailure(failure);
+            std::cerr << '[' << backend_name << "] " << failure << std::endl;
             (*selected_output)->Release();
             *selected_output = nullptr;
             capture_adapter->Release();
@@ -3074,9 +3243,24 @@ namespace fthr {
 
         capture_adapter_vendor_ = EncoderVendorFromPciVendorId(
             capture_desc.VendorId);
+        capture_device_adapter_luid_ = {
+            capture_desc.AdapterLuid.LowPart,
+            capture_desc.AdapterLuid.HighPart};
+        capture_device_adapter_luid_available_ = true;
         nvidia_device_ = capture_adapter_vendor_ == EncoderVendor::Nvidia;
         DXGI_OUTPUT_DESC output_desc{};
-        (*selected_output)->GetDesc(&output_desc);
+        hr = (*selected_output)->GetDesc(&output_desc);
+        if (FAILED(hr)) {
+            const std::string failure = diagnostics::FormatHResultFailure(
+                "IDXGIOutput::GetDesc(selected output)", hr);
+            SetCaptureFailure(failure);
+            std::cerr << '[' << backend_name << "] " << failure << std::endl;
+            (*selected_output)->Release();
+            *selected_output = nullptr;
+            capture_adapter->Release();
+            factory->Release();
+            return false;
+        }
         width_ = static_cast<uint32_t>(
             output_desc.DesktopCoordinates.right
             - output_desc.DesktopCoordinates.left);
@@ -3109,13 +3293,24 @@ namespace fthr {
     // ===========================================================================
 
     bool CaptureEngine::InitializeWGC() {
+        startup_capture_backend_ = "WGC_MONITOR";
         // WGC requires Windows 10 1903+ (build 18362)
         try {
             if (!winrt::Windows::Graphics::Capture::GraphicsCaptureSession::IsSupported()) {
                 std::cerr << "[WGC] GraphicsCaptureSession not supported on this system" << std::endl;
+                SetCaptureFailure(
+                    "api_call=GraphicsCaptureSession::IsSupported result=false");
                 return false;
             }
+        } catch (winrt::hresult_error const& error) {
+            const std::string failure = diagnostics::FormatHResultFailure(
+                "GraphicsCaptureSession::IsSupported", error.code().value);
+            SetCaptureFailure(failure);
+            std::cerr << "[WGC] " << failure << std::endl;
+            return false;
         } catch (...) {
+            SetCaptureFailure(
+                "api_call=GraphicsCaptureSession::IsSupported exception=unknown");
             std::cerr << "[WGC] IsSupported() threw — WGC unavailable" << std::endl;
             return false;
         }
@@ -3128,6 +3323,7 @@ namespace fthr {
         }
         selected_output->Release();
         selected_output = nullptr;
+        last_capture_failure_detail_.clear();
         const HMONITOR hmonitor = reinterpret_cast<HMONITOR>(
             resolved_monitor_.hmonitor);
         HRESULT hr = S_OK;
@@ -3136,27 +3332,33 @@ namespace fthr {
         wgc_state_ = std::make_unique<WGCState>();
         wgc_state_->monitor_item = true;
         monitor_source_invalidated_.store(false, std::memory_order_release);
+        const char* current_api = "ID3D11Device::QueryInterface(IDXGIDevice)";
         try {
             // 4a. Wrap ID3D11Device as WinRT IDirect3DDevice
             winrt::com_ptr<IDXGIDevice> dxgi_dev;
             winrt::check_hresult(device_->QueryInterface(dxgi_dev.put()));
 
             winrt::com_ptr<IInspectable> insp;
+            current_api = "CreateDirect3D11DeviceFromDXGIDevice";
             winrt::check_hresult(CreateDirect3D11DeviceFromDXGIDevice(dxgi_dev.get(), insp.put()));
 
+            current_api = "IInspectable::as(IDirect3DDevice)";
             wgc_state_->winrt_device =
                 insp.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
 
             // 4b. Create a capture item for the exact resolved monitor.
+            current_api = "RoGetActivationFactory(GraphicsCaptureItem)";
             auto item_interop = winrt::get_activation_factory<
                 winrt::Windows::Graphics::Capture::GraphicsCaptureItem,
                 IGraphicsCaptureItemInterop>();
 
+            current_api = "IGraphicsCaptureItemInterop::CreateForMonitor";
             winrt::check_hresult(item_interop->CreateForMonitor(
                 hmonitor,
                 winrt::guid_of<winrt::Windows::Graphics::Capture::GraphicsCaptureItem>(),
                 winrt::put_abi(wgc_state_->item)));
 
+            current_api = "GraphicsCaptureItem::Closed(add handler)";
             wgc_state_->item_closed_token = wgc_state_->item.Closed(
                 [this](auto&, auto&) {
                     monitor_source_invalidated_.store(
@@ -3178,7 +3380,9 @@ namespace fthr {
             // CreateFreeThreaded fires FrameArrived directly on the WinRT thread
             // pool, bypassing the DispatcherQueue entirely.  This is the standard
             // pattern for WGC capture on a dedicated background thread.
+            current_api = "GraphicsCaptureItem::Size";
             auto sz = wgc_state_->item.Size();
+            current_api = "Direct3D11CaptureFramePool::CreateFreeThreaded";
             wgc_state_->frame_pool =
                 winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
                     wgc_state_->winrt_device,
@@ -3189,6 +3393,7 @@ namespace fthr {
             // 6. Apply the version-adaptive WGC capture-border policy before
             // StartCapture. If the indicator cannot be disabled, refuse this
             // WGC session so Initialize() can fall back to border-free DXGI.
+            current_api = "Direct3D11CaptureFramePool::CreateCaptureSession";
             wgc_state_->session =
                 wgc_state_->frame_pool.CreateCaptureSession(wgc_state_->item);
             if (!ApplyCaptureBorderPolicy("monitor")) {
@@ -3201,6 +3406,7 @@ namespace fthr {
             }
 
             // 7. Subscribe FrameArrived: only wakes CaptureThread, no encode work here.
+            current_api = "Direct3D11CaptureFramePool::FrameArrived(add handler)";
             wgc_state_->frame_arrived_token =
                 wgc_state_->frame_pool.FrameArrived([this](auto&, auto&) {
                     {
@@ -3211,15 +3417,23 @@ namespace fthr {
                 });
 
             // 8. Start
+            current_api = "GraphicsCaptureSession::StartCapture";
             wgc_state_->session.StartCapture();
 
         } catch (winrt::hresult_error const& e) {
+            std::string failure = diagnostics::FormatHResultFailure(
+                current_api, e.code().value);
+            const std::string winrt_message = winrt::to_string(e.message());
+            if (!winrt_message.empty()) {
+                failure += " winrt_message=\"";
+                failure += diagnostics::JsonEscape(winrt_message);
+                failure += '\"';
+            }
+            SetCaptureFailure(failure);
             std::cerr << "[WGC] "
                       << monitor::ToString(
                              monitor::MonitorResolveError::CaptureItemCreationFailed)
-                      << ": WinRT setup error 0x"
-                      << std::hex << e.code().value << std::dec
-                      << " " << winrt::to_string(e.message()) << std::endl;
+                      << ": " << failure << std::endl;
             wgc_state_.reset();
             if (context_) { context_->Release(); context_ = nullptr; }
             if (device_)  { device_->Release();  device_  = nullptr; }
@@ -3233,6 +3447,7 @@ namespace fthr {
                   << EncoderVendorName(capture_adapter_vendor_)
                   << " capture adapter"
                   << ")" << std::endl;
+        last_capture_failure_detail_.clear();
         return true;
     }
 
@@ -3265,15 +3480,25 @@ namespace fthr {
                     input.property_set_succeeded = true;
                     input.border_required_after_attempt =
                         session3.IsBorderRequired();
-                } catch (winrt::hresult_error const&) {
+                } catch (winrt::hresult_error const& error) {
+                    SetCaptureFailure(diagnostics::FormatHResultFailure(
+                        "IGraphicsCaptureSession3::IsBorderRequired",
+                        error.code().value));
                     input.property_set_succeeded = false;
                 } catch (...) {
+                    SetCaptureFailure(
+                        "api_call=IGraphicsCaptureSession3::IsBorderRequired exception=unknown");
                     input.property_set_succeeded = false;
                 }
             }
-        } catch (winrt::hresult_error const&) {
+        } catch (winrt::hresult_error const& error) {
+            SetCaptureFailure(diagnostics::FormatHResultFailure(
+                "GraphicsCaptureSession::QueryInterface(IGraphicsCaptureSession3)",
+                error.code().value));
             input.session_interface_available = false;
         } catch (...) {
+            SetCaptureFailure(
+                "api_call=GraphicsCaptureSession::QueryInterface(IGraphicsCaptureSession3) exception=unknown");
             input.session_interface_available = false;
         }
         const auto decision = EvaluateCaptureBorderPolicy(input);
@@ -3288,6 +3513,13 @@ namespace fthr {
                   << " effective=" << (decision.effective_borderless ? "true" : "false")
                   << " reason=" << CaptureBorderPolicyReasonName(decision.reason)
                   << std::endl;
+
+        if (!decision.effective_borderless
+            && last_capture_failure_detail_.empty()) {
+            SetCaptureFailure(
+                std::string("api_call=IGraphicsCaptureSession3::IsBorderRequired result=")
+                + CaptureBorderPolicyReasonName(decision.reason));
+        }
 
         return decision.effective_borderless;
     }
@@ -3582,18 +3814,30 @@ namespace fthr {
     // ===========================================================================
 
     bool CaptureEngine::InitializeWindowCapture() {
+        startup_capture_backend_ = "WGC_WINDOW";
         try {
             if (!winrt::Windows::Graphics::Capture::GraphicsCaptureSession::IsSupported()) {
                 std::cerr << "[WinCapture] GraphicsCaptureSession not supported" << std::endl;
+                SetCaptureFailure(
+                    "api_call=GraphicsCaptureSession::IsSupported result=false");
                 return false;
             }
+        } catch (winrt::hresult_error const& error) {
+            const std::string failure = diagnostics::FormatHResultFailure(
+                "GraphicsCaptureSession::IsSupported", error.code().value);
+            SetCaptureFailure(failure);
+            std::cerr << "[WinCapture] " << failure << std::endl;
+            return false;
         } catch (...) {
+            SetCaptureFailure(
+                "api_call=GraphicsCaptureSession::IsSupported exception=unknown");
             std::cerr << "[WinCapture] IsSupported() threw — WGC unavailable" << std::endl;
             return false;
         }
 
         HWND hwnd = reinterpret_cast<HWND>(target_hwnd_);
         if (!IsWindow(hwnd)) {
+            SetCaptureFailure("api_call=IsWindow result=false");
             std::cerr << "[WinCapture] HWND 0x" << std::hex << target_hwnd_
                       << std::dec << " is not a valid window" << std::endl;
             return false;
@@ -3608,34 +3852,49 @@ namespace fthr {
             nullptr, 0, D3D11_SDK_VERSION,
             &device_, &feature_level, &context_);
         if (FAILED(hr)) {
-            std::cerr << "[WinCapture] D3D11CreateDevice failed: 0x"
-                      << std::hex << hr << std::dec << std::endl;
+            const std::string failure = diagnostics::FormatHResultFailure(
+                "D3D11CreateDevice(window capture)", hr);
+            SetCaptureFailure(failure);
+            std::cerr << "[WinCapture] " << failure << std::endl;
             return false;
         }
         capture_adapter_vendor_ = QueryD3D11DeviceVendor(device_);
         nvidia_device_ = capture_adapter_vendor_ == EncoderVendor::Nvidia;
+        std::string capture_luid_diagnostic;
+        capture_device_adapter_luid_available_ = QueryD3D11DeviceAdapterLuid(
+            device_, capture_device_adapter_luid_, capture_luid_diagnostic);
+        if (!capture_device_adapter_luid_available_) {
+            std::cerr << "[WinCapture] Could not resolve capture device adapter LUID: "
+                      << capture_luid_diagnostic << std::endl;
+        }
 
         // --- Steps 3-8: WinRT capture session (exception-safe) ---
         wgc_state_ = std::make_unique<WGCState>();
+        const char* current_api = "ID3D11Device::QueryInterface(IDXGIDevice)";
         try {
             // 3. Wrap ID3D11Device as WinRT IDirect3DDevice
             winrt::com_ptr<IDXGIDevice> dxgi_dev;
             winrt::check_hresult(device_->QueryInterface(dxgi_dev.put()));
             winrt::com_ptr<IInspectable> insp;
+            current_api = "CreateDirect3D11DeviceFromDXGIDevice";
             winrt::check_hresult(CreateDirect3D11DeviceFromDXGIDevice(dxgi_dev.get(), insp.put()));
+            current_api = "IInspectable::as(IDirect3DDevice)";
             wgc_state_->winrt_device =
                 insp.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
 
             // 4. Create capture item from the target window
+            current_api = "RoGetActivationFactory(GraphicsCaptureItem)";
             auto item_interop = winrt::get_activation_factory<
                 winrt::Windows::Graphics::Capture::GraphicsCaptureItem,
                 IGraphicsCaptureItemInterop>();
+            current_api = "IGraphicsCaptureItemInterop::CreateForWindow";
             winrt::check_hresult(item_interop->CreateForWindow(
                 hwnd,
                 winrt::guid_of<winrt::Windows::Graphics::Capture::GraphicsCaptureItem>(),
                 winrt::put_abi(wgc_state_->item)));
 
             // 5. Get captured dimensions from the item (= window content size)
+            current_api = "GraphicsCaptureItem::Size";
             auto sz = wgc_state_->item.Size();
             width_  = static_cast<uint32_t>(sz.Width);
             height_ = static_cast<uint32_t>(sz.Height);
@@ -3643,6 +3902,7 @@ namespace fthr {
 
             // 7. Frame pool: 2 slots, free-threaded.
             //    See InitializeWGC() comment on why CreateFreeThreaded is required.
+            current_api = "Direct3D11CaptureFramePool::CreateFreeThreaded";
             wgc_state_->frame_pool =
                 winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
                     wgc_state_->winrt_device,
@@ -3654,6 +3914,7 @@ namespace fthr {
             // capture. WGC ownership is independent of UI launch mode. If
             // borderless capture is unavailable, return false so the caller
             // can use the border-free DXGI fallback.
+            current_api = "Direct3D11CaptureFramePool::CreateCaptureSession";
             wgc_state_->session =
                 wgc_state_->frame_pool.CreateCaptureSession(wgc_state_->item);
             if (!ApplyCaptureBorderPolicy("window")) {
@@ -3666,6 +3927,7 @@ namespace fthr {
             }
 
             // 9. FrameArrived: only wakes CaptureThreadWGC, no encoding work in callback
+            current_api = "Direct3D11CaptureFramePool::FrameArrived(add handler)";
             wgc_state_->frame_arrived_token =
                 wgc_state_->frame_pool.FrameArrived([this](auto&, auto&) {
                     {
@@ -3676,12 +3938,20 @@ namespace fthr {
                 });
 
             // 10. Start
+            current_api = "GraphicsCaptureSession::StartCapture";
             wgc_state_->session.StartCapture();
 
         } catch (winrt::hresult_error const& e) {
-            std::cerr << "[WinCapture] WinRT error during setup: 0x"
-                      << std::hex << e.code().value << std::dec
-                      << " " << winrt::to_string(e.message()) << std::endl;
+            std::string failure = diagnostics::FormatHResultFailure(
+                current_api, e.code().value);
+            const std::string winrt_message = winrt::to_string(e.message());
+            if (!winrt_message.empty()) {
+                failure += " winrt_message=\"";
+                failure += diagnostics::JsonEscape(winrt_message);
+                failure += '\"';
+            }
+            SetCaptureFailure(failure);
+            std::cerr << "[WinCapture] " << failure << std::endl;
             wgc_state_.reset();
             if (context_) { context_->Release(); context_ = nullptr; }
             if (device_)  { device_->Release();  device_  = nullptr; }
@@ -3695,6 +3965,7 @@ namespace fthr {
                   << EncoderVendorName(capture_adapter_vendor_)
                   << " capture adapter"
                   << std::endl;
+        last_capture_failure_detail_.clear();
         return true;
     }
 
@@ -3704,27 +3975,39 @@ namespace fthr {
     // ===========================================================================
 
     bool CaptureEngine::InitializeD3D11() {
+        startup_capture_backend_ = "DXGI_OUTPUT_DUPLICATION";
         nvidia_device_ = false;
         capture_adapter_vendor_ = EncoderVendor::Software;
         IDXGIOutput* selected_output = nullptr;
         if (!InitializeMonitorCaptureDevice("DXGI", &selected_output)) {
             return false;
         }
+        last_capture_failure_detail_.clear();
 
         IDXGIOutput1* output1 = nullptr;
         HRESULT hr = selected_output->QueryInterface(
             __uuidof(IDXGIOutput1), reinterpret_cast<void**>(&output1));
-        if (SUCCEEDED(hr)) {
-            hr = output1->DuplicateOutput(device_, &duplication_);
-            output1->Release();
+        if (FAILED(hr) || !output1) {
+            const std::string failure = diagnostics::FormatHResultFailure(
+                "IDXGIOutput::QueryInterface(IDXGIOutput1)", hr);
+            SetCaptureFailure(failure);
+            std::cerr << "[D3D11] " << failure << std::endl;
+            selected_output->Release();
+            if (context_) { context_->Release(); context_ = nullptr; }
+            if (device_) { device_->Release(); device_ = nullptr; }
+            return false;
         }
+        hr = output1->DuplicateOutput(device_, &duplication_);
+        output1->Release();
         selected_output->Release();
         if (FAILED(hr) || !duplication_) {
+            const std::string failure = diagnostics::FormatHResultFailure(
+                "IDXGIOutput1::DuplicateOutput", hr);
+            SetCaptureFailure(failure);
             std::cerr << "[D3D11] "
                       << monitor::ToString(
                              monitor::MonitorResolveError::OutputResolutionFailed)
-                      << ": DuplicateOutput failed for selected output: 0x"
-                      << std::hex << hr << std::dec << std::endl;
+                      << ": " << failure << std::endl;
             if (context_) { context_->Release(); context_ = nullptr; }
             if (device_) { device_->Release(); device_ = nullptr; }
             return false;
@@ -3738,6 +4021,7 @@ namespace fthr {
         std::cout << "[D3D11] Duplication: " << (duplication_ ? "OK" : "NULL") << std::endl;
         std::cout << "[D3D11] Readback texture: deferred until fallback policy"
                   << std::endl;
+        last_capture_failure_detail_.clear();
         return true;
     }
 

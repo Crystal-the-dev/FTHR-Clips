@@ -132,6 +132,7 @@ bool OpenSelectedDxgiOutput(
     const MonitorTopologyEntry& selected_monitor,
     IDXGIAdapter1** adapter,
     IDXGIOutput** output,
+    DxgiOutputIdentity* output_identity,
     std::string& diagnostic);
 
 } // namespace fthr::monitor

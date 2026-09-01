@@ -152,8 +152,10 @@ from core.capture_health import (
 from core.error_codes import APP_FAILURE_CODE_BY_TITLE, format_error_title
 from core.diagnostics import get_logger
 from core.engine_startup_diagnostics import (
+    EngineLaunchContext,
     extract_startup_failure,
     extract_startup_warnings,
+    format_engine_launch_failure,
 )
 from core.clip_files import cleanup_stale_partial_clips, is_completed_video_path
 from core.audio_manifest import manifest_path_for, rebind_manifest_after_media_replace
@@ -5071,24 +5073,51 @@ class MainWindow(QMainWindow):
                 stdout=self._engine_startup_output,
                 stderr=subprocess.STDOUT,
             )
-            self.engine_process = subprocess.Popen(
-                [str(self.engine_path),
-                 str(launch_config.fps), str(launch_config.buffer_seconds),
-                 str(launch_config.width), str(launch_config.height),
-                 str(launch_config.bitrate_kbps), str(max_buffer_mb),
-                 mode_arg, hwnd_arg, scale_arg, engine_monitor_arg,
-                 str(codec_pref_int), str(encoder_preset),
-                 multiband_arg, audio_arg,
-                 microphone_id_arg, microphone_gain_arg,
-                 str(encoder_pref_int),
-                 '1' if launch_config.crop_enabled else '0',
-                 f'{launch_config.crop_x:.9g}',
-                 f'{launch_config.crop_y:.9g}',
-                 f'{launch_config.crop_w:.9g}',
-                 f'{launch_config.crop_h:.9g}',
-                 audio_mode_arg],
-                **popen_options
-            )
+            try:
+                self.engine_process = subprocess.Popen(
+                    [str(self.engine_path),
+                     str(launch_config.fps), str(launch_config.buffer_seconds),
+                     str(launch_config.width), str(launch_config.height),
+                     str(launch_config.bitrate_kbps), str(max_buffer_mb),
+                     mode_arg, hwnd_arg, scale_arg, engine_monitor_arg,
+                     str(codec_pref_int), str(encoder_preset),
+                     multiband_arg, audio_arg,
+                     microphone_id_arg, microphone_gain_arg,
+                     str(encoder_pref_int),
+                     '1' if launch_config.crop_enabled else '0',
+                     f'{launch_config.crop_x:.9g}',
+                     f'{launch_config.crop_y:.9g}',
+                     f'{launch_config.crop_w:.9g}',
+                     f'{launch_config.crop_h:.9g}',
+                     audio_mode_arg],
+                    **popen_options
+                )
+            except OSError as error:
+                failure = format_engine_launch_failure(
+                    error,
+                    EngineLaunchContext(
+                        selected_monitor_id=str(
+                            engine_monitor_arg or 'unavailable:not_configured'),
+                        requested_capture_mode=str(capture_mode),
+                        requested_encoder=str(launch_config.encoder),
+                        codec=str(launch_config.codec),
+                    ),
+                    api_call=('CreateProcessW' if sys.platform == 'win32'
+                              else 'subprocess.Popen'),
+                )
+                print(f'FTHR_STARTUP_ERROR: {failure.code}: {failure.detail}')
+                self.stop_engine()
+                self._set_status('ERROR', status_warning_qss())
+                self.push_error(
+                    'CAPTURE FAILED',
+                    f'{failure.title}: {failure.detail}',
+                    level='error',
+                    actions=[('RESTART ENGINE', self._restart_capture_engine)],
+                )
+                self._capture_config.fail(failure.detail)
+                self._restart_pending = False
+                self._set_capture_apply_state(False)
+                return False
             # Poll for connection in a background thread so the UI stays responsive.
             # Allow up to 10s total for large encoded ring buffers and slower
             # hardware initialization before declaring startup failed.
@@ -5148,8 +5177,10 @@ class MainWindow(QMainWindow):
                 # initialize() never succeeded — kill the orphaned process
                 if self._engine_gen != _my_gen:
                     return   # a newer start owns the engine now — don't kill it
-                failure = extract_startup_failure(
-                    self._read_engine_startup_output())
+                startup_output = self._read_engine_startup_output()
+                if startup_output.strip():
+                    print(startup_output.rstrip())
+                failure = extract_startup_failure(startup_output)
                 print(f"Engine did not respond — {failure.code}: "
                       f"{failure.detail}")
                 def _on_failed():

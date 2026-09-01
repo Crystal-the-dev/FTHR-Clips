@@ -28,6 +28,7 @@
 #include "hardware_encoder.h"
 #include "nvenc_codec_config.h"
 #include "video_encoder.h"
+#include "windows_native_error.h"
 
 #ifdef _MSC_VER
 #pragma warning(push)
@@ -247,7 +248,11 @@ namespace fthr {
 
         HMODULE nvenc_dll = LoadLibraryA("nvEncodeAPI64.dll");
         if (!nvenc_dll) {
-            result.error_message = "nvEncodeAPI64.dll not found - NVIDIA driver not installed or too old";
+            const DWORD native_error = ::GetLastError();
+            result.error_message =
+                "NVENC runtime load failed. "
+                + diagnostics::FormatWin32Failure(
+                    "LoadLibraryA(nvEncodeAPI64.dll)", native_error);
             std::cerr << "[NVENC] " << result.error_message << std::endl;
             return result;
         }
@@ -255,7 +260,11 @@ namespace fthr {
         NVENCAPICREATEINSTANCE NvEncodeAPICreateInstance =
             (NVENCAPICREATEINSTANCE)GetProcAddress(nvenc_dll, "NvEncodeAPICreateInstance");
         if (!NvEncodeAPICreateInstance) {
-            result.error_message = "NvEncodeAPICreateInstance not found in DLL";
+            const DWORD native_error = ::GetLastError();
+            result.error_message =
+                "NVENC entry point lookup failed. "
+                + diagnostics::FormatWin32Failure(
+                    "GetProcAddress(NvEncodeAPICreateInstance)", native_error);
             FreeLibrary(nvenc_dll);
             return result;
         }
@@ -530,8 +539,11 @@ namespace fthr {
         // ------------------------------------------------------------------
         HMODULE nvenc_dll = LoadLibraryA("nvEncodeAPI64.dll");
         if (!nvenc_dll) {
-            last_error_ = "NVENC runtime unavailable: nvEncodeAPI64.dll not found";
-            std::cerr << "[HardwareEncoder] nvEncodeAPI64.dll not found" << std::endl;
+            const DWORD native_error = ::GetLastError();
+            last_error_ = "NVENC runtime unavailable. "
+                + diagnostics::FormatWin32Failure(
+                    "LoadLibraryA(nvEncodeAPI64.dll)", native_error);
+            std::cerr << "[HardwareEncoder] " << last_error_ << std::endl;
             return false;
         }
         nvenc_dll_ = static_cast<void*>(nvenc_dll);
@@ -539,8 +551,11 @@ namespace fthr {
         NVENCAPICREATEINSTANCE NvEncodeAPICreateInstance =
             (NVENCAPICREATEINSTANCE)GetProcAddress(nvenc_dll, "NvEncodeAPICreateInstance");
         if (!NvEncodeAPICreateInstance) {
-            last_error_ = "NVENC runtime unavailable: NvEncodeAPICreateInstance not found";
-            std::cerr << "[HardwareEncoder] NvEncodeAPICreateInstance not found" << std::endl;
+            const DWORD native_error = ::GetLastError();
+            last_error_ = "NVENC runtime unavailable. "
+                + diagnostics::FormatWin32Failure(
+                    "GetProcAddress(NvEncodeAPICreateInstance)", native_error);
+            std::cerr << "[HardwareEncoder] " << last_error_ << std::endl;
             FreeLibrary(nvenc_dll); nvenc_dll_ = nullptr;
             return false;
         }
