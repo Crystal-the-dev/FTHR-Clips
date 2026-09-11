@@ -6462,13 +6462,26 @@ class MainWindow(QMainWindow):
         clip_ready = self.upload_manager.notify_clip_saved(
             str(output_path), has_mic_mux=has_async_mux)
 
-        # Register readiness before refreshing the library.  Otherwise the
+        # Register readiness before updating the library.  Otherwise the
         # new base file appears ready and can be opened while camera/image/
-        # crop post-processing is still rewriting it.  The grid now shows one
-        # FINALIZING card until _publish_final_clip() runs.
+        # crop post-processing is still rewriting it.  Insert just this card;
+        # rebuilding every existing card here made save latency scale with the
+        # entire library and did the same expensive work again at publication.
         if hasattr(self, 'clip_grid'):
-            self.clip_grid._known_files = None
-            self.clip_grid._load_clips()
+            try:
+                self.clip_grid.upsert_saved_clip(
+                    str(output_path),
+                    ready=self._clip_readiness.can_access(output_path))
+            except Exception as error:
+                # Library presentation is post-save enrichment.  A valid base
+                # clip must still finish its rewrite/publication path if the
+                # card update itself fails.
+                emit_event(
+                    'library', 'saved_clip_upsert_failed', state='FAILED',
+                    error=DiagnosticError.LIBRARY_SCAN_FAILED,
+                    phase='engine_committed',
+                    detail=f'{type(error).__name__}: {error}')
+                print(f'[Save] Incremental library insertion failed: {error}')
 
         if has_async_mux:
             self._set_status('SAVING', status_idle_qss())
@@ -6486,8 +6499,11 @@ class MainWindow(QMainWindow):
         self._clip_readiness.record_warning(clip_path, message)
 
     def _complete_clip_finalization(
-            self, clip_path: str, duration_seconds: int) -> None:
-        if self._clip_readiness.state(clip_path) is not ClipReadinessState.FINALIZATION_FAILED:
+            self, clip_path: str, duration_seconds: int,
+            *, already_normalized: bool = False) -> None:
+        if (not already_normalized
+                and self._clip_readiness.state(clip_path)
+                is not ClipReadinessState.FINALIZATION_FAILED):
             # Covers the race where a Linux mic route loses its recorder after
             # route selection and completes directly without a worker gate.
             self._normalize_clip_to_cfr(clip_path)
@@ -6542,9 +6558,21 @@ class MainWindow(QMainWindow):
         ui_notification_ms = round(
             (time.monotonic() - ui_notification_started) * 1000)
         library_started = time.monotonic()
+        library_update_error = None
         if hasattr(self, 'clip_grid'):
-            self.clip_grid._known_files = None
-            self.clip_grid._load_clips()
+            try:
+                self.clip_grid.upsert_saved_clip(
+                    clip_path,
+                    ready=self._clip_readiness.can_access(clip_path))
+            except Exception as error:
+                library_update_error = f'{type(error).__name__}: {error}'
+                emit_event(
+                    'library', 'saved_clip_upsert_failed', state='FAILED',
+                    error=DiagnosticError.LIBRARY_SCAN_FAILED,
+                    phase='final_publication', detail=library_update_error)
+                print(f'[Save] Incremental library finalization failed: {error}')
+        library_update_ms = round(
+            (time.monotonic() - library_started) * 1000)
         started = getattr(
             self, '_clip_diagnostic_started_by_path', {}).pop(key, None)
         emit_event(
@@ -6552,8 +6580,9 @@ class MainWindow(QMainWindow):
             requested_duration_seconds=duration_seconds,
             elapsed_ms=(round((time.monotonic() - started) * 1000)
                         if started is not None else None),
-            library_refresh_ms=round(
-                (time.monotonic() - library_started) * 1000),
+            library_refresh_ms=library_update_ms,
+            library_update_mode='incremental_saved_clip',
+            library_update_error=library_update_error,
             metadata_validation_ms=metadata_elapsed_ms,
             ui_notification_ms=ui_notification_ms,
             warning_count=len(warnings))
@@ -6756,6 +6785,7 @@ class MainWindow(QMainWindow):
             class _CfrReadyGate:
                 def __init__(self):
                     self._released = False
+                    self.normalized = False
 
                 def set(self):
                     if self._released:
@@ -6764,6 +6794,11 @@ class MainWindow(QMainWindow):
                     try:
                         host._normalize_clip_to_cfr(clip_path)
                     finally:
+                        # The completion callback must not probe/re-encode the
+                        # same clip a second time. Keep this true even when
+                        # normalization records a failure, so the failure
+                        # state remains the single source of truth.
+                        self.normalized = True
                         original_ready.set()
 
             worker_args[3] = _CfrReadyGate()
@@ -6777,12 +6812,17 @@ class MainWindow(QMainWindow):
                 self._record_finalization_warning(
                     worker_clip_path, f'Optional clip processing failed: {exc}')
             finally:
+                already_normalized = False
                 if original_ready is not None:
                     worker_args[3].set()
+                    already_normalized = bool(
+                        getattr(worker_args[3], 'normalized', False))
                 else:
                     self._normalize_clip_to_cfr(str(worker_args[0]))
+                    already_normalized = True
                 self._complete_clip_finalization(
-                    str(worker_args[0]), int(worker_args[1]))
+                    str(worker_args[0]), int(worker_args[1]),
+                    already_normalized=already_normalized)
 
         t = threading.Thread(target=_run_and_publish, daemon=True)
         self._mux_threads.append(t)
@@ -7006,7 +7046,12 @@ class MainWindow(QMainWindow):
                     prefix='.fthr-cfr-', dir=os.path.dirname(clip_path)) as td:
                 output = os.path.join(td, 'cfr.mp4')
                 common = [
-                    ffmpeg, '-y', '-i', clip_path,
+                    ffmpeg, '-y',
+                    # CFR repair is the only post-save path allowed to
+                    # re-encode video. Keep its decoder/filter CPU footprint
+                    # bounded so a save cannot monopolize a game session.
+                    '-threads', '2', '-filter_threads', '2',
+                    '-i', clip_path,
                     '-map', '0:v:0', '-map', '0:a?',
                     '-map_metadata', '0', '-map_chapters', '0',
                     '-movflags', 'use_metadata_tags',
@@ -7021,9 +7066,14 @@ class MainWindow(QMainWindow):
                 )
                 last_error = '(no stderr)'
                 for video_args in unique_video_arg_sets:
+                    # Keep the encoder-side thread pool bounded as well as the
+                    # input decoder/filter pools configured above.
+                    bounded_video_args = [*video_args, '-threads:v', '2']
                     result = subprocess.run(
-                        [*common, *video_args, '-c:a', 'copy', output],
-                        capture_output=True, timeout=timeout, **_NO_WINDOW,
+                        [*common, *bounded_video_args,
+                         '-c:a', 'copy', output],
+                        capture_output=True, timeout=timeout,
+                        **_BACKGROUND_NO_WINDOW,
                     )
                     if result.returncode == 0 and os.path.isfile(output):
                         os.replace(output, clip_path)

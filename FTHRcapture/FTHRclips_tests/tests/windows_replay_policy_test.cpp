@@ -1,10 +1,14 @@
 #include "replay_encoder.h"
 #include "encoded_ring_buffer.h"
 #include "frame_rate_scheduler.h"
+#include "save_clip_task.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -215,6 +219,160 @@ void ProductionThreeByThreeMatrixAndRegressionsHold() {
         "Intel policy regression remains protected");
 }
 
+fthr::SaveClipTask QueueTask(uint32_t id) {
+    fthr::SaveClipTask task;
+    task.task_id = id;
+    task.output_path = L"queue-test.mp4";
+    return task;
+}
+
+void SaveQueueIsBoundedAndRejectsWithoutBlocking() {
+    fthr::SaveClipQueue queue;
+    for (uint32_t id = 1; id <= queue.GetCapacity(); ++id) {
+        CheckPolicy(queue.Push(QueueTask(id)),
+            "save queue accepts work up to its documented bound");
+    }
+    CheckPolicy(queue.GetQueueDepth() == queue.GetCapacity(),
+        "save queue exposes its full pending depth");
+    CheckPolicy(!queue.Push(QueueTask(99)),
+        "save queue rejects overload instead of growing without bound");
+
+    fthr::SaveClipTask popped;
+    CheckPolicy(queue.Pop(popped) && popped.task_id == 1,
+        "bounded save queue preserves FIFO ownership");
+    CheckPolicy(queue.Push(QueueTask(5)),
+        "save queue accepts new work after one pending slot is released");
+    queue.Shutdown();
+    size_t drained = 0;
+    while (queue.Pop(popped)) ++drained;
+    CheckPolicy(drained == queue.GetCapacity(),
+        "shutdown drains every accepted save task");
+    CheckPolicy(!queue.Push(QueueTask(100)),
+        "shutdown visibly rejects new save work");
+}
+
+void SlowSaveConsumerDoesNotStopIndependentProgress() {
+    fthr::SaveClipQueue queue;
+    std::atomic<bool> consumer_started{false};
+    std::atomic<bool> release_consumer{false};
+    std::atomic<uint64_t> independent_progress{0};
+    CheckPolicy(queue.Push(QueueTask(1)),
+        "slow-consumer fixture queues its first save");
+
+    std::thread consumer([&] {
+        fthr::SaveClipTask task;
+        if (!queue.Pop(task)) return;
+        consumer_started.store(true, std::memory_order_release);
+        while (!release_consumer.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    });
+    while (!consumer_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    std::thread progress([&] {
+        while (!release_consumer.load(std::memory_order_acquire)) {
+            independent_progress.fetch_add(1, std::memory_order_relaxed);
+            std::this_thread::yield();
+        }
+    });
+
+    CheckPolicy(queue.Push(QueueTask(2)),
+        "producer remains non-blocking while the save consumer is stalled");
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CheckPolicy(independent_progress.load(std::memory_order_relaxed) > 0,
+        "independent capture-like progress continues during a slow save");
+    release_consumer.store(true, std::memory_order_release);
+    progress.join();
+    consumer.join();
+    queue.Shutdown();
+    fthr::SaveClipTask pending;
+    CheckPolicy(queue.Pop(pending) && pending.task_id == 2,
+        "queued save remains intact after the slow consumer resumes");
+    CheckPolicy(!queue.Pop(pending),
+        "drained slow-consumer queue exits cleanly at shutdown");
+}
+
+void FailedSaveLeavesQueuedSuccessorAvailable() {
+    fthr::SaveClipQueue queue;
+    CheckPolicy(queue.Push(QueueTask(1)),
+        "failure-followup fixture queues the first save");
+    CheckPolicy(queue.Push(QueueTask(2)),
+        "failure-followup fixture queues the successor save");
+
+    fthr::SaveClipTask failed;
+    CheckPolicy(queue.Pop(failed) && failed.task_id == 1,
+        "save consumer owns the failed task independently");
+    // The writer failure is simulated at the consumer boundary. Queue
+    // ownership of a later request must not be lost with the failed task.
+    queue.Shutdown();
+    fthr::SaveClipTask successor;
+    CheckPolicy(queue.Pop(successor) && successor.task_id == 2,
+        "a queued save remains available after a prior save failure");
+    CheckPolicy(!queue.Pop(successor),
+        "failed-save followup queue drains exactly once");
+}
+
+void ShutdownDrainsNonEmptyQueueWithActiveConsumer() {
+    fthr::SaveClipQueue queue;
+    CheckPolicy(queue.Push(QueueTask(1)),
+        "active-shutdown fixture queues its active task");
+    CheckPolicy(queue.Push(QueueTask(2)),
+        "active-shutdown fixture retains a pending task");
+    std::atomic<bool> consumer_started{false};
+    std::atomic<bool> release_consumer{false};
+
+    std::thread consumer([&] {
+        fthr::SaveClipTask task;
+        if (!queue.Pop(task)) return;
+        consumer_started.store(true, std::memory_order_release);
+        while (!release_consumer.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    });
+    while (!consumer_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    queue.Shutdown();
+    CheckPolicy(queue.IsShutdown(),
+        "shutdown is observable while a save consumer is active");
+    CheckPolicy(!queue.Push(QueueTask(3)),
+        "shutdown rejects a rapid save request after the active task");
+    release_consumer.store(true, std::memory_order_release);
+    consumer.join();
+
+    fthr::SaveClipTask pending;
+    CheckPolicy(queue.Pop(pending) && pending.task_id == 2,
+        "shutdown preserves the non-empty queue for draining");
+    CheckPolicy(!queue.Pop(pending),
+        "shutdown reports empty only after active and pending work drain");
+    queue.Shutdown();
+    CheckPolicy(queue.IsShutdown(),
+        "repeated shutdown remains idempotent");
+}
+
+void RapidSaveRequestsPreserveAcceptedOrder() {
+    fthr::SaveClipQueue queue;
+    uint32_t next_id = 1;
+    for (int round = 0; round < 32; ++round) {
+        for (size_t slot = 0; slot < queue.GetCapacity(); ++slot) {
+            CheckPolicy(queue.Push(QueueTask(next_id)),
+                "rapid save request is accepted within the queue bound");
+            ++next_id;
+        }
+        for (uint32_t expected = next_id - 4; expected < next_id; ++expected) {
+            fthr::SaveClipTask task;
+            CheckPolicy(queue.Pop(task) && task.task_id == expected,
+                "rapid save requests preserve FIFO order");
+        }
+    }
+    queue.Shutdown();
+    fthr::SaveClipTask task;
+    CheckPolicy(!queue.Pop(task),
+        "rapid request fixture shuts down with no leaked tasks");
+}
+
 } // namespace
 
 int RunWindowsReplayPolicyTests() {
@@ -227,6 +385,11 @@ int RunWindowsReplayPolicyTests() {
     EncodedReplayCapacityHasBoundedHeadroom();
     ActiveTruthAndGenerationAreScoped();
     ProductionThreeByThreeMatrixAndRegressionsHold();
+    SaveQueueIsBoundedAndRejectsWithoutBlocking();
+    SlowSaveConsumerDoesNotStopIndependentProgress();
+    FailedSaveLeavesQueuedSuccessorAvailable();
+    ShutdownDrainsNonEmptyQueueWithActiveConsumer();
+    RapidSaveRequestsPreserveAcceptedOrder();
     std::cout << "Windows replay policy tests: " << policy_checks
               << " checks passed" << std::endl;
     return policy_checks;

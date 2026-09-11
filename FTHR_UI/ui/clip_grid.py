@@ -353,6 +353,13 @@ class _ThumbnailWorker(QRunnable):
                 video_bitrate, total_bitrate)
             self.signals.finished.emit(
                 self.file_path, cache_path, int(duration))
+        except Exception as error:
+            # Thumbnail/metadata enrichment must never invalidate a clip that
+            # was already transactionally published by the engine.
+            emit_event(
+                'library', 'thumbnail_generation_failed', state='FAILED',
+                detail=f'{type(error).__name__}: {error}')
+            self.signals.finished.emit(self.file_path, '', 0)
         finally:
             self.signals.diagnostic_finished.emit(
                 round((time.monotonic() - started) * 1000),
@@ -754,6 +761,36 @@ class ClipThumbnail(QFrame):
         self.uploaded = val
         self._upload_badge.setVisible(val)
 
+    def set_ready(self, ready: bool) -> None:
+        """Update finalization state without replacing the entire card."""
+        ready = bool(ready)
+        if self.ready == ready:
+            return
+        self.ready = ready
+        self.share_btn.setEnabled(ready)
+        self.menu_btn.setEnabled(ready)
+        self.setCursor(
+            Qt.CursorShape.PointingHandCursor
+            if ready else Qt.CursorShape.ArrowCursor)
+        if ready:
+            if self._finalizing_badge is not None:
+                self._finalizing_badge.deleteLater()
+                self._finalizing_badge = None
+            return
+
+        if self._finalizing_badge is None:
+            finalizing = QLabel('FINALIZING', self._thumb_frame)
+            finalizing.setStyleSheet(
+                f'color: {Colors.TEXT}; '
+                f'background: {_rgba(Colors.WARNING, 220)}; '
+                f'font-family: {Fonts.DISPLAY}; '
+                f'font-size: {Fonts.SIZE_MICRO}px; '
+                'padding: 3px 7px; font-weight: bold;')
+            finalizing.adjustSize()
+            finalizing.move(8, 8)
+            finalizing.show()
+            self._finalizing_badge = finalizing
+
     @staticmethod
     def _upload_url(info: dict | None) -> str:
         if not isinstance(info, dict):
@@ -1105,6 +1142,13 @@ class ClipGrid(QWidget):
         self._thumb_widgets = {}
         self._known_files   = set()
         self._imported_files: set = set()
+        # Save completion updates one card in place.  Keep the date-section
+        # layouts indexed so adding a clip never has to tear down and recreate
+        # every card in a large library.
+        self._section_grids: dict[str, QGridLayout] = {}
+        self._section_files: dict[str, list[str]] = {}
+        self._thumbnail_jobs_inflight: set[str] = set()
+        self._pending_saved_clips: dict[str, bool] = {}
         self._thread_pool   = QThreadPool()
         # Cap at 2 workers. cv2/ffmpeg thumbnail decode is already heavy on disk
         # and CPU; throwing 16 threads at it just thrashes and makes everything
@@ -1303,6 +1347,7 @@ class ClipGrid(QWidget):
             # produced and rebuilds the remaining queue.
             self._background_refresh_pending = True
             self._thread_pool.clear()
+            self._thumbnail_jobs_inflight.clear()
             self.refresh_timer.stop()
             self._debounce_timer.stop()
             return
@@ -1312,6 +1357,10 @@ class ClipGrid(QWidget):
             self._background_refresh_pending = False
             self._known_files = None
             self._load_clips()
+        pending = self._pending_saved_clips
+        self._pending_saved_clips = {}
+        for path, ready in pending.items():
+            self.upsert_saved_clip(path, ready=ready)
 
     # ── UI ───────────────────────────────────────────────────────────────
 
@@ -1548,6 +1597,10 @@ class ClipGrid(QWidget):
         self._sections_host.setGraphicsEffect(None)
         self._in_transition = False
         self._transition_anim = None
+        pending = self._pending_saved_clips
+        self._pending_saved_clips = {}
+        for path, ready in pending.items():
+            self.upsert_saved_clip(path, ready=ready)
 
     def _filter_heading(self) -> str:
         if self._filter == 'clips':
@@ -1730,7 +1783,58 @@ class ClipGrid(QWidget):
             self._add_section(section_key, section_files, global_idx)
             global_idx += len(section_files)
 
-    def _add_section(self, header_text: str, files: list[str], starting_idx: int):
+    def _start_thumbnail_worker(self, file_path: str) -> None:
+        card = self._thumb_widgets.get(file_path)
+        if (card is None or not card.is_video or not card.ready
+                or card._thumbnail_ready
+                or file_path in self._thumbnail_jobs_inflight):
+            return
+        worker = _ThumbnailWorker(file_path)
+        worker.signals.finished.connect(self._on_thumb_ready)
+        worker.signals.diagnostic_finished.connect(self._on_thumb_diagnostic)
+        self._thumbnail_jobs_inflight.add(file_path)
+        self._thumbnail_jobs_submitted += 1
+        self._thread_pool.start(worker)
+
+    def _create_thumbnail(
+            self, file_path: str, card_width: int,
+            *, ready_override: bool | None = None) -> ClipThumbnail:
+        is_video = is_completed_video_path(file_path)
+        uploaded = bool(
+            self._upload_checker and self._upload_checker(file_path))
+        upload_info = (
+            self._upload_info_checker(file_path)
+            if uploaded and self._upload_info_checker else None)
+        ready = bool(
+            ready_override
+            if ready_override is not None
+            else (self._readiness_checker(file_path)
+                  if self._readiness_checker else True))
+        thumb = ClipThumbnail(
+            file_path, is_video=is_video,
+            imported=file_path in self._imported_files,
+            upload_enabled=bool(
+                self._upload_enabled and self._upload_enabled()),
+            uploaded=uploaded,
+            upload_info=upload_info,
+            ready=ready,
+            card_width=card_width,
+            clips_root=self.clips_dir,
+        )
+        thumb.opened.connect(self.clip_opened.emit)
+        thumb.clicked.connect(
+            self.clip_clicked.emit
+            if is_video else self.screenshot_clicked.emit)
+        thumb.deleted.connect(self._on_clip_deleted)
+        thumb.upload_requested.connect(self.clip_upload_requested.emit)
+        self.thumbnails.append(thumb)
+        self._thumb_widgets[file_path] = thumb
+        return thumb
+
+    def _add_section(
+            self, header_text: str, files: list[str], starting_idx: int,
+            *, insert_at: int | None = None,
+            ready_overrides: dict[str, bool] | None = None):
         """One block: [date header] + [game subtitle] + [grid of cards]."""
         section = QFrame()
         section.setStyleSheet('background: transparent;')
@@ -1775,31 +1879,12 @@ class ClipGrid(QWidget):
         grid.setVerticalSpacing(self._GRID_SPACING)
         grid.setContentsMargins(0, 0, 0, 0)
 
-        upload_enabled = bool(self._upload_enabled and self._upload_enabled())
         for i, fp in enumerate(files):
-            is_video = is_completed_video_path(fp)
-            uploaded = bool(self._upload_checker and self._upload_checker(fp))
-            upload_info = (
-                self._upload_info_checker(fp)
-                if uploaded and self._upload_info_checker else None)
-            ready = bool(
-                self._readiness_checker(fp)
-                if self._readiness_checker else True)
-            thumb = ClipThumbnail(
-                fp, is_video=is_video,
-                imported=fp in self._imported_files,
-                upload_enabled=upload_enabled,
-                uploaded=uploaded,
-                upload_info=upload_info,
-                ready=ready,
-                card_width=widths[i % cols],
-                clips_root=self.clips_dir,
-            )
-            thumb.opened.connect(self.clip_opened.emit)
-            thumb.clicked.connect(
-                self.clip_clicked.emit if is_video else self.screenshot_clicked.emit)
-            thumb.deleted.connect(self._on_clip_deleted)
-            thumb.upload_requested.connect(self.clip_upload_requested.emit)
+            ready_override = (
+                ready_overrides.get(fp)
+                if ready_overrides and fp in ready_overrides else None)
+            thumb = self._create_thumbnail(
+                fp, widths[i % cols], ready_override=ready_override)
             # Cards have a fixed width.  Explicit left/top alignment prevents
             # Qt from centering a short final row (especially a one-card date
             # section) inside a column that received surplus layout space.
@@ -1807,23 +1892,127 @@ class ClipGrid(QWidget):
                 thumb, i // cols, i % cols,
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
             )
-            self.thumbnails.append(thumb)
-            self._thumb_widgets[fp] = thumb
             if not self._in_transition:
                 thumb.fade_in(delay_ms=min((starting_idx + i) * 35, 600))
 
-            if is_video and ready:
-                worker = _ThumbnailWorker(fp)
-                worker.signals.finished.connect(self._on_thumb_ready)
-                worker.signals.diagnostic_finished.connect(
-                    self._on_thumb_diagnostic)
-                self._thumbnail_jobs_submitted += 1
-                self._thread_pool.start(worker)
+            self._start_thumbnail_worker(fp)
 
         for col, width in enumerate(widths):
             grid.setColumnMinimumWidth(col, width)
         sl.addLayout(grid)
-        self._sections_layout.addWidget(section)
+        self._section_grids[header_text] = grid
+        self._section_files[header_text] = list(files)
+        if insert_at is None:
+            self._sections_layout.addWidget(section)
+        else:
+            self._sections_layout.insertWidget(insert_at, section)
+
+    def upsert_saved_clip(self, file_path: str, *, ready: bool) -> None:
+        """Add or finalize one saved clip without scanning/rebuilding the library.
+
+        Native ``CLIP_SAVED`` already gives us the exact final path.  Walking
+        every imported folder and recreating every card to discover that one
+        known path made save finalization scale with the user's entire
+        library.  This path performs bounded work for the affected date
+        section only.
+        """
+        update_started = time.monotonic()
+        file_path = os.path.abspath(os.path.normpath(os.fspath(file_path)))
+        if not is_completed_video_path(file_path):
+            return
+
+        if self._background_paused or self._in_transition:
+            self._pending_saved_clips[file_path] = (
+                bool(ready)
+                or self._pending_saved_clips.get(file_path, False))
+            if self._background_paused:
+                self._background_refresh_pending = True
+            return
+
+        if self._known_files is None:
+            self._known_files = set(self._thumb_widgets)
+        self._known_files.add(file_path)
+
+        existing = self._thumb_widgets.get(file_path)
+        if existing is not None:
+            existing.set_ready(ready)
+            if ready:
+                self._start_thumbnail_worker(file_path)
+            emit_event(
+                'library', 'saved_clip_upserted', state='UPDATED',
+                ready=bool(ready), full_scan=False,
+                elapsed_ms=round(
+                    (time.monotonic() - update_started) * 1000),
+                visible_card_count=len(self._thumb_widgets))
+            return
+
+        # A locally saved video is not visible in screenshot/imported-only
+        # views.  It is still added to _known_files so the debounced filesystem
+        # watcher sees no unexplained change and does not trigger a rebuild.
+        if self._filter not in {'all', 'clips'}:
+            emit_event(
+                'library', 'saved_clip_upserted', state='FILTERED',
+                ready=bool(ready), full_scan=False,
+                elapsed_ms=round(
+                    (time.monotonic() - update_started) * 1000),
+                visible_card_count=len(self._thumb_widgets))
+            return
+
+        try:
+            section_key = _section_label_for(os.path.getmtime(file_path))
+        except OSError:
+            section_key = 'OTHER'
+
+        grid = self._section_grids.get(section_key)
+        if grid is None:
+            insert_at = 0 if self._sort != 'oldest' else None
+            self._add_section(
+                section_key, [file_path], 0, insert_at=insert_at,
+                ready_overrides={file_path: bool(ready)})
+        else:
+            files = self._section_files.setdefault(section_key, [])
+            files.append(file_path)
+
+            def _sort_value(path: str) -> int | float:
+                try:
+                    return (
+                        os.path.getsize(path)
+                        if self._sort == 'longest'
+                        else os.path.getmtime(path))
+                except OSError:
+                    # The file may disappear between publication and reflow;
+                    # retain the card until the normal watcher removes it.
+                    return 0
+
+            files.sort(
+                key=_sort_value,
+                reverse=self._sort != 'oldest')
+            thumb = self._create_thumbnail(
+                file_path, self._current_card_widths[0],
+                ready_override=bool(ready))
+            cols = self._current_columns
+            widths = self._current_card_widths
+            while grid.count():
+                grid.takeAt(0)
+            for index, path in enumerate(files):
+                card = self._thumb_widgets[path]
+                card.resize_card(widths[index % cols])
+                grid.addWidget(
+                    card, index // cols, index % cols,
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            for col, width in enumerate(widths):
+                grid.setColumnMinimumWidth(col, width)
+            thumb.fade_in()
+            self._start_thumbnail_worker(file_path)
+
+        self._show_empty(False)
+        self._all_count_label.setText(
+            f'{self._filter_heading()}  ({len(self._thumb_widgets)})')
+        emit_event(
+            'library', 'saved_clip_upserted', state='ADDED',
+            ready=bool(ready), full_scan=False,
+            elapsed_ms=round((time.monotonic() - update_started) * 1000),
+            visible_card_count=len(self._thumb_widgets))
 
     def _relayout_grids(self):
         """Re-position existing cards into the new column count without
@@ -1905,6 +2094,8 @@ class ClipGrid(QWidget):
         self._load_clips()
 
     def _clear_sections(self):
+        self._section_grids.clear()
+        self._section_files.clear()
         while self._sections_layout.count():
             item = self._sections_layout.takeAt(0)
             w = item.widget()
@@ -1935,6 +2126,7 @@ class ClipGrid(QWidget):
         self._load_clips()
 
     def _on_thumb_ready(self, file_path: str, cache_path: str, duration: int):
+        self._thumbnail_jobs_inflight.discard(file_path)
         self._thumbnail_jobs_completed += 1
         widget = self._thumb_widgets.get(file_path)
         if widget:

@@ -274,6 +274,78 @@ def test_short_section_cards_are_left_aligned(qapp, tmp_path: Path) -> None:
     assert alignment & clip_grid.Qt.AlignmentFlag.AlignTop
 
 
+def test_saved_clip_is_added_and_finalized_without_a_full_rebuild(
+        qapp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    old_clip = tmp_path / 'old.mp4'
+    new_clip = tmp_path / 'new.mp4'
+    old_clip.write_bytes(b'old')
+    settings = SimpleNamespace(
+        get=lambda key, default=None: {
+            'clips_directory': str(tmp_path), 'hotkeys': {},
+        }.get(key, default))
+    grid = clip_grid.ClipGrid(settings)
+    old_card = grid._thumb_widgets[str(old_clip)]
+    new_clip.write_bytes(b'new')
+
+    monkeypatch.setattr(
+        grid, '_collect_media_files',
+        lambda: pytest.fail('incremental save update performed a directory scan'))
+    monkeypatch.setattr(
+        grid, '_clear_sections',
+        lambda: pytest.fail('incremental save update rebuilt every section'))
+    started_workers: list[object] = []
+    monkeypatch.setattr(grid._thread_pool, 'start', started_workers.append)
+
+    grid.upsert_saved_clip(str(new_clip), ready=False)
+
+    new_card = grid._thumb_widgets[str(new_clip)]
+    assert grid._thumb_widgets[str(old_clip)] is old_card
+    assert new_card.ready is False
+    assert str(new_clip) in grid._known_files
+    assert started_workers == []
+
+    grid.upsert_saved_clip(str(new_clip), ready=True)
+
+    assert grid._thumb_widgets[str(new_clip)] is new_card
+    assert new_card.ready is True
+    assert new_card._finalizing_badge is None
+    assert len(started_workers) == 1
+
+
+def test_rapid_saved_clip_upserts_keep_existing_cards_and_order(
+        qapp, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    first = tmp_path / 'first.mp4'
+    second = tmp_path / 'second.mp4'
+    third = tmp_path / 'third.mp4'
+    first.write_bytes(b'clip')
+    settings = SimpleNamespace(
+        get=lambda key, default=None: {
+            'clips_directory': str(tmp_path), 'hotkeys': {},
+        }.get(key, default))
+    grid = clip_grid.ClipGrid(settings)
+    first_card = grid._thumb_widgets[str(first)]
+    second.write_bytes(b'clip')
+    third.write_bytes(b'clip')
+    started_workers: list[object] = []
+    monkeypatch.setattr(grid._thread_pool, 'start', started_workers.append)
+
+    # Model two rapid native completions. Neither update may rescan or
+    # recreate the card that was already visible when the saves arrived.
+    grid.upsert_saved_clip(str(second), ready=False)
+    second_card = grid._thumb_widgets[str(second)]
+    grid.upsert_saved_clip(str(third), ready=False)
+    third_card = grid._thumb_widgets[str(third)]
+    grid.upsert_saved_clip(str(second), ready=True)
+    grid.upsert_saved_clip(str(third), ready=True)
+
+    assert grid._thumb_widgets[str(first)] is first_card
+    assert grid._thumb_widgets[str(second)] is second_card
+    assert grid._thumb_widgets[str(third)] is third_card
+    assert all(grid._thumb_widgets[str(path)].ready
+               for path in (second, third))
+    assert len(started_workers) == 2
+
+
 def test_thumbnail_worker_rejects_partial_before_decoder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -296,3 +368,64 @@ def test_thumbnail_worker_rejects_partial_before_decoder(
 
     assert not decoder_called
     assert received == [(str(partial), '', 0)]
+
+
+def test_thumbnail_failure_does_not_invalidate_the_saved_clip(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    saved = tmp_path / 'saved.mp4'
+    saved.write_bytes(b'valid-core-clip')
+    monkeypatch.setattr(
+        clip_grid.cv2, 'VideoCapture',
+        lambda _path: (_ for _ in ()).throw(
+            RuntimeError('injected thumbnail decoder failure')))
+    received: list[tuple[str, str, int]] = []
+    worker = clip_grid._ThumbnailWorker(str(saved))
+    worker.signals.finished.connect(
+        lambda path, cache, duration: received.append((path, cache, duration)))
+
+    worker.run()
+
+    assert saved.exists()
+    assert received == [(str(saved), '', 0)]
+
+
+def test_metadata_enrichment_failure_does_not_invalidate_the_saved_clip(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    saved = tmp_path / 'saved.mp4'
+    saved.write_bytes(b'valid-core-clip')
+
+    class _Capture:
+        def isOpened(self):
+            return True
+
+        def read(self):
+            return True, SimpleNamespace(shape=(18, 32, 3))
+
+        def get(self, property_id):
+            return {
+                clip_grid.cv2.CAP_PROP_FPS: 30.0,
+                clip_grid.cv2.CAP_PROP_FRAME_COUNT: 3.0,
+                clip_grid.cv2.CAP_PROP_FRAME_WIDTH: 32.0,
+                clip_grid.cv2.CAP_PROP_FRAME_HEIGHT: 18.0,
+            }.get(property_id, 0.0)
+
+        def release(self):
+            return None
+
+    monkeypatch.setattr(clip_grid.cv2, 'VideoCapture', lambda _path: _Capture())
+    monkeypatch.setattr(clip_grid.cv2, 'imwrite', lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        clip_grid, 'probe_video_metadata',
+        lambda _path: (_ for _ in ()).throw(
+            RuntimeError('injected metadata probe failure')))
+    monkeypatch.setattr(clip_grid, 'THUMB_CACHE_DIR', str(tmp_path / 'cache'))
+
+    received: list[tuple[str, str, int]] = []
+    worker = clip_grid._ThumbnailWorker(str(saved))
+    worker.signals.finished.connect(
+        lambda path, cache, duration: received.append((path, cache, duration)))
+
+    worker.run()
+
+    assert saved.exists()
+    assert received == [(str(saved), '', 0)]

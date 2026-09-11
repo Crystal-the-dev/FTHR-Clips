@@ -30,28 +30,38 @@ SaveClipQueue::~SaveClipQueue() {
 // Thread-safe, never blocks.
 // ---------------------------------------------------------------------------
 
-void SaveClipQueue::Push(SaveClipTask&& task) {
+bool SaveClipQueue::Push(SaveClipTask&& task) {
     std::wstring log_path = task.output_path;
     uint32_t     log_id   = task.task_id;
+    size_t       log_depth = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
 
         if (shutdown_) {
             std::cerr << "[SaveClipQueue] Cannot push task - queue is shutting down"
                       << std::endl;
-            return;
+            return false;
+        }
+        if (queue_.size() >= kMaxPendingTasks) {
+            std::cerr << "[SaveClipQueue] Cannot push task - pending queue is full ("
+                      << queue_.size() << '/' << kMaxPendingTasks << ')'
+                      << std::endl;
+            return false;
         }
 
         queue_.push(std::move(task));
-
-        std::wcout << L"[SaveClipQueue] Task queued: "
-                   << log_path
-                   << L" (ID: " << log_id
-                   << L", queue depth: " << queue_.size() << L")"
-                   << std::endl;
+        log_depth = queue_.size();
     }
 
-    cv_.notify_one();  // Wake up SaveClipThread
+    cv_.notify_one();  // Wake the worker before potentially-slow logging.
+    // Console/file logging may itself block. Keep it outside the queue lock so
+    // the save worker can take ownership of the accepted task immediately.
+    std::wcout << L"[SaveClipQueue] Task queued: "
+               << log_path
+               << L" (ID: " << log_id
+               << L", queue depth: " << log_depth << L")"
+               << std::endl;
+    return true;
 }
 
 

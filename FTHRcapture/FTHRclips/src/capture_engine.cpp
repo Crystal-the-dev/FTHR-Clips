@@ -1692,7 +1692,21 @@ namespace fthr {
                 task.encoded_snapshot.packets.size();
             const size_t diagnostic_audio_tracks =
                 task.encoded_audio_tracks.size();
-            save_clip_queue_.Push(std::move(task));
+            if (!save_clip_queue_.Push(std::move(task))) {
+                SetEngineError(shared_memory,
+                    L"The clip save queue is full or shutting down. Wait for "
+                    L"the current save to finish, then try again.");
+                std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"clip_save\","
+                          << "\"event\":\"save_queue_rejected\","
+                          << "\"state\":\"FAILED\","
+                          << "\"error_code\":\"CLIP_SAVE_FAILED\","
+                          << "\"queue_depth\":"
+                          << save_clip_queue_.GetQueueDepth() << ','
+                          << "\"queue_capacity\":"
+                          << save_clip_queue_.GetCapacity() << "}"
+                          << std::endl;
+                return false;
+            }
             const auto selection_ms = std::chrono::duration_cast<
                 std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - save_request_started).count();
@@ -1764,7 +1778,12 @@ namespace fthr {
             std::cerr << "[SaveClip] Audio device lost - saving clip without audio" << std::endl;
         }
 
-        save_clip_queue_.Push(std::move(task));
+        if (!save_clip_queue_.Push(std::move(task))) {
+            SetEngineError(shared_memory,
+                L"The clip save queue is full or shutting down. Wait for the "
+                L"current save to finish, then try again.");
+            return false;
+        }
         std::wcout << L"[SaveClip] Raw task queued: " << path << std::endl;
         return true;
     }

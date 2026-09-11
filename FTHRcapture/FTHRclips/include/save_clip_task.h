@@ -143,14 +143,17 @@ namespace fthr {
     // ---------------------------------------------------------------------------
     class SaveClipQueue {
     public:
+        static constexpr size_t kMaxPendingTasks = 4;
+
         SaveClipQueue();
         ~SaveClipQueue();
 
-        void   Push(SaveClipTask&& task);
+        bool   Push(SaveClipTask&& task);
         bool   Pop(SaveClipTask& out_task);
         void   Shutdown();
         bool   IsShutdown()    const;
         size_t GetQueueDepth() const;
+        size_t GetCapacity()   const { return kMaxPendingTasks; }
 
     private:
         std::queue<SaveClipTask> queue_;
