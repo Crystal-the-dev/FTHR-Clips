@@ -64,3 +64,12 @@ def test_editor_detaches_display_image_from_decoder_storage():
 
     color = display_image.pixelColor(0, 0)
     assert (color.red(), color.green(), color.blue()) == (12, 34, 56)
+
+
+def test_neutral_preview_keeps_backend_image_format_without_eager_copy():
+    source = QImage(2, 2, QImage.Format.Format_ARGB32)
+
+    display_image = clip_viewer.LiveVideoPreview._normalize_decoded_video_range(
+        source, QVideoFrameFormat.ColorRange.ColorRange_Full)
+
+    assert display_image.format() == QImage.Format.Format_ARGB32

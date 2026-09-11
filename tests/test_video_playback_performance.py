@@ -75,6 +75,39 @@ def test_playback_has_one_ui_loop_and_filmstrip_is_idle_only(
     viewer._teardown_player()
 
 
+def test_video_frame_hotpath_keeps_owned_image_without_eager_normalization(
+        monkeypatch):
+    image = QImage(4, 4, QImage.Format.Format_ARGB32)
+    updated = []
+    frame = SimpleNamespace(
+        isValid=lambda: True,
+        toImage=lambda: image,
+    )
+    viewer = SimpleNamespace(
+        _frame_image=QImage(),
+        _frame_serial=0,
+        _cached_key=('old',),
+        _cached_frame=QImage(2, 2, QImage.Format.Format_ARGB32),
+        update=lambda: updated.append(True),
+    )
+    viewer._invalidate_processed_frame = (
+        LiveVideoPreview._invalidate_processed_frame.__get__(viewer))
+
+    def _unexpected_normalization(*_args):
+        raise AssertionError('neutral frames must bypass eager conversion')
+
+    monkeypatch.setattr(
+        LiveVideoPreview, '_normalize_decoded_video_range',
+        staticmethod(_unexpected_normalization))
+
+    LiveVideoPreview._on_video_frame(viewer, frame)
+
+    assert viewer._frame_image is image
+    assert viewer._frame_serial == 1
+    assert viewer._cached_key is None
+    assert updated == [True]
+
+
 def test_playing_button_uses_contrasting_pause_icon(
         monkeypatch, qtbot, tmp_path):
     viewer = _viewer(monkeypatch, qtbot, str(tmp_path / 'clip.mp4'))

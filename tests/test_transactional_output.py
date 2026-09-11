@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 
 from core.transactional_output import (
     commit_staged_output,
@@ -46,7 +47,6 @@ def test_success_atomically_promotes_staged_output(tmp_path):
 def test_editor_failure_removes_staged_output_and_never_publishes_final(
         tmp_path, monkeypatch):
     from types import SimpleNamespace
-    import subprocess
 
     final = tmp_path / 'export.mp4'
     emitted = []
@@ -57,14 +57,17 @@ def test_editor_failure_removes_staged_output_and_never_publishes_final(
     )
     monkeypatch.setattr('ui.clip_viewer.get_ffmpeg_exe', lambda: 'ffmpeg')
     monkeypatch.setattr('ui.clip_viewer.software_video_args', lambda: [])
+    monkeypatch.setattr('ui.clip_viewer.maximum_quality_video_args', lambda _ff: [])
 
-    def _failed_run(cmd, **_kwargs):
+    def _failed_popen(cmd, **_kwargs):
         Path(cmd[-1]).write_bytes(b'partial')
-        raise subprocess.CalledProcessError(1, cmd, stderr=b'failed')
+        raise OSError('simulated FFmpeg launch failure')
 
-    monkeypatch.setattr('ui.clip_viewer._run_export_process', _failed_run)
+    monkeypatch.setattr('ui.clip_viewer.subprocess.Popen', _failed_popen)
 
-    ClipViewer._export_worker(fake, 0.0, 1.0, str(final), None)
+    fake._export_cancel = threading.Event()
+    fake._export_staged_path = None
+    ClipViewer._export_worker_impl(fake, 0.0, 1.0, str(final), None)
 
     assert not final.exists()
     assert list(tmp_path.glob('*.partial.*')) == []

@@ -3173,6 +3173,7 @@ class MainWindow(QMainWindow):
         self._save_diagnostic_started_at = 0.0
         self._clip_diagnostic_started_by_path: dict[str, float] = {}
         self._diagnostic_engine_start_count = 0
+        self._active_clip_viewer = None
 
         # -- Frameless window --
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
@@ -8104,6 +8105,18 @@ class MainWindow(QMainWindow):
         if camera_timer is not None:
             camera_timer.stop()
         from ui.clip_viewer import ClipViewer
+        # MainWindow is the sole owner of the modal viewer.  A stale hidden
+        # viewer must be torn down before another clip can be opened.
+        previous_viewer = self._active_clip_viewer
+        if previous_viewer is not None:
+            try:
+                previous_viewer.close()
+                previous_viewer.deleteLater()
+            except (RuntimeError, TypeError):
+                # Qt may have deleted an already-closed viewer; ownership is
+                # cleared below and the next viewer remains authoritative.
+                pass
+            self._active_clip_viewer = None
         upload_on = self.upload_manager.is_enabled()
         viewer = ClipViewer(clip_path, self.bridge, self, thumb_pixmap=thumb_pixmap,
                             settings_manager=self.settings_manager,
@@ -8112,8 +8125,22 @@ class MainWindow(QMainWindow):
                             linked_import=self.clip_grid.is_linked_import(clip_path))
         viewer.upload_requested.connect(self.upload_manager.enqueue_upload)
         viewer.export_error.connect(self.push_error)
+        self._active_clip_viewer = viewer
         viewer.showMaximized()
-        viewer.exec()
+        try:
+            viewer.exec()
+        finally:
+            # exec() can return through Escape, close(), accept(), or an
+            # application shutdown.  All paths leave one explicit owner and
+            # release it before the next clip is opened.
+            try:
+                viewer._teardown_player()
+                viewer.deleteLater()
+            except (AttributeError, RuntimeError, TypeError):
+                # exec() can return after Qt has already destroyed the dialog.
+                pass
+            if self._active_clip_viewer is viewer:
+                self._active_clip_viewer = None
 
     # =======================================================================
     # Error bar
@@ -8378,6 +8405,17 @@ class MainWindow(QMainWindow):
             return
         self._shutdown_complete = True
         self.is_capturing = False
+
+        active_viewer = getattr(self, '_active_clip_viewer', None)
+        if active_viewer is not None:
+            try:
+                active_viewer.close()
+                active_viewer._teardown_player()
+                active_viewer.deleteLater()
+            except (AttributeError, RuntimeError, TypeError):
+                # Shutdown continues when the dialog was destroyed by Qt.
+                pass
+            self._active_clip_viewer = None
 
         if hasattr(self, 'status_timer'):
             self.status_timer.stop()
