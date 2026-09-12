@@ -68,6 +68,10 @@ public:
         const AmfCodecSelection& selection,
         EncodedVideoConfig& video_config,
         std::string& error) = 0;
+    virtual bool PrepareGpuFrame(
+        ID3D11Texture2D* source,
+        uint32_t source_subresource,
+        std::string& error) = 0;
     virtual ID3D11Texture2D* GetCurrentInputTexture() const noexcept = 0;
     virtual uint32_t GetCurrentInputSubresource() const noexcept = 0;
     virtual AmfSubmitStatus SubmitFrame(
@@ -96,6 +100,10 @@ public:
         ID3D11DeviceContext* shared_context,
         PacketCallback callback,
         bool cpu_input_mode) override;
+    bool RequiresBackendGpuPreparation() const noexcept override;
+    bool PrepareGpuFrame(
+        ID3D11Texture2D* source,
+        uint32_t source_subresource = 0) override;
     bool EncodeFrame(int64_t present_qpc = 0) override;
     bool EncodeFrameCPU(
         const uint8_t* bgra_data,
@@ -133,6 +141,7 @@ private:
 
     uint32_t fps_ = 0;
     bool initialized_ = false;
+    bool gpu_frame_prepared_ = false;
     bool first_frame_ = true;
     bool flushing_ = false;
     int64_t encode_start_qpc_ = 0;

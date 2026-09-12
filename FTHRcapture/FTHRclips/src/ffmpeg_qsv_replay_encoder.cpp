@@ -1,4 +1,5 @@
 #include "ffmpeg_qsv_replay_encoder.h"
+#include "capture_scale_geometry.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -269,7 +270,8 @@ public:
 
         if (!CreateHardwareContexts(shared_device, error)
             || !CreateConversionPipeline(
-                shared_device, shared_context, config.fps, error)) {
+                shared_device, shared_context, config.fps,
+                config.scaling_mode == 1, error)) {
             Reset();
             return false;
         }
@@ -731,6 +733,7 @@ private:
         ID3D11Device* shared_device,
         ID3D11DeviceContext* shared_context,
         uint32_t fps,
+        bool fit,
         std::string& error) {
         HRESULT result = shared_device->QueryInterface(
             __uuidof(ID3D11VideoDevice),
@@ -825,9 +828,22 @@ private:
             0, 0,
             static_cast<LONG>(source_width_),
             static_cast<LONG>(source_height_)};
+        CaptureScaleGeometry geometry;
+        if (!BuildCaptureScaleGeometry(
+                source_width_, source_height_, output_width_, output_height_,
+                fit, geometry)) {
+            error = "invalid QSV source-to-output scaling geometry";
+            return false;
+        }
         RECT output_rect{
-            0, 0,
-            static_cast<LONG>(output_width_),
+            static_cast<LONG>(geometry.destination.left),
+            static_cast<LONG>(geometry.destination.top),
+            static_cast<LONG>(geometry.destination.left
+                + geometry.destination.width),
+            static_cast<LONG>(geometry.destination.top
+                + geometry.destination.height)};
+        RECT target_rect{
+            0, 0, static_cast<LONG>(output_width_),
             static_cast<LONG>(output_height_)};
         video_context_->VideoProcessorSetStreamFrameFormat(
             video_processor_, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
@@ -836,7 +852,11 @@ private:
         video_context_->VideoProcessorSetStreamDestRect(
             video_processor_, 0, TRUE, &output_rect);
         video_context_->VideoProcessorSetOutputTargetRect(
-            video_processor_, TRUE, &output_rect);
+            video_processor_, TRUE, &target_rect);
+        D3D11_VIDEO_COLOR background{};
+        background.RGBA = {0.f, 0.f, 0.f, 1.f};
+        video_context_->VideoProcessorSetOutputBackgroundColor(
+            video_processor_, FALSE, &background);
         video_context_->VideoProcessorSetStreamAutoProcessingMode(
             video_processor_, 0, FALSE);
 

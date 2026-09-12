@@ -54,6 +54,26 @@
 
 namespace fthr {
 
+namespace {
+
+bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
+    if (!left || !right) return false;
+    IUnknown* left_identity = nullptr;
+    IUnknown* right_identity = nullptr;
+    const HRESULT left_hr = left->QueryInterface(
+        __uuidof(IUnknown), reinterpret_cast<void**>(&left_identity));
+    const HRESULT right_hr = right->QueryInterface(
+        __uuidof(IUnknown), reinterpret_cast<void**>(&right_identity));
+    const bool same = SUCCEEDED(left_hr)
+        && SUCCEEDED(right_hr)
+        && left_identity == right_identity;
+    if (left_identity) left_identity->Release();
+    if (right_identity) right_identity->Release();
+    return same;
+}
+
+} // namespace
+
 
     // ===========================================================================
     // NVENC Error Code to String
@@ -414,6 +434,17 @@ namespace fthr {
         , nvenc_dll_(nullptr)
         , d3d11_device_(nullptr)
         , d3d11_context_(nullptr)
+        , video_device_(nullptr)
+        , video_context_(nullptr)
+        , video_processor_enumerator_(nullptr)
+        , video_processor_(nullptr)
+        , gpu_scale_texture_(nullptr)
+        , gpu_scale_output_view_(nullptr)
+        , gpu_scale_geometry_{}
+        , input_width_(0)
+        , input_height_(0)
+        , gpu_scale_required_(false)
+        , gpu_frame_prepared_(false)
         , cpu_input_mode_(false)
         , input_textures_(nullptr)
         , registered_resources_(nullptr)
@@ -486,6 +517,18 @@ namespace fthr {
         src_height_ = config.src_height;
         enc_width_ = (config.enc_width > 0) ? config.enc_width : config.src_width;
         enc_height_ = (config.enc_height > 0) ? config.enc_height : config.src_height;
+        if (!BuildCaptureScaleGeometry(
+                src_width_, src_height_, enc_width_, enc_height_,
+                config.scaling_mode == 1, gpu_scale_geometry_)) {
+            last_error_ = "invalid NVENC source/target scaling geometry";
+            return false;
+        }
+        enc_width_ = gpu_scale_geometry_.target_width;
+        enc_height_ = gpu_scale_geometry_.target_height;
+        input_width_ = src_width_;
+        input_height_ = src_height_;
+        gpu_scale_required_ = false;
+        gpu_frame_prepared_ = false;
         fps_ = config.fps;
         bitrate_kbps_ = config.bitrate_kbps;
         pts_ = 0;
@@ -593,6 +636,16 @@ namespace fthr {
         d3d11_device_   = shared_device;   // non-owning
         d3d11_context_  = shared_context;  // non-owning
         cpu_input_mode_ = cpu_input_mode;
+        gpu_scale_required_ = !cpu_input_mode_
+            && config.scaling_mode == 1
+            && (gpu_scale_geometry_.destination.width
+                    != gpu_scale_geometry_.target_width
+                || gpu_scale_geometry_.destination.height
+                    != gpu_scale_geometry_.target_height);
+        if (gpu_scale_required_) {
+            input_width_ = enc_width_;
+            input_height_ = enc_height_;
+        }
         std::cout << "[HardwareEncoder] Using shared D3D11 device ("
                   << (cpu_input_mode ? "Optimus CPU-input path" : "GPU zero-copy path")
                   << ")" << std::endl;
@@ -611,12 +664,14 @@ namespace fthr {
                 + NvencStatusToString(status);
             std::cerr << "[HardwareEncoder] nvEncOpenEncodeSessionEx: " << NvencStatusToString(status) << std::endl;
             // d3d11 device/context not owned - do not Release
+            ReleaseGpuScalePipeline();
             delete nvenc_api; nvenc_encoder_ = nullptr;
             FreeLibrary(nvenc_dll); nvenc_dll_ = nullptr;
             return false;
         }
 
         auto close_uninitialized_session = [&]() {
+            ReleaseGpuScalePipeline();
             if (nvenc_session_) {
                 nvenc_api->nvEncDestroyEncoder(nvenc_session_);
                 nvenc_session_ = nullptr;
@@ -626,6 +681,17 @@ namespace fthr {
             FreeLibrary(nvenc_dll);
             nvenc_dll_ = nullptr;
         };
+
+        if (gpu_scale_required_) {
+            std::string scale_error;
+            if (!InitializeGpuScalePipeline(scale_error)) {
+                last_error_ = "NVIDIA FIT GPU scaling initialization failed: "
+                    + scale_error;
+                ReleaseGpuScalePipeline();
+                close_uninitialized_session();
+                return false;
+            }
+        }
 
         // Validate support on the exact D3D11 device/session used for capture.
         // Vendor ID, GPU model and FFmpeg encoder lists are not capability proof.
@@ -750,6 +816,7 @@ namespace fthr {
             std::cerr << "[HardwareEncoder] nvEncInitializeEncoder: " << NvencStatusToString(status) << std::endl;
             nvenc_api->nvEncDestroyEncoder(nvenc_session_); nvenc_session_ = nullptr;
             // d3d11 device/context not owned - do not Release
+            ReleaseGpuScalePipeline();
             delete nvenc_api; nvenc_encoder_ = nullptr;
             FreeLibrary(nvenc_dll); nvenc_dll_ = nullptr;
             return false;
@@ -780,6 +847,7 @@ namespace fthr {
 
         // Helper: clean up partially-allocated output buffers then destroy encoder/dll.
         auto cleanup_and_fail = [&](uint32_t allocated_outputs) {
+            ReleaseGpuScalePipeline();
             for (uint32_t j = 0; j < allocated_outputs; j++) {
                 if (output_buffers_[j])
                     nvenc_api->nvEncDestroyBitstreamBuffer(nvenc_session_, output_buffers_[j]);
@@ -800,8 +868,8 @@ namespace fthr {
 
             for (uint32_t i = 0; i < buffer_count_; i++) {
                 D3D11_TEXTURE2D_DESC tex_desc = {};
-                tex_desc.Width            = src_width_;
-                tex_desc.Height           = src_height_;
+                tex_desc.Width            = input_width_;
+                tex_desc.Height           = input_height_;
                 tex_desc.MipLevels        = 1;
                 tex_desc.ArraySize        = 1;
                 tex_desc.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -828,8 +896,8 @@ namespace fthr {
                 NV_ENC_REGISTER_RESOURCE reg = { NV_ENC_REGISTER_RESOURCE_VER };
                 reg.resourceType       = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
                 reg.resourceToRegister = input_textures_[i];
-                reg.width              = src_width_;
-                reg.height             = src_height_;
+                reg.width              = input_width_;
+                reg.height             = input_height_;
                 reg.pitch              = 0;
                 reg.bufferFormat       = NV_ENC_BUFFER_FORMAT_ARGB;
                 reg.bufferUsage        = NV_ENC_INPUT_IMAGE;
@@ -866,6 +934,7 @@ namespace fthr {
                     input_textures_ = nullptr; registered_resources_ = nullptr; output_buffers_ = nullptr;
                     delete[] slot_qpc_; slot_qpc_ = nullptr;
                     nvenc_api->nvEncDestroyEncoder(nvenc_session_); nvenc_session_ = nullptr;
+                    ReleaseGpuScalePipeline();
                     delete nvenc_api; nvenc_encoder_ = nullptr;
                     FreeLibrary(nvenc_dll); nvenc_dll_ = nullptr;
                     return false;
@@ -916,6 +985,7 @@ namespace fthr {
                     delete[] cpu_input_buffers_; delete[] output_buffers_;
                     cpu_input_buffers_ = nullptr; output_buffers_ = nullptr;
                     nvenc_api->nvEncDestroyEncoder(nvenc_session_); nvenc_session_ = nullptr;
+                    ReleaseGpuScalePipeline();
                     delete nvenc_api; nvenc_encoder_ = nullptr;
                     FreeLibrary(nvenc_dll); nvenc_dll_ = nullptr;
                     return false;
@@ -1021,9 +1091,10 @@ namespace fthr {
                       << " bytes)" << std::endl;
         }
 
-        // Note: resolution downscaling (src -> enc) is now handled by NVENC natively.
-        // The input textures are src_width_ x src_height_; NVENC outputs enc_width_ x enc_height_.
-        // No CPU swscale needed.
+        // STRETCH and aspect-matched FIT use NVENC's native input scaling. FIT
+        // with an aspect mismatch uses the already-created GPU VideoProcessor
+        // surface, so the registered input dimensions are target-sized without
+        // introducing a CPU full-frame copy.
 
         if (codec_ == VideoCodec::H264) {
             avcc_buf_.reserve(static_cast<size_t>(enc_width_) * enc_height_ * 2);
@@ -1127,6 +1198,12 @@ namespace fthr {
             std::cerr << "[EncodeFrame] Not initialized" << std::endl;
             return false;
         }
+        if (gpu_scale_required_ && !gpu_frame_prepared_) {
+            last_error_ = "NVIDIA FIT frame was submitted without GPU preparation";
+            std::cerr << "[EncodeFrame] " << last_error_ << std::endl;
+            return false;
+        }
+        gpu_frame_prepared_ = false;
 
         // Backpressure: the preceding submission prepares this slot before exposing
         // its texture to CaptureEngine. Keep this wait as an invariant guard.
@@ -1173,8 +1250,8 @@ namespace fthr {
         pic.inputBuffer     = map_res.mappedResource;
         pic.outputBitstream = static_cast<NV_ENC_OUTPUT_PTR>(output_buffers_[idx]);
         pic.bufferFmt       = map_res.mappedBufferFmt;
-        pic.inputWidth      = src_width_;
-        pic.inputHeight     = src_height_;
+        pic.inputWidth      = input_width_;
+        pic.inputHeight     = input_height_;
         pic.pictureStruct   = NV_ENC_PIC_STRUCT_FRAME;
         pic.inputTimeStamp  = static_cast<uint64_t>(pts_);
         pic.completionEvent = completion_events_[idx];
@@ -1236,6 +1313,93 @@ namespace fthr {
     // ===========================================================================
     // GetCurrentInputTexture
     // ===========================================================================
+
+    bool HardwareEncoder::RequiresBackendGpuPreparation() const noexcept {
+        return gpu_scale_required_;
+    }
+
+    bool HardwareEncoder::PrepareGpuFrame(
+        ID3D11Texture2D* source,
+        uint32_t source_subresource) {
+        gpu_frame_prepared_ = false;
+        if (!gpu_scale_required_) {
+            last_error_ = "NVIDIA GPU preparation was requested for a non-scaled path";
+            return false;
+        }
+        if (!initialized_ || !source || !d3d11_device_ || !d3d11_context_
+            || !video_device_ || !video_context_ || !video_processor_
+            || !video_processor_enumerator_ || !gpu_scale_texture_
+            || !gpu_scale_output_view_ || !input_textures_
+            || !input_slot_lifecycle_) {
+            last_error_ = "NVIDIA FIT GPU conversion resources are unavailable";
+            return false;
+        }
+        const uint32_t slot = current_buf_idx_ % buffer_count_;
+        if (!input_slot_lifecycle_[slot].is_available()) {
+            last_error_ = "NVIDIA FIT input slot is still pending output";
+            return false;
+        }
+        ID3D11Device* source_device = nullptr;
+        source->GetDevice(&source_device);
+        const bool same_device = SameComObject(source_device, d3d11_device_);
+        if (source_device) source_device->Release();
+        if (!same_device) {
+            last_error_ = "NVIDIA FIT source texture belongs to a different D3D11 device";
+            return false;
+        }
+
+        D3D11_TEXTURE2D_DESC source_description{};
+        source->GetDesc(&source_description);
+        const uint32_t mip_levels = std::max(1U, source_description.MipLevels);
+        const uint32_t array_size = std::max(1U, source_description.ArraySize);
+        if (source_description.Width != src_width_
+            || source_description.Height != src_height_
+            || source_description.Format != DXGI_FORMAT_B8G8R8A8_UNORM
+            || source_subresource >= mip_levels * array_size) {
+            last_error_ = "NVIDIA FIT source texture geometry, format, or subresource is invalid";
+            return false;
+        }
+
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC input_description{};
+        input_description.FourCC = 0;
+        input_description.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+        input_description.Texture2D.MipSlice = source_subresource % mip_levels;
+        input_description.Texture2D.ArraySlice = source_subresource / mip_levels;
+        ID3D11VideoProcessorInputView* input_view = nullptr;
+        HRESULT result = video_device_->CreateVideoProcessorInputView(
+            source, video_processor_enumerator_, &input_description, &input_view);
+        if (FAILED(result) || !input_view) {
+            last_error_ = diagnostics::FormatHResultFailure(
+                "ID3D11VideoDevice::CreateVideoProcessorInputView(NVIDIA FIT)",
+                result);
+            return false;
+        }
+
+        D3D11_VIDEO_PROCESSOR_STREAM stream{};
+        stream.Enable = TRUE;
+        stream.OutputIndex = 0;
+        stream.pInputSurface = input_view;
+        result = video_context_->VideoProcessorBlt(
+            video_processor_, gpu_scale_output_view_, 0, 1, &stream);
+        input_view->Release();
+        if (FAILED(result)) {
+            last_error_ = diagnostics::FormatHResultFailure(
+                "ID3D11VideoContext::VideoProcessorBlt(NVIDIA FIT)", result);
+            return false;
+        }
+
+        d3d11_context_->CopySubresourceRegion(
+            input_textures_[slot], 0, 0, 0, 0,
+            gpu_scale_texture_, 0, nullptr);
+        const HRESULT removed = d3d11_device_->GetDeviceRemovedReason();
+        if (FAILED(removed)) {
+            last_error_ = diagnostics::FormatHResultFailure(
+                "ID3D11Device::GetDeviceRemovedReason(NVIDIA FIT)", removed);
+            return false;
+        }
+        gpu_frame_prepared_ = true;
+        return true;
+    }
 
     ID3D11Texture2D* HardwareEncoder::GetCurrentInputTexture() const noexcept {
         if (!input_textures_ || !initialized_) return nullptr;
@@ -1576,8 +1740,171 @@ namespace fthr {
     // Finalize
     // ===========================================================================
 
+    bool HardwareEncoder::InitializeGpuScalePipeline(std::string& error) {
+        if (!gpu_scale_required_ || !d3d11_device_ || !d3d11_context_) {
+            return true;
+        }
+        HRESULT result = d3d11_device_->QueryInterface(
+            __uuidof(ID3D11VideoDevice),
+            reinterpret_cast<void**>(&video_device_));
+        if (FAILED(result) || !video_device_) {
+            error = diagnostics::FormatHResultFailure(
+                "ID3D11Device::QueryInterface(ID3D11VideoDevice)", result);
+            ReleaseGpuScalePipeline();
+            return false;
+        }
+        result = d3d11_context_->QueryInterface(
+            __uuidof(ID3D11VideoContext),
+            reinterpret_cast<void**>(&video_context_));
+        if (FAILED(result) || !video_context_) {
+            error = diagnostics::FormatHResultFailure(
+                "ID3D11DeviceContext::QueryInterface(ID3D11VideoContext)",
+                result);
+            ReleaseGpuScalePipeline();
+            return false;
+        }
+
+        D3D11_VIDEO_PROCESSOR_CONTENT_DESC content{};
+        content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+        content.InputFrameRate = {fps_, 1};
+        content.InputWidth = src_width_;
+        content.InputHeight = src_height_;
+        content.OutputFrameRate = {fps_, 1};
+        content.OutputWidth = enc_width_;
+        content.OutputHeight = enc_height_;
+        content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+        result = video_device_->CreateVideoProcessorEnumerator(
+            &content, &video_processor_enumerator_);
+        if (FAILED(result) || !video_processor_enumerator_) {
+            error = diagnostics::FormatHResultFailure(
+                "ID3D11VideoDevice::CreateVideoProcessorEnumerator(NVIDIA FIT)",
+                result);
+            ReleaseGpuScalePipeline();
+            return false;
+        }
+
+        UINT input_support = 0;
+        result = video_processor_enumerator_->CheckVideoProcessorFormat(
+            DXGI_FORMAT_B8G8R8A8_UNORM, &input_support);
+        if (FAILED(result)) {
+            error = diagnostics::FormatHResultFailure(
+                "ID3D11VideoProcessorEnumerator::CheckVideoProcessorFormat(BGRA,input)",
+                result);
+            ReleaseGpuScalePipeline();
+            return false;
+        }
+        if ((input_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT) == 0) {
+            error = "ID3D11VideoProcessorEnumerator::CheckVideoProcessorFormat(BGRA,input) reports unsupported format";
+            ReleaseGpuScalePipeline();
+            return false;
+        }
+
+        UINT output_support = 0;
+        result = video_processor_enumerator_->CheckVideoProcessorFormat(
+            DXGI_FORMAT_B8G8R8A8_UNORM, &output_support);
+        if (FAILED(result)) {
+            error = diagnostics::FormatHResultFailure(
+                "ID3D11VideoProcessorEnumerator::CheckVideoProcessorFormat(BGRA,output)",
+                result);
+            ReleaseGpuScalePipeline();
+            return false;
+        }
+        if ((output_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT) == 0) {
+            error = "ID3D11VideoProcessorEnumerator::CheckVideoProcessorFormat(BGRA,output) reports unsupported format";
+            ReleaseGpuScalePipeline();
+            return false;
+        }
+
+        result = video_device_->CreateVideoProcessor(
+            video_processor_enumerator_, 0, &video_processor_);
+        if (FAILED(result) || !video_processor_) {
+            error = diagnostics::FormatHResultFailure(
+                "ID3D11VideoDevice::CreateVideoProcessor(NVIDIA FIT)", result);
+            ReleaseGpuScalePipeline();
+            return false;
+        }
+
+        D3D11_TEXTURE2D_DESC converter_description{};
+        converter_description.Width = enc_width_;
+        converter_description.Height = enc_height_;
+        converter_description.MipLevels = 1;
+        converter_description.ArraySize = 1;
+        converter_description.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        converter_description.SampleDesc.Count = 1;
+        converter_description.Usage = D3D11_USAGE_DEFAULT;
+        converter_description.BindFlags = D3D11_BIND_RENDER_TARGET;
+        result = d3d11_device_->CreateTexture2D(
+            &converter_description, nullptr, &gpu_scale_texture_);
+        if (FAILED(result) || !gpu_scale_texture_) {
+            error = diagnostics::FormatHResultFailure(
+                "ID3D11Device::CreateTexture2D(NVIDIA FIT converter)", result);
+            ReleaseGpuScalePipeline();
+            return false;
+        }
+
+        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC output_description{};
+        output_description.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+        output_description.Texture2D.MipSlice = 0;
+        result = video_device_->CreateVideoProcessorOutputView(
+            gpu_scale_texture_, video_processor_enumerator_,
+            &output_description, &gpu_scale_output_view_);
+        if (FAILED(result) || !gpu_scale_output_view_) {
+            error = diagnostics::FormatHResultFailure(
+                "ID3D11VideoDevice::CreateVideoProcessorOutputView(NVIDIA FIT)",
+                result);
+            ReleaseGpuScalePipeline();
+            return false;
+        }
+
+        RECT source_rect{0, 0, static_cast<LONG>(src_width_),
+            static_cast<LONG>(src_height_)};
+        RECT destination_rect{
+            static_cast<LONG>(gpu_scale_geometry_.destination.left),
+            static_cast<LONG>(gpu_scale_geometry_.destination.top),
+            static_cast<LONG>(gpu_scale_geometry_.destination.left
+                + gpu_scale_geometry_.destination.width),
+            static_cast<LONG>(gpu_scale_geometry_.destination.top
+                + gpu_scale_geometry_.destination.height)};
+        RECT target_rect{0, 0, static_cast<LONG>(enc_width_),
+            static_cast<LONG>(enc_height_)};
+        video_context_->VideoProcessorSetStreamFrameFormat(
+            video_processor_, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+        video_context_->VideoProcessorSetStreamSourceRect(
+            video_processor_, 0, TRUE, &source_rect);
+        video_context_->VideoProcessorSetStreamDestRect(
+            video_processor_, 0, TRUE, &destination_rect);
+        video_context_->VideoProcessorSetOutputTargetRect(
+            video_processor_, TRUE, &target_rect);
+        D3D11_VIDEO_COLOR background{};
+        background.RGBA = {0.f, 0.f, 0.f, 1.f};
+        video_context_->VideoProcessorSetOutputBackgroundColor(
+            video_processor_, FALSE, &background);
+        video_context_->VideoProcessorSetStreamAutoProcessingMode(
+            video_processor_, 0, FALSE);
+        return true;
+    }
+
+    void HardwareEncoder::ReleaseGpuScalePipeline() noexcept {
+        if (gpu_scale_output_view_) gpu_scale_output_view_->Release();
+        if (gpu_scale_texture_) gpu_scale_texture_->Release();
+        if (video_processor_) video_processor_->Release();
+        if (video_processor_enumerator_) video_processor_enumerator_->Release();
+        if (video_context_) video_context_->Release();
+        if (video_device_) video_device_->Release();
+        gpu_scale_output_view_ = nullptr;
+        gpu_scale_texture_ = nullptr;
+        video_processor_ = nullptr;
+        video_processor_enumerator_ = nullptr;
+        video_context_ = nullptr;
+        video_device_ = nullptr;
+        gpu_frame_prepared_ = false;
+    }
+
     void HardwareEncoder::Finalize() {
-        if (!initialized_) return;
+        if (!initialized_) {
+            ReleaseGpuScalePipeline();
+            return;
+        }
 
         std::cout << "[HardwareEncoder] Finalizing..." << std::endl;
 
@@ -1688,6 +2015,8 @@ namespace fthr {
             FreeLibrary(static_cast<HMODULE>(nvenc_dll_));
             nvenc_dll_ = nullptr;
         }
+
+        ReleaseGpuScalePipeline();
 
         initialized_ = false;
         current_buf_idx_ = 0;

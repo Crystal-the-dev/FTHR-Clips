@@ -6,8 +6,10 @@
 // which pushes them into EncodedRingBuffer.
 //
 // Two input paths:
-//   GPU zero-copy (default): CaptureEngine CopyResource's into GetCurrentInputTexture()
-//     then calls EncodeFrame(). No CPU involvement, no staging texture.
+//   GPU zero-copy (default): CaptureEngine CopyResource's into
+//     GetCurrentInputTexture() then calls EncodeFrame(). FIT with an aspect
+//     mismatch uses a same-adapter VideoProcessor surface first; no CPU frame
+//     copy or staging texture is introduced.
 //   CPU-input / Optimus: CaptureEngine maps a staging texture and calls EncodeFrameCPU()
 //     with the CPU pointer. NVENC still encodes in hardware; only the copy is on the CPU.
 //
@@ -37,10 +39,16 @@
 
 #include "replay_encoder.h"
 #include "nvenc_input_lifecycle.h"
+#include "capture_scale_geometry.h"
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
 struct ID3D11Texture2D;
+struct ID3D11VideoDevice;
+struct ID3D11VideoContext;
+struct ID3D11VideoProcessorEnumerator;
+struct ID3D11VideoProcessor;
+struct ID3D11VideoProcessorOutputView;
 
 
 namespace fthr {
@@ -107,6 +115,10 @@ namespace fthr {
         // CaptureEngine calls CopyResource(GetCurrentInputTexture(), dxgi_frame)
         // before calling EncodeFrame().
         ID3D11Texture2D* GetCurrentInputTexture() const noexcept override;
+        bool RequiresBackendGpuPreparation() const noexcept override;
+        bool PrepareGpuFrame(
+            ID3D11Texture2D* source,
+            uint32_t source_subresource = 0) override;
 
         // Flush encoder (EOS), drain remaining output, free all NVENC resources.
         void Finalize();
@@ -150,6 +162,9 @@ namespace fthr {
         // unmap operation so map/unmap calls cannot race across threads.
         bool PrepareCurrentGpuInputSlot();
 
+        bool InitializeGpuScalePipeline(std::string& error);
+        void ReleaseGpuScalePipeline() noexcept;
+
         // -----------------------------------------------------------------------
         // Async drain state
         // -----------------------------------------------------------------------
@@ -173,6 +188,21 @@ namespace fthr {
         // -----------------------------------------------------------------------
         ID3D11Device*        d3d11_device_;
         ID3D11DeviceContext* d3d11_context_;
+
+        // Same-adapter FIT path. The source is converted into the current
+        // target-sized NVENC slot entirely on the GPU; no CPU frame copy is
+        // introduced. The pipeline is used only when FIT needs letterboxing.
+        ID3D11VideoDevice*              video_device_;
+        ID3D11VideoContext*             video_context_;
+        ID3D11VideoProcessorEnumerator* video_processor_enumerator_;
+        ID3D11VideoProcessor*           video_processor_;
+        ID3D11Texture2D*                gpu_scale_texture_;
+        ID3D11VideoProcessorOutputView* gpu_scale_output_view_;
+        CaptureScaleGeometry            gpu_scale_geometry_;
+        uint32_t                        input_width_;
+        uint32_t                        input_height_;
+        bool                            gpu_scale_required_;
+        bool                            gpu_frame_prepared_;
 
         // -----------------------------------------------------------------------
         // Input mode

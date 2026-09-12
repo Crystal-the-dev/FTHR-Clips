@@ -65,6 +65,10 @@ void MissingRuntimeAndUnsupportedCodecStayFailed() {
                     "av1_qsv unsupported by this hardware")
                 == ReplayStartupError::RequestedCodecUnsupported,
         "unsupported requested codec is distinct");
+    CheckPolicy(fthr::ClassifyReplayInitializationFailure(
+                    "h264_qsv unsupported on this Intel adapter")
+                == ReplayStartupError::RequestedCodecUnsupported,
+        "old or incapable Intel hardware is classified from capability failure, not model name");
     CheckPolicy(fthr::SelectWindowsReplayPolicy(
                     EncoderVendor::Nvidia, static_cast<VideoCodec>(99)).error
                 == ReplayStartupError::RequestedCodecUnsupported,

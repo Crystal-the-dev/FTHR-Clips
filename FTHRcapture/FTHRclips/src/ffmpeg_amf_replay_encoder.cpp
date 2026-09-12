@@ -1,4 +1,6 @@
 #include "ffmpeg_amf_replay_encoder.h"
+#include "capture_scale_geometry.h"
+#include "windows_native_error.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -235,21 +237,20 @@ public:
             return false;
         }
 
-        const uint32_t output_width = config.enc_width > 0
-            ? config.enc_width : config.src_width;
-        const uint32_t output_height = config.enc_height > 0
-            ? config.enc_height : config.src_height;
-        if (config.src_width == 0 || config.src_height == 0
+        CaptureScaleGeometry geometry;
+        if (!BuildCaptureScaleGeometry(
+                config.src_width, config.src_height,
+                config.enc_width, config.enc_height,
+                config.scaling_mode == 1, geometry)
             || config.fps == 0 || config.bitrate_kbps == 0) {
             error = "invalid AMF encoder dimensions, frame rate, or bitrate";
             return false;
         }
-        if (output_width != config.src_width
-            || output_height != config.src_height) {
-            error = "AMD AMF same-adapter path currently requires native capture "
-                "resolution; GPU scaling is not implemented";
-            return false;
-        }
+        source_width_ = geometry.source_width;
+        source_height_ = geometry.source_height;
+        output_width_ = geometry.target_width;
+        output_height_ = geometry.target_height;
+        destination_ = geometry.destination;
 
         const AVCodec* codec = avcodec_find_encoder_by_name(selection.encoder_name);
         if (!codec || !codec->name
@@ -288,8 +289,8 @@ public:
             hw_frames_ctx_->data);
         frames_context->format = AV_PIX_FMT_D3D11;
         frames_context->sw_format = AV_PIX_FMT_BGRA;
-        frames_context->width = static_cast<int>(config.src_width);
-        frames_context->height = static_cast<int>(config.src_height);
+        frames_context->width = static_cast<int>(output_width_);
+        frames_context->height = static_cast<int>(output_height_);
         // This pinned D3D11 hwcontext requires a non-zero fixed pool. Eight
         // slices cover AMF async_depth=4 plus the prepared input and transient
         // references. Each submitted AVFrame retains its array slice until AMF
@@ -311,8 +312,8 @@ public:
         }
         codec_context_->codec_id = codec->id;
         codec_context_->codec_type = AVMEDIA_TYPE_VIDEO;
-        codec_context_->width = static_cast<int>(output_width);
-        codec_context_->height = static_cast<int>(output_height);
+        codec_context_->width = static_cast<int>(output_width_);
+        codec_context_->height = static_cast<int>(output_height_);
         codec_context_->pix_fmt = AV_PIX_FMT_D3D11;
         codec_context_->color_range = AVCOL_RANGE_MPEG;
         codec_context_->color_primaries = AVCOL_PRI_BT709;
@@ -377,7 +378,9 @@ public:
             Reset();
             return false;
         }
-        if (!PrepareInputFrame(error)) {
+        d3d11_device_ = shared_device;
+        if (!CreateConversionPipeline(shared_device, shared_context, config.fps, error)
+            || !PrepareInputFrame(error)) {
             Reset();
             return false;
         }
@@ -403,8 +406,8 @@ public:
 
         video_config = BuildAmfVideoConfig(
             selection.codec,
-            output_width,
-            output_height,
+            output_width_,
+            output_height_,
             config.fps,
             config.bitrate_kbps,
             extradata);
@@ -419,6 +422,92 @@ public:
         std::cout << "[AMF] Opened " << selection.encoder_name
                   << " on the selected AMD D3D11 adapter (BGRA hardware frames)"
                   << std::endl;
+        return true;
+    }
+
+    bool PrepareGpuFrame(
+        ID3D11Texture2D* source,
+        uint32_t source_subresource,
+        std::string& error) override {
+        prepared_ = false;
+        if (!initialized_ || !source || !copy_context_ || !video_device_
+            || !video_context_ || !video_processor_ || !video_processor_enumerator_
+            || !converter_texture_ || !converter_output_view_ || !frame_
+            || !frame_->data[0]) {
+            error = "AMF conversion resources are unavailable";
+            return false;
+        }
+        ID3D11Device* source_device = nullptr;
+        source->GetDevice(&source_device);
+        const bool same_device = SameComObject(source_device, d3d11_device_);
+        if (source_device) source_device->Release();
+        if (!same_device) {
+            error = "AMF source texture belongs to a different D3D11 device";
+            return false;
+        }
+        D3D11_TEXTURE2D_DESC source_description{};
+        source->GetDesc(&source_description);
+        const uint32_t mip_levels = std::max(1U, source_description.MipLevels);
+        const uint32_t subresource_count = mip_levels
+            * std::max(1U, source_description.ArraySize);
+        if (source_description.Width != source_width_
+            || source_description.Height != source_height_
+            || source_description.Format != DXGI_FORMAT_B8G8R8A8_UNORM
+            || source_subresource >= subresource_count) {
+            error = "AMF source texture geometry, format, or subresource is invalid";
+            return false;
+        }
+        ID3D11Texture2D* destination_texture =
+            reinterpret_cast<ID3D11Texture2D*>(frame_->data[0]);
+        const uint32_t destination_subresource = static_cast<uint32_t>(
+            reinterpret_cast<uintptr_t>(frame_->data[1]));
+        D3D11_TEXTURE2D_DESC destination_description{};
+        destination_texture->GetDesc(&destination_description);
+        const uint32_t destination_mips = std::max(
+            1U, destination_description.MipLevels);
+        const uint32_t destination_arrays = std::max(
+            1U, destination_description.ArraySize);
+        if (destination_description.Width != output_width_
+            || destination_description.Height != output_height_
+            || destination_description.Format != DXGI_FORMAT_B8G8R8A8_UNORM
+            || destination_subresource >= destination_mips * destination_arrays) {
+            error = "AMF hardware frame texture geometry, format, or subresource is invalid";
+            return false;
+        }
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC input_description{};
+        input_description.FourCC = 0;
+        input_description.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+        input_description.Texture2D.MipSlice = source_subresource % mip_levels;
+        input_description.Texture2D.ArraySlice = source_subresource / mip_levels;
+        ID3D11VideoProcessorInputView* input_view = nullptr;
+        HRESULT result = video_device_->CreateVideoProcessorInputView(
+            source, video_processor_enumerator_, &input_description, &input_view);
+        if (FAILED(result) || !input_view) {
+            error = HResultString(
+                "ID3D11VideoDevice::CreateVideoProcessorInputView", result);
+            return false;
+        }
+        D3D11_VIDEO_PROCESSOR_STREAM stream{};
+        stream.Enable = TRUE;
+        stream.OutputIndex = 0;
+        stream.pInputSurface = input_view;
+        result = video_context_->VideoProcessorBlt(
+            video_processor_, converter_output_view_, 0, 1, &stream);
+        input_view->Release();
+        if (FAILED(result)) {
+            error = HResultString("ID3D11VideoContext::VideoProcessorBlt", result);
+            return false;
+        }
+        copy_context_->CopySubresourceRegion(
+            destination_texture,
+            destination_subresource,
+            0, 0, 0, converter_texture_, 0, nullptr);
+        const HRESULT removed = d3d11_device_->GetDeviceRemovedReason();
+        if (FAILED(removed)) {
+            error = HResultString("AMD D3D11 device", removed);
+            return false;
+        }
+        prepared_ = true;
         return true;
     }
 
@@ -441,7 +530,7 @@ public:
             error = "AMF frame submitted before initialization";
             return detail::AmfSubmitStatus::Error;
         }
-        if (!frame_->data[0]) {
+        if (!prepared_ || !frame_->data[0]) {
             error = prepare_error_.empty()
                 ? "AMF has no prepared D3D11 input texture"
                 : prepare_error_;
@@ -450,10 +539,8 @@ public:
         if (d3d11_device_) {
             const HRESULT removed = d3d11_device_->GetDeviceRemovedReason();
             if (FAILED(removed)) {
-                std::ostringstream stream;
-                stream << "AMD D3D11 device was removed: 0x"
-                       << std::hex << static_cast<uint32_t>(removed);
-                error = stream.str();
+                error = diagnostics::FormatHResultFailure(
+                    "ID3D11Device::GetDeviceRemovedReason(AMF)", removed);
                 return detail::AmfSubmitStatus::Error;
             }
         }
@@ -470,6 +557,7 @@ public:
             return detail::AmfSubmitStatus::Error;
         }
 
+        prepared_ = false;
         av_frame_unref(frame_);
         std::string prepare_error;
         if (!PrepareInputFrame(prepare_error)) {
@@ -553,6 +641,7 @@ public:
 
     void Reset() noexcept override {
         initialized_ = false;
+        prepared_ = false;
         d3d11_device_ = nullptr;
         prepare_error_.clear();
         normalized_packet_.clear();
@@ -562,10 +651,151 @@ public:
         if (codec_context_) avcodec_free_context(&codec_context_);
         if (hw_frames_ctx_) av_buffer_unref(&hw_frames_ctx_);
         if (hw_device_ctx_) av_buffer_unref(&hw_device_ctx_);
+        if (converter_output_view_) converter_output_view_->Release();
+        if (converter_texture_) converter_texture_->Release();
+        if (video_processor_) video_processor_->Release();
+        if (video_processor_enumerator_) video_processor_enumerator_->Release();
+        if (video_context_) video_context_->Release();
+        if (video_device_) video_device_->Release();
+        if (copy_context_) copy_context_->Release();
+        converter_output_view_ = nullptr;
+        converter_texture_ = nullptr;
+        video_processor_ = nullptr;
+        video_processor_enumerator_ = nullptr;
+        video_context_ = nullptr;
+        video_device_ = nullptr;
+        copy_context_ = nullptr;
+        source_width_ = source_height_ = output_width_ = output_height_ = 0;
+        destination_ = {};
         selection_ = nullptr;
     }
 
 private:
+    bool CreateConversionPipeline(
+        ID3D11Device* shared_device,
+        ID3D11DeviceContext* shared_context,
+        uint32_t fps,
+        std::string& error) {
+        HRESULT result = shared_device->QueryInterface(
+            __uuidof(ID3D11VideoDevice),
+            reinterpret_cast<void**>(&video_device_));
+        if (FAILED(result) || !video_device_) {
+            error = HResultString("AMD D3D11 video-device query", result);
+            return false;
+        }
+        result = shared_context->QueryInterface(
+            __uuidof(ID3D11VideoContext),
+            reinterpret_cast<void**>(&video_context_));
+        if (FAILED(result) || !video_context_) {
+            error = HResultString("AMD D3D11 video-context query", result);
+            return false;
+        }
+        copy_context_ = shared_context;
+        copy_context_->AddRef();
+        D3D11_VIDEO_PROCESSOR_CONTENT_DESC content{};
+        content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+        content.InputFrameRate = {fps, 1};
+        content.InputWidth = source_width_;
+        content.InputHeight = source_height_;
+        content.OutputFrameRate = {fps, 1};
+        content.OutputWidth = output_width_;
+        content.OutputHeight = output_height_;
+        content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+        result = video_device_->CreateVideoProcessorEnumerator(
+            &content, &video_processor_enumerator_);
+        if (FAILED(result) || !video_processor_enumerator_) {
+            error = HResultString(
+                "ID3D11VideoDevice::CreateVideoProcessorEnumerator", result);
+            return false;
+        }
+        UINT input_support = 0;
+        UINT output_support = 0;
+        result = video_processor_enumerator_->CheckVideoProcessorFormat(
+            DXGI_FORMAT_B8G8R8A8_UNORM, &input_support);
+        if (FAILED(result)) {
+            error = diagnostics::FormatHResultFailure(
+                "ID3D11VideoProcessorEnumerator::CheckVideoProcessorFormat(BGRA,input)",
+                result);
+            return false;
+        }
+        if ((input_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT) == 0) {
+            error = "ID3D11VideoProcessorEnumerator::CheckVideoProcessorFormat(BGRA,input) reports unsupported format";
+            return false;
+        }
+        result = video_processor_enumerator_->CheckVideoProcessorFormat(
+            DXGI_FORMAT_B8G8R8A8_UNORM, &output_support);
+        if (FAILED(result)) {
+            error = diagnostics::FormatHResultFailure(
+                "ID3D11VideoProcessorEnumerator::CheckVideoProcessorFormat(BGRA,output)",
+                result);
+            return false;
+        }
+        if ((output_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT) == 0) {
+            error = "ID3D11VideoProcessorEnumerator::CheckVideoProcessorFormat(BGRA,output) reports unsupported format";
+            return false;
+        }
+        result = video_device_->CreateVideoProcessor(
+            video_processor_enumerator_, 0, &video_processor_);
+        if (FAILED(result) || !video_processor_) {
+            error = HResultString("ID3D11VideoDevice::CreateVideoProcessor", result);
+            return false;
+        }
+        D3D11_TEXTURE2D_DESC converter_description{};
+        converter_description.Width = output_width_;
+        converter_description.Height = output_height_;
+        converter_description.MipLevels = 1;
+        converter_description.ArraySize = 1;
+        converter_description.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        converter_description.SampleDesc.Count = 1;
+        converter_description.Usage = D3D11_USAGE_DEFAULT;
+        converter_description.BindFlags = D3D11_BIND_RENDER_TARGET;
+        result = shared_device->CreateTexture2D(
+            &converter_description, nullptr, &converter_texture_);
+        if (FAILED(result) || !converter_texture_) {
+            error = HResultString("AMF BGRA converter texture creation", result);
+            return false;
+        }
+        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC output_description{};
+        output_description.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+        output_description.Texture2D.MipSlice = 0;
+        result = video_device_->CreateVideoProcessorOutputView(
+            converter_texture_, video_processor_enumerator_,
+            &output_description, &converter_output_view_);
+        if (FAILED(result) || !converter_output_view_) {
+            error = HResultString(
+                "ID3D11VideoDevice::CreateVideoProcessorOutputView", result);
+            return false;
+        }
+        RECT source_rect{0, 0, static_cast<LONG>(source_width_),
+            static_cast<LONG>(source_height_)};
+        RECT destination_rect{
+            static_cast<LONG>(destination_.left),
+            static_cast<LONG>(destination_.top),
+            static_cast<LONG>(destination_.left + destination_.width),
+            static_cast<LONG>(destination_.top + destination_.height)};
+        RECT target_rect{0, 0, static_cast<LONG>(output_width_),
+            static_cast<LONG>(output_height_)};
+        video_context_->VideoProcessorSetStreamFrameFormat(
+            video_processor_, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+        video_context_->VideoProcessorSetStreamSourceRect(
+            video_processor_, 0, TRUE, &source_rect);
+        video_context_->VideoProcessorSetStreamDestRect(
+            video_processor_, 0, TRUE, &destination_rect);
+        video_context_->VideoProcessorSetOutputTargetRect(
+            video_processor_, TRUE, &target_rect);
+        D3D11_VIDEO_COLOR background{};
+        background.RGBA = {0.f, 0.f, 0.f, 1.f};
+        video_context_->VideoProcessorSetOutputBackgroundColor(
+            video_processor_, FALSE, &background);
+        video_context_->VideoProcessorSetStreamAutoProcessingMode(
+            video_processor_, 0, FALSE);
+        return true;
+    }
+
+    static std::string HResultString(const char* operation, HRESULT result) {
+        return diagnostics::FormatHResultFailure(operation, result);
+    }
+
     bool PrepareInputFrame(std::string& error) {
         if (!frame_ || !hw_frames_ctx_) {
             error = "AMF input frame or hardware pool is unavailable";
@@ -594,6 +824,19 @@ private:
     AVPacket* packet_ = nullptr;
     ID3D11Device* d3d11_device_ = nullptr;
     bool initialized_ = false;
+    bool prepared_ = false;
+    uint32_t source_width_ = 0;
+    uint32_t source_height_ = 0;
+    uint32_t output_width_ = 0;
+    uint32_t output_height_ = 0;
+    CaptureScaleRect destination_{};
+    ID3D11VideoDevice* video_device_ = nullptr;
+    ID3D11VideoContext* video_context_ = nullptr;
+    ID3D11VideoProcessorEnumerator* video_processor_enumerator_ = nullptr;
+    ID3D11VideoProcessor* video_processor_ = nullptr;
+    ID3D11Texture2D* converter_texture_ = nullptr;
+    ID3D11VideoProcessorOutputView* converter_output_view_ = nullptr;
+    ID3D11DeviceContext* copy_context_ = nullptr;
     std::string prepare_error_;
     std::vector<NalSpan> nals_scratch_;
     std::vector<uint8_t> normalized_packet_;
@@ -666,6 +909,7 @@ bool FfmpegAmfReplayEncoder::Initialize(
     packet_callback_ = {};
     first_frame_ = true;
     flushing_ = false;
+    gpu_frame_prepared_ = false;
     encode_start_qpc_ = 0;
     last_pts_ = -1;
     last_forced_keyframe_pts_ = -1;
@@ -724,13 +968,34 @@ bool FfmpegAmfReplayEncoder::Initialize(
     return true;
 }
 
+bool FfmpegAmfReplayEncoder::RequiresBackendGpuPreparation() const noexcept {
+    return true;
+}
+
+bool FfmpegAmfReplayEncoder::PrepareGpuFrame(
+    ID3D11Texture2D* source,
+    uint32_t source_subresource) {
+    gpu_frame_prepared_ = false;
+    if (!initialized_ || flushing_ || !session_) {
+        SetError("AMF GPU preparation called outside an active generation");
+        return false;
+    }
+    std::string error;
+    if (!session_->PrepareGpuFrame(source, source_subresource, error)) {
+        SetError(error.empty() ? "AMF GPU conversion failed" : std::move(error));
+        return false;
+    }
+    gpu_frame_prepared_ = true;
+    return true;
+}
+
 bool FfmpegAmfReplayEncoder::EncodeFrame(int64_t present_qpc) {
     if (!initialized_ || flushing_) {
         SetError("AMF EncodeFrame called outside an active generation");
         return false;
     }
-    if (!GetCurrentInputTexture()) {
-        SetError("AMF D3D11 input texture is unavailable");
+    if (!gpu_frame_prepared_ || !GetCurrentInputTexture()) {
+        SetError("AMF EncodeFrame called before GPU preparation");
         return false;
     }
 
@@ -739,6 +1004,7 @@ bool FfmpegAmfReplayEncoder::EncodeFrame(int64_t present_qpc) {
         || pts - last_forced_keyframe_pts_
             >= static_cast<int64_t>(fps_) * 4;
     if (!SubmitWithBackpressure(pts, force_keyframe)) return false;
+    gpu_frame_prepared_ = false;
 
     LARGE_INTEGER now{};
     if (present_qpc <= 0) QueryPerformanceCounter(&now);
@@ -771,6 +1037,7 @@ void FfmpegAmfReplayEncoder::Shutdown() {
         Flush();
     }
     initialized_ = false;
+    gpu_frame_prepared_ = false;
     flushing_ = false;
     if (session_) session_->Reset();
     packet_callback_ = {};

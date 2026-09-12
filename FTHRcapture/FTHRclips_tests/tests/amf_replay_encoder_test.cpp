@@ -55,6 +55,8 @@ public:
     bool flush_error = false;
     bool emit_packet = false;
     bool emit_keyframe = false;
+    bool prepare_gpu_result = true;
+    std::string prepare_gpu_error;
     bool flush_called = false;
     uint32_t input_subresource = 0;
     int64_t submitted_pts = -1;
@@ -71,13 +73,28 @@ public:
             error = initialize_error;
             return false;
         }
+        const uint32_t width = config.enc_width > 0
+            ? config.enc_width : config.src_width;
+        const uint32_t height = config.enc_height > 0
+            ? config.enc_height : config.src_height;
         video_config = fthr::BuildAmfVideoConfig(
             return_wrong_codec ? VideoCodec::H264 : selection.codec,
-            config.src_width,
-            config.src_height,
+            width,
+            height,
             config.fps,
             config.bitrate_kbps,
             {1, 2, 3, 4});
+        return true;
+    }
+
+    bool PrepareGpuFrame(
+        ID3D11Texture2D*,
+        uint32_t,
+        std::string& error) override {
+        if (!prepare_gpu_result) {
+            error = prepare_gpu_error;
+            return false;
+        }
         return true;
     }
 
@@ -333,13 +350,72 @@ void PacketMetadataPropagates() {
                       callback_pts = pts;
                       callback_keyframe = keyframe;
                   },
-                  false)
+                   false)
+            && encoder.PrepareGpuFrame(nullptr, 0)
             && encoder.EncodeFrame(1)
             && callback_pts == fake->submitted_pts
             && encoder.GetCurrentInputSubresource() == 3,
         "AMF packet timestamp propagates through wrapper");
     CheckAmf(callback_keyframe,
         "AMF keyframe flag propagates through wrapper");
+}
+
+void ScaledAmfConfigUsesEncoderDimensions() {
+    auto session = std::make_unique<FakeAmfSession>();
+    FfmpegAmfReplayEncoder encoder(VideoCodec::H264, std::move(session));
+    EncoderConfig config = TestEncoderConfig();
+    config.src_width = 2560;
+    config.src_height = 1440;
+    config.enc_width = 1920;
+    config.enc_height = 1080;
+    config.scaling_mode = 1;
+    CheckAmf(encoder.Initialize(
+                  config,
+                  reinterpret_cast<ID3D11Device*>(1),
+                  reinterpret_cast<ID3D11DeviceContext*>(1),
+                  [](const uint8_t*, uint32_t, int64_t, bool, int64_t) {},
+                  false),
+        "AMF fake accepts a scaled encoder configuration");
+    const auto active = encoder.GetVideoConfig();
+    CheckAmf(active.width == 1920 && active.height == 1080,
+        "AMF active config reports encoder dimensions");
+    CheckAmf(encoder.PrepareGpuFrame(nullptr, 0),
+        "AMF scaled frame preparation reaches the backend seam");
+}
+
+void AmfGpuPreparationFailurePropagates() {
+    auto session = std::make_unique<FakeAmfSession>();
+    auto* fake = session.get();
+    fake->prepare_gpu_result = false;
+    fake->prepare_gpu_error = "simulated AMF PrepareGpuFrame failure";
+    FfmpegAmfReplayEncoder encoder(VideoCodec::H264, std::move(session));
+    CheckAmf(encoder.Initialize(
+                  TestEncoderConfig(),
+                  reinterpret_cast<ID3D11Device*>(1),
+                  reinterpret_cast<ID3D11DeviceContext*>(1),
+                  [](const uint8_t*, uint32_t, int64_t, bool, int64_t) {},
+                  false)
+            && !encoder.PrepareGpuFrame(nullptr, 0)
+            && encoder.GetLastError().find("PrepareGpuFrame failure")
+                != std::string::npos,
+        "AMF GPU preparation failure propagates without fallback");
+}
+
+void AmfNoPacketOutputIsObservableAtTheSeam() {
+    auto session = std::make_unique<FakeAmfSession>();
+    auto* fake = session.get();
+    fake->emit_packet = false;
+    FfmpegAmfReplayEncoder encoder(VideoCodec::AV1, std::move(session));
+    CheckAmf(encoder.Initialize(
+                  TestEncoderConfig(),
+                  reinterpret_cast<ID3D11Device*>(1),
+                  reinterpret_cast<ID3D11DeviceContext*>(1),
+                  [](const uint8_t*, uint32_t, int64_t, bool, int64_t) {},
+                  false)
+            && encoder.PrepareGpuFrame(nullptr, 0)
+            && encoder.EncodeFrame(1)
+            && fake->submitted_pts >= 0,
+        "AMF output-without-packet remains observable to the stall watchdog seam");
 }
 
 void GenerationConfigCannotChange() {
@@ -372,7 +448,8 @@ void FlushAndErrorsAreObservable() {
                   reinterpret_cast<ID3D11Device*>(1),
                   reinterpret_cast<ID3D11DeviceContext*>(1),
                   [](const uint8_t*, uint32_t, int64_t, bool, int64_t) {},
-                  false)
+                   false)
+            && failing.PrepareGpuFrame(nullptr, 0)
             && !failing.EncodeFrame(1)
             && failing.GetLastError().find("submit failure") != std::string::npos,
         "AMF encode errors propagate without fallback");
@@ -397,10 +474,13 @@ int RunAmfReplayEncoderTests() {
     AmfVideoConfigsAreCodecCorrect();
     RingAndMuxRemainCodecNeutral();
     PacketMetadataPropagates();
+    ScaledAmfConfigUsesEncoderDimensions();
+    AmfGpuPreparationFailurePropagates();
+    AmfNoPacketOutputIsObservableAtTheSeam();
     GenerationConfigCannotChange();
     FlushAndErrorsAreObservable();
     SuccessfulAmfUsesCompressedReplay();
-    std::cout << "FTHRclips AMF tests: 24 scenarios passed ("
+    std::cout << "FTHRclips AMF tests completed ("
               << amf_checks << " checks)" << std::endl;
     return amf_checks;
 }

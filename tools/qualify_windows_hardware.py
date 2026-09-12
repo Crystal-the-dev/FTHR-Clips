@@ -184,6 +184,51 @@ def probe_clip(
     )
 
 
+_DIAGNOSTIC_EVENT_PREFIX = 'FTHR_DIAGNOSTIC_EVENT '
+
+
+def parse_adapter_topology_event(log_text: str) -> dict | None:
+    """Return the last resolved adapter-topology event from an engine log.
+
+    The engine emits one JSON object per diagnostic line.  Keep this parser
+    deliberately independent of the rest of the qualification run so a
+    synthetic log line can exercise it without starting the native engine.
+    A later event wins because topology recovery can emit a fresh resolution.
+    """
+    resolved: dict | None = None
+    for line in log_text.splitlines():
+        marker = line.find(_DIAGNOSTIC_EVENT_PREFIX)
+        if marker < 0:
+            continue
+        payload = line[marker + len(_DIAGNOSTIC_EVENT_PREFIX):].strip()
+        try:
+            event = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if (isinstance(event, dict)
+                and event.get('event') == 'adapter_topology_resolved'):
+            resolved = event
+    return resolved
+
+
+def read_adapter_topology_event(log_path: Path) -> dict | None:
+    try:
+        return parse_adapter_topology_event(
+            log_path.read_text(encoding='utf-8', errors='replace'))
+    except OSError:
+        return None
+
+
+def event_resolution(event: dict | None, prefix: str) -> list[int] | None:
+    if event is None:
+        return None
+    width = event.get(f'{prefix}_width')
+    height = event.get(f'{prefix}_height')
+    if isinstance(width, int) and isinstance(height, int) and width > 0 and height > 0:
+        return [width, height]
+    return None
+
+
 def process_memory_bytes(process: subprocess.Popen) -> tuple[int | None, int | None]:
     class ProcessMemoryCountersEx(ctypes.Structure):
         _fields_ = [
@@ -230,6 +275,137 @@ def process_cpu_seconds(process: subprocess.Popen) -> float | None:
     return (ticks(kernel) + ticks(user)) / 10_000_000.0
 
 
+def process_thread_count(process: subprocess.Popen) -> int | None:
+    """Return the live Win32 thread count without adding a runtime dependency."""
+    create_snapshot = ctypes.windll.kernel32.CreateToolhelp32Snapshot
+    create_snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    create_snapshot.restype = wintypes.HANDLE
+    snapshot = create_snapshot(0x00000004, 0)
+    invalid = ctypes.c_void_p(-1).value
+    snapshot_value = (
+        snapshot.value if hasattr(snapshot, 'value') else snapshot)
+    try:
+        snapshot_value = int(snapshot_value)
+    except (TypeError, ValueError):
+        return None
+    if snapshot_value in (0, -1, invalid):
+        return None
+    snapshot_handle = wintypes.HANDLE(snapshot_value)
+
+    class ThreadEntry32(ctypes.Structure):
+        _fields_ = [
+            ('dwSize', wintypes.DWORD),
+            ('cntUsage', wintypes.DWORD),
+            ('th32ThreadID', wintypes.DWORD),
+            ('th32OwnerProcessID', wintypes.DWORD),
+            ('tpBasePri', wintypes.LONG),
+            ('tpDeltaPri', wintypes.LONG),
+            ('dwFlags', wintypes.DWORD),
+        ]
+
+    first = ctypes.windll.kernel32.Thread32First
+    next_thread = ctypes.windll.kernel32.Thread32Next
+    close_handle = ctypes.windll.kernel32.CloseHandle
+    first.argtypes = [wintypes.HANDLE, ctypes.POINTER(ThreadEntry32)]
+    first.restype = wintypes.BOOL
+    next_thread.argtypes = [wintypes.HANDLE, ctypes.POINTER(ThreadEntry32)]
+    next_thread.restype = wintypes.BOOL
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    entry = ThreadEntry32()
+    entry.dwSize = ctypes.sizeof(ThreadEntry32)
+    count = 0
+    try:
+        if not first(snapshot_handle, ctypes.byref(entry)):
+            return 0
+        while True:
+            if entry.th32OwnerProcessID == process.pid:
+                count += 1
+            entry.dwSize = ctypes.sizeof(ThreadEntry32)
+            if not next_thread(snapshot_handle, ctypes.byref(entry)):
+                break
+        return count
+    finally:
+        close_handle(snapshot_handle)
+
+
+def process_snapshot(process: subprocess.Popen) -> dict:
+    working_set, private_bytes = process_memory_bytes(process)
+    return {
+        'working_set_bytes': working_set,
+        'private_bytes': private_bytes,
+        'process_cpu_seconds': process_cpu_seconds(process),
+        'process_thread_count': process_thread_count(process),
+    }
+
+
+def capture_snapshot(
+    bridge: CaptureBridge,
+    process: subprocess.Popen,
+    started: float,
+) -> dict:
+    status = bridge.get_status()
+    return {
+        'captured_utc': datetime.now(timezone.utc).isoformat(),
+        'elapsed_seconds': round(time.monotonic() - started, 3),
+        'status': status,
+        **process_snapshot(process),
+    }
+
+
+def run_soak(
+    bridge: CaptureBridge,
+    process: subprocess.Popen,
+    started: float,
+    seconds: int,
+    fps: int,
+) -> dict:
+    """Poll bounded health state during a requested fresh-frame soak."""
+    soak_started = time.monotonic()
+    start = capture_snapshot(bridge, process, started)
+    start_status = start['status']
+    if not start_status.get('connected', False):
+        raise RuntimeError('capture bridge disconnected at soak start')
+    start_frames = int(start_status.get('frames_captured', 0))
+    last_frames = start_frames
+    last_progress = soak_started
+    deadline = soak_started + seconds
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(
+                f'engine exited during soak with code {process.returncode}')
+        status = bridge.get_status()
+        if not status.get('connected', False):
+            raise RuntimeError('capture bridge disconnected during soak')
+        if status.get('capture_health_flags', 0) & CAPTURE_HEALTH_BACKEND_FAILED:
+            raise RuntimeError(
+                f'capture health failed during soak with flags '
+                f'{status["capture_health_flags"]:#x}')
+        current_frames = int(status.get('frames_captured', 0))
+        if current_frames > last_frames:
+            last_frames = current_frames
+            last_progress = time.monotonic()
+        elif time.monotonic() - last_progress > 15.0:
+            raise TimeoutError(
+                f'capture produced no fresh frames for 15 seconds during soak '
+                f'(fps={fps})')
+        time.sleep(min(1.0, max(0.05, deadline - time.monotonic())))
+
+    end = capture_snapshot(bridge, process, started)
+    end_status = end['status']
+    end_frames = int(end_status.get('frames_captured', 0))
+    if end_frames <= start_frames:
+        raise TimeoutError(
+            f'capture produced no fresh frames during {seconds}s soak')
+    return {
+        'requested_seconds': seconds,
+        'actual_seconds': round(time.monotonic() - soak_started, 3),
+        'fresh_frames_captured': end_frames - start_frames,
+        'start': start,
+        'end': end,
+    }
+
+
 def machine_inventory() -> dict:
     powershell = (
         "$os=Get-CimInstance Win32_OperatingSystem;"
@@ -263,7 +439,8 @@ def qualify_codec(args, codec: str, monitor_path: str, monitor_name: str) -> dic
     command = [
         str(args.engine), str(args.fps), '62',
         str(args.width), str(args.height), str(args.bitrate), '2048',
-        '0', '0', '0', monitor_path, str(CODECS[codec]), '4', '0',
+        '0', '0', '1' if args.scaling_mode == 'fit' else '0',
+        monitor_path, str(CODECS[codec]), '4', '0',
         '1' if args.audio else '0',
     ]
     started = time.monotonic()
@@ -320,10 +497,32 @@ def qualify_codec(args, codec: str, monitor_path: str, monitor_name: str) -> dic
                 12.0,
             )
 
-            working_set, private_bytes = process_memory_bytes(process)
-            cpu_seconds = process_cpu_seconds(process)
+            soak = None
+            if args.soak_seconds > 0:
+                soak = run_soak(
+                    bridge, process, started, args.soak_seconds, args.fps)
+
+            final_process = process_snapshot(process)
+            working_set = final_process['working_set_bytes']
+            private_bytes = final_process['private_bytes']
+            cpu_seconds = final_process['process_cpu_seconds']
             status = bridge.get_status()
             wall_seconds = time.monotonic() - started
+            # The probe describes the encoded file, not the capture source.
+            # Flush our handle before reading the native engine's event line;
+            # if no topology event was emitted, report capture dimensions as
+            # unavailable instead of copying the encoded dimensions into it.
+            log.flush()
+            topology_event = read_adapter_topology_event(log_path)
+            diagnostic_capture_resolution = event_resolution(
+                topology_event, 'capture')
+            diagnostic_encode_resolution = event_resolution(
+                topology_event, 'encoder')
+            probed_encode_resolution = (
+                [clips[-1].width, clips[-1].height] if clips else None)
+            encode_resolution_matches_diagnostic = (
+                diagnostic_encode_resolution is None
+                or probed_encode_resolution == diagnostic_encode_resolution)
             suffix = active_codec.lower().rsplit('_', 1)[-1]
             active_backend = {
                 'nvenc': 'native-nvenc',
@@ -337,6 +536,7 @@ def qualify_codec(args, codec: str, monitor_path: str, monitor_name: str) -> dic
             }.get(suffix, 'unknown')
             return {
                 'requested_codec': codec,
+                'requested_scaling_mode': args.scaling_mode,
                 'active_codec': active_codec,
                 'active_backend': active_backend,
                 'capture_adapter_vendor': active_vendor,
@@ -345,8 +545,36 @@ def qualify_codec(args, codec: str, monitor_path: str, monitor_name: str) -> dic
                 'raw_replay_pool_allocated': False,
                 'monitor': monitor_name,
                 'monitor_device_path': monitor_path,
-                'capture_resolution': [clips[-1].width, clips[-1].height],
-                'encode_resolution': [clips[-1].width, clips[-1].height],
+                'monitor_id': (
+                    topology_event.get('monitor_id')
+                    if topology_event else None),
+                'windows_display': (
+                    topology_event.get('windows_display')
+                    if topology_event else None),
+                'dxgi_output': (
+                    topology_event.get('dxgi_output')
+                    if topology_event else None),
+                'monitor_adapter_luid': (
+                    topology_event.get('monitor_adapter_luid')
+                    if topology_event else None),
+                'capture_device_luid': (
+                    topology_event.get('capture_device_luid')
+                    if topology_event else None),
+                'encoder_adapter_luid': (
+                    topology_event.get('encoder_adapter_luid')
+                    if topology_event else None),
+                'diagnostic_capture_backend': (
+                    topology_event.get('capture_backend')
+                    if topology_event else None),
+                'diagnostic_encoder_backend': (
+                    topology_event.get('encoder_backend')
+                    if topology_event else None),
+                'capture_resolution': diagnostic_capture_resolution,
+                'encode_resolution': probed_encode_resolution,
+                'diagnostic_encode_resolution': diagnostic_encode_resolution,
+                'encode_resolution_matches_diagnostic': (
+                    encode_resolution_matches_diagnostic
+                    if topology_event else None),
                 'fps': args.fps,
                 'bitrate_kbps': args.bitrate,
                 'capture_generation': status.get('capture_generation'),
@@ -355,11 +583,13 @@ def qualify_codec(args, codec: str, monitor_path: str, monitor_name: str) -> dic
                 'working_set_bytes': working_set,
                 'private_bytes': private_bytes,
                 'process_cpu_seconds': cpu_seconds,
+                'process_thread_count': final_process['process_thread_count'],
                 'average_process_cpu_percent': (
                     round(cpu_seconds / wall_seconds * 100.0, 3)
                     if cpu_seconds is not None and wall_seconds > 0 else None),
                 'wall_seconds': round(wall_seconds, 3),
                 'clips': [asdict(item) for item in clips],
+                'soak': soak,
                 'engine_log': str(log_path),
                 'gpu_metrics': 'Collect GPU 3D/copy/video-encode counters externally.',
             }
@@ -384,6 +614,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--width', type=int, default=0)
     parser.add_argument('--height', type=int, default=0)
     parser.add_argument('--bitrate', type=int, default=16000)
+    parser.add_argument(
+        '--scaling-mode', choices=['stretch', 'fit'], default='stretch',
+        help='requested capture-to-encode scaling geometry')
+    parser.add_argument(
+        '--soak-seconds', type=int, default=0,
+        help='bounded fresh-frame capture soak after rapid saves (default: 0)')
     parser.add_argument('--audio', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         '--engine', type=Path,
@@ -401,6 +637,8 @@ def main() -> int:
     if sys.platform != 'win32':
         raise SystemExit('This qualification harness runs only on Windows.')
     args = parse_args()
+    if args.soak_seconds < 0:
+        raise SystemExit('--soak-seconds must be zero or greater')
     for required in (args.engine, args.ffmpeg, args.ffprobe):
         if not required.is_file():
             raise SystemExit(f'Required executable not found: {required}')
@@ -414,6 +652,8 @@ def main() -> int:
         'generated_utc': datetime.now(timezone.utc).isoformat(),
         'machine': machine_inventory(),
         'policy': 'same-adapter-only; no automatic cross-adapter/raw fallback',
+        'requested_scaling_mode': args.scaling_mode,
+        'soak_seconds': args.soak_seconds,
         'results': [],
     }
     report_path = args.output / 'qualification-report.json'

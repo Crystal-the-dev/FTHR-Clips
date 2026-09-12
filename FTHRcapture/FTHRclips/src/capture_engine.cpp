@@ -66,6 +66,7 @@
 #include "windows_native_error.h"
 #include "replay_interval.h"
 #include "frame_rate_scheduler.h"
+#include "capture_scale_geometry.h"
 #include <iostream>
 #include <chrono>
 #include <cstring>
@@ -170,8 +171,10 @@ namespace fthr {
                 return false;
             }
 
-            bool created = false;
-            for (UINT index = 0; !created; ++index) {
+            IDXGIAdapter1* matched_adapter = nullptr;
+            UINT matching_adapters = 0;
+            bool enumeration_failed = false;
+            for (UINT index = 0; ; ++index) {
                 IDXGIAdapter1* adapter = nullptr;
                 const HRESULT enumerated = factory->EnumAdapters1(
                     index, &adapter);
@@ -182,6 +185,8 @@ namespace fthr {
                     diagnostic = diagnostics::FormatHResultFailure(
                         "IDXGIFactory1::EnumAdapters1(encoder adapter search)",
                         enumerated);
+                    enumeration_failed = true;
+                    if (adapter) adapter->Release();
                     break;
                 }
                 DXGI_ADAPTER_DESC1 description{};
@@ -191,31 +196,68 @@ namespace fthr {
                     diagnostic = diagnostics::FormatHResultFailure(
                         "IDXGIAdapter1::GetDesc1(encoder adapter search)",
                         description_status);
+                    enumeration_failed = true;
                     adapter->Release();
                     break;
                 }
                 if (!(description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)
                     && EncoderVendorFromPciVendorId(description.VendorId)
                         == vendor) {
-                    D3D_FEATURE_LEVEL feature_level{};
-                    const HRESULT device_status = D3D11CreateDevice(
-                        adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
-                        nullptr, 0, D3D11_SDK_VERSION,
-                        device, &feature_level, context);
-                    created = SUCCEEDED(device_status);
-                    if (!created) {
-                        diagnostic = diagnostics::FormatHResultFailure(
-                            "D3D11CreateDevice(encoder adapter)",
-                            device_status);
+                    ++matching_adapters;
+                    if (matching_adapters == 1) {
+                        matched_adapter = adapter;
+                        adapter = nullptr;
                     }
                 }
-                adapter->Release();
+                if (adapter) adapter->Release();
             }
             factory->Release();
-            if (!created && diagnostic.empty()) {
-                diagnostic = "No matching hardware encoder adapter was found";
+            if (matching_adapters > 1) {
+                if (matched_adapter) matched_adapter->Release();
+                diagnostic = "multiple matching hardware encoder adapters were "
+                    "found; explicit adapter identity is required";
+                return false;
             }
-            return created;
+            if (enumeration_failed || matching_adapters == 0 || !matched_adapter) {
+                if (matched_adapter) matched_adapter->Release();
+                if (diagnostic.empty()) {
+                    diagnostic = "No matching hardware encoder adapter was found";
+                }
+                return false;
+            }
+
+            D3D_FEATURE_LEVEL feature_level{};
+            const HRESULT device_status = D3D11CreateDevice(
+                matched_adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
+                nullptr, 0, D3D11_SDK_VERSION,
+                device, &feature_level, context);
+            matched_adapter->Release();
+            if (FAILED(device_status)) {
+                if (*device) {
+                    (*device)->Release();
+                    *device = nullptr;
+                }
+                if (*context) {
+                    (*context)->Release();
+                    *context = nullptr;
+                }
+                diagnostic = diagnostics::FormatHResultFailure(
+                    "D3D11CreateDevice(encoder adapter)", device_status);
+                return false;
+            }
+            if (!*device || !*context) {
+                if (*device) {
+                    (*device)->Release();
+                    *device = nullptr;
+                }
+                if (*context) {
+                    (*context)->Release();
+                    *context = nullptr;
+                }
+                diagnostic = "D3D11CreateDevice(encoder adapter) returned no device/context";
+                return false;
+            }
+            return true;
         }
 
     }  // namespace
@@ -645,6 +687,17 @@ namespace fthr {
         // error to a later encoder failure.
         last_capture_failure_detail_.clear();
         ConfigureCrop(config);
+        CaptureScaleGeometry scale_geometry;
+        if (!BuildCaptureScaleGeometry(
+                crop_width_, crop_height_, target_width_, target_height_,
+                scaling_mode_ == 1, scale_geometry)) {
+            return FailStartup(
+                ReplayStartupError::EncoderInitFailed,
+                "The selected capture and target resolutions cannot form a valid "
+                "even hardware encoder geometry.");
+        }
+        target_width_ = scale_geometry.target_width;
+        target_height_ = scale_geometry.target_height;
         std::cout << "[CaptureEngine] Attempting hardware replay initialization "
                   << "for selected " << EncoderVendorName(capture_adapter_vendor_)
                   << " adapter..." << std::endl;
@@ -657,6 +710,7 @@ namespace fthr {
         hw_cfg.fps = fps_;
         hw_cfg.bitrate_kbps = bitrate_kbps_;
         hw_cfg.hardware_preset = config.encoder_preset;
+        hw_cfg.scaling_mode = scaling_mode_;
 
         const auto selection = SelectWindowsReplayPolicy(
             capture_adapter_vendor_, config.encoder_preference,
@@ -668,7 +722,16 @@ namespace fthr {
                 "source and codec. Cross-adapter AMD/Intel and raw replay "
                 "fallbacks are disabled.");
         }
-
+        if (!selection.same_adapter
+            && scaling_mode_ == 1
+            && (scale_geometry.destination.width != target_width_
+                || scale_geometry.destination.height != target_height_)) {
+            return FailStartup(
+                ReplayStartupError::CrossAdapterPathUnavailable,
+                "error_code=ENCODER_ADAPTER_MISMATCH: explicit NVIDIA "
+                "cross-adapter CPU input does not implement FIT letterboxing; "
+                "use STRETCH or select a same-adapter NVIDIA encoder.");
+        }
         std::cout << "[ReplayCapability] requested="
                   << VideoCodecName(config.video_codec)
                   << " capture_adapter="
@@ -4434,6 +4497,11 @@ namespace fthr {
                           << "\"error_code\":\"CAPTURE_WGC_RUNTIME_FAILED\","
                           << "\"api_call\":\"GraphicsCaptureItem::Closed\","
                           << "\"source_kind\":\"" << source_kind << "\","
+                          << "\"monitor_device_path\":\""
+                          << diagnostics::JsonEscape(diagnostics::WideToUtf8(
+                                 resolved_monitor_.monitor_device_path))
+                          << "\",\"monitor_adapter_luid\":"
+                          << AdapterLuidJson(resolved_monitor_.adapter_luid) << ','
                           << "\"detail\":\"selected capture item closed\"}"
                           << std::endl;
                 SetCaptureFailure(std::string("selected WGC ") + source_kind
@@ -4728,14 +4796,83 @@ namespace fthr {
             return false;
         }
 
+        // A window can move between GPUs on hybrid systems. Resolve the
+        // monitor Windows currently assigns to this HWND and bind the WGC
+        // D3D11 device to that monitor's adapter LUID. Never use adapter 0 or
+        // the primary display as an implicit fallback.
+        const HMONITOR window_monitor = MonitorFromWindow(
+            hwnd, MONITOR_DEFAULTTONULL);
+        if (!window_monitor) {
+            SetCaptureFailure("api_call=MonitorFromWindow result=null");
+            return false;
+        }
+        const auto topology = monitor_topology_source_.QueryActiveTopology();
+        const auto window_monitor_it = std::find_if(
+            topology.monitors.begin(), topology.monitors.end(),
+            [window_monitor](const monitor::MonitorTopologyEntry& entry) {
+                return entry.hmonitor == reinterpret_cast<uintptr_t>(window_monitor);
+            });
+        if (!topology.ok() || window_monitor_it == topology.monitors.end()) {
+            SetCaptureFailure(
+                "api_call=WindowsMonitorTopologySource::QueryActiveTopology "
+                "reason=window_monitor_not_resolved");
+            return false;
+        }
+        resolved_monitor_ = *window_monitor_it;
+        // The HWND's monitor is authoritative for this capture generation.
+        // Persist its identity before WGC/DXGI fallback setup so every later
+        // backend resolves the same physical display instead of the originally
+        // configured or primary monitor.
+        monitor_device_path_ = monitor::NormalizeMonitorDevicePath(
+            resolved_monitor_.monitor_device_path);
+
         // Create one WGC device and keep replay encoding on that exact adapter.
         // Do not enumerate another vendor merely because it exists elsewhere in
         // the machine; cross-adapter window capture is not alpha-qualified.
         D3D_FEATURE_LEVEL feature_level{};
-        HRESULT hr = D3D11CreateDevice(
-            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+        IDXGIFactory1* window_factory = nullptr;
+        HRESULT hr = CreateDXGIFactory1(
+            __uuidof(IDXGIFactory1),
+            reinterpret_cast<void**>(&window_factory));
+        IDXGIAdapter1* window_adapter = nullptr;
+        if (SUCCEEDED(hr) && window_factory) {
+            for (UINT index = 0; ; ++index) {
+                IDXGIAdapter1* candidate = nullptr;
+                const HRESULT enumerated = window_factory->EnumAdapters1(index, &candidate);
+                if (enumerated == DXGI_ERROR_NOT_FOUND) break;
+                if (FAILED(enumerated) || !candidate) {
+                    hr = enumerated;
+                    if (candidate) candidate->Release();
+                    break;
+                }
+                DXGI_ADAPTER_DESC1 description{};
+                const HRESULT described = candidate->GetDesc1(&description);
+                if (SUCCEEDED(described)
+                    && !(description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)
+                    && description.AdapterLuid.LowPart
+                        == static_cast<LONG>(resolved_monitor_.adapter_luid.low_part)
+                    && description.AdapterLuid.HighPart
+                        == resolved_monitor_.adapter_luid.high_part) {
+                    window_adapter = candidate;
+                    break;
+                }
+                candidate->Release();
+            }
+        }
+        if (!window_adapter) {
+            if (window_factory) window_factory->Release();
+            const std::string failure = diagnostics::FormatHResultFailure(
+                "IDXGIFactory1::EnumAdapters1(window monitor adapter)",
+                FAILED(hr) ? hr : DXGI_ERROR_NOT_FOUND);
+            SetCaptureFailure(failure + " reason=window_monitor_adapter_not_found");
+            return false;
+        }
+        hr = D3D11CreateDevice(
+            window_adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
             nullptr, 0, D3D11_SDK_VERSION,
             &device_, &feature_level, &context_);
+        window_adapter->Release();
+        window_factory->Release();
         if (FAILED(hr)) {
             const std::string failure = diagnostics::FormatHResultFailure(
                 "D3D11CreateDevice(window capture)", hr);
