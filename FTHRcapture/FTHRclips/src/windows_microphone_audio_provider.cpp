@@ -31,13 +31,6 @@
 #include <utility>
 #include <vector>
 
-extern "C" {
-#include <libavutil/channel_layout.h>
-#include <libavutil/mathematics.h>
-#include <libavutil/samplefmt.h>
-#include <libswresample/swresample.h>
-}
-
 #pragma comment(lib, "Ole32.lib")
 #pragma comment(lib, "Propsys.lib")
 
@@ -68,28 +61,6 @@ std::string HrText(HRESULT hr) {
     return text;
 }
 
-std::optional<AVSampleFormat> WaveSampleFormat(const WAVEFORMATEX* format) {
-    if (!format || format->nChannels == 0 || format->nSamplesPerSec == 0) return std::nullopt;
-    WORD tag = format->wFormatTag;
-    GUID sub_format{};
-    if (tag == WAVE_FORMAT_EXTENSIBLE) {
-        if (format->cbSize < sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX))
-            return std::nullopt;
-        const auto* extensible = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(format);
-        sub_format = extensible->SubFormat;
-        if (sub_format == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) tag = WAVE_FORMAT_IEEE_FLOAT;
-        else if (sub_format == KSDATAFORMAT_SUBTYPE_PCM) tag = WAVE_FORMAT_PCM;
-        else return std::nullopt;
-    }
-    if (tag == WAVE_FORMAT_IEEE_FLOAT && format->wBitsPerSample == 32)
-        return AV_SAMPLE_FMT_FLT;
-    if (tag == WAVE_FORMAT_PCM && format->wBitsPerSample == 16)
-        return AV_SAMPLE_FMT_S16;
-    if (tag == WAVE_FORMAT_PCM && format->wBitsPerSample == 32)
-        return AV_SAMPLE_FMT_S32;
-    return std::nullopt;
-}
-
 std::string FriendlyName(IMMDevice* device) {
     if (!device) return {};
     ComPtr<IPropertyStore> properties;
@@ -109,8 +80,7 @@ struct MicrophoneSession {
     ComPtr<IAudioCaptureClient> capture_client;
     WAVEFORMATEX* format = nullptr;
     HANDLE sample_event = nullptr;
-    SwrContext* resampler = nullptr;
-    AVSampleFormat input_format = AV_SAMPLE_FMT_NONE;
+    AudioFormatConverter converter;
     std::vector<float> converted;
     std::vector<uint8_t> silent_input;
 
@@ -122,7 +92,6 @@ struct MicrophoneSession {
         sample_event = nullptr;
         if (format) CoTaskMemFree(format);
         format = nullptr;
-        swr_free(&resampler);
         converted.clear();
         silent_input.clear();
     }
@@ -204,6 +173,9 @@ struct WindowsMicrophoneAudioProvider::Impl {
     std::atomic<uint64_t> packet_count{0};
     std::atomic<uint64_t> discontinuity_count{0};
     std::atomic<uint64_t> first_packet_qpc_100ns{0};
+    std::atomic<uint64_t> last_packet_end_qpc_100ns{0};
+    std::atomic<uint64_t> converted_frame_count{0};
+    std::atomic<uint64_t> largest_no_packet_gap_100ns{0};
     mutable std::mutex state_mutex;
     std::string error;
     WindowsMicrophoneRuntimeInfo info;
@@ -211,10 +183,17 @@ struct WindowsMicrophoneAudioProvider::Impl {
     std::unique_ptr<EncodedAudioPacketRing> ring;
     AudioDriftController drift{kCanonicalAudioSampleRate};
     int64_t submitted_frames = 0;
+    uint64_t next_timeline_100ns = 0;
+    std::vector<float> silence;
 
     void SetError(std::string value) {
         std::lock_guard<std::mutex> lock(state_mutex);
         error = std::move(value);
+    }
+
+    void SetState(WindowsMicrophoneRuntimeInfo::State state) {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        info.state = state;
     }
 
     bool StopRequested() const {
@@ -262,31 +241,14 @@ struct WindowsMicrophoneAudioProvider::Impl {
             SetError("microphone mix-format query failed " + HrText(hr));
             return false;
         }
-        const auto input_format = WaveSampleFormat(session->format);
-        if (!input_format) {
+        if (!session->converter.Initialize(session->format)) {
             SetError("microphone source format is unsupported; source is not captured");
             return false;
         }
-        session->input_format = *input_format;
         {
             std::lock_guard<std::mutex> lock(state_mutex);
             info.input_format = {session->format->nSamplesPerSec, session->format->nChannels,
-                                 "device-native"};
-        }
-
-        AVChannelLayout input_layout{};
-        AVChannelLayout output_layout{};
-        av_channel_layout_default(&input_layout, session->format->nChannels);
-        av_channel_layout_default(&output_layout, kCanonicalAudioChannels);
-        const int setup = swr_alloc_set_opts2(&session->resampler,
-            &output_layout, AV_SAMPLE_FMT_FLT, kCanonicalAudioSampleRate,
-            &input_layout, session->input_format,
-            static_cast<int>(session->format->nSamplesPerSec), 0, nullptr);
-        av_channel_layout_uninit(&input_layout);
-        av_channel_layout_uninit(&output_layout);
-        if (setup < 0 || !session->resampler || swr_init(session->resampler) < 0) {
-            SetError("microphone canonical resampler initialization failed");
-            return false;
+                                 session->converter.input_sample_format()};
         }
         session->sample_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!session->sample_event) {
@@ -329,12 +291,34 @@ struct WindowsMicrophoneAudioProvider::Impl {
             return false;
         }
         new_ring->SetCodecExtradata(new_encoder->GetExtradata());
-        timeline_origin_100ns.store(qpc_100ns, std::memory_order_release);
         drift.Reset();
         drift.Observe(qpc_100ns, 0);
         submitted_frames = 0;
+        next_timeline_100ns = qpc_100ns;
+        silence.assign(4800 * kCanonicalAudioChannels, 0.0f);
         ring = std::move(new_ring);
         encoder = std::move(new_encoder);
+        // Publish ownership only after both objects are fully initialized.
+        // Readers acquire the origin before dereferencing either pointer.
+        timeline_origin_100ns.store(qpc_100ns, std::memory_order_release);
+        return true;
+    }
+
+    bool SubmitCanonicalSilence(uint32_t frames) {
+        if (!encoder || frames == 0) return true;
+        const uint32_t block = static_cast<uint32_t>(silence.size())
+            / kCanonicalAudioChannels;
+        if (block == 0) return false;
+        uint32_t remaining = frames;
+        while (remaining > 0) {
+            const uint32_t count = std::min(remaining, block);
+            if (!encoder->EncodeSamples(silence.data(), count * kCanonicalAudioChannels)) {
+                SetError("microphone AAC encoding of timeline silence failed");
+                return false;
+            }
+            submitted_frames += count;
+            remaining -= count;
+        }
         return true;
     }
 
@@ -342,52 +326,91 @@ struct WindowsMicrophoneAudioProvider::Impl {
                           uint32_t input_frames, uint64_t qpc_100ns, bool silent) {
         if (!session || input_frames == 0) return true;
         if (qpc_100ns == 0) qpc_100ns = CurrentAudioTimeline100ns();
+        const uint32_t input_rate = session->converter.input_sample_rate();
+        if (input_rate == 0) {
+            SetError("microphone converter has no input sample rate");
+            return false;
+        }
+        // Record endpoint packet timing independently of converter output. A
+        // persistent resampler may legally emit no canonical samples for its
+        // first packet, but diagnostics still need the packet start/end and
+        // the next packet's no-data gap.
+        const uint64_t packet_duration = (static_cast<uint64_t>(input_frames)
+            * 10'000'000ULL) / input_rate;
+        const uint64_t packet_end = qpc_100ns + packet_duration;
+        last_packet_qpc_100ns.store(qpc_100ns, std::memory_order_release);
+        const uint64_t previous_packet_end = last_packet_end_qpc_100ns.load(
+            std::memory_order_relaxed);
+        if (previous_packet_end > 0 && qpc_100ns > previous_packet_end) {
+            const uint64_t gap = qpc_100ns - previous_packet_end;
+            uint64_t largest = largest_no_packet_gap_100ns.load(
+                std::memory_order_relaxed);
+            while (gap > largest && !largest_no_packet_gap_100ns.compare_exchange_weak(
+                largest, gap, std::memory_order_release,
+                std::memory_order_relaxed)) {}
+        }
+        last_packet_end_qpc_100ns.store(packet_end, std::memory_order_release);
         uint64_t no_packet = 0;
         first_packet_qpc_100ns.compare_exchange_strong(
             no_packet, qpc_100ns, std::memory_order_release,
             std::memory_order_relaxed);
         if (!EnsureEncoder(qpc_100ns)) return false;
+        const auto timeline = ReconcileAudioTimelinePacket(
+            next_timeline_100ns, qpc_100ns, input_frames, input_rate);
+        if (timeline.large_gap) {
+            // There is no representable discontinuity marker in the current
+            // AAC ring. Stop this generation rather than advancing the cursor
+            // and encoding resumed media at a collapsed PTS.
+            discontinuity_count.fetch_add(1, std::memory_order_relaxed);
+            SetError("microphone packet gap exceeded bounded continuity window; "
+                "capture stopped to preserve the audio timeline");
+            return false;
+        }
+        if (timeline.silence_frames > 0
+                    && !SubmitCanonicalSilence(timeline.silence_frames)) {
+            return false;
+        }
         const auto adjustment = drift.Observe(qpc_100ns, submitted_frames);
         if (adjustment.sample_delta != 0 && adjustment.compensation_distance_samples > 0
-                && swr_set_compensation(session->resampler, adjustment.sample_delta,
-                    static_cast<int>(adjustment.compensation_distance_samples)) < 0) {
+                && !session->converter.ApplyDriftCorrection(
+                    adjustment.sample_delta, adjustment.compensation_distance_samples)) {
             SetError("microphone drift compensation setup failed");
             return false;
         }
-        const int64_t capacity_64 = av_rescale_rnd(
-            swr_get_delay(session->resampler, session->format->nSamplesPerSec) + input_frames,
-            kCanonicalAudioSampleRate, session->format->nSamplesPerSec, AV_ROUND_UP)
-            + std::max<int32_t>(0, adjustment.sample_delta);
-        if (capacity_64 <= 0 || capacity_64 > static_cast<int64_t>(std::numeric_limits<int>::max())) {
-            SetError("microphone resampler returned an invalid output capacity");
-            return false;
-        }
-        const int capacity = static_cast<int>(capacity_64);
-        session->converted.resize(static_cast<size_t>(capacity) * kCanonicalAudioChannels);
+        uint32_t skip_frames = 0;
+        skip_frames = timeline.skip_input_frames;
+        const uint32_t submit_frames = input_frames - skip_frames;
+        if (submit_frames == 0) return true;
         const uint8_t* input = data;
         if (silent || !input) {
-            const size_t bytes = static_cast<size_t>(input_frames) * session->format->nBlockAlign;
+            const size_t bytes = static_cast<size_t>(input_frames)
+                * session->format->nBlockAlign;
             session->silent_input.assign(bytes, 0);
             input = session->silent_input.data();
         }
-        const uint8_t* input_planes[] = {input};
-        uint8_t* output_planes[] = {reinterpret_cast<uint8_t*>(session->converted.data())};
-        const int converted = swr_convert(session->resampler, output_planes, capacity,
-            input_planes, static_cast<int>(input_frames));
-        if (converted < 0) {
+        input += static_cast<size_t>(skip_frames)
+            * session->converter.input_bytes_per_frame();
+        session->converted.clear();
+        if (!session->converter.Convert(input, submit_frames, &session->converted)) {
             SetError("microphone resampling failed");
             return false;
         }
-        if (converted > 0) {
+        if (!session->converted.empty()) {
             const float gain = std::clamp(config.input_gain, 0.0f, 2.0f);
             if (gain != 1.0f) {
                 for (float& sample : session->converted) sample *= gain;
             }
-            encoder->EncodeSamples(session->converted.data(),
-                static_cast<uint32_t>(converted) * kCanonicalAudioChannels);
+            const uint32_t converted = static_cast<uint32_t>(
+                session->converted.size() / kCanonicalAudioChannels);
+            if (!encoder->EncodeSamples(session->converted.data(),
+                    static_cast<uint32_t>(converted) * kCanonicalAudioChannels)) {
+                SetError("microphone AAC encoding failed");
+                return false;
+            }
             submitted_frames += converted;
-            last_packet_qpc_100ns.store(qpc_100ns, std::memory_order_release);
+            converted_frame_count.fetch_add(converted, std::memory_order_relaxed);
         }
+        next_timeline_100ns = timeline.next_timeline_100ns;
         {
             std::lock_guard<std::mutex> lock(state_mutex);
             info.max_observed_drift_samples = drift.max_observed_drift_samples();
@@ -431,25 +454,36 @@ struct WindowsMicrophoneAudioProvider::Impl {
     }
 
     void Run() {
+        SetState(WindowsMicrophoneRuntimeInfo::State::Starting);
         const HRESULT apartment = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         if (FAILED(apartment) && apartment != RPC_E_CHANGED_MODE) {
             SetError("microphone capture could not initialize COM " + HrText(apartment));
             failed.store(true, std::memory_order_release);
+            SetState(WindowsMicrophoneRuntimeInfo::State::Failed);
             running.store(false, std::memory_order_release);
             return;
         }
         MicrophoneSession session;
         if (!OpenSession(&session)) {
             failed.store(true, std::memory_order_release);
+            SetState(WindowsMicrophoneRuntimeInfo::State::Failed);
         } else {
+            SetState(WindowsMicrophoneRuntimeInfo::State::Active);
             const HRESULT capture = CaptureSession(&session);
             if (FAILED(capture) && !StopRequested()) {
                 SetError("microphone capture stopped " + HrText(capture)
                     + "; restart capture to use this source again");
                 failed.store(true, std::memory_order_release);
+                SetState(WindowsMicrophoneRuntimeInfo::State::Failed);
             }
         }
-        if (encoder) encoder->Finalize();
+        if (encoder && !encoder->Finalize()) {
+            SetError("microphone AAC finalization failed");
+            failed.store(true, std::memory_order_release);
+            SetState(WindowsMicrophoneRuntimeInfo::State::Failed);
+        }
+        if (!failed.load(std::memory_order_acquire))
+            SetState(WindowsMicrophoneRuntimeInfo::State::Stopped);
         running.store(false, std::memory_order_release);
         if (SUCCEEDED(apartment)) CoUninitialize();
     }
@@ -465,12 +499,19 @@ WindowsMicrophoneAudioProvider::~WindowsMicrophoneAudioProvider() {
 
 bool WindowsMicrophoneAudioProvider::Start() {
     if (!impl_ || impl_->running.exchange(true, std::memory_order_acq_rel)) return false;
+    if (impl_->thread.joinable()) impl_->thread.join();
+    if (impl_->stop_event) {
+        CloseHandle(impl_->stop_event);
+        impl_->stop_event = nullptr;
+    }
     impl_->stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!impl_->stop_event) {
         impl_->SetError("microphone stop event creation failed");
         impl_->running.store(false, std::memory_order_release);
         return false;
     }
+    impl_->failed.store(false, std::memory_order_release);
+    impl_->SetState(WindowsMicrophoneRuntimeInfo::State::Starting);
     impl_->thread = std::thread([this] { impl_->Run(); });
     return true;
 }
@@ -481,6 +522,8 @@ void WindowsMicrophoneAudioProvider::Stop() {
     if (impl_->thread.joinable()) impl_->thread.join();
     if (impl_->stop_event) CloseHandle(impl_->stop_event);
     impl_->stop_event = nullptr;
+    if (!impl_->failed.load(std::memory_order_acquire))
+        impl_->SetState(WindowsMicrophoneRuntimeInfo::State::Stopped);
     impl_->running.store(false, std::memory_order_release);
 }
 
@@ -488,9 +531,10 @@ bool WindowsMicrophoneAudioProvider::IsRunning() const {
     return impl_ && impl_->running.load(std::memory_order_acquire);
 }
 
-const std::string& WindowsMicrophoneAudioProvider::last_error() const {
-    static const std::string empty;
-    return impl_ ? impl_->error : empty;
+std::string WindowsMicrophoneAudioProvider::last_error() const {
+    if (!impl_) return {};
+    std::lock_guard<std::mutex> lock(impl_->state_mutex);
+    return impl_->error;
 }
 
 WindowsMicrophoneRuntimeInfo WindowsMicrophoneAudioProvider::runtime_info() const {
@@ -498,6 +542,7 @@ WindowsMicrophoneRuntimeInfo WindowsMicrophoneAudioProvider::runtime_info() cons
     std::lock_guard<std::mutex> lock(impl_->state_mutex);
     WindowsMicrophoneRuntimeInfo info = impl_->info;
     info.failed = impl_->failed.load(std::memory_order_acquire);
+    info.state = info.failed ? WindowsMicrophoneRuntimeInfo::State::Failed : info.state;
     info.packet_count = impl_->packet_count.load(std::memory_order_relaxed);
     info.discontinuity_count = impl_->discontinuity_count.load(
         std::memory_order_relaxed);
@@ -505,16 +550,35 @@ WindowsMicrophoneRuntimeInfo WindowsMicrophoneAudioProvider::runtime_info() cons
         std::memory_order_acquire);
     info.last_packet_qpc_100ns = impl_->last_packet_qpc_100ns.load(
         std::memory_order_acquire);
+    info.last_packet_end_qpc_100ns = impl_->last_packet_end_qpc_100ns.load(
+        std::memory_order_acquire);
+    info.converted_frame_count = impl_->converted_frame_count.load(
+        std::memory_order_relaxed);
+    info.largest_no_packet_gap_100ns = impl_->largest_no_packet_gap_100ns.load(
+        std::memory_order_acquire);
+    const bool encoder_ready =
+        impl_->timeline_origin_100ns.load(std::memory_order_acquire) != 0;
+    if (encoder_ready && impl_->encoder) {
+        const auto stats = impl_->encoder->stats();
+        info.encoded_packet_count = stats.packets_emitted;
+        info.encoder_error_count = stats.encode_errors + stats.flush_errors;
+    }
+    if (encoder_ready && impl_->ring) {
+        const auto stats = impl_->ring->stats();
+        info.rejected_packet_count = stats.rejected_empty_packets
+            + stats.rejected_regressing_packets;
+    }
     return info;
 }
 
 std::optional<EncodedAudioTrack> WindowsMicrophoneAudioProvider::TakeTrackForInterval(
     double presentation_start_qpc_s, double presentation_end_qpc_s,
     AudioSourceMetadata source) const {
-    if (!impl_ || !impl_->ring || presentation_end_qpc_s <= presentation_start_qpc_s) return std::nullopt;
+    if (!impl_ || presentation_end_qpc_s <= presentation_start_qpc_s)
+        return std::nullopt;
     const uint64_t origin = impl_->timeline_origin_100ns.load(std::memory_order_acquire);
     const uint64_t last = impl_->last_packet_qpc_100ns.load(std::memory_order_acquire);
-    if (origin == 0 || last < origin) return std::nullopt;
+    if (origin == 0 || !impl_->ring || last < origin) return std::nullopt;
     const auto range = MapAudioSourcePresentationRange(
         presentation_start_qpc_s, presentation_end_qpc_s, origin, kCanonicalAudioSampleRate);
     EncodedAudioSnapshot snapshot = impl_->ring->TakeSnapshot(

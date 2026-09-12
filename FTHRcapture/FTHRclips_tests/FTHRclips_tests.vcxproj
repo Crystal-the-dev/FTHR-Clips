@@ -18,6 +18,7 @@
     <ClCompile Include="tests\windows_audio_session_registry_test.cpp" />
     <ClCompile Include="tests\windows_process_loopback_audio_provider_test.cpp" />
     <ClCompile Include="tests\windows_microphone_audio_provider_test.cpp" />
+    <ClCompile Include="tests\audio_format_converter_test.cpp" />
     <ClCompile Include="tests\amf_replay_encoder_test.cpp" />
     <ClCompile Include="tests\qsv_replay_encoder_test.cpp" />
     <ClCompile Include="tests\windows_replay_policy_test.cpp" />
@@ -34,6 +35,7 @@
     <ClCompile Include="..\FTHRclips\src\windows_audio_session_registry.cpp" />
     <ClCompile Include="..\FTHRclips\src\windows_process_loopback_audio_provider.cpp" />
     <ClCompile Include="..\FTHRclips\src\windows_microphone_audio_provider.cpp" />
+    <ClCompile Include="..\FTHRclips\src\audio_format_converter.cpp" />
     <ClCompile Include="..\FTHRclips\src\encoded_video_config.cpp" />
     <ClCompile Include="..\FTHRclips\src\ffmpeg_amf_replay_encoder.cpp" />
     <ClCompile Include="..\FTHRclips\src\ffmpeg_qsv_replay_encoder.cpp" />

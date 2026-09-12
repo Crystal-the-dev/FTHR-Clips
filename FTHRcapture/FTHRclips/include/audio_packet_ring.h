@@ -33,6 +33,13 @@ struct EncodedAudioSnapshot {
     }
 };
 
+struct EncodedAudioRingStats {
+    uint64_t accepted_packets = 0;
+    uint64_t rejected_empty_packets = 0;
+    uint64_t rejected_regressing_packets = 0;
+    uint64_t trimmed_packets = 0;
+};
+
 // The ring's retention bound is in timeline samples, not packet count. This
 // makes 30/60/300 second memory predictable even when encoders vary packet size.
 class EncodedAudioPacketRing {
@@ -46,6 +53,7 @@ public:
                                       int64_t end_pts_samples) const;
     size_t packet_count() const;
     size_t byte_count() const;
+    EncodedAudioRingStats stats() const;
     uint32_t retention_seconds() const { return retention_seconds_; }
 
 private:
@@ -59,6 +67,7 @@ private:
     std::vector<uint8_t> codec_extradata_;
     std::deque<EncodedAudioPacket> packets_;
     size_t byte_count_ = 0;
+    EncodedAudioRingStats stats_;
     mutable std::mutex mutex_;
 };
 

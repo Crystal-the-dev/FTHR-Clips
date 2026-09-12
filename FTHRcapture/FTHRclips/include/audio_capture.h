@@ -12,10 +12,10 @@
 //   This captures game audio, Discord, music, system sounds, everything.
 //
 // Format:
-//   The device mix format is queried at Initialize() time. Modern Windows
-//   systems virtually always use float32, 48kHz, stereo. If a different
-//   format is detected the engine logs a warning but proceeds - AudioEncoder
-//   handles the sample rate and channel count dynamically.
+//   The device mix format is queried at Initialize() time and converted by one
+//   persistent AudioFormatConverter to interleaved float32, 48 kHz, stereo.
+//   AudioEncoder therefore receives one canonical format even for integer,
+//   44.1/96 kHz, mono, 5.1 or 7.1 endpoints.
 //
 // Silence injection:
 //   WASAPI loopback only delivers packets when audio is actively playing.
@@ -45,6 +45,9 @@
 #include <string>
 #include <vector>
 
+#include "audio_format_converter.h"
+#include "audio_timeline.h"
+
 
 namespace fthr {
 
@@ -57,9 +60,8 @@ namespace fthr {
     // AudioCaptureConfig
     // ---------------------------------------------------------------------------
     struct AudioCaptureConfig {
-        // Target sample rate and channel count.
-        // If the device mix format differs, AudioCapture logs a warning.
-        // AudioEncoder is initialized with whatever the device actually provides.
+        // Target sample rate and channel count for the canonical replay path.
+        // The native endpoint is converted to this format before encoding.
         uint32_t preferred_sample_rate = 48000;
         uint32_t preferred_channels = 2;
 
@@ -103,9 +105,12 @@ namespace fthr {
         // Must be called after Stop().
         void Shutdown();
 
-        // Actual device format discovered at Initialize() time.
+        // Canonical format exposed to the replay path. Native endpoint details
+        // are available through GetInputSampleRate/GetInputChannels.
         uint32_t GetSampleRate() const { return sample_rate_; }
         uint32_t GetChannels()   const { return channels_; }
+        uint32_t GetInputSampleRate() const { return input_sample_rate_; }
+        uint32_t GetInputChannels() const { return input_channels_; }
         bool     IsRunning()     const { return running_.load(std::memory_order_relaxed); }
 
         // True if the WASAPI device was lost at runtime (device change, driver reset,
@@ -133,6 +138,38 @@ namespace fthr {
         uint64_t GetLastPacketQpc100ns() const {
             return last_packet_qpc_100ns_.load(std::memory_order_acquire);
         }
+        uint64_t GetConvertedFrameCount() const {
+            return converted_frame_count_.load(std::memory_order_relaxed);
+        }
+        uint64_t GetEncoderErrorCount() const {
+            return encoder_error_count_.load(std::memory_order_relaxed);
+        }
+        uint64_t GetEncodedPacketCount() const;
+        int64_t GetMaxObservedDriftSamples() const {
+            return max_observed_drift_samples_.load(std::memory_order_acquire);
+        }
+        uint64_t GetLargestNoPacketGap100ns() const {
+            return largest_no_packet_gap_100ns_.load(std::memory_order_acquire);
+        }
+        uint64_t GetLastPacketEndQpc100ns() const {
+            return last_packet_end_qpc_100ns_.load(std::memory_order_acquire);
+        }
+        uint64_t GetSilentPacketCount() const {
+            return silent_packet_count_.load(std::memory_order_relaxed);
+        }
+        uint64_t GetNoPacketIntervalCount() const {
+            return no_packet_interval_count_.load(std::memory_order_relaxed);
+        }
+        uint64_t GetRestartCount() const {
+            return restart_count_.load(std::memory_order_relaxed);
+        }
+        uint64_t GetSubmittedFrameCount() const {
+            return submitted_frame_count_.load(std::memory_order_relaxed);
+        }
+        uint32_t GetInputBytesPerFrame() const { return input_bytes_per_frame_; }
+        const std::string& GetInputSampleFormat() const {
+            return input_sample_format_;
+        }
 
 
     private:
@@ -143,9 +180,11 @@ namespace fthr {
 
         // Write 'num_frames' frames of silence to the encoder.
         // Used when WASAPI returns a silent buffer or no data is available.
-        void InjectSilence(uint32_t num_frames, uint64_t qpc_100ns = 0);
-        void SubmitSamples(const float* interleaved_data, uint32_t frame_count,
+        bool InjectSilence(uint32_t num_frames, uint64_t qpc_100ns = 0);
+        bool SubmitSamples(const float* interleaved_data, uint32_t frame_count,
                            uint64_t qpc_100ns);
+        bool SubmitNativeSamples(const uint8_t* interleaved_data,
+                                 uint32_t frame_count, uint64_t qpc_100ns);
 
         // Create WASAPI COM objects (enumerator, device, audio_client, capture_client,
         // buffer_event). Sets sample_rate_, channels_, silence_buf_.
@@ -182,7 +221,12 @@ namespace fthr {
         AudioEncoder* encoder_ = nullptr;
 
         // -----------------------------------------------------------------------
-        // Actual device format (read from mix_format_ during Initialize)
+        // Native endpoint format (read from mix_format_ during Initialize).
+        uint32_t input_sample_rate_ = 0;
+        uint32_t input_channels_ = 0;
+        uint32_t input_bytes_per_frame_ = 0;
+        std::string input_sample_format_ = "unavailable:not_resolved";
+        // Canonical replay format.
         // -----------------------------------------------------------------------
         uint32_t sample_rate_;
         uint32_t channels_;
@@ -201,6 +245,15 @@ namespace fthr {
         std::atomic<uint64_t> discontinuity_count_{ 0 };
         std::atomic<uint64_t> first_packet_qpc_100ns_{ 0 };
         std::atomic<uint64_t> last_packet_qpc_100ns_{ 0 };
+        std::atomic<uint64_t> last_packet_end_qpc_100ns_{ 0 };
+        std::atomic<uint64_t> converted_frame_count_{ 0 };
+        std::atomic<uint64_t> encoder_error_count_{ 0 };
+        std::atomic<uint64_t> largest_no_packet_gap_100ns_{ 0 };
+        std::atomic<uint64_t> silent_packet_count_{ 0 };
+        std::atomic<uint64_t> no_packet_interval_count_{ 0 };
+        std::atomic<uint64_t> restart_count_{ 0 };
+        std::atomic<uint64_t> submitted_frame_count_{ 0 };
+        std::atomic<int64_t> max_observed_drift_samples_{ 0 };
 
         // Stored from the last Initialize() call so recovery can re-open the same
         // device (or fall back to default if empty).
@@ -212,6 +265,13 @@ namespace fthr {
         // Size: preferred_channels * max_expected_frames_per_callback floats.
         // -----------------------------------------------------------------------
         std::vector<float> silence_buf_;
+        std::vector<uint8_t> native_silence_buf_;
+        std::vector<float> converted_samples_;
+        AudioFormatConverter format_converter_;
+        AudioDriftController drift_controller_{ kCanonicalAudioSampleRate };
+        int64_t submitted_frames_ = 0;
+        bool initialize_thread_com_owned_ = false;
+        std::thread::id initialize_thread_id_;
     };
 
 

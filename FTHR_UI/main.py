@@ -169,7 +169,9 @@ from core.engine_startup_diagnostics import (
     format_engine_launch_failure,
 )
 from core.clip_files import cleanup_stale_partial_clips, is_completed_video_path
-from core.audio_manifest import manifest_path_for, rebind_manifest_after_media_replace
+from core.audio_manifest import (
+    manifest_path_for, read_manifest_for_media, rebind_manifest_after_media_replace,
+)
 from core.clip_readiness import ClipReadinessState, get_clip_readiness_registry
 from core.save_state import (SaveStateMachine, EngineEvent, OutcomeKind)
 from core.hotkey_manager import (
@@ -237,8 +239,16 @@ from core.third_party_keyboard import (
     third_party_keyboard_settings,
 )
 from core.windows_microphone_devices import (
-    list_native_microphones,
+    MicrophoneDiscoveryCancelled,
+    MicrophoneDiscoveryJob,
+    MicrophoneDiscoveryResult,
+    discovery_diagnostic_code,
+    discovery_result_event_fields,
     migrate_legacy_microphone_name,
+)
+from core.combined_audio_policy import (
+    descriptors_from_ffprobe_streams,
+    select_combined_audio_streams,
 )
 from core.ffmpeg_tools import (
     get_ffmpeg_exe, get_ffprobe_exe, postprocess_video_args,
@@ -6490,7 +6500,7 @@ class MainWindow(QMainWindow):
         args = (str(output_path), duration_seconds, mic_end_time, clip_ready,
                 crop_profile)
         if route == 'mic':
-            self._mux_mic_into_clip(*args)
+            self._mux_mic_into_clip(*args, audio_mode=audio_mode)
         else:
             self._finalize_clip(*args)
         if not has_async_mux:
@@ -6717,7 +6727,8 @@ class MainWindow(QMainWindow):
     def _mux_mic_into_clip(self, clip_path: str,
                            duration_seconds: int,
                            mic_end_time: float,
-                           clip_ready=None, crop_profile=None):
+                           clip_ready=None, crop_profile=None,
+                           *, audio_mode: str | None = None):
         """
         Finalize the capture's audio layout, then apply any other source-clip
         post-processing. On Windows the native engine already captured the
@@ -6733,7 +6744,8 @@ class MainWindow(QMainWindow):
             return
 
         audio_mode = normalize_audio_capture_mode(
-            self.settings_manager.get(
+            audio_mode if audio_mode is not None
+            else self.settings_manager.get(
                 'audio_capture_mode', AUDIO_CAPTURE_MODE_COMBINED))
         if sys.platform == 'win32':
             if audio_mode == AUDIO_CAPTURE_MODE_COMBINED:
@@ -6874,12 +6886,11 @@ class MainWindow(QMainWindow):
         try:
             probe = subprocess.run(
                 [ffprobe, '-v', 'error', '-select_streams', 'a',
-                 '-show_entries', 'stream=index', '-of', 'json', clip_path],
+                 '-show_entries', 'stream=index,codec_type:stream_tags=title,handler_name',
+                 '-of', 'json', clip_path],
                 capture_output=True, text=True, timeout=30, **_NO_WINDOW)
             streams = json.loads(probe.stdout).get('streams', [])
-            audio_count = sum(
-                1 for stream in streams
-                if isinstance(stream, dict) and isinstance(stream.get('index'), int))
+            stream_descriptors = descriptors_from_ffprobe_streams(streams)
         except (OSError, subprocess.SubprocessError, TypeError, ValueError,
                 json.JSONDecodeError) as error:
             print(f'[Audio] Could not inspect native audio streams: {error}')
@@ -6889,14 +6900,33 @@ class MainWindow(QMainWindow):
                 clip_ready.set()
             return
 
-        if audio_count == 0:
+        manifest = None
+        manifest_sidecar = manifest_path_for(clip_path)
+        try:
+            manifest = read_manifest_for_media(clip_path)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+            print(f'[Audio] Could not inspect audio manifest: {error}')
+        # A present-but-invalid sidecar must not fall back to mixing every
+        # stream: that could sum application stems already contained in
+        # Default Mix.  Legacy clips without a sidecar retain label/all-stream
+        # compatibility behavior in the pure selection policy.
+        if manifest is None and manifest_sidecar.exists():
+            manifest = {'sources': []}
+
+        selected_audio_indexes = select_combined_audio_streams(
+            manifest, stream_descriptors)
+        if not selected_audio_indexes:
             self._record_finalization_warning(
-                clip_path, 'The saved clip contained no audio streams.')
+                clip_path,
+                'Combined audio was skipped because no system or microphone '
+                'streams were identified.')
             if clip_ready is not None:
                 clip_ready.set()
             return
 
-        audio_inputs = ''.join(f'[0:a:{index}]' for index in range(audio_count))
+        audio_count = len(selected_audio_indexes)
+        audio_inputs = ''.join(
+            f'[0:a:{index}]' for index in selected_audio_indexes)
         if audio_count == 1:
             audio_filter = f'{audio_inputs}anull[aout]'
         else:
@@ -8802,6 +8832,13 @@ class _SettingsPage(QWidget):
         self._background_ui_paused = False
         self.setObjectName('settingsPage')
         self._loopback_stream = None
+        self._mic_discovery_generation = 0
+        self._mic_discovery_job: MicrophoneDiscoveryJob | None = None
+        self._mic_discovery_context: dict[str, object] | None = None
+        self._mic_discovery_poll_timer = QTimer(self)
+        self._mic_discovery_poll_timer.setInterval(25)
+        self._mic_discovery_poll_timer.timeout.connect(
+            self._poll_mic_discovery)
         self._presets_mgr = PresetsManager()
         self._encoder_capabilities: tuple[EncoderCapability, ...] = ()
         self._encoder_probe_started = False
@@ -10509,29 +10546,118 @@ class _SettingsPage(QWidget):
     # -- Microphone helpers --
 
     def _populate_mic_devices(self):
-        """Re-scan input devices while preserving a stable native ID on Windows."""
+        """Start a cancellable microphone inventory off the Qt thread.
+
+        Both the native engine helper and the legacy PortAudio query can
+        enter device-driver code.  The settings page only starts a worker and
+        polls its completion; all widget and settings mutations happen in the
+        Qt thread after the generation check below.
+        """
+        self._cancel_mic_discovery()
+        self._mic_discovery_generation += 1
+        generation = self._mic_discovery_generation
         saved_id = self.sm.get('mic_device_id') if self.sm is not None else None
         saved_name = self.sm.get('mic_device_name') if self.sm is not None else None
         previous_name = self.mic_combo.currentText() if self.mic_combo.count() else None
 
-        native_endpoints = []
+        engine_path = None
         if sys.platform == 'win32':
             main_window = self.window()
-            engine_path = getattr(main_window, 'engine_path', None)
-            if engine_path and getattr(main_window, 'engine_process', None) is not None:
-                try:
-                    native_endpoints = list_native_microphones(engine_path)
-                except RuntimeError as exc:
-                    print(f'[Mic] Native endpoint scan failed: {exc}')
+            candidate = getattr(main_window, 'engine_path', None)
+            if candidate and Path(candidate).is_file():
+                engine_path = candidate
 
-        legacy_indices = {}
-        if _SD_AVAILABLE:
-            try:
-                for index, device in enumerate(_sd.query_devices()):
-                    if device.get('max_input_channels', 0) > 0:
-                        legacy_indices.setdefault(device['name'], []).append(index)
-            except Exception as exc:
-                print(f'Mic scan failed: {exc}')
+        # Native WASAPI inventory is authoritative on Windows.  PortAudio is
+        # a separate legacy recorder backend and querying it here can enter a
+        # host API that cannot be cancelled or reaped.  Keep it for Linux,
+        # where it remains the capture backend; Windows native capture does
+        # not need a second device inventory just to populate stable IDs.
+        legacy_query = (
+            _sd.query_devices
+            if _SD_AVAILABLE and sys.platform != 'win32' else None)
+        self._mic_discovery_context = {
+            'generation': generation,
+            'saved_id': saved_id,
+            'saved_name': saved_name,
+            'previous_name': previous_name,
+        }
+        self.mic_combo.blockSignals(True)
+        self.mic_combo.clear()
+        self.mic_combo.addItem('Scanning microphones…', userData=None)
+        self.mic_combo.blockSignals(False)
+
+        job = MicrophoneDiscoveryJob(
+            engine_path,
+            legacy_query=legacy_query,
+            timeout=5,
+            generation=generation,
+        )
+        self._mic_discovery_job = job
+        job.start(lambda _result, _error: None)
+        self._mic_discovery_poll_timer.start()
+
+    def _cancel_mic_discovery(self) -> None:
+        job = self._mic_discovery_job
+        if job is not None and not job.done:
+            job.cancel()
+        self._mic_discovery_job = None
+        self._mic_discovery_context = None
+        self._mic_discovery_poll_timer.stop()
+
+    def _poll_mic_discovery(self) -> None:
+        job = self._mic_discovery_job
+        context = self._mic_discovery_context
+        if job is None or context is None or not job.done:
+            return
+        self._mic_discovery_poll_timer.stop()
+        self._mic_discovery_job = None
+        self._mic_discovery_context = None
+        if context['generation'] != self._mic_discovery_generation:
+            return
+        if isinstance(job.error, MicrophoneDiscoveryCancelled):
+            return
+        if job.error is not None:
+            print(f'[Mic] Discovery failed: {job.error}')
+            diagnostic_code = discovery_diagnostic_code(job.error)
+            if diagnostic_code:
+                emit_event(
+                    'audio', 'endpoint_discovery_failed', state='FAILED',
+                    error=diagnostic_code,
+                    generation=int(context['generation']),
+                    source='microphone',
+                )
+            result = MicrophoneDiscoveryResult(
+                native_endpoints=(), legacy_indices={},
+                native_error=str(job.error), legacy_error=None,
+                generation=int(context['generation']),
+            )
+        else:
+            result = job.result or MicrophoneDiscoveryResult(
+                native_endpoints=(), legacy_indices={},
+                native_error='microphone discovery returned no result',
+                legacy_error=None, generation=int(context['generation']))
+            emit_event(
+                'audio', 'endpoint_discovery_completed', state='COMPLETED',
+                source='microphone',
+                **discovery_result_event_fields(result),
+            )
+        self._apply_mic_devices(
+            result,
+            saved_id=context['saved_id'],
+            saved_name=context['saved_name'],
+            previous_name=context['previous_name'],
+        )
+
+    def _apply_mic_devices(self, result: MicrophoneDiscoveryResult, *,
+                           saved_id: str | None, saved_name: str | None,
+                           previous_name: str | None) -> None:
+        """Apply one current discovery result on the Qt thread only."""
+        native_endpoints = result.native_endpoints
+        legacy_indices = result.legacy_indices
+        if result.native_error:
+            print(f'[Mic] Native endpoint scan failed: {result.native_error}')
+        if result.legacy_error:
+            print(f'[Mic] Legacy endpoint scan failed: {result.legacy_error}')
 
         if sys.platform == 'win32' and not saved_id:
             migrated_id = migrate_legacy_microphone_name(saved_name, native_endpoints)
@@ -10545,11 +10671,11 @@ class _SettingsPage(QWidget):
         default_data = {'endpoint_id': None, 'legacy_index': None,
                         'display_name': 'System Default'}
         self.mic_combo.addItem('System Default', userData=default_data)
-        if native_endpoints:
-            active_ids = set()
-            for endpoint in native_endpoints:
-                if not endpoint.is_active:
-                    continue
+        active_ids = set()
+        active_native_endpoints = [
+            endpoint for endpoint in native_endpoints if endpoint.is_active]
+        if active_native_endpoints:
+            for endpoint in active_native_endpoints:
                 active_ids.add(endpoint.endpoint_id)
                 indices = legacy_indices.get(endpoint.display_name, [])
                 legacy_index = indices[0] if len(indices) == 1 else None
@@ -10558,16 +10684,6 @@ class _SettingsPage(QWidget):
                     'legacy_index': legacy_index,
                     'display_name': endpoint.display_name,
                 })
-            # Explicit selections remain explicit even after a USB/Bluetooth
-            # device disappears. Passing this ID to the engine produces a
-            # clear native failure instead of silently following Default.
-            if saved_id and saved_id not in active_ids:
-                self.mic_combo.addItem(f'{saved_name or "Selected microphone"} (unavailable)',
-                                       userData={
-                                           'endpoint_id': saved_id,
-                                           'legacy_index': None,
-                                           'display_name': saved_name or 'Microphone',
-                                       })
         elif _SD_AVAILABLE:
             # Linux remains on the legacy PortAudio path for this phase.
             for name, indices in legacy_indices.items():
@@ -10577,6 +10693,21 @@ class _SettingsPage(QWidget):
                         'legacy_index': indices[0],
                         'display_name': name,
                     })
+
+        # Explicit selections remain explicit even after a USB/Bluetooth
+        # device disappears or discovery fails. Passing this ID to the engine
+        # produces a clear native failure instead of silently following
+        # Default. This also prevents a stale worker result from selecting
+        # the first newly discovered endpoint.
+        if (sys.platform == 'win32' and saved_id
+                and saved_id not in active_ids):
+            self.mic_combo.addItem(
+                f'{saved_name or "Selected microphone"} (unavailable)',
+                userData={
+                    'endpoint_id': saved_id,
+                    'legacy_index': None,
+                    'display_name': saved_name or 'Microphone',
+                })
 
         selected = 0
         for index in range(self.mic_combo.count()):
@@ -10911,6 +11042,7 @@ class _SettingsPage(QWidget):
     def hideEvent(self, event):
         self._category_switch_timer.stop()
         self._audio_preview_timer.stop()
+        self._cancel_mic_discovery()
         self._stop_loopback()
         if hasattr(self, 'mic_level_meter'):
             self.mic_level_meter.stop()

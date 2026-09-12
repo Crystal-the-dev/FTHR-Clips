@@ -30,6 +30,7 @@
     <ClInclude Include="include\audio_timeline.h" />
     <ClInclude Include="include\audio_capture.h" />
     <ClInclude Include="include\audio_encoder.h" />
+    <ClInclude Include="include\audio_format_converter.h" />
     <ClInclude Include="include\audio_ring_buffer.h" />
     <ClInclude Include="include\capture_engine.h" />
     <ClInclude Include="include\capture_scale_geometry.h" />
@@ -63,6 +64,7 @@
     <ClCompile Include="src\audio_timeline.cpp" />
     <ClCompile Include="src\audio_capture.cpp" />
     <ClCompile Include="src\audio_encoder.cpp" />
+    <ClCompile Include="src\audio_format_converter.cpp" />
     <ClCompile Include="src\audio_ring_buffer.cpp" />
     <ClCompile Include="src\capture_engine.cpp" />
     <ClCompile Include="src\encoded_ring_buffer.cpp" />

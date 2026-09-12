@@ -174,6 +174,7 @@ def test_completion_handler_dispatches_one_route_only():
     dispatch = body[body.index('args = ('):]
 
     assert dispatch.count('self._mux_mic_into_clip(') == 1
+    assert 'self._mux_mic_into_clip(*args, audio_mode=audio_mode)' in dispatch
     assert 'self._mux_multiband_into_clip(' not in dispatch
     assert dispatch.count('self._finalize_clip(') == 1
     assert dispatch.index("if route == 'mic'") < dispatch.index('else:')

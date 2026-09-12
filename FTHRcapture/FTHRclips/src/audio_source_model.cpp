@@ -88,7 +88,10 @@ bool AudioSourceRegistry::Discover(AudioSourceMetadata metadata) {
         return false;
     const AudioSourceId id = metadata.identity.id;
     const auto [_, inserted] = sources_.emplace(id, std::move(metadata));
-    if (inserted) gates_.try_emplace(id);
+    if (inserted) {
+        gates_.try_emplace(id);
+        terminal_at_100ns_.erase(id);
+    }
     return inserted;
 }
 
@@ -126,11 +129,11 @@ void AudioSourceRegistry::MarkEnded(const AudioSourceId& id, int64_t timestamp_1
     const auto it = sources_.find(id);
     if (it == sources_.end()) return;
     it->second.state.active_in_generation = false;
-    if (it->second.state.admitted) {
+    if (it->second.state.health != AudioSourceHealth::Failed)
         it->second.state.health = AudioSourceHealth::Ended;
-        if (it->second.state.last_active_100ns < timestamp_100ns)
-            it->second.state.last_active_100ns = timestamp_100ns;
-    }
+    terminal_at_100ns_[id] = timestamp_100ns;
+    // Keep an admitted source counted until the retention window has elapsed
+    // so its AAC history remains eligible for a replay save.
 }
 
 void AudioSourceRegistry::MarkFailed(const AudioSourceId& id) {
@@ -141,17 +144,45 @@ void AudioSourceRegistry::MarkFailed(const AudioSourceId& id) {
     ++it->second.state.failure_count;
 }
 
+uint32_t AudioSourceRegistry::PruneEndedOlderThan(int64_t cutoff_100ns) {
+    uint32_t pruned = 0;
+    for (auto it = sources_.begin(); it != sources_.end();) {
+        const auto& state = it->second.state;
+        const bool terminal = state.health == AudioSourceHealth::Ended
+            || state.health == AudioSourceHealth::Failed;
+        const auto terminal_at = terminal_at_100ns_.find(it->first);
+        if (!terminal || state.active_in_generation || terminal_at == terminal_at_100ns_.end()
+                || terminal_at->second < 0 || terminal_at->second >= cutoff_100ns) {
+            ++it;
+            continue;
+        }
+        if (state.admitted && admitted_count_ > 0) --admitted_count_;
+        gates_.erase(it->first);
+        terminal_at_100ns_.erase(it->first);
+        it = sources_.erase(it);
+        ++pruned;
+    }
+    return pruned;
+}
+
 uint32_t AudioSourceRegistry::ReleaseAdmissionsOlderThan(int64_t cutoff_100ns) {
     uint32_t released = 0;
     for (auto& [id, source] : sources_) {
         auto& state = source.state;
-        if (!state.admitted || state.active_in_generation
-                || state.last_active_100ns < 0
-                || state.last_active_100ns >= cutoff_100ns) {
+        const auto terminal_at = terminal_at_100ns_.find(id);
+        const int64_t age_anchor = terminal_at != terminal_at_100ns_.end()
+            ? terminal_at->second : state.last_active_100ns;
+        if (!state.admitted || state.active_in_generation || age_anchor < 0
+                || age_anchor >= cutoff_100ns) {
             continue;
         }
         state.admitted = false;
-        state.health = AudioSourceHealth::Ended;
+        // A live runtime group may go quiet for longer than the replay
+        // window. Release its admission slot without making its identity
+        // terminal; a later audible block must be able to re-admit it.
+        if (state.health != AudioSourceHealth::Ended
+                && state.health != AudioSourceHealth::Failed)
+            state.health = AudioSourceHealth::Discovered;
         const auto gate = gates_.find(id);
         if (gate != gates_.end()) gate->second.Reset();
         if (admitted_count_ > 0) --admitted_count_;

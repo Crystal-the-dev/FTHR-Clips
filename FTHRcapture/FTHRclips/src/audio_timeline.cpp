@@ -37,6 +37,58 @@ uint64_t CurrentAudioTimeline100ns() {
 #endif
 }
 
+AudioTimelinePacketAdjustment ReconcileAudioTimelinePacket(
+    uint64_t next_timeline_100ns, uint64_t packet_qpc_100ns,
+    uint32_t input_frames, uint32_t input_sample_rate,
+    uint32_t canonical_sample_rate, uint32_t max_synthetic_gap_seconds) {
+    AudioTimelinePacketAdjustment result;
+    if (packet_qpc_100ns == 0 || input_sample_rate == 0
+            || canonical_sample_rate == 0) return result;
+    const uint64_t packet_duration = (static_cast<uint64_t>(input_frames)
+        * 10'000'000ULL) / input_sample_rate;
+    const uint64_t packet_end = packet_qpc_100ns + packet_duration;
+    if (next_timeline_100ns == 0) {
+        result.next_timeline_100ns = packet_end;
+        return result;
+    }
+    if (packet_qpc_100ns > next_timeline_100ns) {
+        result.gap_100ns = packet_qpc_100ns - next_timeline_100ns;
+        const uint64_t max_gap_100ns = max_synthetic_gap_seconds >
+                std::numeric_limits<uint64_t>::max() / 10'000'000ULL
+            ? std::numeric_limits<uint64_t>::max()
+            : static_cast<uint64_t>(max_synthetic_gap_seconds) * 10'000'000ULL;
+        if (result.gap_100ns > max_gap_100ns) {
+            result.large_gap = true;
+            // Do not advance the cursor on a gap that the caller cannot
+            // represent with bounded synthetic audio. Providers must fail or
+            // restart the source; advancing here would collapse media time and
+            // encode the resumed packet at an earlier AAC PTS.
+            result.next_timeline_100ns = next_timeline_100ns;
+            return result;
+        }
+        const uint64_t gap_frames = (result.gap_100ns * canonical_sample_rate)
+            / 10'000'000ULL;
+        const uint64_t maximum = static_cast<uint64_t>(max_synthetic_gap_seconds)
+            * canonical_sample_rate;
+        if (gap_frames > maximum) {
+            result.large_gap = true;
+            result.next_timeline_100ns = next_timeline_100ns;
+            return result;
+        }
+        result.silence_frames = static_cast<uint32_t>(std::min<uint64_t>(
+            gap_frames, std::numeric_limits<uint32_t>::max()));
+    } else if (packet_qpc_100ns < next_timeline_100ns && input_frames > 0) {
+        const uint64_t overlap_100ns = next_timeline_100ns - packet_qpc_100ns;
+        const uint64_t overlap_frames = overlap_100ns >= packet_duration
+            ? input_frames
+            : (overlap_100ns * input_sample_rate) / 10'000'000ULL;
+        result.skip_input_frames = static_cast<uint32_t>(std::min<uint64_t>(
+            overlap_frames, input_frames));
+    }
+    result.next_timeline_100ns = std::max(next_timeline_100ns, packet_end);
+    return result;
+}
+
 AudioSourcePresentationRange MapAudioSourcePresentationRange(
     double presentation_start_qpc_s, double presentation_end_qpc_s,
     uint64_t source_timeline_origin_100ns, uint32_t sample_rate) {

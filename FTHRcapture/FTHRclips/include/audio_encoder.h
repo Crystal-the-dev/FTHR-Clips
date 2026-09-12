@@ -40,6 +40,7 @@
 #define FTHR_AUDIO_ENCODER_H
 
 #include <cstdint>
+#include <atomic>
 #include <vector>
 #include <functional>
 
@@ -57,6 +58,12 @@ namespace fthr {
     // ---------------------------------------------------------------------------
     class AudioEncoder {
     public:
+        struct Stats {
+            uint64_t frames_submitted = 0;
+            uint64_t packets_emitted = 0;
+            uint64_t encode_errors = 0;
+            uint64_t flush_errors = 0;
+        };
         // Callback fired once per encoded AAC packet.
         // data:     raw AAC frame bytes (no ADTS header)
         // size:     byte count
@@ -72,8 +79,8 @@ namespace fthr {
         ~AudioEncoder();
 
         // Initialize the FFmpeg AAC encoder.
-        // sample_rate:   input sample rate in Hz (must match WASAPI device format)
-        // channels:      number of channels (1=mono, 2=stereo)
+        // sample_rate:   input sample rate in Hz (native conversion is upstream)
+        // channels:      number of channels (1..8)
         // bitrate_kbps:  target AAC bitrate (128 is a good default)
         // callback:      receives every encoded packet - must not be null
         //
@@ -92,11 +99,11 @@ namespace fthr {
         // Internally accumulates samples until a full 1024-sample AAC frame
         // is ready, then encodes and fires the callback.
         // May fire the callback zero or multiple times per call.
-        void EncodeSamples(const float* pcm_data, uint32_t num_samples);
+        bool EncodeSamples(const float* pcm_data, uint32_t num_samples);
 
         // Flush any remaining buffered samples and free all FFmpeg resources.
         // Must be called before destruction.
-        void Finalize();
+        bool Finalize();
 
         // Return the MPEG-4 AudioSpecificConfig (ASC) extracted from
         // codec_ctx->extradata after Initialize(). Pass this to the MP4
@@ -107,12 +114,18 @@ namespace fthr {
         uint32_t GetSampleRate() const { return sample_rate_; }
         uint32_t GetChannels()   const { return channels_; }
         bool     IsInitialized() const { return initialized_; }
+        Stats stats() const {
+            return {frames_submitted_.load(std::memory_order_relaxed),
+                    packets_emitted_.load(std::memory_order_relaxed),
+                    encode_errors_.load(std::memory_order_relaxed),
+                    flush_errors_.load(std::memory_order_relaxed)};
+        }
 
 
     private:
         // Encode one full AVFrame (1024 samples) and fire the callback
         // for every packet avcodec_receive_packet returns.
-        void EncodeFrame();
+        bool EncodeFrame();
 
         // FFmpeg objects
         AVCodecContext* codec_ctx_;
@@ -139,6 +152,10 @@ namespace fthr {
 
         // MPEG-4 AudioSpecificConfig for MP4 muxer
         std::vector<uint8_t> extradata_;
+        std::atomic<uint64_t> frames_submitted_{ 0 };
+        std::atomic<uint64_t> packets_emitted_{ 0 };
+        std::atomic<uint64_t> encode_errors_{ 0 };
+        std::atomic<uint64_t> flush_errors_{ 0 };
     };
 
 

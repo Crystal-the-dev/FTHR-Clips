@@ -432,17 +432,30 @@ def choose_monitor(explicit: str | None) -> tuple[str, str]:
     return selected.device_path, selected.friendly_name
 
 
-def qualify_codec(args, codec: str, monitor_path: str, monitor_name: str) -> dict:
-    codec_dir = args.output / codec
-    codec_dir.mkdir(parents=True, exist_ok=True)
-    log_path = codec_dir / 'engine.log'
+def build_engine_command(
+    args: argparse.Namespace, codec: str, monitor_path: str,
+) -> list[str]:
+    """Build the documented native argv contract, including audio mode 23."""
     command = [
         str(args.engine), str(args.fps), '62',
         str(args.width), str(args.height), str(args.bitrate), '2048',
         '0', '0', '1' if args.scaling_mode == 'fit' else '0',
         monitor_path, str(CODECS[codec]), '4', '0',
         '1' if args.audio else '0',
+        '', '100', '0',
+        '0', '0', '0', '1', '1',
+        '1' if args.separate_audio else '0',
     ]
+    if len(command) != 24:
+        raise AssertionError('native qualification argv contract is incomplete')
+    return command
+
+
+def qualify_codec(args, codec: str, monitor_path: str, monitor_name: str) -> dict:
+    codec_dir = args.output / codec
+    codec_dir.mkdir(parents=True, exist_ok=True)
+    log_path = codec_dir / 'engine.log'
+    command = build_engine_command(args, codec, monitor_path)
     started = time.monotonic()
     clips: list[ClipResult] = []
     with log_path.open('w', encoding='utf-8', errors='replace') as log:
@@ -537,6 +550,7 @@ def qualify_codec(args, codec: str, monitor_path: str, monitor_name: str) -> dic
             return {
                 'requested_codec': codec,
                 'requested_scaling_mode': args.scaling_mode,
+                'separate_audio_enabled': args.separate_audio,
                 'active_codec': active_codec,
                 'active_backend': active_backend,
                 'capture_adapter_vendor': active_vendor,
@@ -594,6 +608,12 @@ def qualify_codec(args, codec: str, monitor_path: str, monitor_name: str) -> dic
                 'gpu_metrics': 'Collect GPU 3D/copy/video-encode counters externally.',
             }
         finally:
+            if bridge is not None and process.poll() is None:
+                bridge.request_engine_shutdown()
+                try:
+                    process.wait(timeout=10.0)
+                except subprocess.TimeoutExpired:
+                    pass
             if bridge is not None:
                 bridge.shutdown()
             if process.poll() is None:
@@ -621,6 +641,9 @@ def parse_args() -> argparse.Namespace:
         '--soak-seconds', type=int, default=0,
         help='bounded fresh-frame capture soak after rapid saves (default: 0)')
     parser.add_argument('--audio', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        '--separate-audio', action=argparse.BooleanOptionalAction, default=False,
+        help='enable dynamic Windows 11 process-loopback stems')
     parser.add_argument(
         '--engine', type=Path,
         default=ROOT / 'FTHRcapture/x64/Release/FTHRclips.exe')

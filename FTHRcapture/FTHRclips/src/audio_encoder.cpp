@@ -83,6 +83,11 @@ namespace fthr {
         }
 
         packet_callback_ = std::move(callback);
+        frames_submitted_.store(0, std::memory_order_relaxed);
+        packets_emitted_.store(0, std::memory_order_relaxed);
+        encode_errors_.store(0, std::memory_order_relaxed);
+        flush_errors_.store(0, std::memory_order_relaxed);
+        extradata_.clear();
         sample_rate_ = sample_rate;
         channels_ = channels;
         bitrate_kbps_ = bitrate_kbps;
@@ -209,9 +214,12 @@ namespace fthr {
     // per call depending on how many full frames are available.
     // ===========================================================================
 
-    void AudioEncoder::EncodeSamples(const float* pcm_data, uint32_t num_samples)
+    bool AudioEncoder::EncodeSamples(const float* pcm_data, uint32_t num_samples)
     {
-        if (!initialized_ || !pcm_data || num_samples == 0) return;
+        if (!initialized_ || !pcm_data || num_samples == 0
+                || num_samples % channels_ != 0) return false;
+
+        bool success = true;
 
         const uint32_t frames_in = num_samples / channels_;
         const uint32_t frame_size = static_cast<uint32_t>(codec_ctx_->frame_size);  // 1024
@@ -231,10 +239,11 @@ namespace fthr {
             consumed += copy_frames;
 
             if (accum_frames_ == frame_size) {
-                EncodeFrame();
+                if (!EncodeFrame()) success = false;
                 accum_frames_ = 0;
             }
         }
+        return success;
     }
 
 
@@ -245,13 +254,16 @@ namespace fthr {
     // drain any output packets and fire the callback.
     // ===========================================================================
 
-    void AudioEncoder::EncodeFrame()
+    bool AudioEncoder::EncodeFrame()
     {
-        if (!initialized_) return;
+        if (!initialized_) return false;
 
         const uint32_t frame_size = static_cast<uint32_t>(codec_ctx_->frame_size);
 
-        av_frame_make_writable(frame_);
+        if (av_frame_make_writable(frame_) < 0) {
+            encode_errors_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
 
         // De-interleave: WASAPI stores L0,R0,L1,R1,...
         // FFmpeg AAC expects separate planes: [all L] [all R]
@@ -268,15 +280,21 @@ namespace fthr {
 
         int ret = avcodec_send_frame(codec_ctx_, frame_);
         if (ret < 0) {
+            encode_errors_.fetch_add(1, std::memory_order_relaxed);
             std::cerr << "[AudioEncoder] avcodec_send_frame failed: " << ret << std::endl;
-            return;
+            return false;
         }
+        frames_submitted_.fetch_add(1, std::memory_order_relaxed);
+
+        bool success = true;
 
         // Drain encoded packets (usually one per send for AAC)
         while (ret >= 0) {
             ret = avcodec_receive_packet(codec_ctx_, packet_);
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
             if (ret < 0) {
+                encode_errors_.fetch_add(1, std::memory_order_relaxed);
+                success = false;
                 std::cerr << "[AudioEncoder] avcodec_receive_packet failed: " << ret << std::endl;
                 break;
             }
@@ -285,9 +303,11 @@ namespace fthr {
                 packet_callback_(packet_->data,
                     static_cast<uint32_t>(packet_->size),
                     packet_->pts);
+                packets_emitted_.fetch_add(1, std::memory_order_relaxed);
             }
             av_packet_unref(packet_);
         }
+        return success;
     }
 
 
@@ -298,9 +318,11 @@ namespace fthr {
     // and frees all FFmpeg resources.
     // ===========================================================================
 
-    void AudioEncoder::Finalize()
+    bool AudioEncoder::Finalize()
     {
-        if (!initialized_) return;
+        if (!initialized_) return true;
+
+        bool success = true;
 
         // Zero-pad and encode any partial frame remaining in the accumulator
         if (accum_frames_ > 0 && codec_ctx_) {
@@ -309,17 +331,31 @@ namespace fthr {
             float* dst = accum_buf_.data() + accum_frames_ * channels_;
             std::memset(dst, 0, static_cast<size_t>(pad_frames) * channels_ * sizeof(float));
             accum_frames_ = frame_size;
-            EncodeFrame();
+            if (!EncodeFrame()) success = false;
         }
 
         // Send NULL frame to flush codec's internal delay
         if (codec_ctx_) {
-            avcodec_send_frame(codec_ctx_, nullptr);
-            while (avcodec_receive_packet(codec_ctx_, packet_) == 0) {
+            const int send_result = avcodec_send_frame(codec_ctx_, nullptr);
+            if (send_result < 0 && send_result != AVERROR_EOF) {
+                flush_errors_.fetch_add(1, std::memory_order_relaxed);
+                success = false;
+            }
+            int receive_result = send_result < 0 ? send_result : 0;
+            while (receive_result >= 0) {
+                receive_result = avcodec_receive_packet(codec_ctx_, packet_);
+                if (receive_result == AVERROR(EAGAIN) || receive_result == AVERROR_EOF)
+                    break;
+                if (receive_result < 0) {
+                    flush_errors_.fetch_add(1, std::memory_order_relaxed);
+                    success = false;
+                    break;
+                }
                 if (packet_callback_ && packet_->size > 0) {
                     packet_callback_(packet_->data,
                         static_cast<uint32_t>(packet_->size),
                         packet_->pts);
+                    packets_emitted_.fetch_add(1, std::memory_order_relaxed);
                 }
                 av_packet_unref(packet_);
             }
@@ -335,6 +371,7 @@ namespace fthr {
         initialized_ = false;
 
         std::cout << "[AudioEncoder] Finalized." << std::endl;
+        return success;
     }
 
 

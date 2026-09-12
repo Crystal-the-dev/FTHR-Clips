@@ -23,6 +23,7 @@ int RunAudioSourceModelTests();
 int RunWindowsAudioSessionRegistryTests();
 int RunWindowsProcessLoopbackAudioProviderTests();
 int RunWindowsMicrophoneAudioProviderTests();
+int RunAudioFormatConverterTests();
 int RunWindowsCaptureBorderPolicyTests();
 int RunContinuousRecordingWriterTests();
 int RunNvencInputLifecycleTests();
@@ -769,6 +770,7 @@ int main() {
     const int windows_audio_checks = RunWindowsAudioSessionRegistryTests();
     const int windows_process_loopback_checks = RunWindowsProcessLoopbackAudioProviderTests();
     const int windows_microphone_checks = RunWindowsMicrophoneAudioProviderTests();
+    const int audio_format_checks = RunAudioFormatConverterTests();
     const int capture_border_checks = RunWindowsCaptureBorderPolicyTests();
     const int recording_checks = RunContinuousRecordingWriterTests();
     const int nvenc_lifecycle_checks = RunNvencInputLifecycleTests();
@@ -776,7 +778,7 @@ int main() {
     std::cout << "FTHRclips_tests: native suites completed ("
               << (checks + amf_checks + qsv_checks + policy_checks + audio_source_checks
                   + windows_audio_checks + windows_process_loopback_checks)
-                  + windows_microphone_checks + capture_border_checks
+                  + windows_microphone_checks + audio_format_checks + capture_border_checks
                   + recording_checks
                   + nvenc_lifecycle_checks
                   + capture_scale_checks

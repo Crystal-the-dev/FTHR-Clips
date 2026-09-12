@@ -417,6 +417,11 @@ namespace fthr {
         // or the frozen Shared Memory v4 boundary.
         std::unique_ptr<WindowsMicrophoneAudioProvider> microphone_audio_source_;
         AudioSourceMetadata               microphone_audio_metadata_;
+        // Process-loopback application stems are opt-in and exist only for
+        // separate-audio generations. The manager owns every provider and is
+        // stopped before the system/microphone audio teardown.
+        std::unique_ptr<WindowsApplicationAudioSourceManager>
+            application_audio_source_manager_;
         // -----------------------------------------------------------------------
         // Continuous recording state
         // -----------------------------------------------------------------------

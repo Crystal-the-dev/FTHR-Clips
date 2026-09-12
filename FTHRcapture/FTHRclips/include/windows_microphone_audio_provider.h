@@ -9,6 +9,7 @@
 #define FTHR_WINDOWS_MICROPHONE_AUDIO_PROVIDER_H
 
 #include "audio_packet_ring.h"
+#include "audio_format_converter.h"
 #include "audio_timeline.h"
 #include "save_clip_task.h"
 
@@ -52,6 +53,8 @@ struct WindowsMicrophoneAudioProviderConfig {
 };
 
 struct WindowsMicrophoneRuntimeInfo {
+    enum class State : uint8_t { Stopped, Starting, Active, Failed };
+    State state = State::Stopped;
     std::wstring active_endpoint_id;
     std::string active_display_name;
     AudioSourceFormat input_format;
@@ -61,6 +64,12 @@ struct WindowsMicrophoneRuntimeInfo {
     uint64_t discontinuity_count = 0;
     uint64_t first_packet_qpc_100ns = 0;
     uint64_t last_packet_qpc_100ns = 0;
+    uint64_t last_packet_end_qpc_100ns = 0;
+    uint64_t converted_frame_count = 0;
+    uint64_t encoded_packet_count = 0;
+    uint64_t encoder_error_count = 0;
+    uint64_t rejected_packet_count = 0;
+    uint64_t largest_no_packet_gap_100ns = 0;
 };
 
 class WindowsMicrophoneAudioProvider {
@@ -74,7 +83,7 @@ public:
     bool Start();
     void Stop();
     bool IsRunning() const;
-    const std::string& last_error() const;
+    std::string last_error() const;
     WindowsMicrophoneRuntimeInfo runtime_info() const;
 
     // A track is returned only when the provider has native AAC history for

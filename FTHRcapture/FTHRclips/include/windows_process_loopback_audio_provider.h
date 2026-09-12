@@ -37,6 +37,29 @@ struct WindowsProcessLoopbackProviderConfig {
     AudioSourceMetadata source;
 };
 
+struct WindowsProcessLoopbackRuntimeInfo {
+    std::string state = "STOPPED";
+    bool admitted = false;
+    uint64_t input_frames = 0;
+    uint64_t packet_count = 0;
+    uint64_t converted_frames = 0;
+    uint64_t submitted_frames = 0;
+    uint64_t encoded_packets = 0;
+    uint64_t encode_failures = 0;
+    uint64_t finalize_failures = 0;
+    uint64_t dropped_blocks = 0;
+    uint64_t no_packet_intervals = 0;
+    uint64_t largest_no_packet_gap_100ns = 0;
+    uint64_t discontinuity_count = 0;
+    uint64_t rejected_packets = 0;
+    uint64_t restart_count = 0;
+    int64_t first_input_qpc_100ns = 0;
+    int64_t last_input_qpc_100ns = 0;
+    int64_t last_submission_qpc_100ns = 0;
+    int64_t last_encoded_qpc_100ns = 0;
+    int64_t largest_gap_100ns = 0;
+};
+
 // Owns one real Windows process-loopback IAudioClient.  It does not create an
 // AAC encoder or replay ring until the common activity gate admits the source,
 // so a merely discovered/silent session cannot become a stored clip stem.
@@ -63,7 +86,8 @@ public:
     void Stop();
     bool IsRunning() const;
     bool HasCapturedAudio() const;
-    const std::string& last_error() const;
+    std::string last_error() const;
+    WindowsProcessLoopbackRuntimeInfo runtime_info() const;
 
     // Returns a contract track only when this provider actually encoded packets
     // overlapping the requested video presentation interval.
@@ -107,6 +131,16 @@ public:
         const WindowsAudioSessionDescriptor& descriptor);
     std::optional<AudioSourceId> RetireRuntimeGroup(
         const std::string& runtime_group_key, int64_t timestamp_100ns);
+    bool HasRuntimeGroup(const std::string& runtime_group_key) const {
+        return runtime_groups_.find(runtime_group_key) != runtime_groups_.end();
+    }
+    // Provider callbacks carry the opaque source UUID, while the registry is
+    // keyed by runtime group. Keep that translation in one tested boundary.
+    std::optional<std::string> RetireSource(
+        const AudioSourceId& id, int64_t timestamp_100ns);
+    bool ShouldRetireRuntimeGroup(const std::string& runtime_group_key,
+                                  int64_t now_100ns) const;
+    void PruneExpired(int64_t now_100ns);
     AudioSourceAdmission ObserveActivity(const AudioSourceId& id, float rms,
                                          int64_t timestamp_100ns);
     void MarkFailed(const AudioSourceId& id);
@@ -115,6 +149,10 @@ public:
         int64_t start_100ns, int64_t end_100ns) const;
     const AudioSourceMetadata* Find(const AudioSourceId& id) const;
     size_t provider_candidate_count() const { return runtime_groups_.size(); }
+    size_t source_count() const { return registry_.source_count(); }
+    uint32_t admitted_count() const {
+        return static_cast<uint32_t>(registry_.admitted_count());
+    }
 
 private:
     uint64_t generation_;
@@ -140,7 +178,32 @@ public:
     void Stop();
     bool available() const;
     WindowsProcessLoopbackCapability capability() const;
-    const std::string& last_error() const;
+    std::string last_error() const;
+
+    struct RuntimeInfo {
+        bool available = false;
+        bool running = false;
+        uint32_t candidate_count = 0;
+        uint32_t retained_provider_count = 0;
+        uint32_t admitted_source_count = 0;
+        uint32_t source_limit = kMaxRetainedAudioSources;
+        uint64_t input_frames = 0;
+        uint64_t packet_count = 0;
+        uint64_t converted_frames = 0;
+        uint64_t submitted_frames = 0;
+        uint64_t encoded_packets = 0;
+        uint64_t encode_failures = 0;
+        uint64_t finalize_failures = 0;
+        uint64_t dropped_blocks = 0;
+        uint64_t no_packet_intervals = 0;
+        uint64_t largest_no_packet_gap_100ns = 0;
+        uint64_t discontinuity_count = 0;
+        uint64_t rejected_packets = 0;
+        uint64_t restart_count = 0;
+        int64_t largest_gap_100ns = 0;
+        uint64_t source_limit_rejections = 0;
+    };
+    RuntimeInfo runtime_info() const;
 
     std::vector<EncodedAudioTrack> TakeTracksForInterval(
         double presentation_start_qpc_s, double presentation_end_qpc_s) const;

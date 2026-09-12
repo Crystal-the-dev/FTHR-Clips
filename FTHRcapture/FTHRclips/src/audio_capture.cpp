@@ -170,9 +170,9 @@ namespace fthr {
         if (!device_id_.empty()) {
             hr = enumerator->GetDevice(device_id_.c_str(), &device);
             if (FAILED(hr)) {
-                std::cerr << "[AudioCapture] Stored device not found, "
-                    << "falling back to default" << std::endl;
-                hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+                std::cerr << "[AudioCapture] Explicit render endpoint unavailable; "
+                    << "no default fallback will be used" << std::endl;
+                return false;
             }
         }
         else {
@@ -210,28 +210,21 @@ namespace fthr {
         FTHR_CHECK_HR(hr, "IAudioClient::GetMixFormat failed");
         mix_format_ = static_cast<void*>(mix_fmt);
 
-        // Step 6: Validate and log format
-        sample_rate_ = mix_fmt->nSamplesPerSec;
-        channels_    = mix_fmt->nChannels;
-
-        const bool is_float = (mix_fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) ||
-            (mix_fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
-                reinterpret_cast<WAVEFORMATEXTENSIBLE*>(mix_fmt)->SubFormat ==
-                KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
-
         std::cout << "[AudioCapture] Device mix format: "
-            << sample_rate_ << "Hz / " << channels_ << "ch / "
-            << mix_fmt->wBitsPerSample << "-bit "
-            << (is_float ? "float" : "integer") << std::endl;
+            << mix_fmt->nSamplesPerSec << "Hz / " << mix_fmt->nChannels << "ch / "
+            << mix_fmt->wBitsPerSample << "-bit" << std::endl;
 
-        if (!is_float || mix_fmt->wBitsPerSample != 32) {
-            // Passing integer endpoint bytes through reinterpret_cast<float*>
-            // used to create corrupt audio. Do not silently do that while the
-            // canonical resampler path is being selected for this generation.
-            std::cerr << "[AudioCapture] Unsupported non-float32 endpoint format; "
+        if (!format_converter_.Initialize(mix_fmt)) {
+            std::cerr << "[AudioCapture] Unsupported WASAPI endpoint format; "
                 << "audio capture is disabled rather than distorted." << std::endl;
             return false;
         }
+        input_sample_rate_ = format_converter_.input_sample_rate();
+        input_channels_ = format_converter_.input_channels();
+        input_bytes_per_frame_ = format_converter_.input_bytes_per_frame();
+        input_sample_format_ = format_converter_.input_sample_format();
+        sample_rate_ = format_converter_.sample_rate();
+        channels_ = format_converter_.channels();
 
         // Step 7: Initialize IAudioClient in loopback event-driven mode
         hr = audio_client->Initialize(
@@ -258,9 +251,12 @@ namespace fthr {
         hr = audio_client->SetEventHandle(evt);
         FTHR_CHECK_HR(hr, "IAudioClient::SetEventHandle failed");
 
-        // Resize silence scratch buffer to match (possibly new) device format.
-        const uint32_t max_silence_frames = (sample_rate_ * 200) / 1000;
+        // Silence is always generated in the canonical replay format.
+        const uint32_t max_silence_frames = (kCanonicalAudioSampleRate * 200) / 1000;
         silence_buf_.assign(static_cast<size_t>(max_silence_frames) * channels_, 0.0f);
+        const uint32_t max_native_silence_frames = (input_sample_rate_ * 200) / 1000;
+        native_silence_buf_.assign(static_cast<size_t>(max_native_silence_frames)
+            * input_bytes_per_frame_, 0);
 
         return true;
     }
@@ -282,18 +278,35 @@ namespace fthr {
         discontinuity_count_.store(0, std::memory_order_relaxed);
         first_packet_qpc_100ns_.store(0, std::memory_order_relaxed);
         last_packet_qpc_100ns_.store(0, std::memory_order_relaxed);
+        last_packet_end_qpc_100ns_.store(0, std::memory_order_relaxed);
+        converted_frame_count_.store(0, std::memory_order_relaxed);
+        encoder_error_count_.store(0, std::memory_order_relaxed);
+        largest_no_packet_gap_100ns_.store(0, std::memory_order_relaxed);
+        silent_packet_count_.store(0, std::memory_order_relaxed);
+        no_packet_interval_count_.store(0, std::memory_order_relaxed);
+        restart_count_.store(0, std::memory_order_relaxed);
+        submitted_frame_count_.store(0, std::memory_order_relaxed);
+        max_observed_drift_samples_.store(0, std::memory_order_relaxed);
+        submitted_frames_ = 0;
+        drift_controller_.Reset();
+        initialize_thread_id_ = std::this_thread::get_id();
 
         std::cout << "[AudioCapture] Initializing WASAPI loopback..." << std::endl;
 
         // COM apartment for this thread (the calling/main thread).
         // RPC_E_CHANGED_MODE = already initialized differently, that's fine.
         HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        initialize_thread_com_owned_ = SUCCEEDED(hr);
         if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
             FTHR_CHECK_HR(hr, "CoInitializeEx failed");
         }
 
         if (!SetupWASAPISession()) {
             TeardownWASAPISession();
+            if (initialize_thread_com_owned_) {
+                CoUninitialize();
+                initialize_thread_com_owned_ = false;
+            }
             return false;
         }
 
@@ -322,6 +335,10 @@ namespace fthr {
             return false;
         }
 
+        // A capture thread can terminate itself after exhausting recovery
+        // attempts. Reap that finished thread before creating a new one.
+        if (capture_thread_.joinable()) capture_thread_.join();
+
         IAudioClient* client = static_cast<IAudioClient*>(audio_client_);
         HRESULT hr = client->Start();
         if (FAILED(hr)) {
@@ -343,15 +360,17 @@ namespace fthr {
     // ===========================================================================
 
     void AudioCapture::Stop() {
-        if (!running_.load()) return;
+        if (running_.load(std::memory_order_acquire)) {
+            running_.store(false, std::memory_order_release);
 
-        running_.store(false, std::memory_order_release);
-
-        // Wake the capture thread if it's blocked on WaitForSingleObject
-        if (buffer_event_) {
-            SetEvent(static_cast<HANDLE>(buffer_event_));
+            // Wake the capture thread if it's blocked on WaitForSingleObject
+            if (buffer_event_) {
+                SetEvent(static_cast<HANDLE>(buffer_event_));
+            }
         }
 
+        // Always reap a thread which already marked itself stopped. This also
+        // makes repeated Stop() calls safe after a failed recovery sequence.
         if (capture_thread_.joinable()) {
             capture_thread_.join();
         }
@@ -370,7 +389,19 @@ namespace fthr {
 
     void AudioCapture::Shutdown() {
         TeardownWASAPISession();
+        if (initialize_thread_com_owned_
+                && std::this_thread::get_id() == initialize_thread_id_) {
+            CoUninitialize();
+            initialize_thread_com_owned_ = false;
+        }
         silence_buf_.clear();
+        native_silence_buf_.clear();
+        converted_samples_.clear();
+        format_converter_.Reset();
+        input_sample_rate_ = 0;
+        input_channels_ = 0;
+        input_bytes_per_frame_ = 0;
+        input_sample_format_ = "unavailable:not_resolved";
         sample_rate_ = 0;
         channels_    = 0;
         ring_        = nullptr;
@@ -388,7 +419,7 @@ namespace fthr {
     //
     // For each packet:
     //   - If AUDCLNT_BUFFERFLAGS_SILENT or data is null: inject silence
-    //   - Otherwise: pass float32 PCM directly to encoder_->EncodeSamples()
+    //   - Otherwise: convert native PCM to canonical float32 before encoding.
     //
     // The encoder accumulates samples into 1024-sample AAC frames, encodes,
     // and fires its callback (AudioRingBuffer::Push) autonomously.
@@ -411,6 +442,7 @@ namespace fthr {
         int  retry_count = 0;
         bool gave_up     = false;
 
+        uint64_t next_timeline_100ns = CurrentAudioTimeline100ns();
         while (running_.load(std::memory_order_relaxed)) {
 
             IAudioCaptureClient* client =
@@ -433,27 +465,41 @@ namespace fthr {
             // clip still has its mandatory compatibility stream. This is not
             // a second clock: synthetic silence only fills measured gaps
             // between QPC-stamped endpoint packets.
-            uint64_t next_timeline_100ns = CurrentAudioTimeline100ns();
-            const auto advance_timeline = [this](uint64_t timestamp, uint32_t frames) {
-                if (sample_rate_ == 0) return timestamp;
+            const auto advance_timeline = [](uint64_t timestamp, uint32_t frames,
+                                             uint32_t rate) {
+                if (rate == 0) return timestamp;
                 return timestamp + (static_cast<uint64_t>(frames) * 10'000'000ULL)
-                    / static_cast<uint64_t>(sample_rate_);
+                    / static_cast<uint64_t>(rate);
             };
-            const auto fill_silence_until = [this, &next_timeline_100ns, &advance_timeline](
-                                               uint64_t end_100ns) {
-                if (end_100ns == 0 || sample_rate_ == 0) return;
-                if (next_timeline_100ns == 0) {
-                    next_timeline_100ns = end_100ns;
-                    return;
+            const auto fill_silence_until = [this, &next_timeline_100ns,
+                                             &device_error](
+                                               uint64_t end_100ns) -> bool {
+                if (end_100ns == 0 || sample_rate_ == 0) return true;
+                // Reuse the same bounded continuity policy as microphone
+                // capture. A zero-frame synthetic endpoint packet lets the
+                // helper measure the gap without inventing a second clock.
+                const auto adjustment = ReconcileAudioTimelinePacket(
+                    next_timeline_100ns, end_100ns, 0, sample_rate_,
+                    sample_rate_, kMaxSyntheticAudioGapSeconds);
+                if (adjustment.large_gap) {
+                    // The AAC ring has no discontinuity marker. Refuse a
+                    // suspend-sized catch-up rather than encoding an
+                    // unbounded silence burst or collapsing resumed PTS.
+                    discontinuity_count_.fetch_add(1, std::memory_order_relaxed);
+                    std::cerr << "[AudioCapture] Synthetic silence gap exceeds "
+                        << kMaxSyntheticAudioGapSeconds
+                        << "s; restarting audio session." << std::endl;
+                    device_error = true;
+                    return false;
                 }
-                if (end_100ns <= next_timeline_100ns) return;
-                const uint64_t frames64 = ((end_100ns - next_timeline_100ns)
-                    * static_cast<uint64_t>(sample_rate_)) / 10'000'000ULL;
-                if (frames64 == 0) return;
-                const uint32_t frames = static_cast<uint32_t>(std::min<uint64_t>(
-                    frames64, static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())));
-                InjectSilence(frames, next_timeline_100ns);
-                next_timeline_100ns = advance_timeline(next_timeline_100ns, frames);
+                if (adjustment.silence_frames > 0
+                        && !InjectSilence(adjustment.silence_frames,
+                                         next_timeline_100ns)) {
+                    device_error = true;
+                    return false;
+                }
+                next_timeline_100ns = adjustment.next_timeline_100ns;
+                return true;
             };
 
             while (running_.load(std::memory_order_relaxed) && !device_error) {
@@ -481,7 +527,8 @@ namespace fthr {
                 // report no packet on both an event wake and a timeout. The
                 // gap is real timeline silence, not a missing source.
                 if (next_packet_size == 0) {
-                    fill_silence_until(CurrentAudioTimeline100ns());
+                    no_packet_interval_count_.fetch_add(1, std::memory_order_relaxed);
+                    if (!fill_silence_until(CurrentAudioTimeline100ns())) break;
                 }
 
                 while (next_packet_size > 0) {
@@ -503,6 +550,9 @@ namespace fthr {
                     if (frames > 0) {
                         const bool is_silent =
                             (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0 || !data;
+                        if (is_silent) {
+                            silent_packet_count_.fetch_add(1, std::memory_order_relaxed);
+                        }
                         const uint64_t packet_qpc = qpc_position != 0
                             ? qpc_position : CurrentAudioTimeline100ns();
                         packet_count_.fetch_add(1, std::memory_order_relaxed);
@@ -513,9 +563,27 @@ namespace fthr {
                         first_packet_qpc_100ns_.compare_exchange_strong(
                             no_packet, packet_qpc, std::memory_order_release,
                             std::memory_order_relaxed);
+                        const uint64_t previous_packet_end_qpc =
+                            last_packet_end_qpc_100ns_.load(std::memory_order_relaxed);
+                        if (previous_packet_end_qpc > 0 && packet_qpc > previous_packet_end_qpc) {
+                            const uint64_t gap = packet_qpc - previous_packet_end_qpc;
+                            uint64_t largest = largest_no_packet_gap_100ns_.load(
+                                std::memory_order_relaxed);
+                            while (gap > largest && !largest_no_packet_gap_100ns_.compare_exchange_weak(
+                                largest, gap, std::memory_order_release,
+                                std::memory_order_relaxed)) {}
+                        }
                         last_packet_qpc_100ns_.store(
                             packet_qpc, std::memory_order_release);
-                        fill_silence_until(packet_qpc);
+                        const uint64_t packet_duration = input_sample_rate_ > 0
+                            ? (static_cast<uint64_t>(frames) * 10'000'000ULL)
+                                / input_sample_rate_ : 0;
+                        last_packet_end_qpc_100ns_.store(
+                            packet_qpc + packet_duration, std::memory_order_release);
+                        if (!fill_silence_until(packet_qpc)) {
+                            client->ReleaseBuffer(frames);
+                            break;
+                        }
 
                         // A packet that arrived while we were maintaining a
                         // silent timeline can overlap the filled boundary by
@@ -523,23 +591,32 @@ namespace fthr {
                         // prefix; never rewind encoder PTS or introduce a
                         // second clock.
                         uint32_t skip_frames = 0;
-                        if (packet_qpc < next_timeline_100ns && sample_rate_ > 0) {
+                        if (packet_qpc < next_timeline_100ns && input_sample_rate_ > 0) {
                             const uint64_t overlap_frames = ((next_timeline_100ns - packet_qpc)
-                                * static_cast<uint64_t>(sample_rate_)) / 10'000'000ULL;
+                                * static_cast<uint64_t>(input_sample_rate_)) / 10'000'000ULL;
                             skip_frames = static_cast<uint32_t>(std::min<uint64_t>(
                                 overlap_frames, frames));
                         }
                         const uint32_t submit_frames = frames - skip_frames;
                         if (submit_frames > 0) {
-                            const uint64_t submit_qpc = advance_timeline(packet_qpc, skip_frames);
+                            const uint64_t submit_qpc = advance_timeline(packet_qpc, skip_frames,
+                                input_sample_rate_);
                             if (is_silent) {
-                                InjectSilence(submit_frames, submit_qpc);
+                                if (!SubmitNativeSamples(nullptr, submit_frames, submit_qpc)) {
+                                    device_error = true;
+                                    client->ReleaseBuffer(frames);
+                                    break;
+                                }
                             } else {
-                                SubmitSamples(reinterpret_cast<const float*>(data)
-                                        + static_cast<size_t>(skip_frames) * channels_,
-                                    submit_frames, submit_qpc);
+                                if (!SubmitNativeSamples(data + static_cast<size_t>(skip_frames)
+                                        * input_bytes_per_frame_, submit_frames, submit_qpc)) {
+                                    device_error = true;
+                                    client->ReleaseBuffer(frames);
+                                    break;
+                                }
                             }
-                            next_timeline_100ns = advance_timeline(submit_qpc, submit_frames);
+                            next_timeline_100ns = advance_timeline(submit_qpc, submit_frames,
+                                input_sample_rate_);
                         }
                     }
 
@@ -591,6 +668,7 @@ namespace fthr {
                         std::cout << "[AudioCapture] WASAPI session restored ("
                             << sample_rate_ << "Hz, " << channels_ << "ch)." << std::endl;
                         retry_count = 0;  // successful recovery resets the counter
+                        restart_count_.fetch_add(1, std::memory_order_relaxed);
                         continue;        // re-enter inner loop with fresh client/evt
                     }
                     std::cerr << "[AudioCapture] IAudioClient::Start failed after recovery." << std::endl;
@@ -629,28 +707,30 @@ namespace fthr {
     // we process it in chunks rather than silently truncating.
     // ===========================================================================
 
-    void AudioCapture::InjectSilence(uint32_t num_frames, uint64_t qpc_100ns) {
-        if ((!ring_ && !encoder_) || num_frames == 0) return;
+    bool AudioCapture::InjectSilence(uint32_t num_frames, uint64_t qpc_100ns) {
+        if ((!ring_ && !encoder_) || num_frames == 0) return num_frames == 0;
 
         const uint64_t ticks_per_frame = (sample_rate_ > 0)
             ? (10000000ULL / static_cast<uint64_t>(sample_rate_)) : 208ULL;
 
         const uint32_t buf_frames =
             static_cast<uint32_t>(silence_buf_.size()) / channels_;
+        if (buf_frames == 0) return false;
         uint32_t remaining = num_frames;
         uint64_t current_qpc = qpc_100ns;
 
         while (remaining > 0) {
             const uint32_t chunk = std::min(remaining, buf_frames);
-            SubmitSamples(silence_buf_.data(), chunk, current_qpc);
+            if (!SubmitSamples(silence_buf_.data(), chunk, current_qpc)) return false;
             current_qpc += static_cast<uint64_t>(chunk) * ticks_per_frame;
             remaining -= chunk;
         }
+        return true;
     }
 
-    void AudioCapture::SubmitSamples(const float* interleaved_data,
+    bool AudioCapture::SubmitSamples(const float* interleaved_data,
         uint32_t frame_count, uint64_t qpc_100ns) {
-        if (!interleaved_data || frame_count == 0) return;
+        if (!interleaved_data || frame_count == 0) return false;
         // Some virtual/device drivers omit pu64QPCPosition. A zero timestamp
         // must not make the persistent AAC ring unsaveable: use the same QPC
         // clock at capture time instead of creating a separate wall clock.
@@ -661,13 +741,60 @@ namespace fthr {
                 expected, qpc_100ns, std::memory_order_release,
                 std::memory_order_relaxed);
         }
-        if (encoder_) {
-            encoder_->EncodeSamples(interleaved_data, frame_count * channels_);
+        bool encoder_ok = true;
+        if (encoder_ && !encoder_->EncodeSamples(interleaved_data, frame_count * channels_)) {
+            encoder_error_count_.fetch_add(1, std::memory_order_relaxed);
+            encoder_ok = false;
         }
         if (ring_) {
             ring_->Push(interleaved_data, frame_count, qpc_100ns);
         }
+        submitted_frames_ += frame_count;
+        submitted_frame_count_.fetch_add(frame_count, std::memory_order_relaxed);
+        return encoder_ok;
     }
 
+    bool AudioCapture::SubmitNativeSamples(const uint8_t* interleaved_data,
+        uint32_t frame_count, uint64_t qpc_100ns) {
+        if (frame_count == 0 || !format_converter_.input_channels())
+            return false;
+        const auto correction = drift_controller_.Observe(qpc_100ns, submitted_frames_);
+        max_observed_drift_samples_.store(
+            drift_controller_.max_observed_drift_samples(), std::memory_order_release);
+        if (correction.sample_delta != 0
+                && correction.compensation_distance_samples > 0
+                && !format_converter_.ApplyDriftCorrection(
+                    correction.sample_delta, correction.compensation_distance_samples)) {
+            std::cerr << "[AudioCapture] Audio drift compensation setup failed" << std::endl;
+            return false;
+        }
+        const uint8_t* input = interleaved_data;
+        if (!input) {
+            const size_t required = static_cast<size_t>(frame_count)
+                * input_bytes_per_frame_;
+            if (native_silence_buf_.size() < required) native_silence_buf_.resize(required);
+            std::fill(native_silence_buf_.begin(),
+                native_silence_buf_.begin() + required, uint8_t{0});
+            input = native_silence_buf_.data();
+        }
+        converted_samples_.clear();
+        if (!format_converter_.Convert(input, frame_count, &converted_samples_)) {
+            std::cerr << "[AudioCapture] WASAPI format conversion failed" << std::endl;
+            return false;
+        }
+        if (!converted_samples_.empty()) {
+            const uint32_t converted_frames = static_cast<uint32_t>(
+                converted_samples_.size() / kCanonicalAudioChannels);
+            const bool submitted = SubmitSamples(converted_samples_.data(),
+                converted_frames, qpc_100ns);
+            converted_frame_count_.fetch_add(converted_frames, std::memory_order_relaxed);
+            if (!submitted) return false;
+        }
+        return true;
+    }
+
+    uint64_t AudioCapture::GetEncodedPacketCount() const {
+        return encoder_ ? encoder_->stats().packets_emitted : 0;
+    }
 
 } // namespace fthr

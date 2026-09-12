@@ -14,6 +14,10 @@ namespace fthr {
 
 inline constexpr uint32_t kCanonicalAudioSampleRate = 48000;
 inline constexpr uint32_t kCanonicalAudioChannels = 2;
+// Synthetic silence is only a bounded continuity repair. A longer gap is
+// treated as a device/session failure by the provider instead of synchronously
+// encoding an unbounded amount of audio on the capture thread.
+inline constexpr uint32_t kMaxSyntheticAudioGapSeconds = 5;
 
 // Converts the process-wide QueryPerformanceCounter clock to 100-nanosecond
 // units. WASAPI's non-zero QPC timestamps are already in this same domain.
@@ -27,6 +31,22 @@ struct AudioSourcePresentationRange {
     int64_t start_pts_samples = 0;
     int64_t end_pts_samples = 0;
 };
+
+struct AudioTimelinePacketAdjustment {
+    uint32_t silence_frames = 0;
+    uint32_t skip_input_frames = 0;
+    uint64_t gap_100ns = 0;
+    uint64_t next_timeline_100ns = 0;
+    bool large_gap = false;
+};
+
+// Computes bounded continuity work for one native endpoint packet. The caller
+// owns the cursor and performs the returned silence insertion/overlap skip.
+AudioTimelinePacketAdjustment ReconcileAudioTimelinePacket(
+    uint64_t next_timeline_100ns, uint64_t packet_qpc_100ns,
+    uint32_t input_frames, uint32_t input_sample_rate,
+    uint32_t canonical_sample_rate = kCanonicalAudioSampleRate,
+    uint32_t max_synthetic_gap_seconds = 5);
 
 AudioSourcePresentationRange MapAudioSourcePresentationRange(
     double presentation_start_qpc_s, double presentation_end_qpc_s,

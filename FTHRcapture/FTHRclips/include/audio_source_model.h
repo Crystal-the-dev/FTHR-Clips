@@ -114,8 +114,9 @@ enum class AudioSourceAdmission : uint8_t {
 };
 
 // Per-generation registry. PID and process handles belong in the Windows
-// provider, not here. The registry retains ended sources until its generation
-// is destroyed, so replay history survives a process exit long enough to save.
+// provider, not here. The registry retains ended sources for the caller's
+// replay window, so process exit history survives long enough to save without
+// growing metadata for the lifetime of a long capture generation.
 class AudioSourceRegistry {
 public:
     explicit AudioSourceRegistry(uint64_t generation,
@@ -124,6 +125,7 @@ public:
     uint64_t generation() const { return generation_; }
     uint32_t limit() const { return limit_; }
     size_t admitted_count() const { return admitted_count_; }
+    size_t source_count() const { return sources_.size(); }
 
     bool Discover(AudioSourceMetadata metadata);
     AudioSourceAdmission ObserveActivity(const AudioSourceId& id,
@@ -131,6 +133,9 @@ public:
                                          int64_t timestamp_100ns);
     void MarkEnded(const AudioSourceId& id, int64_t timestamp_100ns);
     void MarkFailed(const AudioSourceId& id);
+    // Remove ended/failed source metadata after the generation's replay
+    // window. Active and merely discovered sources are never pruned here.
+    uint32_t PruneEndedOlderThan(int64_t cutoff_100ns);
     // Release capacity only after a source is inactive and older than the
     // caller's replay-window cutoff. Its provider/ring may remain alive, so a
     // later audible block can safely re-admit the same runtime source.
@@ -151,6 +156,9 @@ private:
     uint32_t admitted_count_ = 0;
     std::map<AudioSourceId, AudioSourceMetadata> sources_;
     std::map<AudioSourceId, AudioActivityGate> gates_;
+    // Runtime retirement age is deliberately kept out of AudioSourceState so
+    // it cannot leak into the clip manifest or shared-memory contracts.
+    std::map<AudioSourceId, int64_t> terminal_at_100ns_;
 };
 
 // Manifest-safe values are intentionally narrow. The returned value is not a

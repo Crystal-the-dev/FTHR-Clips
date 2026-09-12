@@ -18,12 +18,19 @@ void EncodedAudioPacketRing::SetCodecExtradata(std::vector<uint8_t> codec_extrad
 }
 
 bool EncodedAudioPacketRing::Push(EncodedAudioPacket packet) {
-    if (packet.data.empty() || packet.duration_samples <= 0) return false;
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!packets_.empty() && packet.pts_samples < packets_.back().pts_samples)
+    if (packet.data.empty() || packet.duration_samples <= 0) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++stats_.rejected_empty_packets;
         return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!packets_.empty() && packet.pts_samples < packets_.back().pts_samples) {
+        ++stats_.rejected_regressing_packets;
+        return false;
+    }
     byte_count_ += packet.data.size();
     packets_.push_back(std::move(packet));
+    ++stats_.accepted_packets;
     TrimLocked();
     return true;
 }
@@ -62,6 +69,11 @@ size_t EncodedAudioPacketRing::byte_count() const {
     return byte_count_;
 }
 
+EncodedAudioRingStats EncodedAudioPacketRing::stats() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return stats_;
+}
+
 void EncodedAudioPacketRing::TrimLocked() {
     if (packets_.empty()) return;
     const int64_t newest = packets_.back().pts_samples + packets_.back().duration_samples;
@@ -71,6 +83,7 @@ void EncodedAudioPacketRing::TrimLocked() {
         if (packet.pts_samples + packet.duration_samples > oldest_allowed) break;
         byte_count_ -= packet.data.size();
         packets_.pop_front();
+        ++stats_.trimmed_packets;
     }
 }
 

@@ -73,6 +73,8 @@ void EndedHistorySurvivesAndGenerationDoesNotMix() {
     first_generation.MarkEnded(discord.identity.id, 1200);
     CheckAudio(first_generation.SourcesForInterval(900, 1250).size() == 1,
         "exited source remains available for its replay interval");
+    CheckAudio(first_generation.SourcesForInterval(1150, 1250).empty(),
+        "provider retirement time does not fabricate audible history after the last packet");
 
     fthr::AudioSourceRegistry next_generation(8);
     CheckAudio(next_generation.SourcesForInterval(900, 1250).empty(),
@@ -117,6 +119,14 @@ void EncodedPacketRingIsBoundedAndSnapshotsOverlap() {
     CheckAudio(snapshot.codec_extradata.size() == 2
                    && snapshot.first_pts_samples < 48000 * 3,
         "snapshot carries codec configuration and overlapping packets");
+    CheckAudio(!ring.Push({{}, 123, 1024}),
+        "empty AAC packet is rejected");
+    CheckAudio(!ring.Push({std::vector<uint8_t>(4, 0xB6), 1, 1024}),
+        "regressing AAC packet is rejected");
+    const auto stats = ring.stats();
+    CheckAudio(stats.accepted_packets > 0 && stats.rejected_empty_packets == 1
+                   && stats.rejected_regressing_packets == 1,
+        "AAC ring exposes rejection counters for diagnostics");
 }
 
 void PairedPublicationProtectsTheManifestContract() {

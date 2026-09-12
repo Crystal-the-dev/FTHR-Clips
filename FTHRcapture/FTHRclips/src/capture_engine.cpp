@@ -908,13 +908,15 @@ namespace fthr {
         if (!config.audio_enabled) {
             std::cout << "[CaptureEngine] Audio capture disabled by user settings." << std::endl;
         }
-        else do {
+        else {
+        do {
             AudioCaptureConfig audio_cfg;
             audio_cfg.bitrate_kbps = 128;
 
             if (!audio_capture_.Initialize(nullptr, audio_cfg)) {
                 std::cerr << "[CaptureEngine] AudioCapture init failed - "
                     << "audio disabled" << std::endl;
+                audio_capture_.Shutdown();
                 break;
             }
 
@@ -989,6 +991,8 @@ namespace fthr {
                 << "persistent AAC packet replay)"
                 << std::endl;
 
+        } while (false);
+
             std::string microphone_uuid;
             std::string microphone_uuid_error;
             if (!CreateAudioManifestTransactionId(&microphone_uuid, &microphone_uuid_error)) {
@@ -1026,7 +1030,7 @@ namespace fthr {
                     std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"audio\","
                               << "\"event\":\"microphone_initialized\","
                               << "\"state\":\"FAILED\","
-                              << "\"error_code\":\"AUDIO_MIC_INIT_FAILED\","
+                              << "\"error_code\":\"MIC_INIT_FAILED\","
                               << "\"endpoint\":"
                               << "\"unavailable:provider_start_failed\","
                               << "\"detail\":\""
@@ -1041,14 +1045,48 @@ namespace fthr {
                 }
             }
 
-            // Per-application stems are retired. The capture contract is one
-            // system loopback stream plus one microphone stream.
-            std::cout << "[CaptureEngine] Audio routing: system mix + microphone."
+            if (separate_audio_enabled_) {
+                application_audio_source_manager_ =
+                    std::make_unique<WindowsApplicationAudioSourceManager>(
+                        capture_generation_.load(std::memory_order_relaxed) + 1,
+                        buffer_seconds_);
+                if (!application_audio_source_manager_->Start()) {
+                    const auto capability = application_audio_source_manager_->capability();
+                    const std::string detail = application_audio_source_manager_->last_error();
+                    std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"audio\","
+                              << "\"event\":\"application_audio_initialized\","
+                              << "\"state\":\"UNAVAILABLE\","
+                              << "\"error_code\":"
+                              << (capability.api_build_supported
+                                  ? "\"PROCESS_AUDIO_INIT_FAILED\""
+                                  : "\"AUDIO_PROCESS_LOOPBACK_UNSUPPORTED\"")
+                              << ",\"os_build\":" << capability.os_build
+                              << ",\"detail\":\""
+                              << diagnostics::JsonEscape(detail.empty()
+                                  ? "Windows 11 process loopback is unavailable"
+                                  : detail)
+                              << "\"}" << std::endl;
+                    application_audio_source_manager_.reset();
+                } else {
+                    std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"audio\","
+                              << "\"event\":\"application_audio_initialized\","
+                              << "\"state\":\"STARTING\","
+                              << "\"error_code\":null}"
+                              << std::endl;
+                }
+            }
+            std::cout << "[CaptureEngine] Audio routing: system mix + microphone"
+                      << (application_audio_source_manager_
+                          ? " + application stems."
+                          : (separate_audio_enabled_
+                              ? " (application stems unavailable)."
+                              : "."))
                       << std::endl;
 
-        } while (false);
+        }
 
-        if (!audio_active_) {
+        if (!audio_active_ && !microphone_audio_source_
+                && !application_audio_source_manager_) {
             std::cout << "[CaptureEngine] Running in video-only mode." << std::endl;
         }
 
@@ -1103,18 +1141,19 @@ namespace fthr {
                       << "\"event\":\"system_audio_initialized\","
                       << "\"state\":\"" << (audio_active_ ? "READY" : "FAILED")
                       << "\",\"error_code\":"
-                      << (audio_active_ ? "null" : "\"AUDIO_OUTPUT_INIT_FAILED\"")
+                       << (audio_active_ ? "null" : "\"SYSTEM_AUDIO_INIT_FAILED\"")
                       << ",\"endpoint\":\""
                       << diagnostics::JsonEscape(audio_capture_.GetFriendlyName())
                       << "\",\"requested_sample_rate\":"
                       << audio_capture_.GetRequestedSampleRate()
-                      << ",\"actual_sample_rate\":" << audio_capture_.GetSampleRate()
+                       << ",\"actual_sample_rate\":" << audio_capture_.GetInputSampleRate()
                       << ",\"requested_channels\":"
                       << audio_capture_.GetRequestedChannels()
-                      << ",\"actual_channels\":" << audio_capture_.GetChannels()
-                      << ",\"sample_format\":"
-                      << (audio_active_ ? "\"float32\""
-                                        : "\"unavailable:initialization_failed\"")
+                       << ",\"actual_channels\":" << audio_capture_.GetInputChannels()
+                       << ",\"sample_format\":\""
+                       << diagnostics::JsonEscape(audio_active_
+                           ? audio_capture_.GetInputSampleFormat()
+                           : "unavailable:initialization_failed") << "\""
                       << "}"
                       << std::endl;
             if (microphone_audio_source_) {
@@ -1165,7 +1204,7 @@ namespace fthr {
             || save_clip_thread_
             || device_ || context_ || wgc_state_
             || replay_encoder_ || audio_active_ || nvenc_device_
-            || nvenc_context_ || record_writer_;
+            || nvenc_context_ || record_writer_ || application_audio_source_manager_;
         if (!has_resources) return;
 
         std::cout << "[CaptureEngine] Shutting down..." << std::endl;
@@ -1214,10 +1253,24 @@ namespace fthr {
         //   1. Stop WASAPI thread (no more EncodeSamples calls after this)
         //   2. Finalize encoder (flushes partial AAC frame)
         //   3. compressed packet ring is released with the generation
+        if (application_audio_source_manager_) {
+            // Application providers can still be submitting AAC packets. Stop
+            // and join their monitor/providers before touching any audio state.
+            application_audio_source_manager_->Stop();
+            application_audio_source_manager_.reset();
+        }
         if (audio_active_) {
             microphone_audio_source_.reset();
             audio_capture_.Stop();
-            default_mix_audio_encoder_.Finalize();
+            if (!default_mix_audio_encoder_.Finalize()) {
+                std::cerr << "[CaptureEngine] Default Mix AAC finalization failed"
+                          << std::endl;
+                std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"audio\","
+                             "\"event\":\"encoder_finalize_failed\","
+                             "\"state\":\"FAILED\","
+                             "\"error_code\":\"AUDIO_ENCODER_FAILED\","
+                             "\"source\":\"system_audio\"}" << std::endl;
+            }
             audio_capture_.Shutdown();
             default_mix_audio_ring_.reset();
             default_mix_audio_source_ = {};
@@ -1334,13 +1387,53 @@ namespace fthr {
                           << std::endl;
 
                 if (audio_active_) {
+                    const uint64_t system_packets = audio_capture_.GetPacketCount();
+                    const uint64_t system_discontinuities =
+                        audio_capture_.GetDiscontinuityCount();
                     std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"audio\","
                               << "\"event\":\"audio_health_snapshot\","
                               << "\"source\":\"system_audio\","
-                              << "\"packet_count\":"
-                              << audio_capture_.GetPacketCount() << ','
+                              << "\"state\":\""
+                              << (system_packets == 0 ? "NO_PACKETS" : "ACTIVE") << "\","
+                              << "\"error_code\":"
+                              << (system_packets == 0
+                                  ? "\"SYSTEM_AUDIO_NO_PACKETS\""
+                                  : (system_discontinuities > 0
+                                      ? "\"AUDIO_PACKET_DISCONTINUITY\"" : "null")) << ','
+                              << "\"endpoint\":\""
+                              << diagnostics::JsonEscape(audio_capture_.GetFriendlyName())
+                              << "\",\"actual_sample_rate\":"
+                              << audio_capture_.GetInputSampleRate()
+                              << ",\"actual_channels\":"
+                              << audio_capture_.GetInputChannels()
+                              << ",\"actual_sample_format\":\""
+                              << diagnostics::JsonEscape(audio_capture_.GetInputSampleFormat())
+                              << "\",\"internal_sample_rate\":"
+                              << audio_capture_.GetSampleRate()
+                              << ",\"internal_channels\":"
+                              << audio_capture_.GetChannels()
+                              << ",\"internal_sample_format\":\"float32\","
+                              << "\"packet_count\":" << system_packets << ','
                               << "\"discontinuity_count\":"
-                              << audio_capture_.GetDiscontinuityCount() << ','
+                              << system_discontinuities << ','
+                              << "\"silent_packet_count\":"
+                              << audio_capture_.GetSilentPacketCount() << ','
+                              << "\"no_packet_intervals\":"
+                              << audio_capture_.GetNoPacketIntervalCount() << ','
+                              << "\"converted_frames\":"
+                              << audio_capture_.GetConvertedFrameCount() << ','
+                              << "\"submitted_frames\":"
+                              << audio_capture_.GetSubmittedFrameCount() << ','
+                              << "\"encoded_packets\":"
+                              << audio_capture_.GetEncodedPacketCount() << ','
+                              << "\"encoder_errors\":"
+                              << audio_capture_.GetEncoderErrorCount() << ','
+                              << "\"largest_no_packet_gap_100ns\":"
+                              << audio_capture_.GetLargestNoPacketGap100ns() << ','
+                              << "\"max_drift_samples\":"
+                              << audio_capture_.GetMaxObservedDriftSamples() << ','
+                              << "\"restart_count\":"
+                              << audio_capture_.GetRestartCount() << ','
                               << "\"underrun_count\":"
                               << "\"unavailable:not_exposed_by_wasapi_capture\","
                               << "\"first_packet_timestamp_100ns\":"
@@ -1360,9 +1453,12 @@ namespace fthr {
                                       ? "NO_PACKETS" : "ACTIVE")) << "\","
                               << "\"error_code\":"
                               << (microphone.failed
-                                  ? "\"AUDIO_MIC_INIT_FAILED\""
+                                  ? "\"MIC_INIT_FAILED\""
                                   : (microphone.packet_count == 0
-                                      ? "\"AUDIO_NO_PACKETS\"" : "null")) << ','
+                                      ? "\"MIC_NO_PACKETS\""
+                                      : (microphone.discontinuity_count > 0
+                                          ? "\"AUDIO_PACKET_DISCONTINUITY\""
+                                          : "null"))) << ','
                               << "\"endpoint\":\""
                               << diagnostics::JsonEscape(
                                      microphone.active_display_name.empty()
@@ -1379,8 +1475,18 @@ namespace fthr {
                                      microphone.input_format.sample_format)
                               << "\","
                               << "\"packet_count\":" << microphone.packet_count << ','
+                              << "\"converted_frames\":"
+                              << microphone.converted_frame_count << ','
+                              << "\"encoded_packets\":"
+                              << microphone.encoded_packet_count << ','
+                              << "\"encoder_errors\":"
+                              << microphone.encoder_error_count << ','
+                              << "\"rejected_packets\":"
+                              << microphone.rejected_packet_count << ','
                               << "\"discontinuity_count\":"
                               << microphone.discontinuity_count << ','
+                              << "\"largest_no_packet_gap_100ns\":"
+                              << microphone.largest_no_packet_gap_100ns << ','
                               << "\"underrun_count\":"
                               << "\"unavailable:not_exposed_by_wasapi_capture\","
                               << "\"first_packet_timestamp_100ns\":"
@@ -1683,13 +1789,14 @@ namespace fthr {
                 task.video_qpc_epoch, task.video_qpc_freq);
 
             // Snapshot the persistent AAC packet ring against the exact video
-            // presentation interval. Audio PTS are sample positions relative
-            // to the first timestamped WASAPI packet in this generation.
+            // presentation interval. Every provider maps that interval through
+            // its own QPC origin, so a missing Default Mix never suppresses a
+            // valid microphone or process-loopback stem.
+            const double start_qpc_s = task.encoded_snapshot.presentation_start_qpc_s;
+            const double end_qpc_s = task.encoded_snapshot.presentation_end_qpc_s;
             if (audio_active_ && default_mix_audio_ring_
                     && !audio_capture_.IsDeviceLost()) {
                 const uint64_t origin_qpc = audio_capture_.GetTimelineOriginQpc100ns();
-                const double start_qpc_s = task.encoded_snapshot.presentation_start_qpc_s;
-                const double end_qpc_s = task.encoded_snapshot.presentation_end_qpc_s;
                 const uint32_t sample_rate = audio_capture_.GetSampleRate();
                 if (origin_qpc > 0 && start_qpc_s > 0.0 && end_qpc_s > start_qpc_s
                         && sample_rate > 0) {
@@ -1721,16 +1828,6 @@ namespace fthr {
                                 default_mix_track.snapshot.last_pts_samples,
                                 sample_rate);
                         task.encoded_audio_tracks.push_back(std::move(default_mix_track));
-                        if (microphone_audio_source_) {
-                            if (const auto microphone_track =
-                                    microphone_audio_source_->TakeTrackForInterval(
-                                        start_qpc_s, end_qpc_s, microphone_audio_metadata_)) {
-                                task.encoded_audio_tracks.push_back(*microphone_track);
-                            } else if (!microphone_audio_source_->last_error().empty()) {
-                                std::cerr << "[SaveClip] Native microphone unavailable: "
-                                    << microphone_audio_source_->last_error() << std::endl;
-                            }
-                        }
                         std::cout << "[SaveClip] Persistent AAC snapshot: "
                             << task.encoded_audio_snapshot.packets.size()
                             << " packets, PTS " << start_pts << " - " << end_pts
@@ -1748,6 +1845,59 @@ namespace fthr {
             }
             else if (audio_active_ && audio_capture_.IsDeviceLost()) {
                 std::cerr << "[SaveClip] Audio device lost - saving clip without audio" << std::endl;
+            }
+
+            if (start_qpc_s > 0.0 && end_qpc_s > start_qpc_s) {
+                if (microphone_audio_source_) {
+                    if (const auto microphone_track =
+                            microphone_audio_source_->TakeTrackForInterval(
+                                start_qpc_s, end_qpc_s, microphone_audio_metadata_)) {
+                        task.encoded_audio_tracks.push_back(*microphone_track);
+                    } else {
+                        const std::string detail = microphone_audio_source_->last_error();
+                        if (!detail.empty()) {
+                            std::cerr << "[SaveClip] Native microphone unavailable: "
+                                      << detail << std::endl;
+                        }
+                    }
+                }
+                if (separate_audio_enabled_ && application_audio_source_manager_) {
+                    const auto application_tracks =
+                        application_audio_source_manager_->TakeTracksForInterval(
+                            start_qpc_s, end_qpc_s);
+                    for (const auto& application_track : application_tracks)
+                        task.encoded_audio_tracks.push_back(application_track);
+                    const auto application_info =
+                        application_audio_source_manager_->runtime_info();
+                    std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"audio\","
+                              << "\"event\":\"application_audio_snapshot\","
+                              << "\"state\":\"SNAPSHOTTED\","
+                              << "\"track_count\":" << application_tracks.size()
+                              << ",\"candidate_count\":"
+                              << application_info.candidate_count
+                              << ",\"packet_count\":" << application_info.packet_count
+                              << ",\"admitted_source_count\":"
+                              << application_info.admitted_source_count
+                              << ",\"encoded_packets\":"
+                              << application_info.encoded_packets
+                              << ",\"encode_failures\":"
+                              << application_info.encode_failures
+                              << ",\"finalize_failures\":"
+                              << application_info.finalize_failures
+                              << ",\"dropped_blocks\":"
+                              << application_info.dropped_blocks
+                              << ",\"no_packet_intervals\":"
+                              << application_info.no_packet_intervals
+                              << ",\"largest_no_packet_gap_100ns\":"
+                              << application_info.largest_no_packet_gap_100ns
+                              << ",\"discontinuities\":"
+                              << application_info.discontinuity_count
+                              << ",\"source_limit_rejections\":"
+                              << application_info.source_limit_rejections
+                              << ",\"largest_gap_100ns\":"
+                              << application_info.largest_gap_100ns << "}"
+                              << std::endl;
+                }
             }
 
             const uint32_t diagnostic_task_id = task.task_id;

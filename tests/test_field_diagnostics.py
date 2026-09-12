@@ -301,6 +301,25 @@ def test_failure_events_keep_subsystem_classification_and_detail(
     assert record['fields']['detail'] == 'injected deterministic failure'
 
 
+def test_stage6_audio_error_taxonomy_is_stable():
+    expected = {
+        'SYSTEM_AUDIO_INIT_FAILED',
+        'SYSTEM_AUDIO_NO_PACKETS',
+        'MIC_INIT_FAILED',
+        'MIC_NO_PACKETS',
+        'AUDIO_ENDPOINT_NOT_FOUND',
+        'AUDIO_ENDPOINT_SCAN_TIMEOUT',
+        'AUDIO_DEVICE_INVALIDATED',
+        'AUDIO_FORMAT_UNSUPPORTED',
+        'AUDIO_RESAMPLE_FAILED',
+        'AUDIO_ENCODER_FAILED',
+        'AUDIO_PACKET_DISCONTINUITY',
+        'PROCESS_AUDIO_INIT_FAILED',
+        'PROCESS_AUDIO_SOURCE_LIMIT',
+    }
+    assert {DiagnosticError[name].value for name in expected} == expected
+
+
 def test_native_event_updates_actual_configuration_and_adapter_chain(tmp_path):
     session = DiagnosticSession('test', root=tmp_path).start()
     try:

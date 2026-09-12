@@ -104,12 +104,16 @@ void ExitRestartFailureAndGenerationHistoryStayIsolated() {
             "30000000-0000-4000-8000-000000000002"}));
     const auto first = coordinator.Discover(Session("spotify#99", 99, "spotify", "Spotify"));
     CheckProcessLoopback(first.has_value(), "Spotify source is discoverable on supported Windows");
+    CheckProcessLoopback(coordinator.HasRuntimeGroup("spotify#99"),
+        "a discovered runtime group remains addressable until it is retired");
     coordinator.ObserveActivity(first->source.identity.id, 0.020f, 1000);
     coordinator.ObserveActivity(first->source.identity.id, 0.020f, 1100);
     const auto retired = coordinator.RetireRuntimeGroup("spotify#99", 1200);
     CheckProcessLoopback(retired && *retired == first->source.identity.id
             && coordinator.SourcesForInterval(900, 1250).size() == 1,
         "source exit retires only its runtime group while retaining replay history");
+    CheckProcessLoopback(!coordinator.HasRuntimeGroup("spotify#99"),
+        "retired runtime groups cannot keep an inactive provider candidate alive");
     const auto restart = coordinator.Discover(Session("spotify#99", 199, "spotify", "Spotify"));
     CheckProcessLoopback(restart && !(restart->source.identity.id == first->source.identity.id),
         "a restarted root-PID group receives a fresh source instead of unsafe name-only merging");
@@ -121,6 +125,62 @@ void ExitRestartFailureAndGenerationHistoryStayIsolated() {
         4, supported, Generator({"40000000-0000-4000-8000-000000000001"}));
     CheckProcessLoopback(next_generation.SourcesForInterval(900, 1250).empty(),
         "capture generations never inherit prior application identities or history");
+}
+
+void SourceRetirementByOpaqueIdUsesTheRuntimeGroupKey() {
+    fthr::WindowsProcessLoopbackCapability supported{22631, true, false};
+    fthr::WindowsApplicationSourceCoordinator coordinator(
+        31, supported, Generator({
+            "31000000-0000-4000-8000-000000000001"}));
+    const auto source = coordinator.Discover(
+        Session("game#31", 31, "game", "Game"));
+    CheckProcessLoopback(source.has_value(), "source is discoverable for id retirement");
+    coordinator.ObserveActivity(source->source.identity.id, 0.02f, 100);
+    coordinator.ObserveActivity(source->source.identity.id, 0.02f, 200);
+
+    const auto retired = coordinator.RetireSource(source->source.identity.id, 300);
+    CheckProcessLoopback(retired && *retired == "game#31",
+        "retirement resolves the opaque source id back to its runtime group");
+    CheckProcessLoopback(coordinator.provider_candidate_count() == 0
+            && coordinator.SourcesForInterval(0, 400).size() == 1,
+        "retirement removes only the active group while preserving replay history");
+}
+
+void InactiveSourcePruningIsBoundedToTheReplayWindow() {
+    fthr::WindowsProcessLoopbackCapability supported{22631, true, false};
+    fthr::WindowsApplicationSourceCoordinator coordinator(
+        32, supported, Generator({
+            "32000000-0000-4000-8000-000000000001",
+            "32000000-0000-4000-8000-000000000002"}), 2, 1);
+    const auto stale = coordinator.Discover(
+        Session("stale#1", 1, "stale", "Stale"));
+    const auto current = coordinator.Discover(
+        Session("current#2", 2, "current", "Current"));
+    CheckProcessLoopback(stale && current, "sources are discoverable before pruning");
+    coordinator.ObserveActivity(stale->source.identity.id, 0.02f, 100);
+    coordinator.ObserveActivity(stale->source.identity.id, 0.02f, 200);
+    coordinator.RetireRuntimeGroup("stale#1", 300);
+
+    coordinator.PruneExpired(20'000'000);
+    CheckProcessLoopback(coordinator.Find(stale->source.identity.id) == nullptr,
+        "ended source metadata is removed after the replay retention window");
+    CheckProcessLoopback(coordinator.Find(current->source.identity.id) != nullptr,
+        "current source metadata remains available while its generation is active");
+}
+
+void TimelineDiscontinuityDoesNotCreateUnboundedSilenceWork() {
+    const auto first = fthr::ReconcileAudioTimelinePacket(
+        0, 10'000'000, 480, 48'000, 48'000, 5);
+    CheckProcessLoopback(first.next_timeline_100ns == 10'100'000,
+        "the first process-loopback packet establishes a bounded timeline cursor");
+    const auto bounded = fthr::ReconcileAudioTimelinePacket(
+        first.next_timeline_100ns, 11'100'000, 480, 48'000, 48'000, 5);
+    CheckProcessLoopback(!bounded.large_gap && bounded.silence_frames == 4800,
+        "a short process-loopback gap produces bounded synthetic silence");
+    const auto suspended = fthr::ReconcileAudioTimelinePacket(
+        bounded.next_timeline_100ns, 70'000'000, 480, 48'000, 48'000, 5);
+    CheckProcessLoopback(suspended.large_gap && suspended.silence_frames == 0,
+        "a suspend-sized process-loopback gap is classified instead of encoded wholesale");
 }
 
 void SourceLimitAndTrackContractRemainBounded() {
@@ -248,6 +308,9 @@ int RunWindowsProcessLoopbackAudioProviderTests() {
     CapabilityGateDoesNotAttemptWindows10Sources();
     DiscoveryActivityAndSilentFilteringUseTheCommonModel();
     ExitRestartFailureAndGenerationHistoryStayIsolated();
+    SourceRetirementByOpaqueIdUsesTheRuntimeGroupKey();
+    InactiveSourcePruningIsBoundedToTheReplayWindow();
+    TimelineDiscontinuityDoesNotCreateUnboundedSilenceWork();
     SourceLimitAndTrackContractRemainBounded();
     ExpiredReplayHistoryReleasesAnApplicationSlot();
     EightApplicationStemBoundaryIsExplicit();

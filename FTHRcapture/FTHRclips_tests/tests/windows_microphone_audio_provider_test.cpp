@@ -71,6 +71,35 @@ void ExplicitEndpointIdentityIsNotManifestIdentity() {
         "a selected endpoint is runtime-only while the portable source remains semantic");
 }
 
+void TimelineContinuityBoundsGapAndOverlap() {
+    const auto first = fthr::ReconcileAudioTimelinePacket(
+        0, 10'000'000, 480, 48000);
+    CheckMicrophone(first.silence_frames == 0 && first.skip_input_frames == 0
+        && first.next_timeline_100ns == 10'100'000,
+        "first packet establishes its native-duration timeline end");
+    const auto gap = fthr::ReconcileAudioTimelinePacket(
+        first.next_timeline_100ns, 11'100'000, 480, 48000);
+    CheckMicrophone(gap.silence_frames == 4800 && gap.gap_100ns == 1'000'000
+        && gap.next_timeline_100ns == 11'200'000,
+        "temporary packet gap becomes bounded canonical silence");
+    const auto overlap = fthr::ReconcileAudioTimelinePacket(
+        gap.next_timeline_100ns, 11'150'000, 480, 48000);
+    CheckMicrophone(overlap.skip_input_frames == 240
+        && overlap.next_timeline_100ns == 11'250'000,
+        "overlapping packet prefix is dropped without rewinding the timeline");
+    const auto bounded = fthr::ReconcileAudioTimelinePacket(
+        gap.next_timeline_100ns, 61'200'000, 480, 48000);
+    CheckMicrophone(!bounded.large_gap && bounded.silence_frames == 240'000
+            && bounded.next_timeline_100ns == 61'300'000,
+        "five-second continuity repair stays bounded at the configured limit");
+    const auto large = fthr::ReconcileAudioTimelinePacket(
+        gap.next_timeline_100ns, 70'000'000, 480, 48000);
+    CheckMicrophone(large.large_gap && large.silence_frames == 0
+            && large.next_timeline_100ns == gap.next_timeline_100ns,
+        "large gaps preserve the cursor for explicit failure/restart instead "
+            "of creating unbounded work or collapsing media time");
+}
+
 }  // namespace
 
 int RunWindowsMicrophoneAudioProviderTests() {
@@ -78,6 +107,7 @@ int RunWindowsMicrophoneAudioProviderTests() {
     EncoderDelayStaysSignedInManifestTimeline();
     DriftCorrectionIsSmallAndBounded();
     ExplicitEndpointIdentityIsNotManifestIdentity();
+    TimelineContinuityBoundsGapAndOverlap();
     std::cout << "AUDIT-050 Windows microphone provider tests: "
               << microphone_checks << " checks passed" << std::endl;
     return microphone_checks;

@@ -205,12 +205,36 @@ struct WindowsProcessLoopbackAudioProvider::Impl {
     std::thread thread;
     HANDLE stop_event = nullptr;
     std::atomic<bool> running{false};
+    std::atomic<bool> failed{false};
     std::atomic<uint64_t> timeline_origin_100ns{0};
     mutable std::mutex state_mutex;
     std::string error;
     std::unique_ptr<AudioEncoder> encoder;
     std::unique_ptr<EncodedAudioPacketRing> ring;
     std::atomic<bool> admitted{false};
+    std::atomic<uint64_t> input_frames{0};
+    std::atomic<uint64_t> packet_count{0};
+    std::atomic<uint64_t> converted_frames{0};
+    std::atomic<uint64_t> submitted_frames{0};
+    std::atomic<uint64_t> encoded_packets{0};
+    std::atomic<uint64_t> encode_failures{0};
+    std::atomic<uint64_t> finalize_failures{0};
+    std::atomic<uint64_t> dropped_blocks{0};
+    std::atomic<uint64_t> no_packet_intervals{0};
+    std::atomic<uint64_t> largest_no_packet_gap_100ns{0};
+    std::atomic<uint64_t> last_packet_qpc_100ns{0};
+    std::atomic<uint64_t> last_packet_end_qpc_100ns{0};
+    std::atomic<uint64_t> discontinuity_count{0};
+    std::atomic<uint64_t> rejected_packets{0};
+    std::atomic<uint64_t> restart_count{0};
+    std::atomic<int64_t> first_input_qpc_100ns{0};
+    std::atomic<int64_t> last_input_qpc_100ns{0};
+    std::atomic<int64_t> last_submission_qpc_100ns{0};
+    std::atomic<int64_t> last_encoded_qpc_100ns{0};
+    std::atomic<int64_t> largest_gap_100ns{0};
+    std::atomic<bool> ended_notified{false};
+    std::atomic<bool> failure_notified{false};
+    uint64_t previous_input_qpc_100ns = 0;
     uint64_t next_timeline_100ns = 0;
     std::array<float, 4800 * kCanonicalChannels> silence{};
 
@@ -224,6 +248,15 @@ struct WindowsProcessLoopbackAudioProvider::Impl {
     void SetError(std::string value) {
         std::lock_guard<std::mutex> lock(state_mutex);
         error = std::move(value);
+    }
+
+    void ReportFailure(std::string value) {
+        SetError(std::move(value));
+        failed.store(true, std::memory_order_release);
+        if (!failure_notified.exchange(true, std::memory_order_acq_rel)
+                && on_failure) {
+            on_failure(config.source.identity.id);
+        }
     }
 
     bool OpenSession(ProcessLoopbackSession* session) {
@@ -348,10 +381,13 @@ struct WindowsProcessLoopbackAudioProvider::Impl {
         return true;
     }
 
-    void EnsureEncoder(uint64_t first_qpc_100ns) {
-        if (admitted.load(std::memory_order_acquire) || pending.empty()) return;
+    bool EnsureEncoder(uint64_t first_qpc_100ns) {
+        if (admitted.load(std::memory_order_acquire) || pending.empty()) return true;
         const uint64_t origin = first_qpc_100ns > 0 ? first_qpc_100ns : pending.front().qpc_100ns;
-        if (origin == 0) return;
+        if (origin == 0) {
+            ReportFailure("process-loopback source received no usable capture timestamp");
+            return false;
+        }
         auto new_ring = std::make_unique<EncodedAudioPacketRing>(
             config.source.identity.id, config.generation,
             AudioSourceFormat{kCanonicalSampleRate, kCanonicalChannels, "fltp"},
@@ -359,80 +395,149 @@ struct WindowsProcessLoopbackAudioProvider::Impl {
         auto new_encoder = std::make_unique<AudioEncoder>();
         if (!new_encoder->Initialize(kCanonicalSampleRate, kCanonicalChannels,
                 config.bitrate_kbps,
-                [ring = new_ring.get()](const uint8_t* data, uint32_t size, int64_t pts) {
-                    ring->Push({std::vector<uint8_t>(data, data + size), pts, 1024});
+                [this, ring = new_ring.get()](const uint8_t* data, uint32_t size, int64_t pts) {
+                    if (!ring->Push({std::vector<uint8_t>(data, data + size), pts, 1024})) {
+                        rejected_packets.fetch_add(1, std::memory_order_relaxed);
+                        return;
+                    }
+                    encoded_packets.fetch_add(1, std::memory_order_relaxed);
+                    last_encoded_qpc_100ns.store(
+                        last_submission_qpc_100ns.load(std::memory_order_relaxed),
+                        std::memory_order_relaxed);
                 })) {
-            SetError("process-loopback AAC encoder initialization failed");
-            if (on_failure) on_failure(config.source.identity.id);
+            ReportFailure("process-loopback AAC encoder initialization failed");
             pending.clear();
-            return;
+            return false;
         }
         new_ring->SetCodecExtradata(new_encoder->GetExtradata());
-        timeline_origin_100ns.store(origin, std::memory_order_release);
         {
             std::lock_guard<std::mutex> lock(state_mutex);
             ring = std::move(new_ring);
+            encoder = std::move(new_encoder);
         }
-        encoder = std::move(new_encoder);
+        // Publish readiness only after both owned objects are installed. Save
+        // and diagnostic readers acquire the origin before touching either
+        // pointer, so they cannot observe a half-initialized provider.
+        timeline_origin_100ns.store(origin, std::memory_order_release);
         admitted.store(true, std::memory_order_release);
         next_timeline_100ns = origin;
         for (const auto& block : pending) {
-            EncodeAligned(block.samples.data(), block.frames, block.qpc_100ns);
+            if (!EncodeAligned(block.samples.data(), block.frames, block.qpc_100ns)) {
+                pending.clear();
+                return false;
+            }
         }
         pending.clear();
+        return true;
     }
 
     uint64_t AdvanceTimeline(uint64_t timestamp_100ns, uint64_t frames) const {
         return timestamp_100ns + (frames * 10'000'000ULL) / kCanonicalSampleRate;
     }
 
-    void EncodeSilence(uint64_t frames) {
-        if (!encoder || frames == 0) return;
+    bool EncodeSilence(uint64_t frames) {
+        if (!encoder || frames == 0) return true;
         constexpr uint32_t chunk_frames = 4800;
         while (frames > 0) {
             const uint32_t chunk = static_cast<uint32_t>(
                 std::min<uint64_t>(frames, chunk_frames));
-            encoder->EncodeSamples(silence.data(), chunk * kCanonicalChannels);
+            if (!encoder->EncodeSamples(silence.data(), chunk * kCanonicalChannels)) {
+                encode_failures.fetch_add(1, std::memory_order_relaxed);
+                ReportFailure("process-loopback AAC silence encoding failed");
+                return false;
+            }
             next_timeline_100ns = AdvanceTimeline(next_timeline_100ns, chunk);
             frames -= chunk;
         }
+        return true;
     }
 
-    void FillSilenceUntil(uint64_t timestamp_100ns) {
+    bool FillSilenceUntil(uint64_t timestamp_100ns) {
         if (!admitted.load(std::memory_order_acquire) || !encoder || next_timeline_100ns == 0
                 || timestamp_100ns <= next_timeline_100ns) {
-            return;
+            return true;
         }
-        const uint64_t gap_frames = ((timestamp_100ns - next_timeline_100ns)
-            * kCanonicalSampleRate) / 10'000'000ULL;
-        EncodeSilence(gap_frames);
+        const auto timeline = ReconcileAudioTimelinePacket(
+            next_timeline_100ns, timestamp_100ns, 0,
+            kCanonicalSampleRate, kCanonicalSampleRate, 5);
+        if (timeline.gap_100ns > 0) {
+            uint64_t largest = largest_no_packet_gap_100ns.load(
+                std::memory_order_relaxed);
+            while (timeline.gap_100ns > largest
+                    && !largest_no_packet_gap_100ns.compare_exchange_weak(
+                        largest, timeline.gap_100ns, std::memory_order_release,
+                        std::memory_order_relaxed)) {}
+        }
+        if (timeline.large_gap) {
+            discontinuity_count.fetch_add(1, std::memory_order_relaxed);
+            ReportFailure("process-loopback audio timeline discontinuity exceeds 5 seconds");
+            return false;
+        }
+        if (!EncodeSilence(timeline.silence_frames)) return false;
+        next_timeline_100ns = timeline.next_timeline_100ns;
+        return true;
     }
 
-    void EncodeAligned(const float* samples, uint32_t frames, uint64_t qpc_100ns) {
-        if (!encoder || !samples || frames == 0) return;
+    bool EncodeAligned(const float* samples, uint32_t frames, uint64_t qpc_100ns) {
+        if (!encoder || !samples || frames == 0) return true;
         if (qpc_100ns == 0) qpc_100ns = static_cast<uint64_t>(CurrentQpc100ns());
-        if (next_timeline_100ns == 0) next_timeline_100ns = qpc_100ns;
-        FillSilenceUntil(qpc_100ns);
-
-        uint32_t skip_frames = 0;
-        if (qpc_100ns < next_timeline_100ns) {
-            const uint64_t overlap = ((next_timeline_100ns - qpc_100ns)
-                * kCanonicalSampleRate) / 10'000'000ULL;
-            skip_frames = static_cast<uint32_t>(
-                std::min<uint64_t>(overlap, frames));
+        const auto timeline = ReconcileAudioTimelinePacket(
+            next_timeline_100ns, qpc_100ns, frames,
+            kCanonicalSampleRate, kCanonicalSampleRate, 5);
+        if (timeline.gap_100ns > 0) {
+            uint64_t largest = largest_no_packet_gap_100ns.load(
+                std::memory_order_relaxed);
+            while (timeline.gap_100ns > largest
+                    && !largest_no_packet_gap_100ns.compare_exchange_weak(
+                        largest, timeline.gap_100ns, std::memory_order_release,
+                        std::memory_order_relaxed)) {}
         }
+        if (timeline.large_gap) {
+            discontinuity_count.fetch_add(1, std::memory_order_relaxed);
+            ReportFailure("process-loopback audio timeline discontinuity exceeds 5 seconds");
+            return false;
+        }
+        if (!EncodeSilence(timeline.silence_frames)) return false;
+        const uint32_t skip_frames = timeline.skip_input_frames;
         const uint32_t submit_frames = frames - skip_frames;
-        if (submit_frames == 0) return;
+        if (submit_frames == 0) {
+            dropped_blocks.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
         const uint64_t submit_qpc = AdvanceTimeline(qpc_100ns, skip_frames);
-        encoder->EncodeSamples(
+        submitted_frames.fetch_add(submit_frames, std::memory_order_relaxed);
+        last_submission_qpc_100ns.store(static_cast<int64_t>(submit_qpc),
+            std::memory_order_relaxed);
+        if (!encoder->EncodeSamples(
             samples + static_cast<size_t>(skip_frames) * kCanonicalChannels,
-            submit_frames * kCanonicalChannels);
+            submit_frames * kCanonicalChannels)) {
+            encode_failures.fetch_add(1, std::memory_order_relaxed);
+            ReportFailure("process-loopback AAC encoding failed");
+            return false;
+        }
         next_timeline_100ns = std::max(
-            next_timeline_100ns, AdvanceTimeline(submit_qpc, submit_frames));
+            timeline.next_timeline_100ns, AdvanceTimeline(submit_qpc, submit_frames));
+        return true;
     }
 
-    void SubmitNormalized(const float* samples, uint32_t frames, uint64_t qpc_100ns) {
-        if (!samples || frames == 0) return;
+    bool SubmitNormalized(const float* samples, uint32_t frames, uint64_t qpc_100ns) {
+        if (!samples || frames == 0) return true;
+        converted_frames.fetch_add(frames, std::memory_order_relaxed);
+        const uint64_t previous = previous_input_qpc_100ns;
+        if (previous > 0 && qpc_100ns > previous) {
+            const int64_t gap = static_cast<int64_t>(qpc_100ns - previous);
+            int64_t largest = largest_gap_100ns.load(std::memory_order_relaxed);
+            while (gap > largest && !largest_gap_100ns.compare_exchange_weak(
+                       largest, gap, std::memory_order_relaxed)) {}
+        } else if (previous > 0 && qpc_100ns < previous) {
+            discontinuity_count.fetch_add(1, std::memory_order_relaxed);
+        }
+        previous_input_qpc_100ns = qpc_100ns;
+        if (first_input_qpc_100ns.load(std::memory_order_relaxed) == 0)
+            first_input_qpc_100ns.store(static_cast<int64_t>(qpc_100ns),
+                std::memory_order_relaxed);
+        last_input_qpc_100ns.store(static_cast<int64_t>(qpc_100ns),
+            std::memory_order_relaxed);
         const float rms = CalculateRms(samples, frames);
         const auto admission = on_activity
             ? on_activity(config.source.identity.id, rms, static_cast<int64_t>(qpc_100ns))
@@ -444,18 +549,22 @@ struct WindowsProcessLoopbackAudioProvider::Impl {
             pending_block.frames = frames;
             pending_block.qpc_100ns = qpc_100ns;
             pending.push_back(std::move(pending_block));
-            while (pending.size() > 2) pending.pop_front();
-            if (admission == AudioSourceAdmission::Accepted) EnsureEncoder(qpc_100ns);
-            return;
+            while (pending.size() > 2) {
+                pending.pop_front();
+                dropped_blocks.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (admission == AudioSourceAdmission::Accepted)
+                return EnsureEncoder(qpc_100ns);
+            return true;
         }
-        EncodeAligned(samples, frames, qpc_100ns);
+        return EncodeAligned(samples, frames, qpc_100ns);
     }
 
     bool ConvertAndSubmit(ProcessLoopbackSession* session, const BYTE* data,
-                          uint32_t input_frames, uint64_t qpc_100ns, bool silent) {
-        if (!session || input_frames == 0) return true;
+                          uint32_t source_frames, uint64_t qpc_100ns, bool silent) {
+        if (!session || source_frames == 0) return true;
         const int64_t capacity_64 = av_rescale_rnd(
-            swr_get_delay(session->resampler, session->format->nSamplesPerSec) + input_frames,
+            swr_get_delay(session->resampler, session->format->nSamplesPerSec) + source_frames,
             kCanonicalSampleRate, session->format->nSamplesPerSec, AV_ROUND_UP);
         if (capacity_64 <= 0 || capacity_64 > static_cast<int64_t>(std::numeric_limits<int>::max())) {
             SetError("process-loopback resampler returned an invalid output capacity");
@@ -465,29 +574,38 @@ struct WindowsProcessLoopbackAudioProvider::Impl {
         session->converted.resize(static_cast<size_t>(capacity) * kCanonicalChannels);
         const uint8_t* input = data;
         if (silent || !input) {
-            const size_t input_bytes = static_cast<size_t>(input_frames) * session->format->nBlockAlign;
+            const size_t input_bytes = static_cast<size_t>(source_frames) * session->format->nBlockAlign;
             session->silent_input.assign(input_bytes, 0);
             input = session->silent_input.data();
         }
         const uint8_t* input_planes[] = {input};
         uint8_t* output_planes[] = {reinterpret_cast<uint8_t*>(session->converted.data())};
         const int converted = swr_convert(session->resampler, output_planes, capacity,
-            input_planes, static_cast<int>(input_frames));
+            input_planes, static_cast<int>(source_frames));
         if (converted < 0) {
+            dropped_blocks.fetch_add(1, std::memory_order_relaxed);
             SetError("process-loopback resampling failed");
             return false;
         }
-        SubmitNormalized(session->converted.data(), static_cast<uint32_t>(converted), qpc_100ns);
-        return true;
+        return SubmitNormalized(session->converted.data(), static_cast<uint32_t>(converted), qpc_100ns);
     }
 
     HRESULT CaptureSession(ProcessLoopbackSession* session) {
+        bool no_packet_interval = false;
         while (!WaitForStop(stop_event, 0)) {
             HANDLE wait_handles[] = {stop_event, session->sample_event};
             const DWORD wait = WaitForMultipleObjects(2, wait_handles, FALSE, kCaptureWaitMs);
             if (wait == WAIT_OBJECT_0) return S_FALSE;
             if (wait == WAIT_TIMEOUT) {
-                FillSilenceUntil(static_cast<uint64_t>(CurrentQpc100ns()));
+                // Count a contiguous no-packet interval once. The duration is
+                // measured from the previous packet end when the next packet
+                // arrives, rather than treating every event wake as a gap.
+                if (!no_packet_interval) {
+                    no_packet_intervals.fetch_add(1, std::memory_order_relaxed);
+                    no_packet_interval = true;
+                }
+                if (!FillSilenceUntil(static_cast<uint64_t>(CurrentQpc100ns())))
+                    return E_FAIL;
                 continue;
             }
             if (wait != WAIT_OBJECT_0 + 1) return E_FAIL;
@@ -503,6 +621,42 @@ struct WindowsProcessLoopbackAudioProvider::Impl {
                 hr = session->capture_client->GetBuffer(&data, &frames, &flags,
                     &device_position, &qpc_100ns);
                 if (FAILED(hr)) return hr;
+                if (frames > 0) {
+                    const uint64_t packet_qpc = qpc_100ns != 0
+                        ? qpc_100ns : static_cast<uint64_t>(CurrentQpc100ns());
+                    packet_count.fetch_add(1, std::memory_order_relaxed);
+                    input_frames.fetch_add(frames, std::memory_order_relaxed);
+                    if ((flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0)
+                        discontinuity_count.fetch_add(1, std::memory_order_relaxed);
+                    const uint64_t previous_packet_end =
+                        last_packet_end_qpc_100ns.load(std::memory_order_relaxed);
+                    if (previous_packet_end > 0 && packet_qpc > previous_packet_end) {
+                        const uint64_t gap = packet_qpc - previous_packet_end;
+                        if (!no_packet_interval)
+                            no_packet_intervals.fetch_add(1, std::memory_order_relaxed);
+                        no_packet_interval = false;
+                        uint64_t largest = largest_no_packet_gap_100ns.load(
+                            std::memory_order_relaxed);
+                        while (gap > largest && !largest_no_packet_gap_100ns.compare_exchange_weak(
+                            largest, gap, std::memory_order_release,
+                            std::memory_order_relaxed)) {}
+                    } else {
+                        no_packet_interval = false;
+                    }
+                    int64_t first = 0;
+                    first_input_qpc_100ns.compare_exchange_strong(
+                        first,
+                        static_cast<int64_t>(packet_qpc),
+                        std::memory_order_release,
+                        std::memory_order_relaxed);
+                    last_packet_qpc_100ns.store(packet_qpc, std::memory_order_release);
+                    const uint64_t packet_duration = session->format->nSamplesPerSec > 0
+                        ? (static_cast<uint64_t>(frames) * 10'000'000ULL)
+                            / session->format->nSamplesPerSec : 0;
+                    last_packet_end_qpc_100ns.store(
+                        packet_qpc + packet_duration, std::memory_order_release);
+                    qpc_100ns = packet_qpc;
+                }
                 const bool converted = ConvertAndSubmit(session, data, frames, qpc_100ns,
                     (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0);
                 const HRESULT release_hr = session->capture_client->ReleaseBuffer(frames);
@@ -511,8 +665,9 @@ struct WindowsProcessLoopbackAudioProvider::Impl {
                 hr = session->capture_client->GetNextPacketSize(&packet_frames);
                 if (FAILED(hr)) return hr;
             }
-            if (packet_frames == 0)
-                FillSilenceUntil(static_cast<uint64_t>(CurrentQpc100ns()));
+            if (packet_frames == 0
+                    && !FillSilenceUntil(static_cast<uint64_t>(CurrentQpc100ns())))
+                return E_FAIL;
         }
         return S_FALSE;
     }
@@ -521,12 +676,14 @@ struct WindowsProcessLoopbackAudioProvider::Impl {
         const HRESULT apartment = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         if (FAILED(apartment) && apartment != RPC_E_CHANGED_MODE) {
             SetError("process-loopback COM initialization failed " + HrText(apartment));
+            failed.store(true, std::memory_order_release);
             if (on_failure) on_failure(config.source.identity.id);
             running.store(false, std::memory_order_release);
             return;
         }
 
         uint32_t recovery_attempts = 0;
+        bool opened_once = false;
         while (!WaitForStop(stop_event, 0)) {
             ProcessLoopbackSession session;
             if (!OpenSession(&session)) {
@@ -536,22 +693,37 @@ struct WindowsProcessLoopbackAudioProvider::Impl {
                     if (!WaitForStop(stop_event, delay)) continue;
                     break;
                 }
+                failed.store(true, std::memory_order_release);
                 if (on_failure) on_failure(config.source.identity.id);
                 break;
             }
+            if (opened_once) restart_count.fetch_add(1, std::memory_order_relaxed);
+            opened_once = true;
             recovery_attempts = 0;
             const HRESULT capture_result = CaptureSession(&session);
             if (capture_result == S_FALSE || WaitForStop(stop_event, 0)) break;
+            // Encoding/timeline failures already set the terminal state and
+            // reported their precise cause. Do not overwrite that evidence
+            // with a generic E_FAIL or retry an unsafe timeline.
+            if (failed.load(std::memory_order_acquire)) break;
             SetError("process-loopback capture failed " + HrText(capture_result));
             if (!IsRecoverableAudioFailure(capture_result)
                     || ++recovery_attempts > kMaxRecoveryAttempts) {
+                failed.store(true, std::memory_order_release);
                 if (on_failure) on_failure(config.source.identity.id);
                 break;
             }
             if (WaitForStop(stop_event, 200u * recovery_attempts)) break;
         }
-        if (encoder) encoder->Finalize();
+        if (encoder && !encoder->Finalize()) {
+            finalize_failures.fetch_add(1, std::memory_order_relaxed);
+            ReportFailure("process-loopback AAC finalization failed");
+        }
         running.store(false, std::memory_order_release);
+        if (!WaitForStop(stop_event, 0) && on_ended
+                && !ended_notified.exchange(true, std::memory_order_acq_rel)) {
+            on_ended(config.source.identity.id, CurrentQpc100ns());
+        }
         if (SUCCEEDED(apartment)) CoUninitialize();
     }
 };
@@ -571,9 +743,13 @@ bool WindowsProcessLoopbackAudioProvider::Start() {
     impl_->stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!impl_->stop_event) {
         impl_->SetError("process-loopback stop event creation failed");
+        impl_->failed.store(true, std::memory_order_release);
         impl_->running.store(false, std::memory_order_release);
         return false;
     }
+    impl_->failed.store(false, std::memory_order_release);
+    impl_->ended_notified.store(false, std::memory_order_release);
+    impl_->failure_notified.store(false, std::memory_order_release);
     impl_->thread = std::thread([this] { impl_->Run(); });
     return true;
 }
@@ -595,9 +771,44 @@ bool WindowsProcessLoopbackAudioProvider::HasCapturedAudio() const {
     return impl_ && impl_->admitted.load(std::memory_order_acquire);
 }
 
-const std::string& WindowsProcessLoopbackAudioProvider::last_error() const {
-    static const std::string empty;
-    return impl_ ? impl_->error : empty;
+std::string WindowsProcessLoopbackAudioProvider::last_error() const {
+    if (!impl_) return {};
+    std::lock_guard<std::mutex> lock(impl_->state_mutex);
+    return impl_->error;
+}
+
+WindowsProcessLoopbackRuntimeInfo
+WindowsProcessLoopbackAudioProvider::runtime_info() const {
+    WindowsProcessLoopbackRuntimeInfo result;
+    if (!impl_) return result;
+    result.admitted = impl_->admitted.load(std::memory_order_acquire);
+    if (impl_->running.load(std::memory_order_acquire))
+        result.state = result.admitted ? "ACTIVE" : "STARTING";
+    else if (impl_->failed.load(std::memory_order_acquire))
+        result.state = "FAILED";
+    else
+        result.state = "STOPPED";
+    result.input_frames = impl_->input_frames.load(std::memory_order_relaxed);
+    result.packet_count = impl_->packet_count.load(std::memory_order_relaxed);
+    result.converted_frames = impl_->converted_frames.load(std::memory_order_relaxed);
+    result.submitted_frames = impl_->submitted_frames.load(std::memory_order_relaxed);
+    result.encoded_packets = impl_->encoded_packets.load(std::memory_order_relaxed);
+    result.encode_failures = impl_->encode_failures.load(std::memory_order_relaxed);
+    result.finalize_failures = impl_->finalize_failures.load(std::memory_order_relaxed);
+    result.dropped_blocks = impl_->dropped_blocks.load(std::memory_order_relaxed);
+    result.no_packet_intervals = impl_->no_packet_intervals.load(std::memory_order_relaxed);
+    result.largest_no_packet_gap_100ns = impl_->largest_no_packet_gap_100ns.load(
+        std::memory_order_relaxed);
+    result.discontinuity_count = impl_->discontinuity_count.load(
+        std::memory_order_relaxed);
+    result.rejected_packets = impl_->rejected_packets.load(std::memory_order_relaxed);
+    result.restart_count = impl_->restart_count.load(std::memory_order_relaxed);
+    result.first_input_qpc_100ns = impl_->first_input_qpc_100ns.load(std::memory_order_relaxed);
+    result.last_input_qpc_100ns = impl_->last_input_qpc_100ns.load(std::memory_order_relaxed);
+    result.last_submission_qpc_100ns = impl_->last_submission_qpc_100ns.load(std::memory_order_relaxed);
+    result.last_encoded_qpc_100ns = impl_->last_encoded_qpc_100ns.load(std::memory_order_relaxed);
+    result.largest_gap_100ns = impl_->largest_gap_100ns.load(std::memory_order_relaxed);
+    return result;
 }
 
 std::optional<EncodedAudioTrack> WindowsProcessLoopbackAudioProvider::TakeTrackForInterval(
@@ -673,6 +884,36 @@ std::optional<AudioSourceId> WindowsApplicationSourceCoordinator::RetireRuntimeG
     return id;
 }
 
+std::optional<std::string> WindowsApplicationSourceCoordinator::RetireSource(
+    const AudioSourceId& id, int64_t timestamp_100ns) {
+    for (auto it = runtime_groups_.begin(); it != runtime_groups_.end(); ++it) {
+        if (!(it->second == id)) continue;
+        registry_.MarkEnded(id, timestamp_100ns);
+        const std::string runtime_group_key = it->first;
+        runtime_groups_.erase(it);
+        return runtime_group_key;
+    }
+    return std::nullopt;
+}
+
+bool WindowsApplicationSourceCoordinator::ShouldRetireRuntimeGroup(
+    const std::string& runtime_group_key, int64_t now_100ns) const {
+    const auto group = runtime_groups_.find(runtime_group_key);
+    if (group == runtime_groups_.end()) return false;
+    const auto* source = registry_.Find(group->second);
+    if (!source || source->state.active_in_generation || source->state.admitted
+            || source->state.last_active_100ns < 0) {
+        return false;
+    }
+    return now_100ns >= source->state.last_active_100ns
+        && now_100ns - source->state.last_active_100ns >= retention_100ns_;
+}
+
+void WindowsApplicationSourceCoordinator::PruneExpired(int64_t now_100ns) {
+    registry_.ReleaseAdmissionsOlderThan(now_100ns - retention_100ns_);
+    registry_.PruneEndedOlderThan(now_100ns - retention_100ns_);
+}
+
 AudioSourceAdmission WindowsApplicationSourceCoordinator::ObserveActivity(
     const AudioSourceId& id, float rms, int64_t timestamp_100ns) {
     registry_.ReleaseAdmissionsOlderThan(timestamp_100ns - retention_100ns_);
@@ -699,7 +940,8 @@ struct WindowsApplicationAudioSourceManager::Impl {
 
     struct ProviderEntry {
         std::string runtime_group_key;
-        std::unique_ptr<WindowsProcessLoopbackAudioProvider> provider;
+        std::shared_ptr<WindowsProcessLoopbackAudioProvider> provider;
+        int64_t retired_at_100ns = 0;
     };
 
     uint64_t generation;
@@ -712,7 +954,36 @@ struct WindowsApplicationAudioSourceManager::Impl {
     std::thread monitor_thread;
     HANDLE stop_event = nullptr;
     std::atomic<bool> running{false};
+    std::atomic<uint64_t> source_limit_rejections{0};
     std::string error;
+
+    void OnProviderEnded(const AudioSourceId& id, int64_t timestamp_100ns) {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto entry = providers_by_source_id.find(id.value);
+        if (entry == providers_by_source_id.end()) return;
+        const auto active = active_runtime_groups.find(entry->second.runtime_group_key);
+        if (active != active_runtime_groups.end() && active->second == id)
+            active_runtime_groups.erase(active);
+        if (coordinator) coordinator->RetireSource(id, timestamp_100ns);
+        entry->second.retired_at_100ns = timestamp_100ns;
+    }
+
+    void CleanupRetired(int64_t now_100ns) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (coordinator) coordinator->PruneExpired(now_100ns);
+        const int64_t cutoff = now_100ns
+            - static_cast<int64_t>(std::max<uint32_t>(1, retention_seconds))
+                * 10'000'000LL;
+        for (auto it = providers_by_source_id.begin();
+             it != providers_by_source_id.end();) {
+            const auto& entry = it->second;
+            if (entry.retired_at_100ns <= 0 || entry.retired_at_100ns >= cutoff) {
+                ++it;
+                continue;
+            }
+            it = providers_by_source_id.erase(it);
+        }
+    }
 
     std::optional<AudioSourceId> GenerateSourceId() {
         std::string value;
@@ -740,9 +1011,9 @@ struct WindowsApplicationAudioSourceManager::Impl {
         std::cerr << "[ApplicationAudio] Source '"
             << (source ? source->identity.display_name : "Application")
             << "' failed";
-        if (entry != providers_by_source_id.end() && entry->second.provider
-                && !entry->second.provider->last_error().empty()) {
-            std::cerr << ": " << entry->second.provider->last_error();
+        if (entry != providers_by_source_id.end() && entry->second.provider) {
+            const std::string detail = entry->second.provider->last_error();
+            if (!detail.empty()) std::cerr << ": " << detail;
         }
         std::cerr << std::endl;
     }
@@ -750,9 +1021,17 @@ struct WindowsApplicationAudioSourceManager::Impl {
     void EnsureProvider(const WindowsAudioSessionDescriptor& descriptor) {
         WindowsProcessLoopbackAudioProvider* to_start = nullptr;
         AudioSourceId start_id;
+        std::string start_group;
         {
             std::lock_guard<std::mutex> lock(mutex);
             if (!coordinator) return;
+            const bool existing_group = coordinator->HasRuntimeGroup(
+                descriptor.runtime_group_key);
+            if (!existing_group
+                    && providers_by_source_id.size() >= kMaxRetainedAudioSources) {
+                source_limit_rejections.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
             const auto binding = coordinator->Discover(descriptor);
             if (!binding) return;
             active_runtime_groups[binding->runtime_group_key] = binding->source.identity.id;
@@ -764,18 +1043,18 @@ struct WindowsApplicationAudioSourceManager::Impl {
             config.include_process_tree = true;
             config.retention_seconds = retention_seconds;
             config.source = binding->source;
-            auto provider = std::make_unique<WindowsProcessLoopbackAudioProvider>(
+            auto provider = std::make_shared<WindowsProcessLoopbackAudioProvider>(
                 std::move(config),
                 [this](const AudioSourceId& id, float rms, int64_t timestamp) {
                     return OnActivity(id, rms, timestamp);
                 },
                 [this](const AudioSourceId& id, int64_t timestamp) {
-                    std::lock_guard<std::mutex> callback_lock(mutex);
-                    if (coordinator) coordinator->RetireRuntimeGroup(id.value, timestamp);
+                    OnProviderEnded(id, timestamp);
                 },
                 [this](const AudioSourceId& id) { OnFailure(id); });
             to_start = provider.get();
             start_id = binding->source.identity.id;
+            start_group = binding->runtime_group_key;
             providers_by_source_id.emplace(source_key,
                 ProviderEntry{binding->runtime_group_key, std::move(provider)});
         }
@@ -783,12 +1062,15 @@ struct WindowsApplicationAudioSourceManager::Impl {
             std::cout << "[ApplicationAudio] Capturing active source '"
                 << descriptor.identity.display_name << "' (PID "
                 << descriptor.process_id << ")" << std::endl;
-            if (!to_start->Start()) OnFailure(start_id);
+            if (!to_start->Start()) {
+                OnFailure(start_id);
+                RetireProvider(start_group);
+            }
         }
     }
 
     void RetireProvider(const std::string& runtime_group_key) {
-        WindowsProcessLoopbackAudioProvider* provider = nullptr;
+        std::shared_ptr<WindowsProcessLoopbackAudioProvider> provider;
         AudioSourceId id;
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -797,13 +1079,17 @@ struct WindowsApplicationAudioSourceManager::Impl {
             id = active->second;
             active_runtime_groups.erase(active);
             const auto entry = providers_by_source_id.find(id.value);
-            if (entry != providers_by_source_id.end()) provider = entry->second.provider.get();
+            if (entry != providers_by_source_id.end()) provider = entry->second.provider;
         }
         if (provider) provider->Stop();
         // Stop first so a final capture callback cannot reactivate an already
         // retired group while the provider thread is winding down.
+        const int64_t retired_at_100ns = CurrentQpc100ns();
         std::lock_guard<std::mutex> lock(mutex);
-        if (coordinator) coordinator->RetireRuntimeGroup(runtime_group_key, CurrentQpc100ns());
+        if (coordinator) coordinator->RetireRuntimeGroup(runtime_group_key, retired_at_100ns);
+        const auto entry = providers_by_source_id.find(id.value);
+        if (entry != providers_by_source_id.end())
+            entry->second.retired_at_100ns = retired_at_100ns;
     }
 
     bool ProviderHasCapturedAudio(const std::string& runtime_group_key) {
@@ -815,20 +1101,25 @@ struct WindowsApplicationAudioSourceManager::Impl {
             && entry->second.provider->HasCapturedAudio();
     }
 
-    void HandleUpdate(const WindowsAudioSessionUpdate& update,
-                      bool prime_existing_sessions = false) {
+    bool ProviderShouldRetire(const std::string& runtime_group_key,
+                              int64_t now_100ns) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return coordinator && coordinator->ShouldRetireRuntimeGroup(
+            runtime_group_key, now_100ns);
+    }
+
+    void HandleUpdate(const WindowsAudioSessionUpdate& update) {
         // Inactive WASAPI sessions can linger for hours. Starting a process-
         // loopback client for all of them created an unbounded set of idle
         // threads and made genuinely audible sources unreliable. State-change
         // notifications (plus the safety poll below) start a provider only
         // when Windows reports that application as actively rendering.
+        const int64_t now_100ns = static_cast<int64_t>(CurrentQpc100ns());
         for (const auto& descriptor : update.current) {
-            const bool appeared = std::find(
-                update.appeared_runtime_groups.begin(),
-                update.appeared_runtime_groups.end(),
-                descriptor.runtime_group_key) != update.appeared_runtime_groups.end();
-            if (descriptor.currently_active || prime_existing_sessions || appeared
-                    || ProviderHasCapturedAudio(descriptor.runtime_group_key)) {
+            const bool quiet_expired = ProviderShouldRetire(
+                descriptor.runtime_group_key, now_100ns);
+            if (!quiet_expired && (descriptor.currently_active
+                    || ProviderHasCapturedAudio(descriptor.runtime_group_key))) {
                 EnsureProvider(descriptor);
             } else {
                 RetireProvider(descriptor.runtime_group_key);
@@ -853,16 +1144,15 @@ struct WindowsApplicationAudioSourceManager::Impl {
         }
         WindowsAudioSessionUpdate initial;
         sessions.RefreshIfNeeded(&initial);
-        // Prime every session already present when FTHR starts. Some Chromium
-        // audio sessions report a stale inactive state until their next stream
-        // transition even though process-loopback can already capture them.
-        // Silent candidates are retired by the next safety poll; any provider
-        // that proves real PCM stays alive until its session disappears.
-        HandleUpdate(initial, true);
+        // Only sessions currently reported active receive a provider. This
+        // keeps silent/background session discovery from creating idle capture
+        // threads; later state notifications start a provider on demand.
+        HandleUpdate(initial);
         auto next_topology_refresh = std::chrono::steady_clock::now()
             + std::chrono::seconds(2);
         while (!WaitForStop(stop_event, 250)) {
             const auto now = std::chrono::steady_clock::now();
+            CleanupRetired(static_cast<int64_t>(CurrentQpc100ns()));
             if (now >= next_topology_refresh) {
                 sessions.RequestRefresh();
                 next_topology_refresh = now + std::chrono::seconds(2);
@@ -889,6 +1179,7 @@ WindowsApplicationAudioSourceManager::~WindowsApplicationAudioSourceManager() {
 bool WindowsApplicationAudioSourceManager::Start() {
     if (!impl_ || !impl_->capability.api_build_supported) return false;
     if (impl_->running.exchange(true, std::memory_order_acq_rel)) return true;
+    impl_->source_limit_rejections.store(0, std::memory_order_relaxed);
     impl_->stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!impl_->stop_event) {
         impl_->SetError("Windows application-audio stop event creation failed");
@@ -912,17 +1203,22 @@ void WindowsApplicationAudioSourceManager::Stop() {
     if (!impl_) return;
     if (impl_->stop_event) SetEvent(impl_->stop_event);
     if (impl_->monitor_thread.joinable()) impl_->monitor_thread.join();
-    std::vector<WindowsProcessLoopbackAudioProvider*> providers;
+    std::vector<std::shared_ptr<WindowsProcessLoopbackAudioProvider>> providers;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         for (auto& [_, entry] : impl_->providers_by_source_id) {
-            if (entry.provider) providers.push_back(entry.provider.get());
+            if (entry.provider) providers.push_back(entry.provider);
         }
         impl_->active_runtime_groups.clear();
     }
-    for (auto* provider : providers) provider->Stop();
+    for (const auto& provider : providers) provider->Stop();
     if (impl_->stop_event) CloseHandle(impl_->stop_event);
     impl_->stop_event = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->providers_by_source_id.clear();
+        impl_->coordinator.reset();
+    }
     impl_->running.store(false, std::memory_order_release);
 }
 
@@ -934,14 +1230,58 @@ WindowsProcessLoopbackCapability WindowsApplicationAudioSourceManager::capabilit
     return impl_ ? impl_->capability : WindowsProcessLoopbackCapability{};
 }
 
-const std::string& WindowsApplicationAudioSourceManager::last_error() const {
-    static const std::string empty;
-    return impl_ ? impl_->error : empty;
+std::string WindowsApplicationAudioSourceManager::last_error() const {
+    if (!impl_) return {};
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->error;
+}
+
+WindowsApplicationAudioSourceManager::RuntimeInfo
+WindowsApplicationAudioSourceManager::runtime_info() const {
+    RuntimeInfo result;
+    if (!impl_) return result;
+    result.available = impl_->capability.api_build_supported;
+    result.running = impl_->running.load(std::memory_order_acquire);
+    result.source_limit_rejections = impl_->source_limit_rejections.load(
+        std::memory_order_relaxed);
+    std::vector<std::shared_ptr<WindowsProcessLoopbackAudioProvider>> providers;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        result.candidate_count = static_cast<uint32_t>(
+            impl_->active_runtime_groups.size());
+        result.retained_provider_count = static_cast<uint32_t>(
+            impl_->providers_by_source_id.size());
+        result.admitted_source_count = impl_->coordinator
+            ? impl_->coordinator->admitted_count() : 0;
+        providers.reserve(impl_->providers_by_source_id.size());
+        for (const auto& [_, entry] : impl_->providers_by_source_id)
+            if (entry.provider) providers.push_back(entry.provider);
+    }
+    for (const auto& provider : providers) {
+        const auto info = provider->runtime_info();
+        result.input_frames += info.input_frames;
+        result.packet_count += info.packet_count;
+        result.converted_frames += info.converted_frames;
+        result.submitted_frames += info.submitted_frames;
+        result.encoded_packets += info.encoded_packets;
+        result.encode_failures += info.encode_failures;
+        result.finalize_failures += info.finalize_failures;
+        result.dropped_blocks += info.dropped_blocks;
+        result.no_packet_intervals += info.no_packet_intervals;
+        result.largest_no_packet_gap_100ns = std::max(
+            result.largest_no_packet_gap_100ns, info.largest_no_packet_gap_100ns);
+        result.discontinuity_count += info.discontinuity_count;
+        result.rejected_packets += info.rejected_packets;
+        result.restart_count += info.restart_count;
+        result.largest_gap_100ns = std::max(result.largest_gap_100ns,
+                                            info.largest_gap_100ns);
+    }
+    return result;
 }
 
 std::vector<EncodedAudioTrack> WindowsApplicationAudioSourceManager::TakeTracksForInterval(
     double presentation_start_qpc_s, double presentation_end_qpc_s) const {
-    std::vector<std::pair<WindowsProcessLoopbackAudioProvider*, AudioSourceMetadata>> candidates;
+    std::vector<std::pair<std::shared_ptr<WindowsProcessLoopbackAudioProvider>, AudioSourceMetadata>> candidates;
     if (!impl_ || presentation_end_qpc_s <= presentation_start_qpc_s) return {};
     const int64_t start = static_cast<int64_t>(std::llround(presentation_start_qpc_s * 10'000'000.0));
     const int64_t end = static_cast<int64_t>(std::llround(presentation_end_qpc_s * 10'000'000.0));
@@ -951,7 +1291,7 @@ std::vector<EncodedAudioTrack> WindowsApplicationAudioSourceManager::TakeTracksF
         for (const auto& source : impl_->coordinator->SourcesForInterval(start, end)) {
             const auto entry = impl_->providers_by_source_id.find(source.identity.id.value);
             if (entry != impl_->providers_by_source_id.end() && entry->second.provider)
-                candidates.emplace_back(entry->second.provider.get(), source);
+                candidates.emplace_back(entry->second.provider, source);
         }
     }
     std::vector<EncodedAudioTrack> tracks;
