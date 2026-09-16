@@ -4,7 +4,7 @@
 
 | Version | Supported |
 |---------|-----------|
-| 1.0.x (alpha) | ✅ |
+| 1.1.x (alpha) | ✅ |
 
 ## Reporting a vulnerability
 
@@ -18,7 +18,8 @@ Include:
 - Potential impact
 - Your suggested fix (optional)
 
-You'll get a response within 72 hours. If the issue is confirmed, we'll work on a fix and credit you in the release notes (unless you prefer to stay anonymous).
+we will most likely reply within 48 hours though we cannot guarantee that our laziness doesn't overcome our striving for improvement. 
+in case your report leads to a change in the app you may be listed in the apps credits unless you do not want to.
 
 ## Scope
 
