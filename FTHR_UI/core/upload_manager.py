@@ -1,9 +1,7 @@
-"""Offline Core coordinator for the optional FTHR upload packages.
+"""Coordinate optional upload packages through local subprocess IPC.
 
-Core owns consent, verified extraction, local settings, queueing, and JSON
-subprocess IPC. It deliberately contains no HTTP client or provider upload
-implementation. Network work runs in the separately installed uploader, and
-machine identity is read by a second separately installed Lustful capability.
+Core owns consent, extraction, settings, and queueing. Network requests
+run in the uploader; hardware identity requires its separate capability.
 """
 
 from __future__ import annotations
@@ -27,7 +25,7 @@ from typing import Any, Optional
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
-from core.clip_files import is_completed_video_path
+from core.clip_files import is_completed_video_path, iter_safe_tree
 from core.clip_readiness import (
     ClipReadinessRegistry,
     ClipReadinessState,
@@ -199,13 +197,16 @@ class UploadManager(QObject):
         self._stop_event = threading.Event()
         self._interval_timer = QTimer(self)
         self._interval_timer.timeout.connect(self._interval_scan)
+        self._interval_scan_lock = threading.Lock()
+        self._interval_scan_thread: threading.Thread | None = None
+        self._interval_scan_cancel = threading.Event()
         self._in_flight: set[str] = set()
         self._in_flight_lock = threading.Lock()
         self._history: dict[str, Any] = {}
         self._history_mtime_ns = -1
         self._bundle_cache: dict[str, tuple[str, dict[str, Any], str, str]] = {}
 
-    # Settings adapter -------------------------------------------------
+    # Settings adapter
 
     def get(self, key: str, default: Any = None) -> Any:
         return self._settings.get(key, default)
@@ -241,7 +242,7 @@ class UploadManager(QObject):
         except (OSError, ValueError, TypeError):
             return dict(_DEFAULT_SETTINGS)
 
-    # Dormant bundles and activation ----------------------------------
+    # Dormant bundles and activation
 
     def bundle_path(self, filename: str = 'FTHR-Uploader.fthrplugin') -> Path:
         candidates: list[Path] = []
@@ -534,7 +535,7 @@ class UploadManager(QObject):
             _HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(_LEGACY_HISTORY_FILE, _HISTORY_FILE)
 
-    # Process invocation -----------------------------------------------
+    # Process invocation
 
     def _activation(self, spec: _BundleSpec) -> dict[str, Any]:
         if not self._is_installed(spec):
@@ -600,10 +601,11 @@ class UploadManager(QObject):
             return {'ok': False, 'message': 'Uploader returned an invalid response.'}
         return response
 
-    # Lifecycle and queue ----------------------------------------------
+    # Lifecycle and queue
 
     def start(self) -> None:
         self._stop_event.clear()
+        self._interval_scan_cancel.clear()
         self._worker_thread = threading.Thread(
             target=self._worker_loop,
             daemon=True,
@@ -615,9 +617,13 @@ class UploadManager(QObject):
     def stop(self) -> None:
         self._stop_event.set()
         self._interval_timer.stop()
+        self._interval_scan_cancel.set()
         self._queue.put(None)
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=3.0)
+        scan_thread = self._interval_scan_thread
+        if scan_thread is not None and scan_thread.is_alive():
+            scan_thread.join(timeout=1.0)
 
     def refresh_settings(self) -> None:
         self._apply_interval_timer()
@@ -864,10 +870,26 @@ class UploadManager(QObject):
     def _interval_scan(self) -> None:
         if not self.is_enabled():
             return
+        with self._interval_scan_lock:
+            if (self._interval_scan_thread is not None
+                    and self._interval_scan_thread.is_alive()):
+                return
+            cancel_event = self._interval_scan_cancel
+            worker = threading.Thread(
+                target=self._interval_scan_worker,
+                args=(cancel_event,), daemon=True,
+                name='fthr-upload-library-scan')
+            self._interval_scan_thread = worker
+            worker.start()
+
+    def _interval_scan_worker(self, cancel_event: threading.Event) -> None:
+        """Enumerate settled clips without occupying the Qt event loop."""
         try:
             now = time.time()
-            paths = []
-            for item in self.clips_directory().rglob('*'):
+            for item in iter_safe_tree(
+                    self.clips_directory(), cancel_event=cancel_event):
+                if (cancel_event.is_set() or self._stop_event.is_set()):
+                    break
                 if not item.is_file() or not is_completed_video_path(item):
                     continue
                 try:
@@ -876,15 +898,18 @@ class UploadManager(QObject):
                 except OSError:
                     # The file changed during the scan; retry it next interval.
                     continue
-                paths.append(item)
+                path = str(item)
+                if not self.is_uploaded(path):
+                    self.enqueue_upload(path)
         except OSError:
             # A temporarily unavailable clips directory is retried next interval.
             return
-        for path in paths:
-            if not self.is_uploaded(str(path)):
-                self.enqueue_upload(str(path))
+        finally:
+            with self._interval_scan_lock:
+                if self._interval_scan_thread is threading.current_thread():
+                    self._interval_scan_thread = None
 
-    # Local state consumed by Core UI ---------------------------------
+    # Local state consumed by Core UI
 
     def _invalidate_history(self) -> None:
         self._history_mtime_ns = -1
@@ -933,7 +958,7 @@ class UploadManager(QObject):
             return None
         return value if value.get('account_id') and value.get('hwid') else None
 
-    # Settings UI actions ---------------------------------------------
+    # Settings UI actions
 
     def account_action(
             self,

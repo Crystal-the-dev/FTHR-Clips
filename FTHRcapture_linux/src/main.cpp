@@ -7,16 +7,12 @@
 #include <csignal>
 #include <unistd.h>
 
-// ---------------------------------------------------------------------------
 // Signal handling for clean shutdown
-// ---------------------------------------------------------------------------
 
 static volatile bool g_quit = false;
 static void on_signal(int) { g_quit = true; }
 
-// ---------------------------------------------------------------------------
 // Argv parsing helpers
-// ---------------------------------------------------------------------------
 
 static uint32_t arg_u32(char** argv, int idx, uint32_t def) {
     if (!argv[idx] || argv[idx][0] == '\0') return def;
@@ -24,31 +20,10 @@ static uint32_t arg_u32(char** argv, int idx, uint32_t def) {
     return (v < 0) ? def : static_cast<uint32_t>(v);
 }
 
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
 
 int main(int argc, char* argv[]) {
-    // Argv contract (identical to Windows version):
-    //   [1]  fps            (1-360,   default 60)
-    //   [2]  buffer_sec     (1-300,   default 30)
-    //   [3]  target_width   (0=native)
-    //   [4]  target_height  (0=native)
-    //   [5]  bitrate_kbps   (500-60000, default 16000)
-    //   [6]  max_buffer_mb  (ignored on Linux)
-    //   [7]  capture_mode   (0=desktop, 1=window — Linux always desktop)
-    //   [8]  target_hwnd    (ignored on Linux)
-    //   [9]  scaling_mode   (0=stretch, 1=fit)
-    //   [10] target_output  (Wayland output name, or UI-resolved
-    //                        "@x11:x,y,width,height" on native X11)
-    //   [11] codec_pref     (0=auto, 1=h264, 2=hevc, 3=av1)
-    //   [12] encoder_preset (1-7, default 4)
-    //   [13] multiband      (retired; ignored)
-    //   [14] audio_enabled  (1=on default, 0=off)
-    //   [15] microphone ID  (reserved; Windows only)
-    //   [16] mic gain       (reserved; Windows only)
-    //   [17] encoder_pref   (0=auto, 1=NVIDIA, 2=AMD, 3=Intel, 4=software)
-    //   [23] audio_mode     (0=combined default, 1=separated tracks)
+    // Keep positional arguments aligned with the UI and Windows engine.
+    // See docs/engine-startup.md for platform differences and reserved slots.
 
     fthr::CaptureConfig cfg{};
     cfg.fps            = (argc > 1) ? arg_u32(argv, 1, 60)     : 60;
@@ -72,7 +47,6 @@ int main(int argc, char* argv[]) {
     cfg.encoder_pref = static_cast<fthr::EncoderPref>(
         (argc > 17) ? std::min<uint32_t>(arg_u32(argv, 17, 0), 4) : 0);
 
-    // Clamp
     if (cfg.fps            < 1)     cfg.fps            = 1;
     if (cfg.fps            > 360)   cfg.fps            = 360;
     if (cfg.buffer_seconds < 1)     cfg.buffer_seconds = 1;
@@ -136,22 +110,12 @@ int main(int argc, char* argv[]) {
 
             switch (cmd) {
             case fthr::CommandType::SAVE_CLIP: {
-                // Clear any message left by an earlier save. engine_string was
-                // only ever written on error and never reset, so after one
-                // failed save every subsequent SUCCESS still carried the old
-                // "SaveClip failed: ..." text straight into the UI.
-                //
-                // This clear is also what makes the publication order below
-                // safe in the one place it cannot be perfect: see the note on
-                // SAVE_STARTED.
+                // Clear the previous save detail before queueing this request so a later
+                // success cannot carry stale error text.
                 fthr::set_engine_string(layout, "");
 
-                // Immediately acknowledge so the UI doesn't time out.
-                //
-                // SAVE_STARTED carries no payload of its own, so there is
-                // nothing to publish before it. The engine_string it leaves
-                // behind is the empty one cleared above — never a stale
-                // message from a previous save.
+                // Acknowledge queueing immediately. SAVE_STARTED has no payload, and
+                // engine_string was cleared before submission.
                 layout->engine_response =
                     static_cast<uint32_t>(fthr::ResponseType::SAVE_STARTED);
 
@@ -166,9 +130,7 @@ int main(int argc, char* argv[]) {
                 bool ok = engine.SaveClip(
                     out_path, duration_sec, layout, &save_error);
 
-                // Payload first, response last (AUDIT-018). The previous order
-                // published ERROR_OCCURRED and only then wrote the message, so
-                // a UI polling in between saw a failure with no explanation.
+                // Write the error detail before publishing ERROR_OCCURRED.
                 if (!ok)
                     fthr::set_engine_string(
                         layout, save_error.empty()
@@ -181,8 +143,7 @@ int main(int argc, char* argv[]) {
             }
 
             case fthr::CommandType::GET_STATUS:
-                // Payload first, response last (AUDIT-018) — engine_param1 is
-                // this response's payload and used to be written after it.
+                // Write engine_param1 before publishing its response.
                 layout->engine_param1 = engine.IsNvencActive() ? 1 : 0;
                 layout->engine_response =
                     static_cast<uint32_t>(fthr::ResponseType::STATUS_UPDATE);
@@ -245,7 +206,6 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Update live status in shared memory
         layout->frames_captured = engine.GetFrameCount();
         layout->nvenc_active    = engine.IsNvencActive();
         layout->capture_health_flags = engine.GetCaptureHealthFlags();

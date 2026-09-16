@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import subprocess
 
 import pytest
 
@@ -166,8 +167,7 @@ def test_delayed_audio_preview_does_not_start_after_background_pause():
 @pytest.mark.parametrize(
     ('handler', 'next_handler'),
     [
-        ('_on_clip_changed', '_on_ext_clip_changed'),
-        ('_on_ext_clip_changed', 'reload_from_settings'),
+        ('_on_clip_changed', 'reload_from_settings'),
         ('_on_fps_changed', '_on_res_changed'),
         ('_on_res_changed', '_on_qual_changed'),
         ('_on_qual_changed', '_mark_restart'),
@@ -357,7 +357,6 @@ def test_active_game_crop_is_part_of_requested_encoder_config(monkeypatch):
             exe_path='C:\\Games\\crop-game.exe', exe_name='crop-game.exe'),
         capture_fps=60,
         clip_duration=30,
-        extended_clip_duration=60,
         capture_width=0,
         capture_height=0,
         capture_bitrate=25_000,
@@ -574,6 +573,8 @@ def test_manual_recording_close_only_validates_direct_fragmented_file(
         _manual_record_path=recording,
         _manual_record_state='stopping',
         _manual_record_timer=SimpleNamespace(stop=lambda: None),
+        _normalize_clip_to_cfr=lambda *_: pytest.fail(
+            'manual recording must not scan/re-encode the entire file at close'),
         _fail_manual_recording=lambda *args, **kwargs:
             pytest.fail(f'unexpected recording failure: {args!r} {kwargs!r}'),
         _complete_manual_recording_file=lambda *args, **kwargs:
@@ -588,8 +589,11 @@ def test_manual_recording_close_only_validates_direct_fragmented_file(
     assert recording.read_bytes() == b'fragmented-video-and-audio'
 
 
+@pytest.mark.parametrize('probe_error', [
+    RuntimeError('no video stream'), subprocess.TimeoutExpired('ffprobe', 45),
+])
 def test_invalid_manual_recording_is_kept_for_fragment_recovery(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, probe_error):
     pytest.importorskip('PySide6.QtCore')
     import main
 
@@ -598,7 +602,7 @@ def test_invalid_manual_recording_is_kept_for_fragment_recovery(
     recording.write_bytes(b'incomplete-last-fragment')
     monkeypatch.setattr(
         main, 'probe_media',
-        lambda _path: (_ for _ in ()).throw(RuntimeError('no video stream')))
+        lambda _path: (_ for _ in ()).throw(probe_error))
     failures = []
     fake = SimpleNamespace(
         _manual_record_path=recording,
@@ -614,7 +618,7 @@ def test_invalid_manual_recording_is_kept_for_fragment_recovery(
         fake, publish_ui=False)
 
     assert recording.read_bytes() == b'incomplete-last-fragment'
-    assert failures == [(('no video stream',), {
+    assert failures == [((str(probe_error),), {
         'keep_recording': True,
         'expected_recording': recording,
     })]

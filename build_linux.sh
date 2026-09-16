@@ -31,7 +31,7 @@ echo "Python: $("$PYTHON_BIN" --version)"
 echo "GCC:    $(gcc --version | head -1)"
 echo ""
 
-# ── 1. Check requirements ──────────────────────────────────────────────────
+# 1. Check requirements
 echo ">>> Checking dependencies..."
 for cmd in cmake gcc pkg-config wayland-scanner curl readelf file; do
     command -v "$cmd" >/dev/null 2>&1 || {
@@ -95,7 +95,7 @@ if [ ${#_missing_sys[@]} -gt 0 ]; then
 fi
 echo "    All dependencies found."
 
-# ── 1c. Pinned LGPL FFmpeg (AUDIT-014) ────────────────────────────────────
+# 1c. Pinned LGPL FFmpeg (AUDIT-014)
 # The distribution's FFmpeg is a GPL build. The engine is compiled against this
 # tree and ships with it; nothing here ever links /usr/lib FFmpeg.
 FFMPEG_ROOT="$SCRIPT_DIR/FTHRcapture_linux/third_party/ffmpeg"
@@ -108,7 +108,7 @@ if ! "$PYTHON_BIN" "$SCRIPT_DIR/tools/fetch_third_party.py" --ffmpeg-linux; then
     exit 1
 fi
 
-# ── 2. Build Linux C++ engine ─────────────────────────────────────────────
+# 2. Build Linux C++ engine
 echo ""
 echo ">>> Building Linux capture engine (against the pinned LGPL FFmpeg)..."
 cd "$SCRIPT_DIR/FTHRcapture_linux"
@@ -151,7 +151,7 @@ fi
 echo "    Engine links only the pinned LGPL FFmpeg."
 cd "$SCRIPT_DIR"
 
-# ── 3. Bundle with PyInstaller ─────────────────────────────────────────────
+# 3. Bundle with PyInstaller
 echo ""
 echo ">>> Bundling Python app with PyInstaller..."
 "$PYTHON_BIN" -m PyInstaller FTHR_linux.spec --clean --noconfirm
@@ -160,7 +160,7 @@ PYINST_DIR="$SCRIPT_DIR/dist/FTHRClips"
 [[ -f "$PYINST_DIR/FTHRClips" ]] || { echo "ERROR: PyInstaller output missing."; exit 1; }
 echo "    Raw bundle: $(du -sh "$PYINST_DIR" | cut -f1)"
 
-# ── 4. Strip unused libraries ─────────────────────────────────────────────
+# 4. Strip unused libraries
 # This is the most impactful size-reduction step. We remove shared libraries
 # that PyInstaller pulled in transitively but FTHR Clips never calls at runtime.
 echo ""
@@ -219,17 +219,9 @@ _rm "libprotobuf*.so*"
 AFTER="$(du -sh "$PYINST_DIR" | cut -f1)"
 echo "    After strip: $AFTER"
 
-# ── 4b. Remove GPL FFmpeg copies PyInstaller collected (AUDIT-014) ────────
-# cv2 and Qt link the *system* FFmpeg, so PyInstaller collects libavcodec.so.60
-# and friends even though the engine never touches them. A GPL library sitting
-# in the AppDir is a GPL library being distributed, so they go.
-#
-# The regex matches the eight FFmpeg library names EXACTLY, anchored on the
-# basename. An earlier version used the glob 'libav*.so*', which also matched
-# libavif (the AV1 *image* codec Qt and OpenCV use) and libavc1394. Deleting
-# those produced a bundle that died on startup with
-#   ImportError: libavif-cbf1e83c.so.16.3.0: cannot open shared object file
-# Do not widen this pattern back to a glob.
+# Remove unapproved system FFmpeg copies collected through Qt/OpenCV. Match
+# exact library basenames: libav* also matches unrelated libraries such as
+# libavif and libavc1394, whose removal would break the bundle.
 _FFMPEG_LIB_RE='.*/lib(avcodec|avformat|avutil|avdevice|avfilter|swscale|swresample|postproc)\.so[.0-9]*$'
 
 # Kept on purpose:
@@ -258,7 +250,7 @@ echo "    Removed $_removed file(s)."
 echo ">>> FFmpeg libraries remaining in the bundle:"
 find "$INT" -regextype posix-extended -regex "$_FFMPEG_LIB_RE" -printf '    %f\n' | sort
 
-# ── 5. Verify the app still launches after stripping ──────────────────────
+# 5. Verify the app still launches after stripping
 echo ""
 echo ">>> Smoke-testing stripped bundle..."
 if timeout 6 "$PYINST_DIR/FTHRClips" 2>&1 | grep -q "Engine found\|successfully initiated"; then
@@ -267,7 +259,7 @@ else
     echo "    WARNING: Could not confirm launch (no display / normal in CI)."
 fi
 
-# ── 6. Set up AppDir ──────────────────────────────────────────────────────
+# 6. Set up AppDir
 echo ""
 echo ">>> Setting up AppDir..."
 rm -rf "$APPDIR"
@@ -331,7 +323,7 @@ cp "$SCRIPT_DIR/THIRD_PARTY_NOTICES.md" "$APPDIR/"
 cp -r "$SCRIPT_DIR/licenses"            "$APPDIR/"
 echo "    Licence files copied into AppDir."
 
-# ── 6b. Verify no GPL FFmpeg slipped into the bundle ──────────────────────
+# 6b. Verify no GPL FFmpeg slipped into the bundle
 # PyInstaller pulls in the shared libraries the engine links against, so a
 # distro GPL build of FFmpeg can end up inside the AppImage without anyone
 # choosing it. Fail the build rather than ship it.
@@ -344,7 +336,7 @@ if ! "$PYTHON_BIN" "$SCRIPT_DIR/tools/verify_release_licenses.py" --appdir "$APP
     exit 1
 fi
 
-# ── 7. Download appimagetool ──────────────────────────────────────────────
+# 7. Download appimagetool
 APPIMAGETOOL="$BUILD_DIR/appimagetool-x86_64.AppImage"
 if [ ! -f "$APPIMAGETOOL" ]; then
     echo ""
@@ -354,7 +346,7 @@ if [ ! -f "$APPIMAGETOOL" ]; then
     chmod +x "$APPIMAGETOOL"
 fi
 
-# ── 8. Pack AppImage ──────────────────────────────────────────────────────
+# 8. Pack AppImage
 echo ""
 echo ">>> Packing AppImage..."
 OUTPUT="$BUILD_DIR/FTHRClips-${APP_VERSION}-x86_64.AppImage"

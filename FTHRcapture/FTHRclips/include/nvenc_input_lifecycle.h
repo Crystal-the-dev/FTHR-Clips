@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 
 namespace fthr {
@@ -18,7 +19,7 @@ enum class NvencInputSlotState : uint8_t {
 
 class NvencInputSlotLifecycle final {
 public:
-    constexpr NvencInputSlotLifecycle() noexcept = default;
+    NvencInputSlotLifecycle() noexcept = default;
 
     bool OnMapped() noexcept {
         return Transition(NvencInputSlotState::Available, NvencInputSlotState::Mapped);
@@ -56,24 +57,35 @@ public:
             NvencInputSlotState::Available);
     }
 
-    constexpr NvencInputSlotState state() const noexcept { return state_; }
-    constexpr bool is_available() const noexcept {
-        return state_ == NvencInputSlotState::Available;
+    NvencInputSlotState state() const noexcept {
+        return static_cast<NvencInputSlotState>(
+            state_.load(std::memory_order_acquire));
     }
-    constexpr bool is_ready_to_unmap() const noexcept {
-        return state_ == NvencInputSlotState::OutputConsumed;
+    bool is_available() const noexcept {
+        return state() == NvencInputSlotState::Available;
+    }
+    bool is_ready_to_unmap() const noexcept {
+        return state() == NvencInputSlotState::OutputConsumed;
     }
 
-    void ResetForShutdown() noexcept { state_ = NvencInputSlotState::Available; }
+    void ResetForShutdown() noexcept {
+        state_.store(
+            static_cast<uint8_t>(NvencInputSlotState::Available),
+            std::memory_order_release);
+    }
 
 private:
     bool Transition(NvencInputSlotState expected, NvencInputSlotState next) noexcept {
-        if (state_ != expected) return false;
-        state_ = next;
-        return true;
+        auto expected_value = static_cast<uint8_t>(expected);
+        return state_.compare_exchange_strong(
+            expected_value,
+            static_cast<uint8_t>(next),
+            std::memory_order_acq_rel,
+            std::memory_order_acquire);
     }
 
-    NvencInputSlotState state_{NvencInputSlotState::Available};
+    std::atomic<uint8_t> state_{
+        static_cast<uint8_t>(NvencInputSlotState::Available)};
 };
 
 } // namespace fthr

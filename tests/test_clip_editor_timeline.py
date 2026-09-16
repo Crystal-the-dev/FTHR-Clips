@@ -65,7 +65,9 @@ def test_repeated_scrub_requests_restart_the_seek_debounce():
         _pending_seek_ms=None,
         _resume_anchor_ms=500,
         _last_stable_position_ms=0,
-        trim_slider=SimpleNamespace(set_playhead=playheads.append),
+        trim_slider=SimpleNamespace(set_playhead=playheads.append,
+                                    cancel_thumbnail_loading=lambda: None),
+        _timeline_prepare_timer=SimpleNamespace(stop=lambda: None),
         _seek_timer=Timer(),
     )
 

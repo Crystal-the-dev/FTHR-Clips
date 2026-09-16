@@ -1,20 +1,9 @@
-"""
-Hotkey Manager - global keyboard shortcuts for FTHR Clips.
+"""Global shortcuts through RegisterHotKey on Windows and compositor binds
+or the keyboard library on Linux.
 
-On Linux/Wayland the preferred trigger path is via compositor binds that send
-commands to a Unix socket. This file starts that socket server automatically.
-
-The socket lives in a PRIVATE per-user runtime directory — normally
-$XDG_RUNTIME_DIR/fthr/hotkey.sock — not in /tmp. See core/linux_runtime.py for
-why: /tmp is world-writable, so the path itself could be squatted or symlinked
-by any local user even though the socket mode is 0600. Call
-core.linux_runtime.hotkey_socket_path() for the resolved path; do not hardcode
-one, and do not print one you did not resolve.
-
-On Hyprland these lines are written automatically to ~/.config/hypr/fthr-hotkeys.conf
-whenever a hotkey is changed. Windows uses RegisterHotKey/WM_HOTKEY so hiding
-the UI cannot suspend shortcut delivery. The `keyboard` library remains the
-fallback for non-Wayland Linux desktops.
+Wayland binds send commands to the private socket resolved by
+core.linux_runtime.hotkey_socket_path(). Hyprland configuration is written
+to ~/.config/hypr/fthr-hotkeys.conf when a shortcut changes.
 """
 import ctypes
 import keyboard
@@ -45,7 +34,6 @@ _LEGACY_ACTION_NAMES = {
 
 _HOTKEY_ACTIONS = (
     'save_clip',
-    'save_extended_clip',
     'save_screenshot',
     'start_recording',
     'stop_recording',
@@ -433,7 +421,6 @@ class HotkeyManager(QObject):
     
     # Signals
     save_clip_triggered = Signal()
-    save_extended_clip_triggered = Signal()
     save_screenshot_triggered = Signal()
     start_recording_triggered = Signal()
     stop_recording_triggered = Signal()
@@ -447,10 +434,9 @@ class HotkeyManager(QObject):
         # Lives next to all the other user state in ~/.fthr. Survives reinstalls.
         self.config_file = Path.home() / '.fthr' / 'hotkeys.json'
 
-        # Sensible defaults nobody's ever bound to anything else. F9/F10/F11 it is.
+        # Default shortcuts for clips and screenshots; recording is opt-in.
         self.hotkeys = {
             'save_clip': 'F9',
-            'save_extended_clip': 'F10',
             'save_screenshot': 'F12',
             # Recording controls are opt-in so an upgrade never claims a key
             # the user already relies on in a game or another recorder.
@@ -495,7 +481,6 @@ class HotkeyManager(QObject):
         self._controller_timer.setInterval(40)
         self._controller_timer.timeout.connect(self._poll_controller_buttons)
 
-        # Load saved hotkeys
         self._load_hotkeys()
     
     def _load_hotkeys(self):
@@ -511,7 +496,11 @@ class HotkeyManager(QObject):
                 if not isinstance(saved_hotkeys, dict):
                     raise ValueError('hotkeys config must contain an object')
 
-                migrated = False
+                # Retire the old action instead of registering or re-saving it.
+                migrated = any(
+                    isinstance(mapping, dict) and 'save_extended_clip' in mapping
+                    for mapping in (saved_hotkeys, saved_hotkeys.get('keyboard'),
+                                    saved_hotkeys.get('controller')))
                 keyboard_map = saved_hotkeys.get('keyboard')
                 controller_map = saved_hotkeys.get('controller')
                 for action in self.hotkeys:
@@ -574,13 +563,7 @@ class HotkeyManager(QObject):
                 pass
     
     def set_hotkey(self, action: str, key: str, device: str = 'keyboard'):
-        """
-        Set a hotkey for an action
-        
-        Args:
-            action: A key from ``_HOTKEY_ACTIONS``.
-            key: The key combination (e.g., 'F9', 'ctrl+shift+s')
-        """
+        """Bind an action from ``_HOTKEY_ACTIONS`` to a key such as ctrl+shift+s."""
         if action not in self.hotkeys:
             print(f"Unknown action: {action}")
             return False
@@ -753,7 +736,6 @@ class HotkeyManager(QObject):
     def _register_action(self, action: str) -> bool:
         registrations = {
             'save_clip': self._register_save_clip,
-            'save_extended_clip': self._register_save_extended_clip,
             'save_screenshot': self._register_save_screenshot,
             'start_recording': self._register_start_recording,
             'stop_recording': self._register_stop_recording,
@@ -770,10 +752,6 @@ class HotkeyManager(QObject):
             self.hotkeys['save_clip'], self.save_clip_triggered,
             action='save_clip')
 
-    def _register_save_extended_clip(self):
-        return self._register_keyboard_hotkey(
-            self.hotkeys['save_extended_clip'], self.save_extended_clip_triggered,
-            action='save_extended_clip')
 
     def _register_save_screenshot(self):
         return self._register_keyboard_hotkey(
@@ -983,7 +961,6 @@ class HotkeyManager(QObject):
         self._last_emit_at[action] = now
         signals = {
             'save_clip': self.save_clip_triggered,
-            'save_extended_clip': self.save_extended_clip_triggered,
             'save_screenshot': self.save_screenshot_triggered,
             'start_recording': self.start_recording_triggered,
             'stop_recording': self.stop_recording_triggered,
@@ -1241,10 +1218,9 @@ class HotkeyManager(QObject):
         self._controller_active_actions = matching
 
     def _warn_if_linux_hotkeys_dead(self):
-        """On Linux the keyboard lib needs root and fails silently by design;
-        the socket path only works when a compositor (Hyprland) sends binds.
-        On anything else (GNOME/KDE/X11 without manual binds) the user has
-        NO working hotkeys and previously got no hint why."""
+        """The keyboard fallback may lack Linux input permissions. Compositor
+        socket binds need separate setup, so report when neither path is usable.
+        """
         if sys.platform == 'win32' or not getattr(self, '_keyboard_failed', False):
             return
         comp = None
@@ -1281,18 +1257,13 @@ class HotkeyManager(QObject):
             'warning',
         )
 
-    # ------------------------------------------------------------------
     # Compositor auto-config (Hyprland)
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _to_hyprland_bind(key: str) -> tuple[str, str]:
-        """Convert a key string to (modifier, key) for Hyprland bind syntax.
+        """Convert key syntax to a Hyprland modifier/key pair.
 
-        Examples:
-          'F9'           -> ('', 'F9')
-          'ctrl+shift+s' -> ('CTRL SHIFT', 'S')
-          'alt+F12'      -> ('ALT', 'F12')
+        For example, ctrl+shift+s becomes ('CTRL SHIFT', 'S').
         """
         parts = key.split('+')
         if len(parts) == 1:
@@ -1302,12 +1273,9 @@ class HotkeyManager(QObject):
         return mods, k
 
     def socket_command(self, action: str) -> str:
-        """The exact shell command a compositor bind must run for *action*.
+        """Build the shell command shared by compositor binds and setup instructions.
 
-        Single source for every generated bind and every instruction we show
-        the user. Both the socket path and the `nc` binary are resolved, not
-        guessed: the path moved out of /tmp (AUDIT-003b) and a bare `nc` picks
-        up whatever is first on PATH.
+        Resolve both the private socket path and the absolute nc executable path.
         """
         nc = linux_tools.path('nc') or 'nc'
         sock = getattr(self, '_socket_path', None)
@@ -1323,7 +1291,7 @@ class HotkeyManager(QObject):
         """Return compositor instructions built from the real private socket."""
         commands = {
             action: self.socket_command(action)
-            for action in ('save_clip', 'save_extended_clip', 'save_screenshot')
+            for action in ('save_clip', 'save_screenshot')
         }
         if compositor == 'kwin':
             heading = 'KDE: System Settings → Shortcuts → Custom Shortcuts'
@@ -1348,7 +1316,6 @@ class HotkeyManager(QObject):
             '# FTHR Clips hotkeys — auto-generated, do not edit manually.',
             '# Change hotkeys inside FTHR Clips → Hotkeys menu.',
             self._build_bind_line('save_clip'),
-            self._build_bind_line('save_extended_clip'),
             self._build_bind_line('save_screenshot'),
             '',
         ]
@@ -1497,7 +1464,6 @@ class HotkeyManager(QObject):
 
         _dispatch = {
             'save_clip':               self.save_clip_triggered,
-            'save_extended_clip':      self.save_extended_clip_triggered,
             'save_screenshot':         self.save_screenshot_triggered,
             'start_recording':         self.start_recording_triggered,
             'stop_recording':          self.stop_recording_triggered,

@@ -1,30 +1,9 @@
 #!/usr/bin/env python3
-"""Verify the engine -> UI publication contract in both C++ engines.
+"""Check payload-before-response ordering and error details in both engines.
 
-The contract (see AUDIT-018 in docs/AUDIT_REPORT.md):
-
-    1. write engine_string / engine_param* — the payload
-    2. publish engine_response LAST
-
-plus, since AUDIT-019:
-
-    every ERROR_OCCURRED carries a diagnostic message
-
-Why a static gate. The C++ error paths are the least-executed code in the
-project — they need a disk to fill up or an encoder to fail — and neither
-engine has tests. A pytest run proves nothing about them. This checker reads
-the sources instead, so a reordering regression fails CI on the commit that
-introduces it rather than in a bug report nobody can reproduce.
-
-It is deliberately not a line-number check. It tracks brace depth to find the
-enclosing block of each publication and compares the *order of events* inside
-that block, so the sources can be freely reformatted.
-
-Usage:
-    python tools/verify_engine_response_contract.py
-    python tools/verify_engine_response_contract.py --root some/fixture/dir
-
-Exit code 0 = contract intact, 1 = violations found.
+Inspect enclosing C++ blocks rather than fixed line numbers. This source
+gate supplements runtime tests for error paths that are hard to trigger.
+Use --root to check a fixture tree. Exit 0 means intact; 1 means violations.
 """
 
 from __future__ import annotations
@@ -44,7 +23,7 @@ DEFAULT_ROOTS = [
     REPO / 'FTHRcapture_linux' / 'src',
 ]
 
-# --- what counts as an event -------------------------------------------------
+# what counts as an event
 
 #: Publishing a response by raw assignment. Captures the response name if it is
 #: on the same line; a multi-line assignment carries it on a following line, so

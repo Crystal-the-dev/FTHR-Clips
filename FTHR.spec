@@ -85,10 +85,8 @@ PLAYBACK_MIXER = (
 # FFmpeg DLLs the C++ engine links against on Windows
 _FFMPEG_BIN  = ROOT / 'FTHRcapture' / 'FTHRclips' / 'third_party' / 'ffmpeg' / 'bin'
 _FFMPEG_DLLS = _glob.glob(str(_FFMPEG_BIN / '*.dll'))
-# ffmpeg.exe / ffprobe.exe from the SAME LGPL build. The Python side shells
-# out to these for mic mux, watermark, webcam overlay and export.
-# They were previously taken from imageio-ffmpeg, which (a) is GPL and
-# (b) was never actually bundled — so all of the above silently no-opped.
+# Bundle ffmpeg and ffprobe from the same build as the engine libraries.
+# Python uses them for audio finalization, overlays, and export.
 _FFMPEG_TOOLS = [str(_FFMPEG_BIN / n) for n in ('ffmpeg.exe', 'ffprobe.exe')]
 
 a = Analysis(
@@ -168,12 +166,8 @@ a = Analysis(
     hookspath=[],
     runtime_hooks=[],
     excludes=[
-        # imageio_ffmpeg is deliberately EXCLUDED (AUDIT-005).
-        # Its bundled binary is a gyan.dev build configured with
-        # --enable-gpl --enable-libx264 --enable-libx265, i.e. GPLv3.
-        # Shipping it would place this whole artifact under the GPL.
-        # FTHR uses the LGPL FFmpeg next to the engine — see
-        # FTHR_UI/core/ffmpeg_tools.py.
+        # Exclude imageio_ffmpeg; use the project-pinned FFmpeg runtime beside
+        # the engine. See core/ffmpeg_tools.py.
         'imageio_ffmpeg',
         # Qt modules unused on Windows (no Wayland, no QML)
         'PySide6.QtQuick', 'PySide6.QtQml', 'PySide6.QtWebEngine',
@@ -199,11 +193,9 @@ a = Analysis(
     noarchive=False,
 )
 
-# PyInstaller's QtGui hook collects every platform-input-context plugin,
-# including Qt Virtual Keyboard. That module is GPL-only in Qt 6.11 and pulls
-# the otherwise unused QML/Quick runtime with it. Python-module exclusions do
-# not filter hook-added binaries, so prune that reviewed-unnecessary chain from
-# the actual TOCs before COLLECT.
+# QtGui hooks collect Virtual Keyboard and its QML/Quick dependencies even
+# when Python modules are excluded. Filter the binary TOCs before COLLECT
+# to keep unused modules out of the bundle.
 def _keep_reviewed_qt_runtime(entry):
     dest = str(entry[0]).replace('\\', '/').casefold()
     name = dest.rsplit('/', 1)[-1]

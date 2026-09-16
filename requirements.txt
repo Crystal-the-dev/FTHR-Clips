@@ -1,12 +1,4 @@
-# DEPRECATED — kept only so `pip install -r requirements.txt` still does the
-# right thing for anyone following an older README or bookmark.
-#
-# The unpinned `>=` list that used to live here was AUDIT-009: it let two
-# clean installs end up on different Qt versions, which made UI bug reports
-# irreproducible.
-#
-# Use one of these instead:
-#   requirements.in         direct dependencies, human-edited
-#   requirements-alpha.txt  the pinned lock — the ONLY release install path
-#   requirements-dev.txt    pinned test / lint / packaging tools
+# Compatibility entry point for older install instructions.
+# requirements-alpha.txt is the release lock; requirements.in lists direct
+# dependencies and requirements-dev.txt adds development tools.
 -r requirements-alpha.txt

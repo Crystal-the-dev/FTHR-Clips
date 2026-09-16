@@ -1,4 +1,3 @@
-// windows_audio_session_registry.h
 // Runtime-only WASAPI session discovery for AUDIT-050 Windows audio providers.
 
 #pragma once

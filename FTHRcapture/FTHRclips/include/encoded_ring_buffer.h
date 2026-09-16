@@ -1,21 +1,7 @@
-// encoded_ring_buffer.h
-// FTHR Capture Engine - Encoded packet ring buffer
-//
-// Stores container-ready compressed video packets plus their codec-neutral
-// stream configuration.
-// Replaces the raw BGRA FramePool on the NVENC path, dropping RAM usage
-// from ~8GB to ~60MB for a 30-second buffer at 1080p/60fps/16Mbps.
-//
-// Threading model:
-//   Push()         - single producer; publishes one sequence-numbered slot.
-//   TakeSnapshot() - save thread; takes short per-slot locks while copying.
-// This avoids a global capture lock while preventing a wrapped slot from being
-// overwritten during its deep copy. Selection is by capture timestamp, not by
-// packet count, and includes the keyframe immediately before the visible start.
-//
-// Packet bytes are already in the EncodedVideoConfig packet format. The ring
-// never parses or converts them and copies the matching codec configuration
-// into every save snapshot.
+// Compressed replay ring with codec configuration copied into each snapshot.
+// Push has one producer; snapshots take per-slot locks while copying so a
+// wrapped slot cannot be overwritten mid-copy. Select by capture timestamp
+// and retain keyframe pre-roll. Packet format conversion belongs to the encoder.
 
 #pragma once
 #ifndef FTHR_ENCODED_RING_BUFFER_H
@@ -52,14 +38,7 @@ namespace fthr {
     }
 
 
-    // ---------------------------------------------------------------------------
-    // SlotState
-    //
-    // Per-slot lifecycle flags used by the published-slot protocol.
-    //   EMPTY   - slot has never been written (ring not yet full)
-    //   WRITING - Push() is actively writing to this slot
-    //   READY   - slot data is complete and safe to read
-    // ---------------------------------------------------------------------------
+    // Slot publication states: unused, being written, or ready for a snapshot.
     enum class SlotState : uint32_t {
         EMPTY   = 0,
         WRITING = 1,
@@ -67,20 +46,12 @@ namespace fthr {
     };
 
 
-    // ---------------------------------------------------------------------------
-    // EncodedRingPacket
-    //
-    // One compressed video frame stored in the ring buffer.
-    // data is a container-ready encoded sample in video_config.packet_format.
-    //
-    // Named EncodedRingPacket (not EncodedPacket) to avoid collision with
-    // the EncodedPacket struct defined in video_encoder.h (pool-backed, different
-    // members). Both live in namespace fthr so the names must be distinct.
-    // ---------------------------------------------------------------------------
+    // One compressed frame in video_config.packet_format.
     struct EncodedRingPacket {
         std::vector<uint8_t> data;         // Encoded sample in configured packet format
         int64_t              pts = 0;
         int64_t              wall_qpc = 0; // Raw QPC ticks at capture time (same clock as WASAPI)
+        uint64_t             generation = 0; // Internal capture generation; not shared-memory ABI
         bool                 is_keyframe = false;
         bool                 valid = false; // False on uninitialized slots
         uint64_t             absolute_position =
@@ -88,15 +59,15 @@ namespace fthr {
     };
 
 
-    // ---------------------------------------------------------------------------
     // EncodedRingSnapshot
     //
     // Returned by TakeSnapshot(). Caller owns all data - safe to use while
     // CaptureThread continues encoding into the ring buffer.
-    // ---------------------------------------------------------------------------
     struct EncodedRingSnapshot {
         std::vector<EncodedRingPacket> packets;   // Ordered oldest -> newest
         EncodedVideoConfig video_config;
+        uint64_t capture_generation = 0;
+        bool generation_continuous = true;
 
         // Wall-clock QPC range of packets in this snapshot (seconds).
         // Derived from first/last packet wall_qpc, converted using qpc_freq.
@@ -111,9 +82,6 @@ namespace fthr {
     };
 
 
-    // ---------------------------------------------------------------------------
-    // EncodedRingBuffer
-    // ---------------------------------------------------------------------------
     class EncodedRingBuffer {
     public:
         // capacity:  number of packet slots to pre-allocate.
@@ -128,51 +96,44 @@ namespace fthr {
         EncodedRingBuffer& operator=(const EncodedRingBuffer&) = delete;
 
 
-        // -----------------------------------------------------------------------
-        // Push
-        //
-        // Store one encoded packet in the next ring slot.
-        // Called from CaptureThread - must be fast.
-        //
-        // encoded_data: bytes in video_config.packet_format. The encoder owns
-        //               any conversion before publication.
-        // -----------------------------------------------------------------------
-        void Push(const uint8_t* encoded_data, uint32_t size,
+        // Store a packet from CaptureThread in video_config.packet_format.
+        // The encoder must finish any format conversion before publication.
+        bool Push(const uint8_t* encoded_data, uint32_t size,
             int64_t pts, bool is_keyframe, int64_t wall_qpc = 0);
 
 
-        // -----------------------------------------------------------------------
         // Store codec, geometry, timing, packet format and decoder config as
         // one atomic stream description for future snapshots.
-        // -----------------------------------------------------------------------
         // The stream description is immutable after its first publication in
         // this generation, preventing codec/config and packet mismatches.
         bool SetVideoConfig(const EncodedVideoConfig& config);
         bool HasVideoConfig() const;
+        bool WaitForVideoConfig(EncodedVideoConfig& config,
+            std::chrono::milliseconds timeout) const;
 
 
-        // -----------------------------------------------------------------------
-        // TakeSnapshot
-        //
-        // Copy the requested wall-clock interval plus decoder keyframe pre-roll.
-        //
-        // Called from SaveClipThread - blocking is acceptable here.
-        // -----------------------------------------------------------------------
+        // Copy the requested wall-clock interval with decoder keyframe pre-roll.
+        // Called from the save thread, where blocking is permitted.
         EncodedRingSnapshot TakeSnapshotByTime(
             uint32_t duration_seconds, int64_t target_end_qpc) const;
 
         bool WaitUntilPublished(
             int64_t target_qpc, std::chrono::milliseconds timeout) const;
 
-        // Invalidate replay across a backend recovery. Slot storage is retained
-        // to avoid reallocations; atomic state/count publication makes a
-        // concurrent snapshot safely observe an empty/non-ready buffer.
-        void Clear();
+        // Invalidate replay after recovery without reallocating slot storage.
+        // Concurrent snapshots see an empty/non-ready ring. Reject delayed packets
+        // at or before recovery_cutoff_qpc so old output cannot enter the new generation.
+        void Clear(int64_t recovery_cutoff_qpc = 0);
+
+        // Internal packet-generation token used to prove that a snapshot did
+        // not cross a backend recovery boundary. This is deliberately not part
+        // of the shared-memory v4 contract.
+        uint64_t GetGeneration() const {
+            return generation_.load(std::memory_order_acquire);
+        }
 
 
-        // -----------------------------------------------------------------------
         // Stats
-        // -----------------------------------------------------------------------
         size_t   GetCount()    const { return count_.load(std::memory_order_relaxed); }
         size_t   GetCapacity() const { return capacity_; }
         uint64_t GetPushCount() const { return head_.load(std::memory_order_relaxed); }
@@ -199,12 +160,15 @@ namespace fthr {
         // Number of valid slots, capped at capacity_.
         std::atomic<size_t>    count_{ 0 };
         std::atomic<int64_t>   latest_wall_qpc_{ 0 };
+        std::atomic<uint64_t>  generation_{ 0 };
+        std::atomic<int64_t>   recovery_cutoff_qpc_{ 0 };
 
         mutable std::mutex publication_mutex_;
         mutable std::condition_variable publication_cv_;
 
         EncodedVideoConfig video_config_;
         mutable std::mutex video_config_mutex_;
+        mutable std::condition_variable video_config_cv_;
         bool video_config_set_ = false;
     };
 

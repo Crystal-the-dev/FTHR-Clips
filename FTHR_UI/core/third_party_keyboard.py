@@ -1,14 +1,7 @@
-"""Windows third-party keyboard-window capture and chroma-key helpers.
+"""Capture Windows keyboard visualizers into a timestamped JPEG ring.
 
-The keyboard visualizers supported here (NohBoard/Noboard, Keyviz, and
-similar tools) are ordinary top-level Windows windows.  FTHR keeps a small
-timestamped JPEG ring of that window while it is enabled.  JPEGs keep the
-long replay window bounded without moving any work onto the Qt GUI thread;
-the newest uncompressed frame is also exposed for the live settings preview.
-
-This module intentionally uses Win32/GDI through ``ctypes`` instead of adding
-another capture dependency.  The native replay engine remains the owner of
-the main screen texture and this source never changes its capture generation.
+Win32/GDI capture runs outside the GUI thread; the latest raw frame serves
+the settings preview. This source is independent of native screen capture.
 """
 
 from __future__ import annotations
@@ -232,13 +225,10 @@ def enumerate_keyboard_windows() -> list[dict]:
 
 
 def capture_window(hwnd: int):
-    """Capture a window's client area as BGR, excluding native window chrome.
+    """Capture the client area as BGR without native window chrome.
 
-    ``PrintWindow(PW_RENDERFULLCONTENT)`` keeps the source usable when the
-    visualizer is behind another window. ``PW_CLIENTONLY`` and ``GetDC`` keep
-    the title bar, resize frame, and drop shadow out of both previews and saved
-    clips. The BitBlt path is retained for tools that refuse PrintWindow but
-    are visible on the desktop.
+    PrintWindow supports occluded sources; BitBlt is the fallback for visible
+    visualizers that reject PrintWindow.
     """
     if sys.platform != 'win32':
         return None
@@ -517,12 +507,8 @@ class ThirdPartyKeyboardCapture:
                 next_tick = time.monotonic()
 
     def _store_ring_frame_if_changed(self, stamp: float, frame) -> bool:
-        """JPEG-stage a source state only when its pixels actually changed.
-
-        Keyboard windows are static for most capture ticks. Keeping one entry
-        per changed state retains exact key timing but prevents the capture
-        service from continuously JPEG-encoding duplicate full frames while a
-        user is playing or editing a clip.
+        """JPEG-encode only changed keyboard states to retain timing without
+        repeatedly encoding identical frames.
         """
         try:
             import numpy as np
@@ -560,13 +546,9 @@ class ThirdPartyKeyboardCapture:
     def iter_segment_frames(self, end_time: float,
                             duration_seconds: int,
                             output_fps: int = 30):
-        """Yield timestamp-matched BGR frames without retaining a second copy.
+        """Yield timestamp-matched BGR frames with one decoded hold-last frame.
 
-        The old finalizer decoded every JPEG in the replay window before it
-        started writing.  A five-minute ring can contain thousands of frames,
-        so that briefly multiplied the source resolution by the whole clip
-        duration.  This iterator decodes only the frame needed for each output
-        tick and keeps one decoded frame as the hold-last-frame value.
+        Decode on demand to avoid expanding a full replay window of JPEGs in memory.
         """
         if sys.platform != 'win32':
             return

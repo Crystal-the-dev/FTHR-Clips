@@ -1,17 +1,7 @@
-"""Tests for the private runtime directory and hotkey socket path (AUDIT-003b).
+"""Verify private Linux runtime paths and safe socket reuse.
 
-The original socket lived at a fixed /tmp/fthr_hotkey.sock. Its *mode* was
-fixed (0600 via umask around bind); its *path* was not. /tmp is world-writable,
-so any local user could create that path first — and the old code then ran an
-unconditional os.unlink() on it. Either FTHR deleted a stranger's file, or the
-unlink failed under the sticky bit and hotkeys were dead for as long as the
-squatter left the file in place.
-
-These tests pin the properties that make that class of attack impossible:
-a private 0700 directory, no deletion of anything we do not own, no following
-of symlinks, and no reuse of a socket a live instance still holds.
-
-Everything here is POSIX-only and writes exclusively into tmp_path.
+Require user-owned 0700 directories; preserve foreign files, symlinks,
+and sockets with active listeners. POSIX-only fixtures use tmp_path.
 """
 
 import os
@@ -36,9 +26,7 @@ def xdg(tmp_path, monkeypatch):
     return base
 
 
-# ---------------------------------------------------------------------------
 # Path selection
-# ---------------------------------------------------------------------------
 
 def test_socket_lives_under_xdg_runtime_dir(xdg):
     p = linux_runtime.hotkey_socket_path()
@@ -81,9 +69,7 @@ def test_falls_back_when_xdg_runtime_dir_is_unusable(tmp_path, monkeypatch):
     assert p.startswith(str(home))
 
 
-# ---------------------------------------------------------------------------
 # Directory permissions and ownership
-# ---------------------------------------------------------------------------
 
 def test_runtime_dir_is_created_0700(xdg):
     d = linux_runtime.runtime_dir()
@@ -126,9 +112,7 @@ def test_runtime_dir_error_when_nothing_is_usable(tmp_path, monkeypatch):
         linux_runtime.runtime_dir()
 
 
-# ---------------------------------------------------------------------------
 # prepare_socket_path — what may and may not be deleted
-# ---------------------------------------------------------------------------
 
 def test_missing_path_is_fine(xdg):
     linux_runtime.prepare_socket_path(linux_runtime.hotkey_socket_path())
@@ -189,9 +173,7 @@ def test_directory_at_socket_path_is_refused(xdg):
     assert os.path.isdir(p)
 
 
-# ---------------------------------------------------------------------------
 # Bind end to end — mode 0600 (AUDIT-003)
-# ---------------------------------------------------------------------------
 
 def test_bound_socket_is_owner_only(xdg):
     """The AUDIT-003 property, re-asserted at the new path."""
@@ -239,9 +221,7 @@ def test_cleanup_after_crash(xdg):
     assert not os.path.exists(p)
 
 
-# ---------------------------------------------------------------------------
 # Legacy /tmp socket migration
-# ---------------------------------------------------------------------------
 
 def test_legacy_cleanup_leaves_foreign_paths_alone(monkeypatch, tmp_path):
     legacy = tmp_path / 'fthr_hotkey.sock'

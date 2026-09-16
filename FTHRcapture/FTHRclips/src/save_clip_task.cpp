@@ -1,4 +1,3 @@
-// save_clip_task.cpp
 // FTHR Capture Engine - SaveClipQueue implementation
 
 #include "save_clip_task.h"
@@ -8,9 +7,7 @@
 namespace fthr {
 
 
-// ---------------------------------------------------------------------------
 // SaveClipQueue construction
-// ---------------------------------------------------------------------------
 
 SaveClipQueue::SaveClipQueue()
     : shutdown_(false)
@@ -18,17 +15,14 @@ SaveClipQueue::SaveClipQueue()
 }
 
 SaveClipQueue::~SaveClipQueue() {
-    // Ensure shutdown was called
     Shutdown();
 }
 
 
-// ---------------------------------------------------------------------------
 // Push
 //
 // Adds a task to the queue and signals the SaveClipThread.
 // Thread-safe, never blocks.
-// ---------------------------------------------------------------------------
 
 bool SaveClipQueue::Push(SaveClipTask&& task) {
     std::wstring log_path = task.output_path;
@@ -65,13 +59,8 @@ bool SaveClipQueue::Push(SaveClipTask&& task) {
 }
 
 
-// ---------------------------------------------------------------------------
-// Pop
-//
-// Removes and returns the next task from the queue.
-// Blocks if queue is empty (waits for Push() or Shutdown()).
-// Returns false if shutting down and queue is empty.
-// ---------------------------------------------------------------------------
+// Wait for a queued task or shutdown. Return false once shutdown is requested
+// and the queue is empty.
 
 bool SaveClipQueue::Pop(SaveClipTask& out_task) {
     std::unique_lock<std::mutex> lock(mutex_);
@@ -86,7 +75,6 @@ bool SaveClipQueue::Pop(SaveClipTask& out_task) {
         return false;
     }
     
-    // Get the next task
     out_task = std::move(queue_.front());
     queue_.pop();
     
@@ -94,12 +82,10 @@ bool SaveClipQueue::Pop(SaveClipTask& out_task) {
 }
 
 
-// ---------------------------------------------------------------------------
 // Shutdown
 //
 // Signals SaveClipThread to drain remaining tasks and exit.
 // After this, Pop() will return false once the queue is empty.
-// ---------------------------------------------------------------------------
 
 void SaveClipQueue::Shutdown() {
     {
@@ -116,9 +102,6 @@ void SaveClipQueue::Shutdown() {
 }
 
 
-// ---------------------------------------------------------------------------
-// IsShutdown
-// ---------------------------------------------------------------------------
 
 bool SaveClipQueue::IsShutdown() const {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -126,9 +109,6 @@ bool SaveClipQueue::IsShutdown() const {
 }
 
 
-// ---------------------------------------------------------------------------
-// GetQueueDepth
-// ---------------------------------------------------------------------------
 
 size_t SaveClipQueue::GetQueueDepth() const {
     std::lock_guard<std::mutex> lock(mutex_);

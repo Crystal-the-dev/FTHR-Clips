@@ -120,13 +120,7 @@ def test_save_clip_writes_command_last():
 
 
 def test_save_clip_does_not_touch_engine_response():
-    """AUDIT-017 regression at the bridge boundary.
-
-    `engine_response` is a single slot. Clearing it here destroyed the
-    still-unconsumed verdict of the previous save — the user got no
-    confirmation for a clip that had been written, or no error for one that
-    had not.
-    """
+    """Submitting a save must preserve the previous unconsumed engine response."""
     for pending in (ResponseType.CLIP_SAVED, ResponseType.ERROR_OCCURRED,
                     ResponseType.SAVE_STARTED):
         layout, buf = _make_fake_layout()
@@ -179,6 +173,40 @@ def test_peek_reports_save_started():
     bridge = _FakeBridge(layout)
     layout.engine_response = ResponseType.SAVE_STARTED
     assert bridge.peek_save_response()[0] == 'started'
+
+
+def test_ack_consumption_preserves_completion_published_after_peek():
+    for terminal, kind in ((ResponseType.CLIP_SAVED, 'saved'),
+                           (ResponseType.ERROR_OCCURRED, 'error')):
+        layout, buf = _make_fake_layout()
+        bridge = _FakeBridge(layout)
+        layout.engine_response = ResponseType.SAVE_STARTED
+        peeked_kind, _ = bridge.peek_save_response()
+        # The save worker finishes while the UI interprets its earlier ack.
+        layout.engine_string = _encode_engine_string('terminal payload')
+        layout.engine_response = terminal
+
+        assert bridge.consume_save_response(peeked_kind)
+        assert layout.engine_response == terminal
+        assert bridge.peek_save_response() == (kind, 'terminal payload')
+        assert bridge.consume_save_response(kind)
+        assert layout.engine_response == ResponseType.NONE
+
+
+def test_ack_is_delivered_once_and_rearmed_for_next_save():
+    layout, buf = _make_fake_layout()
+    bridge = _FakeBridge(layout)
+    for _ in range(3):
+        assert bridge.save_clip(_a_path(), 5)
+        layout.engine_response = ResponseType.SAVE_STARTED
+        assert bridge.peek_save_response() == ('started', '')
+        assert bridge.consume_save_response('started')
+        # No response means the poller advances timeout deadlines normally.
+        assert bridge.peek_save_response() is None
+        assert not bridge.consume_save_response('started')
+        layout.engine_response = ResponseType.CLIP_SAVED
+        assert bridge.peek_save_response() == ('saved', '')
+        assert bridge.consume_save_response('saved')
 
 
 def test_peek_ignores_unrelated_responses():

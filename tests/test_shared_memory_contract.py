@@ -1,12 +1,4 @@
-"""The shared-memory contract is checked on every test run, not just at release.
-
-Rationale: a mismatch between capture_bridge.py's ctypes struct and the C++
-shared_memory.h is invisible at build time and silently corrupts every field
-after the drift point at runtime. Catching it in CI is the only cheap moment.
-
-These tests exercise tools/verify_shared_memory_contract.py directly and also
-prove it can fail — a verifier that always passes is worse than none.
-"""
+"""Verify ctypes/C++ layout agreement and reject deliberately mismatched layouts."""
 
 import sys
 from pathlib import Path
@@ -24,9 +16,7 @@ WIN_HEADER = ROOT / 'FTHRcapture' / 'FTHRclips' / 'include' / 'shared_memory.h'
 LINUX_HEADER = ROOT / 'FTHRcapture_linux' / 'src' / 'shared_memory.h'
 
 
-# ---------------------------------------------------------------------------
 # The contract itself
-# ---------------------------------------------------------------------------
 
 def test_contract_verifier_passes_on_current_tree():
     assert vsmc.main() == 0, 'shared-memory contract drifted — see output above'
@@ -78,9 +68,7 @@ def test_mapping_name_is_layout_versioned():
     assert CaptureBridge.SHARED_MEM_NAME.rsplit('_', 1)[-1].startswith('v')
 
 
-# ---------------------------------------------------------------------------
 # Negative tests — prove the verifier can actually fail
-# ---------------------------------------------------------------------------
 
 def _cpp_fields():
     return vsmc.parse_struct(WIN_HEADER)

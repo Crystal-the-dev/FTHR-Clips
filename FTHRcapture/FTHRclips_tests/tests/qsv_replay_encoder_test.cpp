@@ -381,6 +381,17 @@ void PacketMetadataAndDeferredAv1ConfigPropagate() {
         "QSV PTS and first-packet AV1 configuration propagate");
     CheckQsv(callback_keyframe,
         "QSV keyframe metadata propagates");
+    CheckQsv(encoder.PrepareGpuFrame(reinterpret_cast<ID3D11Texture2D*>(1), 0) && encoder.EncodeFrame(2)
+            && !fake->submitted_force_keyframe,
+        "normal following frame does not force an IDR");
+    encoder.RequestKeyframe();
+    CheckQsv(encoder.PrepareGpuFrame(reinterpret_cast<ID3D11Texture2D*>(1), 0) && encoder.EncodeFrame(3)
+            && fake->submitted_force_keyframe,
+        "recording start requests an immediate random-access frame");
+    CheckQsv(encoder.PrepareGpuFrame(reinterpret_cast<ID3D11Texture2D*>(1), 0) && encoder.EncodeFrame(4)
+            && !fake->submitted_force_keyframe,
+        "keyframe request is consumed exactly once");
+
 }
 
 void GenerationFlushAndErrorsAreObservable() {

@@ -1,29 +1,8 @@
-# save_state.py — the one place that knows what a save is doing.
+# Single-flight save state machine driven by the Qt main-thread poller.
 #
-# Why this exists (AUDIT-011 / AUDIT-017)
-# ---------------------------------------
-# The engine reports the fate of a SaveClip through exactly two shared-memory
-# fields: `engine_response` and `engine_string`. Both are single-slot. There is
-# no queue, no sequence number, no correlation id. Whoever reads the response
-# and writes NONE back has *destroyed* it for everyone else.
-#
-# We used to have three readers:
-#   1. save_clip()               — busy-waited for SAVE_STARTED on the Qt main
-#                                  thread, and cleared the field before every
-#                                  new request (AUDIT-017: that clear could
-#                                  eat the still-unread completion of the
-#                                  *previous* save)
-#   2. wait_for_clip_completion()— a second consumer, unused but live
-#   3. poll_async_result()       — the status timer
-#
-# Now there is one reader (the save poller in main.py) and this module is the
-# only thing that interprets what it read. This module is deliberately free of
-# Qt, of ctypes, and of the bridge: it takes events and a clock, and returns
-# outcomes. That is what makes the fake-engine tests deterministic.
-#
-# Threading: not thread-safe by design. It is driven from the Qt main thread
-# by a QTimer and from nowhere else. Adding a lock here would only hide a
-# violation of that rule.
+# The engine has one response slot with no request ID. Only the poller reads
+# and consumes it; this module interprets events and deadlines without Qt,
+# ctypes, or bridge access. Instances are not thread-safe.
 
 from __future__ import annotations
 
@@ -64,13 +43,10 @@ class EngineEvent(Enum):
 
 
 class OutcomeKind(Enum):
-    """What the UI is being told.
+    """Save results and non-terminal notices for the UI.
 
-    COMPLETED and FAILED are *results*: an operation emits at most one of them,
-    ever. TIMEOUT_NOTICE is not a result — it says "the engine has not acked,
-    warn the user" while the operation stays under observation. That split is
-    what lets a late CLIP_SAVED still be honoured without ever producing two
-    success messages for one clip. See `LATE_RESULT`.
+    Each operation emits at most one COMPLETED or FAILED result. TIMEOUT_NOTICE
+    keeps the save under observation so a late CLIP_SAVED can still be accepted.
     """
     ACCEPTED = 'ACCEPTED'                # engine acked; UI may show progress
     COMPLETED = 'COMPLETED'              # result — clip written
@@ -152,15 +128,10 @@ DEFAULT_COMPLETION_TIMEOUT_S = 60.0
 
 
 class SaveStateMachine:
-    """Single-flight save tracker.
+    """Track one save at a time.
 
-    Usage from the poller::
-
-        sm.submit(path, duration, now)      # after the command was written
-        outcome = sm.on_event(event, detail, now)   # response was read
-        outcome = sm.on_tick(now)                   # no response this tick
-
-    Every method returns at most one Outcome. Act on it, then poll again.
+    Call submit after writing the command, on_event for a response, and on_tick
+    when none arrives. Each call returns at most one Outcome for the poller.
     """
 
     def __init__(self,
@@ -176,7 +147,7 @@ class SaveStateMachine:
         #: attributable and any response we see is unexpected.
         self._current: Optional[SaveOperation] = None
 
-    # -- introspection ---------------------------------------------------
+    # introspection
 
     @property
     def state(self) -> SaveState:
@@ -201,18 +172,14 @@ class SaveStateMachine:
                 and self._current.is_in_flight
                 and not self._current.result_emitted)
 
-    # -- submission ------------------------------------------------------
+    # submission
 
     def submit(self, output_path: str, duration_seconds: int, now: float,
                **context) -> SubmitResult:
-        """Register a save that has just been handed to the engine.
+        """Register a save after its command is written to shared memory.
 
-        Call this *after* the command was written to shared memory, so the
-        request timestamp brackets the engine's actual work.
-
-        Single-flight: while another save is in flight this returns
-        ``accepted=False`` with ``RejectReason.BUSY`` and creates nothing. The
-        caller must not tell the user a second clip is being saved.
+        If a save is already in flight, return accepted=False with RejectReason.BUSY
+        without creating a second operation.
         """
         if self.is_busy():
             self._log(f'Rejected save (single-flight, current='
@@ -234,7 +201,7 @@ class SaveStateMachine:
                   f'({duration_seconds}s)')
         return SubmitResult(accepted=True, operation=op)
 
-    # -- events ----------------------------------------------------------
+    # events
 
     def on_event(self, event: EngineEvent, detail: str, now: float) -> Optional[Outcome]:
         """Interpret one engine response. Returns an Outcome to act on, or None.
@@ -339,7 +306,7 @@ class SaveStateMachine:
         op.finished_at = now
         return None
 
-    # -- internals -------------------------------------------------------
+    # internals
 
     def _transition(self, op: SaveOperation, new_state: SaveState, now: float,
                     kind: OutcomeKind, detail: str = '',

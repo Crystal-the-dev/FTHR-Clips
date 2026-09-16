@@ -1,17 +1,6 @@
-// packet_buffer_pool.h
-// FTHR Capture Engine - Lock-free pre-allocated packet buffer pool
-//
-// Eliminates per-frame malloc/free in the x264 encode path.
-// Pre-allocates pool_size buffers at construction - zero heap activity
-// during normal operation after warm-up.
-//
-// Acquire() - lock-free CAS pop from free-list, returns PooledBuffer RAII handle
-// Release() - lock-free CAS push back onto free-list (called by ~PooledBuffer)
-//
-// ABA protection: 16-bit tag packed into the free-list atomic value.
-// free_list_ is std::atomic<uint64_t> (guaranteed lock-free on MSVC x64).
-// TaggedPointer is a helper struct that packs/unpacks that value - it is
-// NOT stored inside the atomic, avoiding std::atomic<UserStruct> portability issues.
+// Preallocated packet buffers returned through PooledBuffer RAII handles.
+// Acquire/Release use a CAS free-list with a 16-bit ABA tag packed into a
+// uint64_t atomic; TaggedPointer only encodes and decodes that value.
 
 #pragma once
 #ifndef FTHR_PACKET_BUFFER_POOL_H
@@ -41,11 +30,9 @@ namespace fthr {
         PacketBufferPool& operator=(const PacketBufferPool&) = delete;
 
 
-        // -----------------------------------------------------------------------
         // PooledBuffer - RAII handle returned by Acquire().
         // Returns the buffer to the pool automatically on destruction.
         // Move-only (mirrors unique_ptr semantics).
-        // -----------------------------------------------------------------------
         class PooledBuffer {
         public:
             PooledBuffer() noexcept : buffer_(nullptr), pool_(nullptr) {}
@@ -109,25 +96,15 @@ namespace fthr {
 
 
     private:
-        // -----------------------------------------------------------------------
         // Intrusive singly-linked list node
-        // -----------------------------------------------------------------------
         struct Node {
             std::vector<uint8_t>* buffer = nullptr;
             Node* next = nullptr;
         };
 
 
-        // -----------------------------------------------------------------------
-        // TaggedPointer
-        //
-        // Packs a Node* and a 16-bit ABA counter into one uint64_t value.
-        // Used as a value type only - the actual atomic is std::atomic<uint64_t>
-        // which is guaranteed lock-free and trivially supported by all MSVC versions.
-        //
-        //  bits [63:16]  Node*     (pointer shifted left 16)
-        //  bits [15: 0]  uint16_t  ABA tag
-        // -----------------------------------------------------------------------
+        // Pack the Node pointer into bits 63:16 and the ABA tag into bits 15:0.
+        // The atomic stores uint64_t rather than this helper struct.
         struct TaggedPointer {
             uint64_t value;
 
@@ -150,9 +127,7 @@ namespace fthr {
         };
 
 
-        // -----------------------------------------------------------------------
         // Members
-        // -----------------------------------------------------------------------
         const size_t pool_size_;
         const size_t buffer_capacity_;
 

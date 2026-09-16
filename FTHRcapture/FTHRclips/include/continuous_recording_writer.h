@@ -1,11 +1,6 @@
-// Crash-resilient continuous recording from the capture engine's existing
-// compressed video and audio packets.
-//
-// The writer deliberately does not encode, read GPU textures back to the CPU,
-// create sidecars, or perform a second remux after recording. It writes a
-// fragmented MP4 and commits a completed fragment at every video keyframe.
-// Consequently a process or power failure can lose only the open fragment,
-// not the entire recording.
+// Write existing compressed packets to fragmented MP4 without re-encoding.
+// Commit a fragment at each video keyframe so completed fragments remain
+// recoverable if recording stops before the final trailer.
 
 #pragma once
 #ifndef FTHR_CONTINUOUS_RECORDING_WRITER_H

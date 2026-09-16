@@ -6,10 +6,12 @@ from types import SimpleNamespace
 import pytest
 
 from core.media_metadata import (
+    evaluate_physical_video_timeline,
     format_bitrate,
     format_fps,
     parse_ffprobe_video_metadata,
     probe_video_cfr,
+    probe_video_physical_timeline,
 )
 from core import media_metadata
 
@@ -134,7 +136,10 @@ def test_probe_video_cfr_checks_physical_sample_durations(
         lambda *_args, **_kwargs: SimpleNamespace(
             returncode=0,
             stdout=json.dumps({
-                'packets': [{'duration_time': value} for value in durations],
+                'packets': [
+                    {'duration_time': value, 'pts_time': f'{index / 60:.6f}'}
+                    for index, value in enumerate(durations)
+                ],
             }),
         ),
     )
@@ -152,3 +157,118 @@ def test_probe_video_cfr_treats_malformed_probe_output_as_inconclusive(
     )
 
     assert probe_video_cfr('clip.mp4', 60.0) is None
+
+
+def test_probe_video_cfr_rejects_nominal_durations_with_large_pts_gap(
+        monkeypatch):
+    monkeypatch.setattr(media_metadata, 'get_ffprobe_exe', lambda: 'ffprobe')
+    monkeypatch.setattr(
+        media_metadata.subprocess, 'run',
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({
+                'packets': [
+                    {'duration_time': '0.016667', 'pts_time': '0.000000'},
+                    {'duration_time': '0.016667', 'pts_time': '0.016667'},
+                    {'duration_time': '0.016667', 'pts_time': '5.000000'},
+                ],
+            }),
+        ),
+    )
+
+    assert probe_video_cfr('clip.mp4', 60.0) is False
+    assert probe_video_physical_timeline('clip.mp4', 60.0) is False
+
+
+def test_physical_timeline_allows_short_bounded_gap_and_rejects_sparse_input():
+    bounded = [
+        {'pts_time': '0.000000'},
+        {'pts_time': '0.016667'},
+        {'pts_time': '0.050000'},  # one missed 60 FPS deadline
+        {'pts_time': '0.066667'},
+    ]
+    sparse = [
+        {'pts_time': '0.000000'},
+        {'pts_time': '1.500000'},
+        {'pts_time': '3.000000'},
+        {'pts_time': '5.000000'},
+    ]
+
+    assert evaluate_physical_video_timeline(bounded, 60.0) is True
+    assert evaluate_physical_video_timeline(sparse, 60.0) is False
+
+
+def test_probe_video_cfr_is_inconclusive_when_pts_evidence_is_missing(
+        monkeypatch):
+    monkeypatch.setattr(media_metadata, 'get_ffprobe_exe', lambda: 'ffprobe')
+    monkeypatch.setattr(
+        media_metadata.subprocess, 'run',
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({
+                'packets': [
+                    {'duration_time': '0.016667'},
+                    {'duration_time': '0.016667'},
+                ],
+            }),
+        ),
+    )
+
+    assert probe_video_cfr('clip.mp4', 60.0) is None
+
+
+def test_physical_timeline_rejects_non_monotonic_pts_without_sorting():
+    packets = [
+        {'pts_time': '0.000000'},
+        {'pts_time': '0.033333'},
+        {'pts_time': '0.016667'},
+    ]
+
+    assert evaluate_physical_video_timeline(packets, 60.0) is False
+
+
+def test_physical_timeline_allows_decoder_preroll_before_zero():
+    preroll = [
+        {'pts_time': '-0.950000'},
+        {'pts_time': '-0.916667'},
+        {'pts_time': '-0.900000'},
+        {'pts_time': '-0.866667'},
+    ]
+    assert evaluate_physical_video_timeline(preroll, 60.0) is True
+
+    with_gap = [
+        {'pts_time': '-0.950000'},
+        {'pts_time': '-0.916667'},
+        {'pts_time': '5.000000'},
+    ]
+    assert evaluate_physical_video_timeline(with_gap, 60.0) is False
+
+
+def test_timing_evidence_reused_only_for_unchanged_file(tmp_path, monkeypatch):
+    from core import media_metadata as media
+    clip = tmp_path / 'replay.mp4'
+    clip.write_bytes(b'base')
+    calls = []
+    def probe(*args, **kwargs):
+        calls.append(args)
+        return media.VideoCfrProbeEvidence(False, True)
+    monkeypatch.setattr(media, '_probe_video_cfr_evidence', probe)
+    assert media.probe_video_cfr_evidence(clip, 60).physical_timeline_bounded
+    assert media.probe_video_cfr_evidence(clip, 60).physical_timeline_bounded
+    assert len(calls) == 1
+    clip.write_bytes(b'overlay-replaced-file')
+    media.probe_video_cfr_evidence(clip, 60)
+    media.probe_video_cfr_evidence(clip, 30)
+    assert len(calls) == 3
+
+
+def test_failed_timing_probe_is_retried(tmp_path, monkeypatch):
+    from core import media_metadata as media
+    clip = tmp_path / 'retry.mp4'
+    clip.write_bytes(b'media')
+    outcomes = iter([media.VideoCfrProbeEvidence(None, None),
+                     media.VideoCfrProbeEvidence(True, True)])
+    monkeypatch.setattr(media, '_probe_video_cfr_evidence',
+                        lambda *args, **kwargs: next(outcomes))
+    assert media.probe_video_cfr_evidence(clip, 60).cfr is None
+    assert media.probe_video_cfr_evidence(clip, 60).cfr is True

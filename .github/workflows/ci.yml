@@ -7,9 +7,7 @@ on:
   pull_request:
     branches: [main, master]
 
-# No secrets are used anywhere in this workflow, and none should ever be added.
-# The release-verification job exists partly to catch a credential that made it
-# into the tree; giving that job access to credentials would be self-defeating.
+# Keep CI read-only and free of secrets; release verification scans untrusted changes.
 permissions:
   contents: read
 
@@ -18,9 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ==========================================================================
   # Python — the UI and its tests, on both platforms that ship a build.
-  # ==========================================================================
   python:
     name: Python ${{ matrix.python-version }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -87,9 +83,7 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: python -m pytest tests/ -v --tb=short
 
-  # ==========================================================================
   # Linux capture engine
-  # ==========================================================================
   linux-engine:
     name: Linux engine (CMake)
     runs-on: ubuntu-latest
@@ -151,9 +145,7 @@ jobs:
       # has no compositor, no DRM device and no audio server. Starting it here
       # would test the failure path and prove nothing about capture.
 
-  # ==========================================================================
   # Windows capture engine
-  # ==========================================================================
   windows-engine:
     name: Windows engine (MSBuild)
     runs-on: windows-latest
@@ -230,9 +222,7 @@ jobs:
           if (-not (Test-Path "dist\FTHRClips\_internal\engine\FTHRClips.exe")) { throw "bundled engine not produced" }
           python tools/verify_release_licenses.py --windows-dist dist\FTHRClips
 
-  # ==========================================================================
   # Release verification — the gates that decide whether a tag is allowed.
-  # ==========================================================================
   release-verification:
     name: Release verification
     runs-on: ubuntu-latest
@@ -296,9 +286,7 @@ jobs:
           fi
           echo "GPL-3.0-only project licence declaration is consistent."
 
-  # ==========================================================================
   # Tag guard
-  # ==========================================================================
   tag-guard:
     name: Tag guard
     if: startsWith(github.ref, 'refs/tags/v')
@@ -322,7 +310,4 @@ jobs:
           fi
           echo "Tag v$tag matches the source version."
 
-      # Nothing is published from CI. Uploading an installer that no human has
-      # installed, launched and uninstalled is how an untested build becomes a
-      # release. Artefacts are attached to a GitHub Release by hand, after the
-      # manual gates in RELEASE_CHECKLIST.md have actually been performed.
+      # Publish artifacts manually after install, launch, and uninstall qualification.

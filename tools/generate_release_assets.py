@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-"""Generate FTHR-owned release art without external media inputs.
+"""Generate release art from geometric primitives and an original bitmap font.
 
-The generator uses only simple geometric primitives and an original compact
-bitmap alphabet. The UI logo, brand icon, action icons, and notification sounds
-are workspace-supplied source assets and are intentionally not regenerated here.
-See ``licenses/FTHR-GENERATED-ASSETS.txt`` for the redistribution notice. The
-separately sourced Oswald font is not generated here.
+Source UI assets and Oswald are retained. Redistribution terms are in
+licenses/FTHR-GENERATED-ASSETS.txt.
 """
 
 from __future__ import annotations
@@ -321,8 +318,8 @@ def social_preview() -> Canvas:
     c.rect(92, 380, 486, 388, ACCENT)
     c.text(92, 414, 'INSTANT REPLAY', 4, MUTED)
     c.text(92, 458, 'WINDOWS + LINUX', 4, MUTED)
-    for y, key, label in ((130, 'F9', 'SAVE CLIP'), (230, 'F10', 'EXTENDED'),
-                          (330, 'F11', 'START STOP'), (430, 'F8', 'DISMISS')):
+    for y, key, label in ((130, 'F9', 'SAVE CLIP'), (280, 'F12', 'SCREENSHOT'),
+                          (430, 'F7', 'DISMISS')):
         c.rect(890, y, 968, y + 48, ACCENT if key == 'F9' else MUTED)
         c.text(900, y + 13, key, 3, BLACK)
         c.text(980, y + 10, label, 4, WHITE if key == 'F9' else MUTED)

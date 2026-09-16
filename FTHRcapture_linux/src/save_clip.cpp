@@ -15,9 +15,7 @@ extern "C" {
 
 namespace fthr {
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 static void set_shm_bytes(SharedMemoryLayout* shm, uint64_t bytes) {
     if (shm) shm->bytes_written = bytes;
@@ -45,9 +43,7 @@ static void apply_configured_video_metadata(
         0);
 }
 
-// ---------------------------------------------------------------------------
 // save_clip_to_file
-// ---------------------------------------------------------------------------
 
 static bool write_clip_to_temporary_file(
     const std::string&               path,

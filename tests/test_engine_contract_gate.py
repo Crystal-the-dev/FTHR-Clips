@@ -1,12 +1,6 @@
-"""The engine publication-contract gate must be able to fail (AUDIT-018/019).
+"""Reject broken engine response ordering in mutated source fixtures.
 
-`tools/verify_engine_response_contract.py` guards C++ that no test executes.
-That makes it the only thing standing between a reordering regression and a
-release, and it makes proving it can *fail* mandatory: a green gate that
-cannot go red is worse than no gate, because it reads as evidence.
-
-Each test below mutates a fixture into a known-bad shape and asserts the gate
-rejects it. The last one asserts the real tree passes.
+These tests exercise the static verifier and confirm the real tree passes.
 """
 
 import subprocess
@@ -30,9 +24,7 @@ def _rules(violations):
     return {v.rule for v in violations}
 
 
-# ---------------------------------------------------------------------------
 # The exact pre-fix shapes. These are the regressions the gate exists for.
-# ---------------------------------------------------------------------------
 
 def test_catches_the_original_linux_save_clip_ordering(tmp_path):
     """Verbatim shape of FTHRcapture_linux/src/main.cpp before AUDIT-018:
@@ -85,9 +77,7 @@ void MuxEncodedClip(const SaveClipTask& task) {
     assert 'ERROR-WITHOUT-PAYLOAD' in _rules(check_file(src))
 
 
-# ---------------------------------------------------------------------------
 # Other shapes that must not slip through
-# ---------------------------------------------------------------------------
 
 def test_catches_unsafe_string_primitive(tmp_path):
     src = _write(tmp_path, '''
@@ -129,9 +119,7 @@ void f(SharedMemoryLayout* layout) {
     assert 'RAW-PAYLOAD-WRITE' in _rules(check_file(src))
 
 
-# ---------------------------------------------------------------------------
 # It must not cry wolf
-# ---------------------------------------------------------------------------
 
 def test_accepts_the_corrected_shape(tmp_path):
     src = _write(tmp_path, '''
@@ -176,9 +164,7 @@ bool f(SharedMemoryLayout* layout) {
     assert check_file(src) == []
 
 
-# ---------------------------------------------------------------------------
 # The real tree
-# ---------------------------------------------------------------------------
 
 def test_real_engines_pass_the_gate():
     result = subprocess.run([sys.executable, str(GATE)],
@@ -205,9 +191,7 @@ void f(SharedMemoryLayout* layout) {
     assert main(['--root', str(tmp_path)]) == 1
 
 
-# ---------------------------------------------------------------------------
 # Stale payload: a message must never outlive the save it describes
-# ---------------------------------------------------------------------------
 
 def _engine_source(rel: str) -> str:
     return (REPO / rel).read_text(encoding='utf-8', errors='replace')

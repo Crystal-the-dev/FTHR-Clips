@@ -1,4 +1,3 @@
-// windows_monitor_resolver.h
 // Stable Windows monitor identity and current-topology resolution (AUDIT-048).
 
 #pragma once

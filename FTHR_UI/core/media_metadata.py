@@ -1,14 +1,13 @@
-"""Authoritative, read-only video metadata for editor presentation.
+"""Read saved-stream FPS and bitrate from FFprobe for the editor.
 
-OpenCV's ``CAP_PROP_FPS`` is a decoder estimate and can be derived from frame
-count/timestamps.  It is useful for seeking, but it must not be presented as
-the saved stream's factual FPS or bitrate.  This module keeps that UI metadata
-on FFprobe's stream/container semantics and makes missing values explicit.
+OpenCV decoder estimates are suitable for seeking, but not presentation
+as container metadata. Missing probe values remain explicit.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import OrderedDict
 from fractions import Fraction
 import json
 import math
@@ -16,12 +15,14 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 from typing import Any, Mapping
 
 from core.ffmpeg_tools import FFmpegUnavailable, get_ffprobe_exe
 
 
 _NO_WINDOW = {'creationflags': 0x08000000} if sys.platform == 'win32' else {}
+_MAX_PACKET_PROBE_OUTPUT = 16 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -40,8 +41,18 @@ def _positive_float(value: Any) -> float | None:
     try:
         parsed = float(value)
     except (TypeError, ValueError, OverflowError):
+        # Malformed metadata is unknown, never a fabricated positive value.
         return None
     return parsed if math.isfinite(parsed) and parsed > 0 else None
+
+
+def _finite_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        # Invalid packet timing leaves physical-timeline evidence inconclusive.
+        return None
+    return parsed if math.isfinite(parsed) else None
 
 
 def _positive_int(value: Any) -> int | None:
@@ -57,6 +68,7 @@ def parse_frame_rate(value: Any) -> float | None:
     try:
         rate = float(Fraction(str(value)))
     except (ValueError, ZeroDivisionError, OverflowError):
+        # Invalid rationals are unknown rather than a guessed frame rate.
         return None
     # Anything beyond 1000 FPS is not useful clip metadata and is almost
     # certainly a codec time-base artifact rather than a presentation rate.
@@ -71,6 +83,7 @@ def parse_ffprobe_video_metadata(
     try:
         document = json.loads(payload) if isinstance(payload, str) else payload
     except (TypeError, json.JSONDecodeError):
+        # Corrupt probe JSON provides no trustworthy media metadata.
         return None
     if not isinstance(document, Mapping):
         return None
@@ -169,57 +182,185 @@ def probe_video_metadata(
     return parse_ffprobe_video_metadata(result.stdout, file_size=file_size)
 
 
-def probe_video_cfr(
-        media_path: str | os.PathLike[str], expected_fps: float, *,
-        timeout_seconds: float = 30.0,
-) -> bool | None:
-    """Check whether every video sample has the requested CFR duration.
+def _probe_video_packets(
+        media_path: str | os.PathLike[str], *, timeout_seconds: float,
+) -> list[Mapping[str, Any]] | None:
+    """Read bounded packet timing evidence without decoding media."""
 
-    Stream ``avg_frame_rate`` is not sufficient here: an MP4 can advertise a
-    configured rate while its sample table still contains long gaps. Explorer
-    uses that sample timing. ``True`` means the file is safe to publish,
-    ``False`` means it needs a frame-rate repair, and ``None`` means probing
-    failed and callers should take the repair path conservatively.
-    """
-
-    if (not math.isfinite(expected_fps)
-            or expected_fps <= 0
-            or expected_fps > 1000):
-        return None
     try:
         probe = get_ffprobe_exe()
         result = subprocess.run(
             [
                 probe, '-v', 'error', '-select_streams', 'v:0',
-                '-show_entries', 'packet=duration_time',
+                '-show_entries', 'packet=duration_time,pts_time',
                 '-of', 'json', os.fspath(media_path),
             ],
             capture_output=True, text=True, timeout=timeout_seconds,
             check=False, **_NO_WINDOW,
         )
     except (FFmpegUnavailable, OSError, subprocess.SubprocessError):
+        # Unavailable packet timing remains inconclusive for the caller policy.
         return None
     if result.returncode != 0:
         return None
+    # A normal FTHR replay is bounded to a few hundred seconds.  Refuse an
+    # unexpectedly large ffprobe response rather than retaining an arbitrary
+    # packet list in the finalization worker.
+    stdout = result.stdout
+    if isinstance(stdout, (str, bytes)) and len(stdout) > _MAX_PACKET_PROBE_OUTPUT:
+        return None
     try:
-        packets = json.loads(result.stdout).get('packets')
+        packets = json.loads(stdout).get('packets')
     except (TypeError, json.JSONDecodeError, AttributeError):
-        # Malformed probe output cannot prove CFR, so callers must repair.
+        # Malformed packet JSON cannot establish a valid source timeline.
         return None
     if not isinstance(packets, list) or not packets:
         return None
+    return [packet for packet in packets if isinstance(packet, Mapping)]
+
+
+def evaluate_physical_video_timeline(
+        packets: list[Mapping[str, Any]], expected_fps: float,
+) -> bool | None:
+    """Check packet PTS gaps against the requested cadence.
+
+    Nominal FPS can conceal missing intervals that a CFR repair would otherwise
+    expand into a misleading clip.
+    """
+
+    if (not math.isfinite(expected_fps)
+            or expected_fps <= 0
+            or expected_fps > 1000
+            or not packets):
+        return None
+    pts = []
+    for packet in packets:
+        # Decoder-preroll packets may legitimately have negative PTS values;
+        # only finiteness and ordering are relevant to physical gaps.
+        value = _finite_float(packet.get('pts_time'))
+        if value is None:
+            return None
+        pts.append(value)
+    if len(pts) < 2:
+        # Older FFprobe builds may not expose packet PTS. Duration evidence is
+        # still useful, but it cannot prove a physical timeline either way.
+        return None
+    gaps = [right - left for left, right in zip(pts, pts[1:], strict=False)]
+    if any(gap <= 0 for gap in gaps):
+        return False
+    largest_gap = max(gaps)
+    expected_duration = 1.0 / expected_fps
+    max_bounded_gap = max(0.250, expected_duration * 4.0)
+    return math.isfinite(largest_gap) and largest_gap <= max_bounded_gap
+
+
+def probe_video_physical_timeline(
+        media_path: str | os.PathLike[str], expected_fps: float, *,
+        timeout_seconds: float = 30.0,
+) -> bool | None:
+    """Probe whether the physical packet PTS timeline has no large holes."""
+
+    packets = _probe_video_packets(
+        media_path, timeout_seconds=timeout_seconds)
+    if packets is None:
+        return None
+    return evaluate_physical_video_timeline(packets, expected_fps)
+
+
+@dataclass(frozen=True)
+class VideoCfrProbeEvidence:
+    """One packet probe result used by the finalization gate."""
+
+    cfr: bool | None
+    physical_timeline_bounded: bool | None
+
+
+_timing_cache: OrderedDict[tuple, VideoCfrProbeEvidence] = OrderedDict()
+_timing_cache_lock = threading.Lock()
+
+
+def _timing_fingerprint(media_path, expected_fps):
+    try:
+        path = Path(media_path).resolve()
+        stat = path.stat()
+        return (str(path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns,
+                expected_fps)
+    except OSError:
+        return None
+
+
+def probe_video_cfr_evidence(
+        media_path: str | os.PathLike[str], expected_fps: float, *,
+        timeout_seconds: float = 30.0,
+) -> VideoCfrProbeEvidence:
+    """Reuse timing evidence only while the exact media file is unchanged.
+
+    Source validation and final publication often inspect the same packets.
+    Keep only small summaries, and invalidate after any overlay/audio rewrite.
+    Failed probes are retried rather than cached.
+    """
+    key = _timing_fingerprint(media_path, expected_fps)
+    if key is not None:
+        with _timing_cache_lock:
+            evidence = _timing_cache.get(key)
+            if evidence is not None:
+                _timing_cache.move_to_end(key)
+                return evidence
+    evidence = _probe_video_cfr_evidence(
+        media_path, expected_fps, timeout_seconds=timeout_seconds)
+    if (key is not None and evidence.physical_timeline_bounded is not None
+            and key == _timing_fingerprint(media_path, expected_fps)):
+        with _timing_cache_lock:
+            _timing_cache[key] = evidence
+            _timing_cache.move_to_end(key)
+            while len(_timing_cache) > 32:
+                _timing_cache.popitem(last=False)
+    return evidence
+
+
+def _probe_video_cfr_evidence(
+        media_path: str | os.PathLike[str], expected_fps: float, *,
+        timeout_seconds: float,
+) -> VideoCfrProbeEvidence:
+    """Probe duration and physical PTS evidence in one FFprobe invocation."""
+
+    if (not math.isfinite(expected_fps)
+            or expected_fps <= 0
+            or expected_fps > 1000):
+        return VideoCfrProbeEvidence(None, None)
+    packets = _probe_video_packets(
+        media_path, timeout_seconds=timeout_seconds)
+    if packets is None:
+        return VideoCfrProbeEvidence(None, None)
 
     expected_duration = 1.0 / expected_fps
     tolerance = max(0.00005, expected_duration * 0.002)
+    physical_timeline = evaluate_physical_video_timeline(packets, expected_fps)
     for packet in packets:
-        if not isinstance(packet, Mapping):
-            return None
         duration = _positive_float(packet.get('duration_time'))
         if duration is None:
-            return None
+            return VideoCfrProbeEvidence(None, physical_timeline)
         if abs(duration - expected_duration) > tolerance:
-            return False
-    return True
+            return VideoCfrProbeEvidence(False, physical_timeline)
+
+    # Nominal durations without packet PTS cannot prove a healthy CFR stream.
+    if physical_timeline is not True:
+        return VideoCfrProbeEvidence(physical_timeline, physical_timeline)
+    return VideoCfrProbeEvidence(True, True)
+
+
+def probe_video_cfr(
+        media_path: str | os.PathLike[str], expected_fps: float, *,
+        timeout_seconds: float = 30.0,
+) -> bool | None:
+    """Check sample durations rather than advertised average FPS.
+
+    Return True for CFR, False when repair is needed, or None if probing fails.
+    Callers conservatively repair inconclusive results.
+    """
+
+    return probe_video_cfr_evidence(
+        media_path, expected_fps, timeout_seconds=timeout_seconds).cfr
 
 
 def format_fps(value: float | None) -> str:

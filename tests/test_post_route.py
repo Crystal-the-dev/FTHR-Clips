@@ -1,12 +1,7 @@
-"""One CLIP_SAVED starts exactly one post-processing route (AUDIT-011).
+"""Each CLIP_SAVED selects one route that owns clip_ready through finalization.
 
-The two routes — mic mux and finalize (crop/camera) —
-each end by setting the `clip_ready` event, and `clip_ready` is the single gate
-the upload manager waits on. If two routes fire for one clip the event is set
-twice and the upload starts against a half-written file.
-
-`select_post_route` is imported from main.py directly; importing main.py builds
-no window, so this stays cheap.
+Concurrent routes could release an uploader while another still writes.
+Import the route selector directly; importing main.py creates no window.
 """
 
 import itertools
@@ -295,7 +290,10 @@ def test_duplicate_final_publication_is_ignored_after_first_success(
 
 
 def test_finalizer_cfr_gate_normalizes_once_and_releases_ready_event(
-        tmp_path: Path):
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # This fixture exercises finalizer ordering, not packet probing of its
+    # synthetic bytes. Source-timeline rejection is covered separately below.
+    monkeypatch.setattr(MainWindow, '_source_timeline_is_safe', lambda *_: True)
     clip_path = str(tmp_path / 'finalizer-once.mp4')
     Path(clip_path).write_bytes(b'valid-final-payload')
     normalized: list[str] = []
@@ -362,7 +360,49 @@ def test_finalizer_cfr_gate_normalizes_once_and_releases_ready_event(
     assert published == [clip_path, no_ready_clip]
 
 
-def test_cfr_repair_uses_bounded_background_ffmpeg_invocation(
+def test_sparse_source_gate_runs_before_overlay_or_crop(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A proven source PTS hole must not reach a timestamp-rewriting worker."""
+    clip_path = str(tmp_path / 'sparse-source.mp4')
+    Path(clip_path).write_bytes(b'source')
+    overlay_calls: list[str] = []
+    completed: list[str] = []
+    failures: list[str] = []
+    ready = threading.Event()
+
+    def _worker(_path, _duration, _end_time, _clip_ready, _crop):
+        overlay_calls.append('crop')
+
+    monkeypatch.setattr(
+        main_module, 'probe_video_metadata',
+        lambda _path: SimpleNamespace(average_fps=60.0, fps_source="fthr_frame_rate"))
+    monkeypatch.setattr(
+        main_module, 'probe_video_cfr_evidence',
+        lambda _path, _fps: SimpleNamespace(
+            physical_timeline_bounded=False))
+    host = SimpleNamespace(
+        _mux_threads=[],
+        _clip_readiness=SimpleNamespace(
+            finalization_failed=lambda path, _message, **_kwargs:
+                failures.append(path)),
+        _record_finalization_warning=lambda *_args: None,
+        _complete_clip_finalization=lambda path, _duration, **_kwargs:
+            completed.append(path),
+    )
+    host._source_timeline_is_safe = MainWindow._source_timeline_is_safe.__get__(
+        host, MainWindow)
+    worker = MainWindow._spawn_mux_thread(
+        host, _worker, (clip_path, 30, 0.0, ready, None))
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert ready.is_set()
+    assert overlay_calls == []
+    assert failures == [clip_path]
+    assert completed == [clip_path]
+
+
+def test_inconclusive_cfr_repair_uses_bounded_background_ffmpeg_invocation(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     clip_path = tmp_path / 'vfr.mp4'
     clip_path.write_bytes(b'vfr-source')
@@ -386,8 +426,10 @@ def test_cfr_repair_uses_bounded_background_ffmpeg_invocation(
 
     monkeypatch.setattr(main_module, 'probe_video_metadata',
                         lambda _path: metadata)
-    monkeypatch.setattr(main_module, 'probe_video_cfr',
-                        lambda _path, _fps: False)
+    monkeypatch.setattr(
+        main_module, 'probe_video_cfr_evidence',
+        lambda _path, _fps: SimpleNamespace(
+            cfr=False, physical_timeline_bounded=None))
     monkeypatch.setattr(main_module, 'postprocess_video_args',
                         lambda *_args, **_kwargs: [
                             '-c:v', 'h264_nvenc', '-preset', 'p1',
@@ -449,3 +491,23 @@ def test_every_post_processing_entrypoint_has_the_completed_clip_guard():
         start = src.index(f'def {name}')
         body = src[start:start + 1200]
         assert '_allow_completed_clip_pipeline' in body
+
+
+@pytest.mark.parametrize('bounded, expected', [(True, True), (False, False)])
+def test_valid_vfr_is_preserved_and_sparse_replay_is_rejected(
+        tmp_path, monkeypatch, bounded, expected):
+    clip = tmp_path / 'native.mp4'
+    clip.write_bytes(b'original-video-and-audio')
+    failures = []
+    monkeypatch.setattr(main_module, 'probe_video_metadata',
+                        lambda _: SimpleNamespace(average_fps=60.0))
+    monkeypatch.setattr(main_module, 'probe_video_cfr_evidence',
+                        lambda *_: SimpleNamespace(
+                            cfr=False, physical_timeline_bounded=bounded))
+    monkeypatch.setattr(main_module.subprocess, 'run',
+                        lambda *_args, **_kwargs: pytest.fail('unexpected transcode'))
+    host = SimpleNamespace(_clip_readiness=SimpleNamespace(
+        finalization_failed=lambda *args, **kwargs: failures.append((args, kwargs))))
+    assert MainWindow._normalize_clip_to_cfr(host, str(clip)) is expected
+    assert bool(failures) is (not expected)
+    assert clip.read_bytes() == b'original-video-and-audio'

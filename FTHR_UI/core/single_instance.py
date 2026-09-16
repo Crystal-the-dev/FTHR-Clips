@@ -1,34 +1,7 @@
-"""
-single_instance.py — cross-platform "only one FTHR Clips at a time" guard.
+"""Prevent concurrent UIs from sharing the single-writer capture IPC channel.
 
-Why this exists
----------------
-Two running instances are actively destructive, not merely redundant:
-
-  * Both spawn a capture engine. Two engines encode the same screen in
-    parallel — double GPU/NVENC load, and on machines with a single NVENC
-    session limit the second engine fails in a way that looks like a bug.
-  * Both map ``FTHR_SharedMemory_v4``. The command/response fields are a
-    single-writer contract; two UIs writing ``ui_command`` interleave and
-    each one consumes the other's ``engine_response``, so saves time out.
-  * On Linux the second instance calls ``os.unlink()`` on
-    ``/tmp/fthr_hotkey.sock`` and rebinds it, silently stealing every
-    hotkey from the first instance.
-
-The guard is intentionally dumb and dependency-free: acquire on startup,
-release on exit, never block.
-
-Platform mechanics
-------------------
-Windows  A named kernel mutex (``CreateMutexW``). The kernel drops it when
-         the process dies for any reason, including a hard kill — so a
-         crashed instance never leaves a stale lock behind.
-
-Linux    ``flock(LOCK_EX | LOCK_NB)`` on ``~/.fthr/fthr.lock``. The kernel
-         releases the lock when the fd closes, which includes process death,
-         giving the same crash-safety as the Windows mutex. A leftover lock
-         *file* is harmless — only the flock state matters, so there is no
-         stale-PID-file problem to reason about.
+Windows uses a named mutex; Linux uses nonblocking flock on ~/.fthr/fthr.lock.
+The OS releases either lock on process exit, so a leftover lock file is safe.
 """
 
 from __future__ import annotations
@@ -48,23 +21,10 @@ _ERROR_ALREADY_EXISTS = 183
 
 
 class SingleInstance:
-    """Best-effort single-instance guard.
+    """Acquire the instance slot at startup and release it on exit.
 
-    Usage::
-
-        guard = SingleInstance()
-        if not guard.acquire():
-            print('already running')
-            return 1
-        # ... run the app ...
-        guard.release()
-
-    ``acquire()`` returns True when this process owns the instance slot.
-    It never raises: if the platform primitive is unavailable for any
-    reason we fail *open* (return True) rather than refusing to start the
-    app — a broken guard must not be the thing that keeps a user from
-    recording. The optional primitive names let tests coexist with an
-    installed, running FTHR instance; production callers use the defaults.
+    acquire() returns True on ownership or if the platform lock is unavailable
+    (fail-open). Optional primitive names isolate tests from a running app.
     """
 
     def __init__(
@@ -79,7 +39,7 @@ class SingleInstance:
         self._win_mutex_name = win_mutex_name
         self._lock_file = Path(lock_file)
 
-    # ── public API ────────────────────────────────────────────────────────
+    # public API
 
     def acquire(self) -> bool:
         if self._acquired:
@@ -134,21 +94,16 @@ class SingleInstance:
     def __exit__(self, *_exc) -> None:
         self.release()
 
-    # ── platform implementations ──────────────────────────────────────────
+    # platform implementations
 
     def _acquire_windows(self) -> bool:
         try:
             import ctypes
             from ctypes import wintypes
 
-            # use_last_error=True is load-bearing, not decoration. ctypes saves
-            # and restores the thread's last-error value around every foreign
-            # call, so calling kernel32.GetLastError() *through ctypes* reads a
-            # value ctypes has already put back — i.e. whatever unrelated Win32
-            # call ran before this one. That made the guard's answer depend on
-            # the interpreter's recent history: it passed under one Python and
-            # spuriously reported "already running" under another. The private
-            # ctypes copy read by get_last_error() is the real one.
+            # Use ctypes.get_last_error() with use_last_error=True. ctypes preserves
+            # a private last-error copy around foreign calls; calling GetLastError
+            # through ctypes can read the restored, unrelated value.
             kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
 
             # Explicit signatures matter on x64: the default restype is c_int,

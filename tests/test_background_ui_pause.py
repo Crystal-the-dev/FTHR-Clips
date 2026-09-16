@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -113,6 +114,38 @@ def test_application_inactive_state_drives_the_saved_pause_preference(qtbot):
     assert applied == [True, False]
 
 
+def test_game_clip_saved_in_background_appears_on_return_without_another_save(
+        qtbot, tmp_path, monkeypatch):
+    from ui.clip_grid import ClipGrid
+
+    settings = SimpleNamespace(get=lambda key, default=None: {
+        'clips_directory': str(tmp_path), 'imported_clip_folders': [],
+    }.get(key, default))
+    monkeypatch.setattr(ClipGrid, '_start_thumbnail_worker', lambda *_: None)
+    grid = ClipGrid(settings)
+    qtbot.addWidget(grid)
+    try:
+        qtbot.waitUntil(lambda: grid._active_scan_worker is None)
+        game_dir = tmp_path / 'VALORANT'
+        game_dir.mkdir()
+        for cycle in range(3):
+            grid.set_background_paused(True)
+            clip = game_dir / f'game-{cycle}.mp4'
+            clip.write_bytes(b'completed clip fixture')
+            grid.upsert_saved_clip(str(clip), ready=False)
+            grid.upsert_saved_clip(str(clip), ready=True)
+            assert str(clip) not in grid._thumb_widgets
+
+            grid.set_background_paused(False)
+            qtbot.waitUntil(lambda: grid._active_scan_worker is None)
+            assert str(clip) in grid._thumb_widgets
+            assert grid._thumb_widgets[str(clip)].ready
+            assert len(grid._records) == cycle + 1
+            assert not grid._pending_saved_clips
+    finally:
+        grid.shutdown()
+
+
 def test_background_pause_leaves_core_timer_card_and_sound_state_alone(qtbot):
     from PySide6.QtCore import QTimer
     from main import MainWindow
@@ -155,3 +188,326 @@ def test_background_pause_leaves_core_timer_card_and_sound_state_alone(qtbot):
         'sound_volume_clip': 42,
     }
     core_timer.stop()
+
+
+def test_thumbnail_cancel_resume_re_enriches_card_and_allows_open(
+        qtbot, tmp_path, monkeypatch):
+    """A cancelled thumbnail must not strand an otherwise valid library card."""
+    from PySide6.QtCore import QTimer, QThreadPool, QRunnable, Qt
+    from PySide6.QtWidgets import QApplication
+    from ui import clip_grid as clip_grid_module
+    from ui.clip_grid import ClipGrid, ClipThumbnail
+    from core.library_index import LibraryRecord, canonical_media_path
+
+    QApplication.instance() or QApplication([])
+    media = tmp_path / 'clip.mp4'
+    media.write_bytes(b'fixture')
+    media_path = str(media)
+
+    class _FakeThumbnailWorker(QRunnable):
+        workers = []
+
+        def __init__(self, file_path, cancel_event):
+            super().__init__()
+            self.file_path = file_path
+            self.cancel_event = cancel_event
+            self.signals = clip_grid_module._ThumbnailSignals()
+            self.setAutoDelete(False)
+            self.workers.append(self)
+
+        def run(self):
+            # The test drives result/cancellation signals explicitly.
+            return None
+
+    monkeypatch.setattr(clip_grid_module, '_ThumbnailWorker', _FakeThumbnailWorker)
+
+    card = ClipThumbnail(media_path, is_video=True, ready=True)
+    qtbot.addWidget(card)
+    card.show()
+    opened: list[str] = []
+    card.opened.connect(lambda path, *_args: opened.append(path))
+
+    grid = ClipGrid.__new__(ClipGrid)
+    grid._shutdown_started = False
+    grid._background_paused = False
+    grid._background_refresh_pending = False
+    grid._scan_generation = 0
+    grid._active_scan_worker = None
+    grid._pending_saved_clips = {}
+    grid._thread_pool = QThreadPool()
+    grid._thumbnail_cancel_event = threading.Event()
+    grid._thumbnail_generation = 0
+    grid._thumbnail_jobs_inflight = set()
+    grid._thumbnail_job_fingerprints = {}
+    grid._thumbnail_job_owners = {}
+    grid._thumbnail_workers = {}
+    grid._thumbnail_jobs_submitted = 0
+    grid._thumbnail_jobs_completed = 0
+    grid._thumbnail_diagnostics_completed = 0
+    grid._thumbnail_total_elapsed_ms = 0
+    grid._metadata_total_elapsed_ms = 0
+    grid._thumbnail_cache_hits = 0
+    grid._thumbnail_queue_peak = 0
+    grid._thumb_widgets = {media_path: card}
+    grid._records = {
+        canonical_media_path(media_path): LibraryRecord(
+            media_path, canonical_media_path(media_path), (), False, 'video',
+            media.stat().st_size, media.stat().st_mtime_ns)
+    }
+    grid._imported_files = set()
+    grid.refresh_timer = QTimer()
+    grid._debounce_timer = QTimer()
+    loads: list[str] = []
+    grid._load_clips = lambda: loads.append('scan')
+
+    assert card.ready is True
+    assert card._thumbnail_ready is False
+    assert media_path in grid._thumb_widgets
+    grid._start_thumbnail_worker(media_path)
+    assert grid._thumbnail_job_owners
+    assert len(_FakeThumbnailWorker.workers) == 1
+    assert grid._thumbnail_jobs_inflight == {media_path}
+
+    grid.set_background_paused(True)
+    # Pause cancellation does not revoke ownership from the still-running
+    # worker.  Its terminal callback must arrive before a replacement is
+    # allowed to start.
+    assert grid._thumbnail_jobs_inflight == {media_path}
+    grid.set_background_paused(False)
+
+    # Resume does not race the cancelled old generation.
+    assert len(_FakeThumbnailWorker.workers) == 1
+    old_worker = _FakeThumbnailWorker.workers[0]
+    old_worker.signals.finished.emit(media_path, '', 12)
+    old_worker.signals.diagnostic_finished.emit(1, 0, True)
+    QApplication.processEvents()
+
+    # Once the old owner reaches terminal cleanup, resume owns a fresh
+    # generation and requeues the visible card without a library scan.
+    assert len(_FakeThumbnailWorker.workers) == 2
+    assert loads == []
+    replacement = _FakeThumbnailWorker.workers[-1]
+    replacement.signals.finished.emit(media_path, '', 12)
+    replacement.signals.diagnostic_finished.emit(1, 0, True)
+    QApplication.processEvents()
+
+    # Duration survived, but a failed image remains eligible for enrichment.
+    assert card._thumbnail_ready is False
+    assert card.duration_label.text() == '0:12'
+    qtbot.mouseClick(card, Qt.MouseButton.LeftButton, pos=card.rect().center())
+    assert opened == [media_path]
+
+
+@pytest.mark.parametrize('terminal_state', ('success', 'failure', 'cancel'))
+def test_thumbnail_terminal_cleanup_releases_only_owned_job(terminal_state):
+    from ui.clip_grid import ClipGrid
+
+    grid = ClipGrid.__new__(ClipGrid)
+    grid._thumbnail_jobs_inflight = {'clip.mp4'}
+    grid._thumbnail_job_fingerprints = {'clip.mp4': 'fp'}
+    grid._thumbnail_job_owners = {'clip.mp4': (4, 'fp')}
+    grid._thumbnail_workers = {}
+
+    assert grid._finish_thumbnail_job('clip.mp4', 4, 'fp') is True
+    assert grid._thumbnail_jobs_inflight == set()
+    assert grid._thumbnail_job_fingerprints == {}
+    assert grid._thumbnail_job_owners == {}
+
+
+@pytest.mark.parametrize('terminal_state', ('success', 'failure', 'cancel', 'exception'))
+def test_thumbnail_worker_emits_terminal_diagnostic_for_every_exit_path(
+        terminal_state, tmp_path, monkeypatch):
+    """Worker finally owns terminal cleanup for all real exit paths."""
+    from PySide6.QtGui import QImage
+    from ui import clip_grid
+
+    media = tmp_path / f'{terminal_state}.mp4'
+    media.write_bytes(b'fixture')
+    cache = tmp_path / f'{terminal_state}.jpg'
+    monkeypatch.setattr(clip_grid, 'THUMB_CACHE_DIR', str(tmp_path))
+    monkeypatch.setattr(clip_grid, '_get_cached_thumb_path',
+                        lambda _path: str(cache))
+    monkeypatch.setattr(clip_grid, 'is_completed_video_path', lambda _path: True)
+
+    cancel_event = threading.Event()
+    if terminal_state == 'cancel':
+        cancel_event.set()
+    elif terminal_state == 'exception':
+        monkeypatch.setattr(
+            clip_grid, '_probe_with_owned_process',
+            lambda *_args: (_ for _ in ()).throw(RuntimeError('probe failed')))
+    else:
+        monkeypatch.setattr(
+            clip_grid, '_probe_with_owned_process',
+            lambda _path, _cancel: SimpleNamespace(
+                duration_seconds=12.0, width=1920, height=1080,
+                average_fps=60.0, video_bitrate_bps=1, total_bitrate_bps=1))
+    if terminal_state == 'success':
+        image = QImage(4, 4, QImage.Format.Format_RGB32)
+        image.fill(0xFFFFFFFF)
+        monkeypatch.setattr(
+            clip_grid, '_decode_thumbnail_with_owned_process',
+            lambda _path, _cancel: image)
+    elif terminal_state == 'failure':
+        monkeypatch.setattr(
+            clip_grid, '_decode_thumbnail_with_owned_process',
+            lambda _path, _cancel: None)
+
+    worker = clip_grid._ThumbnailWorker(str(media), cancel_event)
+    diagnostics: list[tuple] = []
+    worker.signals.diagnostic_finished.connect(
+        lambda *args: diagnostics.append(args))
+    worker.run()
+
+    assert len(diagnostics) == 1
+
+
+def test_stale_thumbnail_terminal_cannot_release_replacement_job():
+    from ui.clip_grid import ClipGrid
+
+    grid = ClipGrid.__new__(ClipGrid)
+    grid._thumbnail_jobs_inflight = {'clip.mp4'}
+    grid._thumbnail_job_fingerprints = {'clip.mp4': 'new-fp'}
+    grid._thumbnail_job_owners = {'clip.mp4': (5, 'new-fp')}
+    grid._thumbnail_workers = {}
+
+    assert grid._finish_thumbnail_job('clip.mp4', 4, 'old-fp') is False
+    assert grid._thumbnail_jobs_inflight == {'clip.mp4'}
+    assert grid._thumbnail_job_owners == {'clip.mp4': (5, 'new-fp')}
+
+
+def test_current_generation_failure_cleanup_does_not_resubmit():
+    """A failed current job is terminal; it must not spin a retry loop."""
+    from ui.clip_grid import ClipGrid
+
+    class _FakeThreadPool:
+        def activeThreadCount(self):
+            return 0
+
+    grid = ClipGrid.__new__(ClipGrid)
+    grid._thumbnail_generation = 7
+    grid._thumbnail_jobs_inflight = {'clip.mp4'}
+    grid._thumbnail_job_fingerprints = {'clip.mp4': 'fp'}
+    grid._thumbnail_job_owners = {'clip.mp4': (7, 'fp')}
+    grid._thumbnail_workers = {}
+    grid._thumbnail_jobs_completed = 0
+    grid._thumbnail_diagnostics_completed = 0
+    grid._thumbnail_jobs_submitted = 0
+    grid._thumbnail_total_elapsed_ms = 0
+    grid._metadata_total_elapsed_ms = 0
+    grid._thumbnail_cache_hits = 0
+    grid._thread_pool = _FakeThreadPool()
+    grid._records = {}
+
+    grid._on_thumb_diagnostic(1, 0, False, 'clip.mp4', 7, 'fp')
+
+    assert grid._thumbnail_jobs_inflight == set()
+    assert grid._thumbnail_job_owners == {}
+
+
+def test_repeated_pause_resume_does_not_strand_thumbnail_ownership(
+        qtbot, tmp_path, monkeypatch):
+    """Each pause/resume cycle gets one replacement job, never duplicates."""
+    from PySide6.QtCore import QTimer, QRunnable
+    from PySide6.QtGui import QImage
+    from PySide6.QtWidgets import QApplication
+    from ui import clip_grid as clip_grid_module
+    from ui.clip_grid import ClipGrid, ClipThumbnail
+    from core.library_index import LibraryRecord, canonical_media_path
+
+    QApplication.instance() or QApplication([])
+    media = tmp_path / 'clip.mp4'
+    media.write_bytes(b'fixture')
+    media_path = str(media)
+    thumbnail_path = tmp_path / 'thumb.jpg'
+    thumbnail = QImage(8, 8, QImage.Format.Format_RGB32)
+    thumbnail.fill(0xFFFFFFFF)
+    assert thumbnail.save(str(thumbnail_path), 'JPG')
+
+    class _FakeThumbnailWorker(QRunnable):
+        workers = []
+
+        def __init__(self, file_path, cancel_event):
+            super().__init__()
+            self.signals = clip_grid_module._ThumbnailSignals()
+            self.setAutoDelete(False)
+            self.workers.append(self)
+
+        def run(self):
+            return None
+
+    monkeypatch.setattr(clip_grid_module, '_ThumbnailWorker', _FakeThumbnailWorker)
+    card = ClipThumbnail(media_path, is_video=True, ready=True)
+    qtbot.addWidget(card)
+    grid = ClipGrid.__new__(ClipGrid)
+    grid._shutdown_started = False
+    grid._background_paused = False
+    grid._background_refresh_pending = False
+    grid._scan_generation = 0
+    grid._active_scan_worker = None
+    grid._pending_saved_clips = {}
+    class _FakeThreadPool:
+        def start(self, _worker):
+            return None
+
+        def activeThreadCount(self):
+            return 0
+
+    grid._thread_pool = _FakeThreadPool()
+    grid._thumbnail_cancel_event = threading.Event()
+    grid._thumbnail_generation = 0
+    grid._thumbnail_jobs_inflight = set()
+    grid._thumbnail_job_fingerprints = {}
+    grid._thumbnail_job_owners = {}
+    grid._thumbnail_workers = {}
+    grid._thumbnail_jobs_submitted = 0
+    grid._thumbnail_jobs_completed = 0
+    grid._thumbnail_diagnostics_completed = 0
+    grid._thumbnail_total_elapsed_ms = 0
+    grid._metadata_total_elapsed_ms = 0
+    grid._thumbnail_cache_hits = 0
+    grid._thumbnail_queue_peak = 0
+    grid._thumb_widgets = {media_path: card}
+    grid._records = {
+        canonical_media_path(media_path): LibraryRecord(
+            media_path, canonical_media_path(media_path), (), False, 'video',
+            media.stat().st_size, media.stat().st_mtime_ns)
+    }
+    grid._imported_files = set()
+    grid.refresh_timer = QTimer()
+    grid._debounce_timer = QTimer()
+    grid._load_clips = lambda: None
+
+    assert card.ready is True
+    assert card._thumbnail_ready is False
+    assert media_path in grid._thumb_widgets
+    grid._start_thumbnail_worker(media_path)
+    assert grid._thumbnail_job_owners
+    for _cycle in range(20):
+        grid.set_background_paused(True)
+        assert grid._thumbnail_jobs_inflight == {media_path}
+        old_worker = _FakeThumbnailWorker.workers[-1]
+        grid.set_background_paused(False)
+        assert len(_FakeThumbnailWorker.workers) == (2 * _cycle) + 1
+        assert grid._thumbnail_jobs_inflight == {media_path}
+        # No replacement may run concurrently with the cancelled owner.
+        assert grid._thumbnail_job_owners[media_path][0] == _cycle
+        old_worker.signals.diagnostic_finished.emit(1, 0, False)
+        QApplication.processEvents()
+        assert len(_FakeThumbnailWorker.workers) == (2 * _cycle) + 2
+        assert len(grid._thumbnail_jobs_inflight) == 1
+        replacement = _FakeThumbnailWorker.workers[-1]
+        replacement.signals.finished.emit(media_path, str(thumbnail_path), 1)
+        replacement.signals.diagnostic_finished.emit(1, 0, False)
+        QApplication.processEvents()
+        assert not grid._thumbnail_jobs_inflight
+        assert not card._thumb_pixmap.isNull()
+        card._thumbnail_ready = False
+        if _cycle < 19:
+            # The next cycle starts with a fresh visible enrichment request;
+            # this keeps each cancellation/resume assertion independent while
+            # still exercising twenty consecutive cycles.
+            grid._start_thumbnail_worker(media_path)
+            assert len(grid._thumbnail_jobs_inflight) == 1
+
+    assert len(_FakeThumbnailWorker.workers) == 40

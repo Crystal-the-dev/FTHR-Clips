@@ -1,14 +1,7 @@
-"""Shared FTHR design tokens.
+"""Shared color, font, and spacing tokens for FTHR widgets.
 
-Widgets should consume the color, font, and spacing tokens from this module so
-theme application and future branding changes remain centralized.
-
-Brand direction:
-- Pure black canvas with neutral grays.
-- Teal (#00ffaa) is the restrained accent for hover, active, and recording state.
-- Oswald is the standard display and interface typeface. User-imported theme
-  fonts may replace either role explicitly.
-- Sharp 0px corners everywhere on an 8px grid. Rounded corners are for clouds.
+Defaults use black and neutral grays, a teal accent, Oswald, square corners,
+and an 8px spacing grid. Imported themes can override fonts and colors.
 """
 from __future__ import annotations
 
@@ -21,7 +14,7 @@ from PySide6.QtWidgets import QComboBox, QPushButton, QWidget
 from core.theme_manager import ThemeManager
 
 
-# ─── Palette ──────────────────────────────────────────────────────────
+# Palette
 class Colors:
     # Body canvas — pure black, matching fthrclips.com
     BG          = '#000000'
@@ -69,7 +62,7 @@ class Colors:
     BAR_HAIRLINE = '#222222'
 
 
-# ─── Type ─────────────────────────────────────────────────────────────
+# Type
 class Fonts:
     # Display face — Oswald is bundled in fonts/.  The leading family in each
     # stack is themeable; the remaining families are deliberate fallbacks.
@@ -269,7 +262,24 @@ def retarget_widget_font_styles(root, old_display: str, old_body: str) -> None:
             style_setter(updated)
 
 
-# ─── Geometry ─────────────────────────────────────────────────────────
+def set_theme_style(widget: QWidget, factory) -> None:
+    """Keep the token-based recipe so an existing control can change themes.
+
+    Replacing old hex values loses token identity when two tokens happen to
+    share a color. Re-evaluate the recipe instead, preserving widget state.
+    """
+    widget._theme_style_factory = factory
+    widget.setStyleSheet(factory())
+
+
+def refresh_theme_styles(root: QWidget) -> None:
+    for widget in [root, *root.findChildren(QWidget)]:
+        factory = getattr(widget, '_theme_style_factory', None)
+        if factory is not None:
+            widget.setStyleSheet(factory())
+
+
+# Geometry
 class Sizes:
     # 8-px grid
     SPACE_2  = 4
@@ -304,7 +314,7 @@ class Sizes:
     HAIRLINE_W = 1
 
 
-# ─── Inline label helpers ─────────────────────────────────────────────
+# Inline label helpers
 def label_display(
     color: str = Colors.TEXT,
     size: int = Fonts.SIZE_H2,
@@ -340,7 +350,7 @@ def label_body(color: str = Colors.TEXT, size: int = Fonts.SIZE_BODY) -> str:
     )
 
 
-# ─── Capture status text (shown in the top bar) ───────────────────────
+# Capture status text (shown in the top bar)
 def _status_text_base() -> str:
     return (
         f'font-size: {Fonts.SIZE_MICRO}px; font-family: {Fonts.DISPLAY};'
@@ -359,7 +369,7 @@ def status_warning_qss() -> str:
     return _status_text_base() + f' color: {Colors.ERROR};'
 
 
-# ─── Reusable QSS fragments ───────────────────────────────────────────
+# Reusable QSS fragments
 def combo_qss(background: str | None = None) -> str:
     """Return the shared combo style, with an optional non-default surface."""
     combo_background = background or Colors.SURFACE_2

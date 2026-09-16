@@ -1,18 +1,8 @@
 #!/usr/bin/env python3
-"""Check that every place stating a product version states the same one.
+"""Check product-version declarations against FTHR_UI/version.py.
 
-FTHR_UI/version.py is the single source of truth (AUDIT-008). This script
-walks the files that historically drifted away from it and fails if any of
-them disagrees.
-
-    python tools/verify_version_consistency.py
-
-Exit code 0 = consistent, 1 = drift found.
-
-Deliberately NOT checked here:
-  - CaptureBridge.SHARED_MEM_NAME ('FTHR_SharedMemory_v4'). That is the IPC
-    layout contract, not the product version. It only changes when the struct
-    changes. tools/verify_shared_memory_contract.py owns it.
+The independently versioned IPC layout is checked by
+verify_shared_memory_contract.py. Exit 1 reports product-version drift.
 """
 
 from __future__ import annotations

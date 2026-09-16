@@ -1,30 +1,16 @@
-# requirements-alpha.txt — the LOCK for FTHR Clips 1.0.0-alpha.
-#
-# Generated from requirements.in. Fully pinned across the whole transitive
-# closure so that two clean installs produce byte-identical package sets.
-# This is the ONLY file a release build may install from.
-#
-#     python -m pip install --require-hashes=false -r requirements-alpha.txt
-#
-# Target interpreter: CPython 3.14 (see PYTHON_VERSION note below).
-# Verified on: Windows 10 x64, CPython 3.14.3, 2026-08-06.
-#
-# Do not edit by hand except to bump a pin deliberately. After any change,
-# re-run the two clean-install checks documented in RELEASE_CHECKLIST.md.
+# Pinned runtime dependencies for release builds, maintained from requirements.in.
+# Install with: python -m pip install -r requirements-alpha.txt
+# Target: CPython 3.14. Recheck clean installs after changing any pin.
 
-# ---------------------------------------------------------------------------
 # Direct dependencies
-# ---------------------------------------------------------------------------
 PySide6==6.11.1
 opencv-python-headless==4.13.0.92
 numpy==2.4.4
 sounddevice==0.5.5
 keyboard==0.13.5
 
-# ---------------------------------------------------------------------------
 # Transitive dependencies — pinned so a silent upstream release cannot change
 # what an alpha build contains.
-# ---------------------------------------------------------------------------
 PySide6-Addons==6.11.1    # via PySide6 (Qt Multimedia)
 PySide6-Essentials==6.11.1 # via PySide6
 shiboken6==6.11.1         # via PySide6

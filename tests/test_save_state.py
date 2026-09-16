@@ -1,13 +1,7 @@
-"""Fake-engine tests for the save state machine (AUDIT-011, AUDIT-017).
+"""Drive the save state machine with scripted shared-memory responses.
 
-The engine is replaced by a scripted sequence of shared-memory values, so
-every timing case that is a race in production becomes deterministic here:
-an engine that answers instantly, one that never answers, one that leaves a
-completion in the field across a save boundary.
-
-The bridge is the real CaptureBridge driven against a real ctypes struct in
-process memory — only the mapping is fake. That keeps peek/consume, the
-string decoding and the response-code handling under test rather than mocked.
+Use the real CaptureBridge and ctypes layout with an in-memory mapping
+to exercise timing, peek/consume ordering, and response decoding.
 """
 
 import ctypes
@@ -24,9 +18,7 @@ from core.save_state import (
 )
 
 
-# ---------------------------------------------------------------------------
 # Harness
-# ---------------------------------------------------------------------------
 
 class FakeEngine:
     """A shared-memory segment plus the ability to write responses into it."""
@@ -69,13 +61,9 @@ class FakeBridge(CaptureBridge):
 
 
 class Driver:
-    """Bridge + state machine + the one pump, mirroring main.py's poller.
+    """Mirror the main-window poller: read, interpret, then consume.
 
-    main.py's `_pump_save_responses()` is reproduced here rather than imported
-    because importing main.py pulls in the whole Qt window. The read → interpret
-    → consume ordering is the contract under test and is kept identical; a
-    change to one without the other is caught by
-    `test_pump_mirrors_main_window_ordering`.
+    The ordering test checks this Qt-free harness against main.py.
     """
 
     def __init__(self, ack_timeout_s=1.0, completion_timeout_s=60.0):
@@ -109,12 +97,12 @@ class Driver:
                      'saved': EngineEvent.CLIP_SAVED,
                      'error': EngineEvent.ERROR_OCCURRED}[kind]
             outcome = self.sm.on_event(event, detail, self.now)
-            self.bridge.consume_save_response()
+            self.bridge.consume_save_response(kind)
         if outcome is not None:
             self.outcomes.append(outcome)
         return outcome
 
-    # -- assertions helpers ------------------------------------------------
+    # assertions helpers
 
     def kinds(self):
         return [o.kind for o in self.outcomes]
@@ -129,9 +117,7 @@ def d():
     return Driver()
 
 
-# ---------------------------------------------------------------------------
 # T1 — normal flow
-# ---------------------------------------------------------------------------
 
 def test_T1_normal_save_started_then_clip_saved(d):
     d.submit()
@@ -154,9 +140,7 @@ def test_T1_normal_save_started_then_clip_saved(d):
     assert len(d.results()) == 1
 
 
-# ---------------------------------------------------------------------------
 # T2 — ultra fast: CLIP_SAVED without an observable SAVE_STARTED (AUDIT-015)
-# ---------------------------------------------------------------------------
 
 def test_T2_clip_saved_without_save_started_succeeds(d):
     d.submit()
@@ -169,9 +153,7 @@ def test_T2_clip_saved_without_save_started_succeeds(d):
     assert d.outcomes[0].late is False
 
 
-# ---------------------------------------------------------------------------
 # T3 / T4 — failures
-# ---------------------------------------------------------------------------
 
 def test_T3_immediate_failure_reports_once_with_detail(d):
     d.submit()
@@ -196,9 +178,7 @@ def test_T4_accepted_then_failure(d):
     assert len(d.results()) == 1
 
 
-# ---------------------------------------------------------------------------
 # T5 — no response at all
-# ---------------------------------------------------------------------------
 
 def test_T5_no_response_times_out_then_fails(d):
     d.submit()
@@ -231,9 +211,7 @@ def test_T5_timeout_does_not_destroy_a_late_success(d):
     assert any('late success after timeout' in m for m in d.log)
 
 
-# ---------------------------------------------------------------------------
 # T6 / T7 — AUDIT-017: an old verdict must survive until it is consumed
-# ---------------------------------------------------------------------------
 
 def test_T6_old_clip_saved_is_processed_before_the_next_save(d):
     """Regression: save A completes, its CLIP_SAVED is still in the field, and
@@ -283,9 +261,7 @@ def test_T7_old_error_is_processed_before_the_next_save(d):
     assert b.state is SaveState.REQUESTED
 
 
-# ---------------------------------------------------------------------------
 # T8 — duplicate visibility across ticks
-# ---------------------------------------------------------------------------
 
 def test_T8_same_clip_saved_seen_twice_succeeds_once(d):
     d.submit()
@@ -309,9 +285,7 @@ def test_T8_duplicate_save_started_emits_one_accepted(d):
     assert d.kinds().count(OutcomeKind.ACCEPTED) == 1
 
 
-# ---------------------------------------------------------------------------
 # T9 — garbled strings
-# ---------------------------------------------------------------------------
 
 def test_T9_garbled_engine_string_does_not_crash(d):
     d.submit()
@@ -339,9 +313,7 @@ def test_error_with_empty_string_is_tolerated(d):
     assert out.detail == ''
 
 
-# ---------------------------------------------------------------------------
 # T11 — two rapid requests / single flight
-# ---------------------------------------------------------------------------
 
 def test_T11_second_request_while_in_flight_is_refused(d):
     a = d.submit('/clips/a.mp4').operation
@@ -372,9 +344,7 @@ def test_T11_timed_out_operation_does_not_block_the_next_save(d):
     assert result.accepted is True
 
 
-# ---------------------------------------------------------------------------
 # T12 — shutdown
-# ---------------------------------------------------------------------------
 
 def test_T12_shutdown_with_active_save_emits_no_result(d):
     d.submit()
@@ -390,9 +360,7 @@ def test_T12_shutdown_with_active_save_emits_no_result(d):
     assert d.results() == []
 
 
-# ---------------------------------------------------------------------------
 # Invariants
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize('script', [
     [ResponseType.CLIP_SAVED],
@@ -465,8 +433,9 @@ def test_consume_only_clears_what_was_peeked(d):
     d.engine.respond(ResponseType.SAVE_STARTED)
     assert d.bridge.peek_save_response()[0] == 'started'
     assert d.bridge.consume_save_response() is True
-    assert d.engine.response == ResponseType.NONE
-    # Nothing pending now — a second consume must be a no-op, not a stray write.
+    assert d.engine.response == ResponseType.SAVE_STARTED
+    assert d.bridge.peek_save_response() is None
+    # The ack stays in shared memory but is delivered only once locally.
     assert d.bridge.consume_save_response() is False
 
 

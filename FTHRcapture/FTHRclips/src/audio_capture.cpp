@@ -1,4 +1,3 @@
-// audio_capture.cpp
 // FTHR Capture Engine - WASAPI Loopback Audio Capture implementation
 
 #ifdef _MSC_VER
@@ -42,9 +41,7 @@
 #include <limits>
 
 
-// ---------------------------------------------------------------------------
 // Helper macro - log HRESULT failures without throwing
-// ---------------------------------------------------------------------------
 #define FTHR_CHECK_HR(hr, msg)                                          \
     if (FAILED(hr)) {                                                   \
         std::cerr << "[AudioCapture] " << (msg)                         \
@@ -57,9 +54,7 @@
 namespace fthr {
 
 
-    // ===========================================================================
     // Constructor / Destructor
-    // ===========================================================================
 
     AudioCapture::AudioCapture()
         : enumerator_(nullptr)
@@ -80,31 +75,9 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
-    // Initialize
-    //
-    // Steps:
-    //   1.  CoInitializeEx (apartment for this thread)
-    //   2.  Create IMMDeviceEnumerator
-    //   3.  Get default render device (or device_id if specified)
-    //   4.  Activate IAudioClient
-    //   5.  Query mix format (WAVEFORMATEX)
-    //   6.  Validate / log format details
-    //   7.  Initialize IAudioClient in loopback event-driven mode
-    //   8.  Get IAudioCaptureClient
-    //   9.  Create buffer-ready event + associate with audio client
-    //   10. Initialize AudioEncoder with discovered format
-    //   11. Pre-allocate silence buffer
-    // ===========================================================================
 
-    // ===========================================================================
-    // TeardownWASAPISession
-    //
-    // Releases the WASAPI COM objects. Safe with partial state (each pointer is
-    // null-checked before Release). Does NOT touch ring_, silence_buf_, or the
-    // thread's COM apartment — only the session-level objects that can be
-    // recreated on reconnect.
-    // ===========================================================================
+    // Release partially initialized WASAPI session objects. Preserve the ring,
+    // silence buffer, and COM apartment for reconnection.
 
     void AudioCapture::TeardownWASAPISession() {
         if (audio_client_) {
@@ -137,26 +110,13 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
-    // SetupWASAPISession
-    //
-    // Creates the WASAPI COM objects needed to capture loopback audio. Extracted
-    // from Initialize() so it can also be called from CaptureThread during
-    // recovery (e.g. after BT headphones reconnect or device invalidation).
-    //
-    // COM must already be initialized on the calling thread.
-    // Uses device_id_ (stored in Initialize) to re-open the same device.
-    // On failure, COM objects may be partially created — caller must call
-    // TeardownWASAPISession() to clean up.
-    //
-    // Also resizes silence_buf_ to match the new device format, so recovery
-    // after a format change (e.g. 44100 -> 48000 headset) works correctly.
-    // ===========================================================================
+    // Open or recover the stored WASAPI device and resize the silence buffer
+    // for its format. COM must be initialized on the caller thread. On failure,
+    // call TeardownWASAPISession to release partial state.
 
     bool AudioCapture::SetupWASAPISession() {
         HRESULT hr;
 
-        // Step 2: Create device enumerator
         IMMDeviceEnumerator* enumerator = nullptr;
         hr = CoCreateInstance(
             __uuidof(MMDeviceEnumerator), nullptr,
@@ -165,7 +125,6 @@ namespace fthr {
         FTHR_CHECK_HR(hr, "CoCreateInstance(MMDeviceEnumerator) failed");
         enumerator_ = static_cast<void*>(enumerator);
 
-        // Step 3: Get the target render device (or default)
         IMMDevice* device = nullptr;
         if (!device_id_.empty()) {
             hr = enumerator->GetDevice(device_id_.c_str(), &device);
@@ -197,14 +156,12 @@ namespace fthr {
             props->Release();
         }
 
-        // Step 4: Activate IAudioClient
         IAudioClient* audio_client = nullptr;
         hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL,
             nullptr, reinterpret_cast<void**>(&audio_client));
         FTHR_CHECK_HR(hr, "IMMDevice::Activate(IAudioClient) failed");
         audio_client_ = static_cast<void*>(audio_client);
 
-        // Step 5: Query mix format
         WAVEFORMATEX* mix_fmt = nullptr;
         hr = audio_client->GetMixFormat(&mix_fmt);
         FTHR_CHECK_HR(hr, "IAudioClient::GetMixFormat failed");
@@ -226,21 +183,18 @@ namespace fthr {
         sample_rate_ = format_converter_.sample_rate();
         channels_ = format_converter_.channels();
 
-        // Step 7: Initialize IAudioClient in loopback event-driven mode
         hr = audio_client->Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
             0, 0, mix_fmt, nullptr);
         FTHR_CHECK_HR(hr, "IAudioClient::Initialize failed");
 
-        // Step 8: Get IAudioCaptureClient
         IAudioCaptureClient* capture_client = nullptr;
         hr = audio_client->GetService(__uuidof(IAudioCaptureClient),
             reinterpret_cast<void**>(&capture_client));
         FTHR_CHECK_HR(hr, "IAudioClient::GetService(IAudioCaptureClient) failed");
         capture_client_ = static_cast<void*>(capture_client);
 
-        // Step 9: Create buffer-ready event
         HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!evt) {
             std::cerr << "[AudioCapture] CreateEvent failed" << std::endl;
@@ -262,9 +216,6 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
-    // Initialize
-    // ===========================================================================
 
     bool AudioCapture::Initialize(AudioRingBuffer* ring,
         const AudioCaptureConfig& config) {
@@ -319,9 +270,6 @@ namespace fthr {
         encoder_ = encoder;
     }
 
-    // ===========================================================================
-    // Start
-    // ===========================================================================
 
     bool AudioCapture::Start() {
         if (!audio_client_ || !capture_client_ || (!ring_ && !encoder_)) {
@@ -355,9 +303,6 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
-    // Stop
-    // ===========================================================================
 
     void AudioCapture::Stop() {
         if (running_.load(std::memory_order_acquire)) {
@@ -383,9 +328,6 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
-    // Shutdown
-    // ===========================================================================
 
     void AudioCapture::Shutdown() {
         TeardownWASAPISession();
@@ -411,19 +353,8 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
-    // CaptureThread
-    //
-    // Hot loop. Waits for WASAPI to signal buffer_event_ (~every 10ms),
-    // then drains all available packets from IAudioCaptureClient.
-    //
-    // For each packet:
-    //   - If AUDCLNT_BUFFERFLAGS_SILENT or data is null: inject silence
-    //   - Otherwise: convert native PCM to canonical float32 before encoding.
-    //
-    // The encoder accumulates samples into 1024-sample AAC frames, encodes,
-    // and fires its callback (AudioRingBuffer::Push) autonomously.
-    // ===========================================================================
+    // Drain packets when WASAPI signals buffer_event_. Convert active PCM to
+    // the canonical format and insert silence for silent or missing data.
 
     void AudioCapture::CaptureThread() {
         std::cout << "[AudioCapture] Thread started." << std::endl;
@@ -455,9 +386,7 @@ namespace fthr {
                 break;
             }
 
-            // ------------------------------------------------------------------
             // Inner capture loop — runs until the device is lost or Stop() is called
-            // ------------------------------------------------------------------
             bool device_error = false;
             // A render endpoint can legitimately stop producing WASAPI
             // packets when every application is silent. Keep the Default Mix
@@ -631,15 +560,8 @@ namespace fthr {
 
             if (!running_.load(std::memory_order_relaxed)) break;
 
-            // ------------------------------------------------------------------
-            // Device error recovery
-            //
-            // Typical cause: BT headphones disconnected/reconnected, Windows audio
-            // engine restarted, exclusive-mode app grabbed the device.
-            // Strategy: wait for Windows to settle the new default device, then
-            // tear down the old WASAPI session and build a fresh one.
-            // Back-off: 1s, 2s, 3s, 4s, 5s — then give up.
-            // ------------------------------------------------------------------
+            // Reopen the WASAPI session after device loss, allowing Windows to settle.
+            // Retry with delays of 1 through 5 seconds, then stop recovery.
             if (device_error) {
                 if (retry_count >= kMaxRetries) {
                     std::cerr << "[AudioCapture] WASAPI recovery failed after "
@@ -696,16 +618,8 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
-    // InjectSilence
-    //
-    // Write 'num_frames' zero-filled frames to the encoder so its PTS
-    // counter advances even when no audio is playing.
-    //
-    // Uses the pre-allocated silence_buf_ - zero cost, no allocation.
-    // If num_frames exceeds the pre-allocated buffer (pathological case),
-    // we process it in chunks rather than silently truncating.
-    // ===========================================================================
+    // Advance the audio timeline with zero-filled frames from silence_buf_.
+    // Process oversized requests in chunks to avoid allocating in the capture loop.
 
     bool AudioCapture::InjectSilence(uint32_t num_frames, uint64_t qpc_100ns) {
         if ((!ring_ && !encoder_) || num_frames == 0) return num_frames == 0;

@@ -1,19 +1,9 @@
 #!/usr/bin/env python3
-"""Refuse a tree that contains secrets, user data or unexpected large binaries.
+"""Scan for credential patterns, user-state files, and oversized binaries.
 
-Runs against what git actually tracks, not the working directory: an ignored
-215 MB installer sitting on disk is fine, the same file staged is not.
-
-    python tools/scan_repo_hygiene.py              # tracked files (needs git)
-    python tools/scan_repo_hygiene.py --staged     # what is about to be committed
-    python tools/scan_repo_hygiene.py --all-files  # walk the tree, no git
-
-Exit code 0 = clean, 1 = findings.
-
-This is a tripwire, not a guarantee. It catches the shapes of credential that
-have actually shown up in projects like this one — Authorization headers,
-Discord bot tokens, webhook URLs, private keys — plus the user-state files the
-app writes at runtime. It cannot prove the absence of a secret.
+Default: git-tracked files. --staged checks the index; --all-files walks the
+working tree. Exit 0 means no findings; 1 means findings. Pattern checks
+cannot prove that a tree contains no secrets.
 """
 
 from __future__ import annotations
@@ -136,7 +126,7 @@ def scan(paths: list[str]) -> Findings:
         name = Path(rel).name
         suffix = Path(rel).suffix.lower()
 
-        # --- filename-based ------------------------------------------------
+        # filename-based
         if name in USER_STATE_NAMES:
             f.add('user data', rel, 'runtime state belongs in ~/.fthr, not the repo')
         if suffix in SECRET_FILE_SUFFIXES:
@@ -149,7 +139,6 @@ def scan(paths: list[str]) -> Findings:
         if suffix == '.log':
             f.add('log', rel, 'log file')
 
-        # --- size ----------------------------------------------------------
         size = p.stat().st_size
         if size > MAX_BINARY_BYTES and not rel.startswith(LARGE_FILE_ALLOWLIST):
             f.add('large file', rel,
@@ -157,7 +146,7 @@ def scan(paths: list[str]) -> Findings:
                   f'{MAX_BINARY_BYTES // 1024 // 1024} MB limit — should this be '
                   f'downloaded at build time or shipped as a release artefact?')
 
-        # --- content -------------------------------------------------------
+        # content
         if rel.startswith(CONTENT_SCAN_SKIP_PREFIXES):
             continue
         if suffix not in TEXT_SUFFIXES:

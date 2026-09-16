@@ -236,12 +236,9 @@ def _load_themed_icon(filename: str, size: int, tint: str | None = None) -> QIco
 
 
 def _running_windows_app_icon(persistent_identity: str | None) -> QIcon | None:
-    """Resolve a real icon without persisting an executable path in a clip.
+    """Resolve an icon from a running process matching the manifest identity.
 
-    Native manifests intentionally store only a privacy-safe executable key.
-    While the captured app is still running, match that key to a process and
-    ask Windows for its normal shell icon. A semantic glyph remains the honest
-    fallback for older clips or apps which have already exited.
+    Persist no executable path. Use a semantic glyph if no process matches.
     """
 
     if sys.platform != 'win32' or not persistent_identity:
@@ -323,9 +320,7 @@ def _running_windows_app_icon(persistent_identity: str | None) -> QIcon | None:
         return None
 
 
-# ---------------------------------------------------------------------------
 # Timeline primitives
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -512,6 +507,20 @@ class _ClipMetadataSignals(QObject):
     ready = Signal(object)
 
 
+class _PlaybackSourceWorker(QRunnable):
+    def __init__(self, path: str, cancelled: threading.Event):
+        super().__init__()
+        self.path = path
+        self.cancelled = cancelled
+        self.signals = _ClipMetadataSignals()
+
+    def run(self):
+        from core.playback_proxy import prepare_playback_path
+        path = prepare_playback_path(self.path, self.cancelled)
+        if not self.cancelled.is_set():
+            self.signals.ready.emit(path)
+
+
 class _ClipMetadataWorker(QRunnable):
     """Probe clip metadata without blocking the editor's first paint."""
 
@@ -654,9 +663,8 @@ def _video_filter_chain(crop_rect=None, effects: dict | None = None,
     contrast = max(-100, min(100, int(values.get('contrast', 0))))
     saturation = max(-100, min(100, int(values.get('saturation', 0))))
     if exposure or contrast:
-        # The reviewed bundled FFmpeg intentionally omits `eq`. A three-point
-        # RGB curve provides the same basic exposure/contrast controls using a
-        # filter that ships on every supported build.
+        # The bundled FFmpeg lacks eq; use a three-point RGB curve for basic
+        # exposure and contrast controls.
         brightness_value = exposure * 0.003
         contrast_value = 1.0 + contrast * 0.006
         curve_points = []
@@ -700,13 +708,9 @@ def _video_filter_chain(crop_rect=None, effects: dict | None = None,
 
 
 class ClickableSlider(QSlider):
-    """A compact slider with a forgiving hit area and absolute-click input.
+    """Compact slider with a larger hit area and absolute-click positioning.
 
-    The groove and handle remain visually compact. The widget itself is taller
-    than the artwork, so a click a few pixels above or below the line still
-    feels like it landed on the control. Every left click also starts a normal
-    slider gesture, which keeps live updates and undo history consistent with a
-    drag.
+    Left clicks start the same gesture as dragging for live updates and undo.
     """
 
     _HIT_HEIGHT = 26
@@ -863,34 +867,33 @@ class TrimSlider(QFrame):
 
         def _worker():
             images: list[QImage] = []
-            cap = None
             try:
-                cap = cv2.VideoCapture(clip_path)
-                if cancelled.is_set() or not cap.isOpened():
+                # Decode once, sequentially. Random OpenCV seeks made a
+                # 24-image strip decode the same long GOP up to 24 times,
+                # competing with interactive seeking and surviving cancel.
+                from core.media_process import run_media_process
+                duration_seconds = max(0.001, self.duration_ms / 1000.0)
+                result = run_media_process(
+                    [get_ffmpeg_exe(), '-v', 'error', '-threads', '1',
+                     '-filter_threads', '1', '-i', clip_path, '-an', '-sn',
+                     '-vf', (f'fps={count / duration_seconds:.9f},'
+                             'scale=180:100:force_original_aspect_ratio=decrease,'
+                             'pad=180:100:(ow-iw)/2:(oh-ih)/2'),
+                     '-frames:v', str(count), '-pix_fmt', 'rgb24',
+                     '-f', 'rawvideo', '-threads:v', '1', '-'],
+                    cancelled, timeout_seconds=30.0)
+                if cancelled.is_set() or result is None or result[0] != 0:
                     return
-                total = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 1))
-                for index in range(count):
-                    if cancelled.is_set():
-                        return
-                    frame_index = int(index / max(count - 1, 1) * (total - 1))
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-                    if cancelled.is_set():
-                        return
-                    ok, frame = cap.read()
-                    if not ok or frame is None:
-                        continue
-                    frame = cv2.resize(frame, (180, 100), interpolation=cv2.INTER_AREA)
-                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame_bytes = 180 * 100 * 3
+                for offset in range(0, len(result[1]) - frame_bytes + 1, frame_bytes):
+                    pixels = result[1][offset:offset + frame_bytes]
                     image = QImage(
-                        rgb.data, rgb.shape[1], rgb.shape[0], rgb.strides[0],
+                        pixels, 180, 100, 180 * 3,
                         QImage.Format.Format_RGB888).copy()
                     images.append(image)
-            except (cv2.error, OSError, RuntimeError, TypeError, ValueError) as error:
+            except (FFmpegUnavailable, OSError, RuntimeError, TypeError, ValueError) as error:
                 print(f'[ClipTimeline] thumbnail filmstrip unavailable: {error}')
                 images = []
-            finally:
-                if cap is not None:
-                    cap.release()
             if cancelled.is_set():
                 return
             _store_timeline_images(cache_key, images)
@@ -1227,9 +1230,7 @@ class TrimSlider(QFrame):
         return f'{s // 60}:{s % 60:02d}'
 
 
-# ---------------------------------------------------------------------------
 # CropOverlay — transparent drag-handle crop net
-# ---------------------------------------------------------------------------
 
 class CropOverlay(QWidget):
     """
@@ -1413,9 +1414,7 @@ class CropOverlay(QWidget):
         self._drag = None
 
 
-# ---------------------------------------------------------------------------
 # CropPreviewOverlay — paints the active crop region over a video surface
-# ---------------------------------------------------------------------------
 
 class CropPreviewOverlay(QWidget):
     """
@@ -1497,18 +1496,14 @@ class CropPreviewOverlay(QWidget):
         painter.drawText(label_rect, Qt.AlignmentFlag.AlignCenter, label)
 
 
-# ---------------------------------------------------------------------------
 # LiveVideoPreview — software-backed player surface with real-time edit preview
-# ---------------------------------------------------------------------------
 
 
 class LiveVideoPreview(CropPreviewOverlay):
-    """Paint decoded frames and visual edits in one reliable Qt surface.
+    """Composite frames, effects, and the crop guide in one Qt surface.
 
-    QVideoWidget may be backed by a native child window on Windows. Native
-    video children always cover ordinary Qt overlays, which made the crop guide
-    disappear. QVideoSink gives us each decoded frame so the image, look,
-    stretch, vignette and crop guide are composited by the same paint event.
+    Native Windows video widgets can cover ordinary overlays; QVideoSink
+    allows all layers to share the paint event.
     """
 
     def __init__(self, src_w: int, src_h: int, parent=None):
@@ -1609,22 +1604,11 @@ class LiveVideoPreview(CropPreviewOverlay):
     @staticmethod
     def _normalize_decoded_video_range(
             image: QImage, color_range: QVideoFrameFormat.ColorRange) -> QImage:
-        """Return the decoded frame as stable, display-ready RGB.
+        """Return a detached display-ready image without changing its color range.
 
-        ``QVideoFrame.toImage()`` has already converted the frame's source
-        YUV range into RGB.  ``color_range`` describes that source surface;
-        it must not be applied again to the resulting ``QImage``.  Expanding
-        RGB values here when the surface reports ``ColorRange_Video`` clips
-        highlights and makes the preview visibly brighter than the same clip
-        in FFmpeg or an external player.
-
-        Keep the range argument for compatibility with integrations that call
-        this helper directly, but deliberately do not reinterpret the pixels.
-        Keep the backend image format when possible. The helper returns a
-        detached image for callers that need an independent display buffer;
-        the live frame callback bypasses this copy and keeps the QVideoFrame's
-        owned QImage directly. Color-effect paths convert lazily in
-        ``_apply_color_effects``.
+        QVideoFrame.toImage() already converts YUV to RGB; applying color_range
+        again would clip highlights. Keep that argument for caller compatibility
+        and preserve the image format until color effects require conversion.
         """
 
         del color_range
@@ -1646,12 +1630,10 @@ class LiveVideoPreview(CropPreviewOverlay):
 
     @staticmethod
     def _apply_color_effects(image: QImage, effects: dict | None) -> QImage:
-        """Apply the export look with one affine channel transform.
+        """Combine linear color operations into one OpenCV affine transform.
 
-        Exposure, contrast, saturation, and temperature are all linear color
-        operations, so composing them into one OpenCV matrix avoids the many
-        full-frame float arrays previously allocated by NumPy. Sharpness then
-        needs only one blur and one saturated weighted add.
+        Apply sharpness with a blur and weighted add to avoid full-frame float
+        intermediates for each effect.
         """
 
         values = effects or {}
@@ -1811,9 +1793,7 @@ class LiveVideoPreview(CropPreviewOverlay):
         super().paintEvent(event)
 
 
-# ---------------------------------------------------------------------------
 # StretchOverlay — interactive horizontal output-aspect handles
-# ---------------------------------------------------------------------------
 
 
 class StretchOverlay(QWidget):
@@ -2089,9 +2069,7 @@ class StretchDialog(QDialog):
             f'{self.stretch_ratio:.2f}×  ·  {target_w} × {target_h}')
 
 
-# ---------------------------------------------------------------------------
 # _DragZone — proper QWidget subclass that initiates a file drag
-# ---------------------------------------------------------------------------
 
 class _DragZone(QWidget):
     """Transparent overlay that initiates a QDrag on mouse-move (>10px threshold)."""
@@ -2135,9 +2113,7 @@ class _DragZone(QWidget):
         self._drag_start = None
 
 
-# ---------------------------------------------------------------------------
 # CropDialog — frame display with CropOverlay
-# ---------------------------------------------------------------------------
 
 class CropDialog(QDialog):
     """Show first frame of clip; user creates/adjusts crop with 8-handle net."""
@@ -2388,9 +2364,7 @@ class CropDialog(QDialog):
         self.accept()
 
 
-# ---------------------------------------------------------------------------
 # ShareModeDialog — share mode picker (frameless QDialog, same pattern as ShareWindow)
-# ---------------------------------------------------------------------------
 
 class ShareModeDialog(QDialog):
     """
@@ -2530,17 +2504,13 @@ class ShareModeDialog(QDialog):
         self._win_drag_pos = None
 
 
-# ---------------------------------------------------------------------------
 # ShareWindow — centered modal-ish dialog: export + drag-to-share + watermark
-# ---------------------------------------------------------------------------
 
 class ShareWindow(QDialog):
-    """
-    Non-modal dialog centered on ClipViewer.
-    Exports the clip immediately; once done shows a thumbnail the user can
-    drag directly into Discord (or any app).
-    Closing before export finishes cancels the subprocess.
-    A FTHRClips watermark slides in and out twice when the clip is ready.
+    """Non-modal export dialog with a draggable completed clip thumbnail.
+
+    Closing during export cancels the process. The ready preview animates
+    the FTHRClips watermark.
     """
 
     _export_sig  = Signal(bool, str)
@@ -2665,7 +2635,7 @@ class ShareWindow(QDialog):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ── Header (window drag handle) ──────────────────────────────────────
+        # Header (window drag handle)
         hdr = QFrame()
         hdr.setFixedHeight(38)
         hdr.setObjectName('swHdr')
@@ -2704,7 +2674,7 @@ class ShareWindow(QDialog):
         hdr_lay.addWidget(close_btn)
         root.addWidget(hdr)
 
-        # ── Thumbnail area (also the drag zone once ready) ───────────────────
+        # Thumbnail area (also the drag zone once ready)
         self._drag_zone = _DragZone(self)
         self._drag_zone.setFixedHeight(174)
         self._drag_zone.setStyleSheet(
@@ -2734,7 +2704,7 @@ class ShareWindow(QDialog):
 
         root.addWidget(self._drag_zone)
 
-        # ── Filename bar ─────────────────────────────────────────────────────
+        # Filename bar
         fname_bar = QFrame()
         fname_bar.setFixedHeight(30)
         fname_bar.setStyleSheet(
@@ -2751,7 +2721,7 @@ class ShareWindow(QDialog):
         fb_lay.addStretch()
         root.addWidget(fname_bar)
 
-        # ── FTHRClips corner popup (slides in over thumbnail when ready) ─────
+        # FTHRClips corner popup (slides in over thumbnail when ready)
         self._popup_lbl = QLabel('FTHRClips', self._drag_zone)
         self._popup_lbl.setStyleSheet(
             f'background-color: {_theme_rgba(Colors.BG, 170)}; '
@@ -2762,7 +2732,7 @@ class ShareWindow(QDialog):
         _ph = self._popup_lbl.height()
         self._popup_lbl.move(340, 174 - _ph - 10)   # start off-screen right
 
-    # ── Window dragging ──────────────────────────────────────────────────────
+    # Window dragging
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -2784,7 +2754,7 @@ class ShareWindow(QDialog):
                                         self._drag_zone.width(),
                                         self._drag_hint.height())
 
-    # ── Export ───────────────────────────────────────────────────────────────
+    # Export
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -3060,7 +3030,7 @@ class ShareWindow(QDialog):
                 'warning',
             )
 
-    # ── FTHRClips corner popup animation ────────────────────────────────────
+    # FTHRClips corner popup animation
 
     def _animate_popup_in(self):
         if self._cancelled:
@@ -3092,7 +3062,7 @@ class ShareWindow(QDialog):
         self._popup_anim = anim
         anim.start()
 
-    # ── Cleanup on close ────────────────────────────────────────────────────
+    # Cleanup on close
 
     def closeEvent(self, event):
         self._cancelled = True
@@ -3121,7 +3091,11 @@ class ShareWindow(QDialog):
                 os.remove(pending)
             except OSError:
                 pass
-        super().closeEvent(event)
+        # QDialog.closeEvent calls reject(). Our reject routes back through
+        # close() for cleanup, so delegating there recursively leaves the
+        # Share dialog visible. Finish the dialog directly after cleanup.
+        QDialog.done(self, QDialog.DialogCode.Rejected)
+        event.accept()
 
     def reject(self):
         """Route Escape/programmatic rejection through process cleanup."""
@@ -3129,9 +3103,7 @@ class ShareWindow(QDialog):
         self.close()
 
 
-# ---------------------------------------------------------------------------
 # VolumePopup — frameless dropdown with per-source mix sliders
-# ---------------------------------------------------------------------------
 
 class VolumePopup(QDialog):
     """
@@ -3317,9 +3289,7 @@ class VolumePopup(QDialog):
         self.show()
 
 
-# ---------------------------------------------------------------------------
 # AudioMixPanel — sidebar audio controls using the editor's effect-slider layout
-# ---------------------------------------------------------------------------
 
 class AudioMixPanel(QFrame):
     """Compact in-sidebar audio mixer with one effect-style control per source."""
@@ -3456,9 +3426,6 @@ class AudioMixPanel(QFrame):
         self.source_muted.emit(key, muted)
 
 
-# ---------------------------------------------------------------------------
-# ClipViewer
-# ---------------------------------------------------------------------------
 
 class ClipViewer(QDialog):
     """Full FTHR clip editor — video preview, trim bar, export/delete/crop sidebar."""
@@ -3473,6 +3440,10 @@ class ClipViewer(QDialog):
                  linked_import: bool = False):
         super().__init__(parent)
         self.clip_path       = clip_path
+        from core.playback_proxy import cached_playback_path
+        self._playback_path = cached_playback_path(clip_path)
+        self._prepared_playback_path = None
+        self._playback_source_worker = None
         self.bridge          = bridge
         self.sm              = settings_manager
         self._mm             = metadata_manager
@@ -3683,14 +3654,8 @@ class ClipViewer(QDialog):
         self._ph_timer.setInterval(80)
         self._ph_timer.timeout.connect(self._update_playhead)
 
-        # ── Seek/play/pause coalescing ────────────────────────────────────
-        # QMediaPlayer (Windows MediaFoundation backend) cannot keep up if
-        # setPosition is called dozens of times per second while a slider is
-        # dragged — the result is a frozen video output or, worst case, a
-        # native crash inside MFMediaSession. We coalesce all seek requests
-        # through a 50 ms single-shot timer that holds only the latest target
-        # position; the user perceives this as immediate but the player only
-        # ever sees one in-flight seek at a time.
+        # Coalesce seeks through a 50 ms timer, keeping only the latest position.
+        # Rapid setPosition calls can freeze or crash the Windows media backend.
         self._pending_seek_ms: int | None = None
         self._seek_timer = QTimer(self)
         self._seek_timer.setSingleShot(True)
@@ -3711,17 +3676,16 @@ class ClipViewer(QDialog):
         self._audio_sources_discovered.connect(self._on_audio_sources_discovered)
         self._restore_persisted_editor_draft()
         QTimer.singleShot(0, self._discover_audio_sources_async)
+        QTimer.singleShot(0, self._prepare_playback_source)
 
-    # =========================================================================
     # UI layout
-    # =========================================================================
 
     def _setup_ui(self):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ── Header ───────────────────────────────────────────────────────────
+        # Header
         header = QFrame()
         header.setFixedHeight(40)
         header.setObjectName('editorHeader')
@@ -3755,12 +3719,12 @@ class ClipViewer(QDialog):
         self._editor_header = header
         self._editor_header_h = 40
 
-        # ── Main ─────────────────────────────────────────────────────────────
+        # Main
         main = QHBoxLayout()
         main.setContentsMargins(0, 0, 0, 0)
         main.setSpacing(0)
 
-        # ── Video column ─────────────────────────────────────────────────────
+        # Video column
         vid_col = QVBoxLayout()
         vid_col.setContentsMargins(0, 0, 0, 0)
         vid_col.setSpacing(0)
@@ -3943,7 +3907,7 @@ class ClipViewer(QDialog):
         vid_col.addWidget(trim_frame)
         main.addLayout(vid_col, stretch=1)
 
-        # ── Sidebar (Medal-style) ───────────────────────────────────────────
+        # Sidebar (Medal-style)
         sidebar = QFrame()
         sidebar.setObjectName('editorSidebar')
         sidebar.setFixedWidth(280)
@@ -3972,7 +3936,7 @@ class ClipViewer(QDialog):
         self._sidebar_scroll.setWidget(sidebar_content)
         sb_shell.addWidget(self._sidebar_scroll)
 
-        # ── PRIMARY ACTIONS ──
+        # PRIMARY ACTIONS ──
         self.share_btn = QPushButton('Share clip')
         self.share_btn.setObjectName('shareBtn')
         self.share_btn.setFixedHeight(42)
@@ -3994,7 +3958,7 @@ class ClipViewer(QDialog):
 
         sb_outer.addSpacing(6)
 
-        # ── CLIP SPEED ──
+        # CLIP SPEED ──
         speed_panel, speed_body = self._build_collapsible_panel(
             'CLIP SPEED', expanded=True)
         spb = QVBoxLayout()
@@ -4028,7 +3992,7 @@ class ClipViewer(QDialog):
         speed_body.addLayout(spb)
         sb_outer.addWidget(speed_panel)
 
-        # ── EDIT TOOLS ──
+        # EDIT TOOLS ──
         edit_panel, edit_body = self._build_collapsible_panel('EDIT TOOLS', expanded=True)
         epb = QVBoxLayout()
         epb.setContentsMargins(14, 4, 14, 14)
@@ -4078,7 +4042,7 @@ class ClipViewer(QDialog):
         edit_body.addLayout(epb)
         sb_outer.addWidget(edit_panel)
 
-        # ── AUDIO MIX ──
+        # AUDIO MIX ──
         audio_panel, audio_body = self._build_collapsible_panel(
             'AUDIO MIX', expanded=True)
         self._audio_mix_panel = AudioMixPanel(
@@ -4097,7 +4061,7 @@ class ClipViewer(QDialog):
         audio_body.addWidget(self._audio_mix_panel)
         sb_outer.addWidget(audio_panel)
 
-        # ── VIDEO LOOK ──
+        # VIDEO LOOK ──
         look_panel, look_body = self._build_collapsible_panel('COLOR & EFFECTS', expanded=False)
         lpb = QVBoxLayout()
         lpb.setContentsMargins(14, 4, 14, 14)
@@ -4120,7 +4084,7 @@ class ClipViewer(QDialog):
         look_body.addLayout(lpb)
         sb_outer.addWidget(look_panel)
 
-        # ── CLIP DETAILS panel ──
+        # CLIP DETAILS panel ──
         details_panel, details_body = self._build_collapsible_panel('CLIP DETAILS', expanded=False)
         dpb = QVBoxLayout()
         dpb.setContentsMargins(14, 4, 14, 14)
@@ -4133,14 +4097,12 @@ class ClipViewer(QDialog):
         if len(title_text) > 38:
             title_text = title_text[:36] + '…'
 
-        # Title
         dpb.addWidget(self._kv_label('Title'))
         title_val = QLabel(title_text)
         title_val.setObjectName('detailValBig')
         title_val.setWordWrap(True)
         dpb.addWidget(title_val)
 
-        # Tag
         dpb.addWidget(self._kv_label('Tag'))
         meta = self._mm.get(self.clip_path) if self._mm else {'tag': '', 'description': ''}
         _edit_style = (
@@ -4159,7 +4121,6 @@ class ClipViewer(QDialog):
             )
         dpb.addWidget(tag_edit)
 
-        # Description
         dpb.addWidget(self._kv_label('Description'))
         desc_edit = QLineEdit(meta['description'])
         desc_edit.setPlaceholderText('Short clip description …')
@@ -4174,16 +4135,14 @@ class ClipViewer(QDialog):
         details_body.addLayout(dpb)
         sb_outer.addWidget(details_panel)
 
-        # ── FILE DETAILS panel ──
+        # FILE DETAILS panel ──
         file_panel, file_body = self._build_collapsible_panel('FILE DETAILS', expanded=False)
         fpb = QVBoxLayout()
         fpb.setContentsMargins(14, 4, 14, 14)
         fpb.setSpacing(10)
 
-        # Created
         fpb.addWidget(self._kv_label('Created'))
         fpb.addWidget(self._kv_value(date_str))
-        # Quality
         fpb.addWidget(self._kv_label('Video Quality'))
         quality_text = (
             f'{self._src_w}x{self._src_h}, {format_fps(self._fps)}'
@@ -4202,11 +4161,9 @@ class ClipViewer(QDialog):
             format_bitrate(self._total_bitrate_bps)
             if self._metadata_loaded else 'Loading…')
         fpb.addWidget(self._total_bitrate_value)
-        # Duration
         fpb.addWidget(self._kv_label('Duration'))
         self._duration_value = self._kv_value(dur_str)
         fpb.addWidget(self._duration_value)
-        # Size
         fpb.addWidget(self._kv_label('Size'))
         fpb.addWidget(self._kv_value(f'{self._size_mb:.1f} MB'))
         # Location (truncated)
@@ -4235,7 +4192,7 @@ class ClipViewer(QDialog):
         main.addWidget(sidebar)
         root.addLayout(main, stretch=1)
 
-        # ── Media player ──────────────────────────────────────────────────────
+        # Media player
         self.player = QMediaPlayer(self)
         playback_instance_created()
         self._diagnostic_player_counted = True
@@ -4262,9 +4219,7 @@ class ClipViewer(QDialog):
         # perceived click-to-editor latency.
         QTimer.singleShot(0, self._set_media_source)
 
-    # =========================================================================
     # Event filter — keep the software video surface sized to the clip frame
-    # =========================================================================
 
     @property
     def player_state(self) -> PlayerLifecycleState:
@@ -4306,12 +4261,10 @@ class ClipViewer(QDialog):
         return super().eventFilter(obj, event)
 
     def _requires_software_video(self) -> bool:
-        """Return whether the live preview needs a composited video surface.
+        """Use composited preview when crop guides or visual effects require it.
 
-        A native QVideoWidget is substantially cheaper for a neutral preview,
-        but it cannot be covered by the crop guide or receive the editor's
-        color/stretch processing. Keep the decision derived from the live
-        preview state so switching renderers never changes export semantics.
+        Neutral preview uses the cheaper native surface; renderer choice does not
+        change export settings.
         """
 
         if not self._live_clip_preview:
@@ -4361,13 +4314,10 @@ class ClipViewer(QDialog):
 
     def _recreate_player_for_renderer(self, target: str, position: int,
                                       was_playing: bool) -> bool:
-        """Reopen MediaFoundation with its output fixed before setSource().
+        """Recreate QMediaPlayer with its output set before setSource().
 
-        On Windows, changing QMediaPlayer's video output after a source has
-        loaded can leave the new sink permanently starved even though position
-        and audio continue. A fresh QMediaPlayer is the smallest reliable
-        boundary; the logical viewer/audio objects and playback position stay
-        owned by this dialog.
+        On Windows, switching outputs after loading can leave the new sink starved.
+        Retain the viewer, audio controller, and playback position.
         """
 
         if self._closing:
@@ -4433,7 +4383,7 @@ class ClipViewer(QDialog):
         self._timeline_prepare_timer.stop()
         self.trim_slider.cancel_thumbnail_loading()
         try:
-            player.setSource(QUrl.fromLocalFile(self.clip_path))
+            player.setSource(QUrl.fromLocalFile(self._playback_path))
         except (RuntimeError, TypeError) as exc:
             self._fail_playback(
                 f'{type(exc).__name__}: {exc}',
@@ -4528,7 +4478,7 @@ class ClipViewer(QDialog):
         try:
             self._playback_preparing_at = time.monotonic()
             emit_event('playback', 'media_requested', state='PREPARING')
-            self.player.setSource(QUrl.fromLocalFile(self.clip_path))
+            self.player.setSource(QUrl.fromLocalFile(self._playback_path))
         except Exception as e:
             print(f'[ClipViewer] setSource failed: {e}')
             detail = f'{type(e).__name__}: {e}'
@@ -4536,6 +4486,37 @@ class ClipViewer(QDialog):
             emit_event('playback', 'media_request_failed', state='FAILED',
                        error=DiagnosticError.PLAYBACK_INIT_FAILED,
                        detail=detail)
+
+    def _prepare_playback_source(self):
+        if self._closing or self._playback_path != self.clip_path:
+            return
+        worker = _PlaybackSourceWorker(self.clip_path, self._prepare_cancel)
+        self._playback_source_worker = worker
+        worker.signals.ready.connect(self._on_playback_source_ready)
+        QThreadPool.globalInstance().start(worker)
+
+    def _on_playback_source_ready(self, path):
+        self._playback_source_worker = None
+        if self._closing or path == self._playback_path:
+            return
+        self._prepared_playback_path = path
+        self._apply_prepared_playback_source()
+
+    def _apply_prepared_playback_source(self):
+        if (self._closing or not self._prepared_playback_path
+                or self.player.playbackState() == QMediaPlayer.PlayingState):
+            return
+        position = (self._pending_seek_ms if self._pending_seek_ms is not None
+                    else int(self.player.position()))
+        self._seek_timer.stop()
+        self._pending_seek_ms = None
+        self._playback_path = self._prepared_playback_path
+        self._prepared_playback_path = None
+        self._renderer_resume_position_ms = position
+        self._media_ready = False
+        self._playback_ready = False
+        self._set_player_state(PlayerLifecycleState.PREPARING)
+        self._set_media_source()
 
     def _on_media_status_changed(self, status):
         if (self._closing
@@ -4579,6 +4560,9 @@ class ClipViewer(QDialog):
                 'playback', 'backend_stalled', state='STALLED',
                 error=DiagnosticError.PLAYBACK_STALLED)
         elif status == QMediaPlayer.MediaStatus.InvalidMedia:
+            if self._playback_path != self.clip_path:
+                self._on_player_error()
+                return
             self._playback_status_lbl.setText('CLIP UNAVAILABLE')
             self._fail_playback('Media backend reported InvalidMedia',
                                 DiagnosticError.PLAYBACK_DECODER_FAILED)
@@ -4832,9 +4816,7 @@ class ClipViewer(QDialog):
         self._effect_value_labels[key] = value_label
         return row
 
-    # =========================================================================
     # Sidebar helpers (collapsible panels + key/value labels)
-    # =========================================================================
 
     def _build_collapsible_panel(self, title: str, expanded: bool = True):
         """
@@ -4883,9 +4865,7 @@ class ClipViewer(QDialog):
         lbl.setWordWrap(True)
         return lbl
 
-    # =========================================================================
     # Styles
-    # =========================================================================
 
     def _apply_styles(self):
         # Medal-style clip viewer — dark canvas, accented primary action,
@@ -5157,9 +5137,7 @@ class ClipViewer(QDialog):
             QSlider::sub-page:horizontal {{ background: {Colors.ACCENT}; }}
         ''')
 
-    # =========================================================================
     # Reversible editor history
-    # =========================================================================
 
     def _restore_persisted_editor_draft(self):
         loader = getattr(self._mm, 'get_editor_draft', None)
@@ -5326,9 +5304,7 @@ class ClipViewer(QDialog):
         if before is not None:
             self._commit_editor_change(before)
 
-    # =========================================================================
     # Playback
-    # =========================================================================
 
     def _apply_playback_rate(self):
         """Apply one speed to the video clock and any live audio mixer."""
@@ -5452,6 +5428,11 @@ class ClipViewer(QDialog):
                 return
             try:
                 if want_play:
+                    # A play click can beat the scrub debounce. Apply its
+                    # latest destination before starting either video/audio,
+                    # so playback never starts then immediately flushes again.
+                    self._seek_timer.stop()
+                    self._flush_pending_seek()
                     self._playback_requested_at = time.monotonic()
                     emit_event('playback', 'play_requested', state='REQUESTED')
                     self._timeline_prepare_timer.stop()
@@ -5565,6 +5546,8 @@ class ClipViewer(QDialog):
             delay = (1500 if state == QMediaPlayer.PlaybackState.PausedState
                      else 300)
             self._schedule_timeline_thumbnails(delay)
+            if self._prepared_playback_path:
+                QTimer.singleShot(0, self._apply_prepared_playback_source)
 
     def _update_playhead(self):
         try:
@@ -5606,6 +5589,8 @@ class ClipViewer(QDialog):
         # Coalesce: the slider can fire this 100+ times per second during a
         # drag. We remember only the most-recent target and let the timer
         # apply it once playback can keep up.
+        self._timeline_prepare_timer.stop()
+        self.trim_slider.cancel_thumbnail_loading()
         self._pending_seek_ms = max(0, min(self.duration_ms,
                                             int(pct * self.duration_ms)))
         self._resume_anchor_ms = None
@@ -5638,6 +5623,13 @@ class ClipViewer(QDialog):
         # files, and a few transient seek failures. Logging keeps the editor
         # alive — the alternative was an uncaught exception ricocheting up
         # through the Qt event loop.
+        if (not self._closing and self._playback_path != self.clip_path):
+            # A deleted/corrupt disposable preview cannot invalidate the clip.
+            from core.playback_proxy import discard_playback_cache
+            discard_playback_cache(self.clip_path, self._playback_path)
+            self._prepared_playback_path = self.clip_path
+            QTimer.singleShot(0, self._apply_prepared_playback_source)
+            return
         try:
             err_str = self.player.errorString()
         except Exception:
@@ -5650,9 +5642,7 @@ class ClipViewer(QDialog):
         if not self._closing:
             self._fail_playback(err_str, DiagnosticError.PLAYBACK_DECODER_FAILED)
 
-    # =========================================================================
     # Audio mix controls
-    # =========================================================================
 
     def _toggle_volume_popup(self):
         """Compatibility hook for older callers; the mixer now lives in the sidebar."""
@@ -5912,8 +5902,8 @@ class ClipViewer(QDialog):
         self._refresh_audio_mix_panel()
 
     def _on_audio_source_failed(self, source_id: str):
-        # The bridge continues the healthy stems. Keep this clip-local row
-        # visible but honestly disable its controls rather than inventing audio.
+        # Keep failed source rows visible with disabled controls while healthy
+        # stems continue playing.
         self._playback_sources = tuple(
             replace(source, available=False) if source.source_id == source_id else source
             for source in self._playback_sources)
@@ -5926,9 +5916,7 @@ class ClipViewer(QDialog):
         # same point. Do not issue a competing seek or restart here.
         return
 
-    # =========================================================================
     # Trim
-    # =========================================================================
 
     def _zoom_timeline(self, multiplier: float):
         self.trim_slider.set_zoom(self.trim_slider.zoom_factor * multiplier)
@@ -6011,9 +5999,7 @@ class ClipViewer(QDialog):
             self._on_seek_requested(target / self.duration_ms)
         self._schedule_editor_draft_save()
 
-    # =========================================================================
     # Color effects / stretch
-    # =========================================================================
 
     def _on_effect_changed(self, key: str, value: int):
         before = None
@@ -6071,9 +6057,7 @@ class ClipViewer(QDialog):
         self._refresh_live_preview(immediate=True)
         self._commit_editor_change(before)
 
-    # =========================================================================
     # Crop
-    # =========================================================================
 
     def _open_crop_dialog(self):
         was_playing = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
@@ -6106,7 +6090,7 @@ class ClipViewer(QDialog):
         self._relayout_video()
         self._on_stretch_changed(self._stretch_ratio)
 
-    # ── Quick crop ────────────────────────────────────────────────────────────
+    # Quick crop
 
     def _refresh_quick_crop_btn(self):
         qc = self.sm.get('quick_crop') if self.sm else None
@@ -6152,9 +6136,7 @@ class ClipViewer(QDialog):
         self.save_qc_btn.setText('✓  SAVED')
         QTimer.singleShot(1800, lambda: self.save_qc_btn.setText(orig))
 
-    # =========================================================================
     # Export
-    # =========================================================================
 
     def _on_upload_click(self):
         # Don't show 'Queued ✓' when the manager will silently drop the
@@ -6269,12 +6251,10 @@ class ClipViewer(QDialog):
                           extra_video_filters: list[str] | None = None,
                           force_video_encode: bool = False,
                           force_audio_encode: bool = False) -> list:
-        """Compose an ffmpeg command for the editor's export pipeline.
+        """Build the editor export command.
 
-        - ``video_args`` is the list of codec/preset args used when video is
-          re-encoded (libx264 path, or x264 + bitrate cap for Discord share).
-        - When neither crop nor multi-track audio mixing is needed, falls back
-          to a pure ``-c copy`` stream copy.
+        Use video_args when edits require re-encoding; stream-copy compatible
+        video when no visual transform is needed.
         """
         clip_path = getattr(self, 'clip_path', getattr(self, '_clip_path', ''))
         selected_segments = list(segments or [(start_s, start_s + duration_s)])
@@ -6597,9 +6577,7 @@ class ClipViewer(QDialog):
             f'font-family: {Fonts.DISPLAY}; background: transparent;')
         self._update_crop_ui()
 
-    # =========================================================================
     # Share
-    # =========================================================================
 
     def _show_share_overlay(self):
         dlg = ShareModeDialog(self.sm, parent=self)
@@ -6650,9 +6628,7 @@ class ClipViewer(QDialog):
         sw.export_error.connect(self.export_error)
         sw.show()
 
-    # =========================================================================
     # Delete
-    # =========================================================================
 
     def _delete_clip(self):
         imported_roots = (
@@ -6729,9 +6705,7 @@ class ClipViewer(QDialog):
                 FthrMessageDialog.warning(self, 'Delete Failed', str(e))
                 return
 
-    # =========================================================================
     # Close / cleanup
-    # =========================================================================
 
     def _close(self):
         self._draft_save_timer.stop()
@@ -6871,9 +6845,7 @@ class ClipViewer(QDialog):
             playback_instance_destroyed()
         self._set_player_state(PlayerLifecycleState.CLOSED)
 
-    # =========================================================================
     # Window drag / native resize (matches MainWindow)
-    # =========================================================================
 
     def _bar_mouse_press(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -6962,9 +6934,7 @@ class ClipViewer(QDialog):
                 pass
         return False, 0
 
-    # =========================================================================
     # Helpers
-    # =========================================================================
 
     def _fmt(self, ms) -> str:
         s = int(ms / 1000)

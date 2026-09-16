@@ -1,22 +1,7 @@
-// hardware_encoder.h
-// FTHR Capture Engine - NVENC Hardware Encoder
-//
-// HardwareEncoder is a pure encode-only component.
-// Encoded NAL units are delivered via PacketCallback to CaptureEngine,
-// which pushes them into EncodedRingBuffer.
-//
-// Two input paths:
-//   GPU zero-copy (default): CaptureEngine CopyResource's into
-//     GetCurrentInputTexture() then calls EncodeFrame(). FIT with an aspect
-//     mismatch uses a same-adapter VideoProcessor surface first; no CPU frame
-//     copy or staging texture is introduced.
-//   CPU-input / Optimus: CaptureEngine maps a staging texture and calls EncodeFrameCPU()
-//     with the CPU pointer. NVENC still encodes in hardware; only the copy is on the CPU.
-//
-// Lifecycle:
-//   Initialize()      - start of engine lifetime
-//   EncodeFrame() or EncodeFrameCPU() - called every frame from CaptureThread
-//   Finalize()        - called at engine shutdown
+// NVENC encoder delivering packets through PacketCallback to the replay ring.
+// Normally accepts a same-adapter GPU texture via EncodeFrame; legacy CPU
+// input uses EncodeFrameCPU after readback. Initialize once per engine
+// generation, submit from CaptureThread, and Finalize at shutdown.
 
 #pragma once
 #ifndef FTHR_HARDWARE_ENCODER_H
@@ -49,14 +34,13 @@ struct ID3D11VideoContext;
 struct ID3D11VideoProcessorEnumerator;
 struct ID3D11VideoProcessor;
 struct ID3D11VideoProcessorOutputView;
+struct SwsContext;
 
 
 namespace fthr {
 
 
-    // ---------------------------------------------------------------------------
     // NVENC Detection Result
-    // ---------------------------------------------------------------------------
     struct NVENCDetectionResult {
         bool        available;
         bool        h264_supported;
@@ -73,26 +57,19 @@ namespace fthr {
     NVENCDetectionResult DetectNVENC();
 
 
-    // ---------------------------------------------------------------------------
     // HardwareEncoder - native NVENC H.264/HEVC/AV1 encoder (encode-only)
-    // ---------------------------------------------------------------------------
     class HardwareEncoder final : public IReplayEncoder {
     public:
-        // Callback: fired once per encoded frame from within EncodeFrame / EncodeFrameCPU.
-        // Runs on CaptureThread. Must be fast — no blocking, no allocation.
+        // Called by DrainThread for each encoded packet. Consume or copy the
+        // bytes before returning; the encoder reuses its output storage.
         using PacketCallback = IReplayEncoder::PacketCallback;
 
         explicit HardwareEncoder(VideoCodec codec);
         ~HardwareEncoder();
 
-        // Initialize NVENC session and allocate input buffer pool.
-        // shared_device:   D3D11 device for NVENC session. NON-OWNING — caller keeps alive
-        //                  until Finalize() returns.
-        // shared_context:  Immediate context for the shared device.
-        // callback:        receives every encoded packet.
-        // cpu_input_mode:  false (default) = GPU zero-copy path (NVIDIA adapter drives display).
-        //                  true            = Optimus path (Intel drives display; NVIDIA device
-        //                                    passed in for NVENC only; frames arrive via CPU memcpy).
+        // Open NVENC and allocate input buffers. The caller owns shared_device and
+        // shared_context and must keep them alive through Finalize(). cpu_input_mode
+        // selects system-memory input; otherwise frames use registered GPU textures.
         bool Initialize(const EncoderConfig&  config,
                         ID3D11Device*         shared_device,
                         ID3D11DeviceContext*  shared_context,
@@ -128,6 +105,9 @@ namespace fthr {
         ActiveEncoderInfo GetActiveEncoderInfo() const override;
         std::string GetLastError() const override { return last_error_; }
         ReplayEncoderDiagnostics GetDiagnostics() const noexcept override;
+        void SetCaptureGeneration(uint64_t generation) noexcept override {
+            diagnostic_generation_.store(generation, std::memory_order_release);
+        }
 
         // Return the QPC epoch used for PTS computation.
         // Returns false if the first frame has not been encoded yet.
@@ -165,9 +145,7 @@ namespace fthr {
         bool InitializeGpuScalePipeline(std::string& error);
         void ReleaseGpuScalePipeline() noexcept;
 
-        // -----------------------------------------------------------------------
         // Async drain state
-        // -----------------------------------------------------------------------
         std::thread*            drain_thread_;
         std::atomic<bool>       drain_stop_;
         std::atomic<bool>       drain_failed_;
@@ -176,22 +154,18 @@ namespace fthr {
         std::condition_variable slot_cv_;      // signalled when drain frees a slot
         std::deque<uint32_t>    drain_queue_;
 
-        // -----------------------------------------------------------------------
         // NVENC state
-        // -----------------------------------------------------------------------
         void* nvenc_encoder_;  // NV_ENCODE_API_FUNCTION_LIST*
         void* nvenc_session_;  // NVENC encoder session handle
         void* nvenc_dll_;      // HMODULE
 
-        // -----------------------------------------------------------------------
         // D3D11 state (NON-OWNING - shared from CaptureEngine, do NOT Release)
-        // -----------------------------------------------------------------------
         ID3D11Device*        d3d11_device_;
         ID3D11DeviceContext* d3d11_context_;
 
-        // Same-adapter FIT path. The source is converted into the current
+        // Same-adapter scaling path. The source is converted into the current
         // target-sized NVENC slot entirely on the GPU; no CPU frame copy is
-        // introduced. The pipeline is used only when FIT needs letterboxing.
+        // introduced. The pipeline is used whenever source and encoded dimensions differ.
         ID3D11VideoDevice*              video_device_;
         ID3D11VideoContext*             video_context_;
         ID3D11VideoProcessorEnumerator* video_processor_enumerator_;
@@ -204,37 +178,32 @@ namespace fthr {
         bool                            gpu_scale_required_;
         bool                            gpu_frame_prepared_;
 
-        // -----------------------------------------------------------------------
         // Input mode
-        // -----------------------------------------------------------------------
         bool cpu_input_mode_;  // true = Optimus path (CPU-side NVENC input buffers)
 
-        // -----------------------------------------------------------------------
         // GPU zero-copy path: D3D11 texture pool registered with NVENC
-        // -----------------------------------------------------------------------
         ID3D11Texture2D** input_textures_;        // GPU-only D3D11_USAGE_DEFAULT
         void**            registered_resources_;  // NV_ENC_REGISTERED_PTR handles
         void**            mapped_input_resources_; // Kept mapped until output lock completes
         NvencInputSlotLifecycle* input_slot_lifecycle_;
 
-        // -----------------------------------------------------------------------
         // CPU-input path: NVENC system-memory input buffers
-        // -----------------------------------------------------------------------
         void** cpu_input_buffers_;  // NV_ENC_INPUT_PTR handles
+        SwsContext* cpu_scale_context_ = nullptr;
 
-        // -----------------------------------------------------------------------
         // Shared I/O pool state
-        // -----------------------------------------------------------------------
         void**   output_buffers_;    // NV_ENC bitstream output buffer handles
         void**   completion_events_; // Registered Windows events, one per output
         int64_t* slot_qpc_;         // Per-slot raw QPC ticks, indexed same as output_buffers_
+        std::unique_ptr<std::atomic<uint64_t>[]> diagnostic_slot_frame_;
+        std::unique_ptr<std::atomic<int64_t>[]> diagnostic_slot_pts_;
+        std::unique_ptr<std::atomic<int64_t>[]> diagnostic_slot_qpc_;
+        std::unique_ptr<std::atomic<uint64_t>[]> diagnostic_slot_generation_;
         uint32_t buffer_count_;
         uint32_t current_buf_idx_;
         uint32_t pending_count_;
 
-        // -----------------------------------------------------------------------
         // Encoder configuration
-        // -----------------------------------------------------------------------
         uint32_t src_width_;
         uint32_t src_height_;
         uint32_t enc_width_;
@@ -247,28 +216,19 @@ namespace fthr {
         int64_t  pts_;
         int64_t  last_forced_idr_pts_;
 
-        // -----------------------------------------------------------------------
         // Wall-clock PTS (QPC-based)
-        // -----------------------------------------------------------------------
         bool    first_frame_;
         int64_t encode_start_qpc_;
         int64_t qpc_freq_;
         int64_t last_frame_qpc_;  // Raw QPC ticks of the most recently computed PTS frame
 
-        // -----------------------------------------------------------------------
-        // Packet callback + conversion scratch buffers
-        //
-        // Both buffers are reused across encoded packets to avoid heap allocation
-        // on the drain thread (~60 calls/sec). Capacity stabilises after the
-        // first few keyframes; the resize/clear operations after that are O(1).
-        // -----------------------------------------------------------------------
+        // Reuse packet conversion buffers on the drain thread to avoid allocations
+        // once capacity has grown to fit the encoded packets.
         PacketCallback       packet_callback_;
         std::vector<uint8_t> avcc_buf_;
         std::vector<std::pair<const uint8_t*, int>> nals_scratch_;
 
-        // -----------------------------------------------------------------------
         // H.264 avcC, HEVC Annex B VPS/SPS/PPS, or AV1 sequence header OBUs.
-        // -----------------------------------------------------------------------
         std::vector<uint8_t> extradata_;
 
         // Per-instance packet log counter — logs first 3 encoded packets so the
@@ -301,7 +261,10 @@ namespace fthr {
         std::atomic<uint32_t> diag_queued_outputs_{0};
         std::atomic<uint32_t> diag_submit_stage_{0};
         std::atomic<uint32_t> diag_drain_stage_{0};
+        std::atomic<uint32_t> diag_submit_slot_{0xffffffffu};
+        std::atomic<uint32_t> diag_drain_slot_{0xffffffffu};
         std::atomic<int32_t> diag_last_nvenc_status_{0};
+        std::atomic<uint64_t> diagnostic_generation_{0};
     };
 
 } // namespace fthr

@@ -11,9 +11,7 @@
 
 namespace fthr {
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 static int64_t mono_ns() {
     struct timespec ts;
@@ -109,9 +107,7 @@ static std::string resolve_default_sink_monitor() {
     return result;
 }
 
-// ---------------------------------------------------------------------------
 // Start / Stop
-// ---------------------------------------------------------------------------
 
 bool AudioCapture::Start(const std::string& device_name) {
     Stop();
@@ -161,9 +157,7 @@ void AudioCapture::Stop() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // CaptureLoop — runs on background thread
-// ---------------------------------------------------------------------------
 
 void AudioCapture::CaptureLoop() {
     int pa_err = 0;
@@ -206,9 +200,6 @@ void AudioCapture::CaptureLoop() {
     std::cout << "[Audio] PulseAudio capture stopped" << std::endl;
 }
 
-// ---------------------------------------------------------------------------
-// ExtractSegment
-// ---------------------------------------------------------------------------
 
 std::vector<float> AudioCapture::ExtractSegment(int64_t end_time_ns,
                                                   uint32_t duration_ms) const {

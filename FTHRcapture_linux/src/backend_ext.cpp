@@ -12,7 +12,7 @@ extern "C" {
 
 namespace fthr {
 
-// ── wl_output listener ──────────────────────────────────────────────────────
+// wl_output listener
 static void _eo_geom(void*, wl_output*, int32_t, int32_t, int32_t,
                      int32_t, int32_t, const char*, const char*, int32_t) {}
 static void _eo_mode(void*, wl_output*, uint32_t, int32_t, int32_t, int32_t) {}
@@ -29,7 +29,7 @@ static const wl_output_listener kExtOutListener = {
     _eo_scale, ExtBackend::OutputName, _eo_desc,
 };
 
-// ── wl_registry listener ────────────────────────────────────────────────────
+// wl_registry listener
 void ExtBackend::RegistryGlobal(void* d, wl_registry* reg,
                                  uint32_t name, const char* iface, uint32_t ver) {
     auto* b = static_cast<ExtBackend*>(d);
@@ -52,7 +52,7 @@ void ExtBackend::RegistryGlobal(void* d, wl_registry* reg,
 }
 void ExtBackend::RegistryRemove(void*, wl_registry*, uint32_t) {}
 
-// ── session listener ────────────────────────────────────────────────────────
+// session listener
 void ExtBackend::SessionBufferSize(void* d,
         ext_image_copy_capture_session_v1*, uint32_t w, uint32_t h) {
     auto* b = static_cast<ExtBackend*>(d);
@@ -83,7 +83,7 @@ static const ext_image_copy_capture_session_v1_listener kSessionListener = {
     ExtBackend::SessionStopped,
 };
 
-// ── frame listener ──────────────────────────────────────────────────────────
+// frame listener
 void ExtBackend::FrameTransform(void*, ext_image_copy_capture_frame_v1*, uint32_t) {}
 void ExtBackend::FrameDamage(void*, ext_image_copy_capture_frame_v1*,
                               int32_t, int32_t, int32_t, int32_t) {}
@@ -103,7 +103,7 @@ static const ext_image_copy_capture_frame_v1_listener kFrameListener = {
     ExtBackend::FrameFailed,
 };
 
-// ── buffer management ───────────────────────────────────────────────────────
+// buffer management
 bool ExtBackend::AllocShmBuffer() {
     shm_size_ = static_cast<size_t>(buf_width_) * buf_height_ * 4;
     shm_fd_ = memfd_create("fthr_ext_frame", MFD_CLOEXEC);
@@ -170,7 +170,7 @@ bool ExtBackend::Roundtrip(WaylandDeadline deadline, const char* operation) {
     return false;
 }
 
-// ── ICaptureBackend impl ────────────────────────────────────────────────────
+// ICaptureBackend impl
 bool ExtBackend::Initialize(const CaptureConfig& cfg) {
     target_output_ = cfg.target_output;
     const auto deadline = std::chrono::steady_clock::now() + kInitializationTimeout;

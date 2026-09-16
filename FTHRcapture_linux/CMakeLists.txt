@@ -90,26 +90,9 @@ endif()
 
 find_package(PkgConfig REQUIRED)
 
-# ---------------------------------------------------------------------------
-# FFmpeg — AUDIT-014
-#
-# The distribution's FFmpeg is a GPL build on every mainstream distro
-# (Ubuntu 24.04: --enable-gpl --enable-libx264 --enable-libx265 --enable-libxvid).
-# Linking the engine against it and bundling the result puts the whole AppImage
-# under the GPL, and build_linux.sh correctly refuses to package that.
-#
-# A Release build therefore MUST be pointed at the pinned LGPL distribution:
-#
-#     python tools/fetch_third_party.py --ffmpeg-linux
-#     cmake -S FTHRcapture_linux -B build \
-#           -DCMAKE_BUILD_TYPE=Release \
-#           -DFTHR_FFMPEG_ROOT=<repo>/FTHRcapture_linux/third_party/ffmpeg
-#
-# Note this is a different SONAME generation from the system one
-# (libavcodec.so.62 vs .so.60), so it is not enough to build against the system
-# libraries and substitute others at runtime — the engine is compiled against
-# exactly the headers that ship next to it.
-# ---------------------------------------------------------------------------
+# Release builds require the pinned FFmpeg headers and libraries from
+# tools/fetch_third_party.py --ffmpeg-linux. Set FTHR_FFMPEG_ROOT to that tree;
+# headers and runtime libraries must use the same ABI. See BUILDING.md.
 set(FTHR_FFMPEG_ROOT "" CACHE PATH
     "Root of the pinned LGPL FFmpeg (contains include/ and lib/). Required for Release builds.")
 
@@ -348,32 +331,10 @@ target_link_libraries(FTHRPlaybackMixer PRIVATE
     $<$<NOT:$<BOOL:${FTHR_FFMPEG_BUNDLED}>>:PkgConfig::FFMPEG>)
 target_compile_options(FTHRPlaybackMixer PRIVATE -Wall -Wextra -Wpedantic)
 
-# ---------------------------------------------------------------------------
-# Runtime library search path — AUDIT-014
-#
-# The engine previously had no RPATH or RUNPATH at all, so it took whatever
-# libavcodec.so.60 the system loader found. Inside the AppImage that is exactly
-# the wrong behaviour: we ship a verified LGPL runtime and it must be the one
-# that loads.
-#
-# $ORIGIN is resolved by the loader relative to the executable, so this stays
-# correct wherever the AppImage is mounted. Two entries because PyInstaller
-# places the engine in _internal/ while the libraries land next to it, and the
-# raw CMake build keeps them one level up in third_party.
-#
-# --disable-new-dtags forces RPATH rather than RUNPATH. RUNPATH is not
-# inherited by transitive dependencies, so libavdevice would fail to find its
-# sibling libavfilter and the loader would fall back to the system copy — a GPL
-# library, silently, at runtime.
-# ---------------------------------------------------------------------------
-# BUILD_WITH_INSTALL_RPATH is deliberately TRUE. With the default (FALSE) CMake
-# appends the *absolute* link directory — /home/<user>/…/third_party/ffmpeg/lib —
-# to the build-tree RPATH. That path is meaningless on any other machine, leaks
-# the build host into a shipped binary, and would be searched before the bundled
-# libraries on a machine where it happens to exist.
-#
-# The last entry lets the binary run straight out of the build tree during
-# development without an absolute path: build/FTHRclips → ../third_party/ffmpeg/lib.
+# Use relative $ORIGIN paths for the bundle and development tree. RPATH
+# (--disable-new-dtags) also resolves transitive FFmpeg dependencies, unlike
+# RUNPATH. BUILD_WITH_INSTALL_RPATH prevents CMake from embedding an absolute
+# build-host library path ahead of the bundled runtime.
 set_target_properties(FTHRclips PROPERTIES
     BUILD_WITH_INSTALL_RPATH TRUE
     INSTALL_RPATH "$ORIGIN:$ORIGIN/lib:$ORIGIN/../lib:$ORIGIN/../third_party/ffmpeg/lib"

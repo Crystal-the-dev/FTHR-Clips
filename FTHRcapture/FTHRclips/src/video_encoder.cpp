@@ -1,10 +1,4 @@
-﻿// video_encoder.cpp
-// FTHR Capture Engine - x264 encoder implementation
-//
-// Phase 1 Optimization: Packet buffer pool
-//   - Eliminates malloc/free in PushPacket() (60fps = 60 allocs/sec)
-//   - Pre-allocates 128 buffers of 512KB each (~64MB total)
-//   - Buffers returned to pool automatically via EncodedPacket destructor
+﻿// Legacy raw-frame encoding with pooled packets and a separate disk writer.
 
 #ifdef _MSC_VER
 #if __has_include("pch.h")
@@ -36,9 +30,7 @@ extern "C" {
 
 namespace fthr {
 
-    // ---------------------------------------------------------------------------
     // EncodedPacket move operations
-    // ---------------------------------------------------------------------------
 
     EncodedPacket::~EncodedPacket() {
         // Return buffer to pool if we own one
@@ -79,9 +71,7 @@ namespace fthr {
         return *this;
     }
 
-    // ---------------------------------------------------------------------------
     // VideoEncoder construction
-    // ---------------------------------------------------------------------------
 
     VideoEncoder::VideoEncoder()
         : format_ctx_(nullptr)
@@ -110,9 +100,7 @@ namespace fthr {
     {
     }
 
-    // ---------------------------------------------------------------------------
     // SetAudioData — must be called before Initialize()
-    // ---------------------------------------------------------------------------
 
     void VideoEncoder::SetAudioData(std::vector<float> pcm,
                                     uint32_t           sample_rate,
@@ -130,9 +118,6 @@ namespace fthr {
         (void)Finalize();
     }
 
-    // ---------------------------------------------------------------------------
-    // Initialize
-    // ---------------------------------------------------------------------------
 
     bool VideoEncoder::Initialize(const wchar_t* output_path, const EncoderConfig& config) {
         if (initialized_) {
@@ -216,7 +201,6 @@ namespace fthr {
         std::cout << "  Preset         : " << (config.preset ? config.preset : "superfast") << std::endl;
         std::cout << "  Tune           : " << (config.tune ? config.tune : "(none)") << std::endl;
 
-        // Initialize packet buffer pool (Phase 1 optimization)
         packet_pool_ = std::make_unique<PacketBufferPool>();
 
         // Allocate format context
@@ -228,23 +212,9 @@ namespace fthr {
             return false;
         }
 
-        // Pick the software H.264 encoder EXPLICITLY, by name.
-        //
-        // This used to call avcodec_find_encoder(AV_CODEC_ID_H264), which
-        // returns whatever H.264 encoder happens to be first in FFmpeg's
-        // internal list. Against the old GPL build that was reliably libx264.
-        // Against the LGPL build it can resolve to a *hardware* encoder
-        // (h264_amf / h264_qsv / h264_mf), which is exactly wrong here: this
-        // class is the CPU fallback that runs when hardware encoding was
-        // already ruled out, so silently opening a hardware encoder would fail
-        // on the very machines this path exists to serve.
-        //
-        // Order of preference:
-        //   libopenh264  Cisco OpenH264 (BSD-2-Clause) — the LGPL-compatible
-        //                replacement for libx264. Present in our bundled build.
-        //   h264_mf      Windows MediaFoundation. Ships with the OS, so it is a
-        //                genuine last resort if the bundled DLLs ever lack
-        //                OpenH264. Quality is mediocre but it produces a file.
+        // Select OpenH264 by name, with MediaFoundation as the fallback. A generic
+        // H.264 lookup can choose a hardware encoder, which is unsuitable for this
+        // legacy software path.
         static const char* kSoftwareH264[] = { "libopenh264", "h264_mf" };
 
         const AVCodec* codec = nullptr;
@@ -265,7 +235,6 @@ namespace fthr {
         }
         const bool is_openh264 = (std::strcmp(codec->name, "libopenh264") == 0);
 
-        // Create video stream
         video_stream_ = avformat_new_stream(format_ctx_, nullptr);
         if (!video_stream_) {
             std::cerr << "[VideoEncoder] Failed to create video stream" << std::endl;
@@ -347,7 +316,6 @@ namespace fthr {
             return false;
         }
 
-        // Set stream time base
         video_stream_->time_base = codec_ctx_->time_base;
         const EncodedVideoConfig metadata_config{
             VideoCodec::H264,
@@ -464,7 +432,6 @@ namespace fthr {
             return false;
         }
 
-        // Create swscale context
         int sws_filter = SWS_BILINEAR;  // Default
 
         // Use higher quality filter if downscaling significantly
@@ -508,7 +475,6 @@ namespace fthr {
             return false;
         }
 
-        // Start disk writer thread
         disk_running_.store(true);
         disk_thread_ = std::thread(&VideoEncoder::DiskWriterThread, this);
 
@@ -517,9 +483,6 @@ namespace fthr {
         return true;
     }
 
-    // ---------------------------------------------------------------------------
-    // Finalize
-    // ---------------------------------------------------------------------------
 
     bool VideoEncoder::Finalize() {
         if (!initialized_) {
@@ -687,9 +650,6 @@ namespace fthr {
         initialized_ = false;
     }
 
-    // ---------------------------------------------------------------------------
-    // EncodeFrame
-    // ---------------------------------------------------------------------------
 
     bool VideoEncoder::EncodeFrame(const uint8_t* bgra_data) {
         if (!initialized_) {
@@ -766,19 +726,8 @@ namespace fthr {
         return true;
     }
 
-    // ---------------------------------------------------------------------------
-    // PushPacket - PHASE 1 OPTIMIZATION: Use pool instead of resize
-    //
-    // OLD CODE (60 allocations/sec at 60fps):
-    //   ep.data.resize(pkt->size);
-    //   std::memcpy(ep.data.data(), pkt->data, pkt->size);
-    //
-    // NEW CODE (zero allocations):
-    //   Acquire pre-allocated buffer from pool
-    //   Fill it with packet data
-    //   Transfer ownership to EncodedPacket (via release())
-    //   Buffer automatically returned to pool when EncodedPacket is destroyed
-    // ---------------------------------------------------------------------------
+    // Copy packet bytes into a pooled buffer and transfer ownership to
+    // EncodedPacket. Its destructor returns the buffer after the writer finishes.
 
     void VideoEncoder::PushPacket(AVPacket* pkt) {
         // Acquire a pre-allocated buffer from the pool
@@ -790,7 +739,6 @@ namespace fthr {
         // Copy packet data
         std::memcpy(pooled_buf->data(), pkt->data, static_cast<size_t>(pkt->size));
 
-        // Create EncodedPacket and transfer buffer ownership
         EncodedPacket ep;
         ep.buffer = pooled_buf.release();      // Transfer ownership from RAII wrapper
         ep.size = static_cast<size_t>(pkt->size);
@@ -809,9 +757,6 @@ namespace fthr {
         packet_cv_.notify_one();
     }
 
-    // ---------------------------------------------------------------------------
-    // DiskWriterThread
-    // ---------------------------------------------------------------------------
 
     void VideoEncoder::DiskWriterThread() {
         while (true) {

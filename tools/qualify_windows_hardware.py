@@ -188,12 +188,9 @@ _DIAGNOSTIC_EVENT_PREFIX = 'FTHR_DIAGNOSTIC_EVENT '
 
 
 def parse_adapter_topology_event(log_text: str) -> dict | None:
-    """Return the last resolved adapter-topology event from an engine log.
+    """Return the last adapter-topology JSON event in an engine log.
 
-    The engine emits one JSON object per diagnostic line.  Keep this parser
-    deliberately independent of the rest of the qualification run so a
-    synthetic log line can exercise it without starting the native engine.
-    A later event wins because topology recovery can emit a fresh resolution.
+    Recovery can resolve a new topology, so later events replace earlier ones.
     """
     resolved: dict | None = None
     for line in log_text.splitlines():

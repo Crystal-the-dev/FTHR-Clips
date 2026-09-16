@@ -1,13 +1,7 @@
-"""T10 — the Qt event loop must stay alive during a save (AUDIT-011).
+"""Check that saves keep the Qt event loop responsive.
 
-Every other save test is Qt-free on purpose. This one is not: the whole point
-of AUDIT-011 is a property of the *event loop*, and only a real event loop can
-demonstrate it. A fast QTimer counts ticks while an engine that never answers
-is being saved to. If any part of the save path blocks the main thread, the
-counter stalls and these tests fail.
-
-The pre-fix code would fail `test_save_submit_does_not_stall_the_event_loop`:
-save_clip() busy-waited up to a full second on this very thread.
+A fast QTimer counts ticks while a fake engine never answers; blocking
+submission would stall that counter.
 """
 
 import ctypes
@@ -99,7 +93,7 @@ def test_poller_keeps_the_loop_responsive_while_engine_is_silent(qapp):
                      'saved': EngineEvent.CLIP_SAVED,
                      'error': EngineEvent.ERROR_OCCURRED}[kind]
             out = sm.on_event(event, detail, now)
-            bridge.consume_save_response()
+            bridge.consume_save_response(kind)
         if out is not None:
             outcomes.append(out)
 
@@ -146,7 +140,7 @@ def test_late_completion_after_timeout_is_still_delivered(qapp):
                      'saved': EngineEvent.CLIP_SAVED,
                      'error': EngineEvent.ERROR_OCCURRED}[kind]
             out = sm.on_event(event, detail, now)
-            bridge.consume_save_response()
+            bridge.consume_save_response(kind)
         if out is not None:
             outcomes.append(out)
 

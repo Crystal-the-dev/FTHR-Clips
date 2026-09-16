@@ -1,10 +1,7 @@
-"""Foreground game/window detection.
+"""Detect foreground game windows using platform-specific APIs.
 
-The Linux path keeps the compositor-specific window enumeration used by the
-current build.  Windows uses the more conservative foreground-window detector
-from the legacy Windows build: it inspects the owning process, filters common
-launcher/browser/tool false positives, consults Windows Game Bar's known-game
-registry, and requires a candidate to remain stable across multiple polls.
+Windows filters launchers, browsers, and tools, consults Game Bar, and
+requires stable candidates. Linux uses compositor-specific enumeration.
 """
 
 from __future__ import annotations
@@ -170,9 +167,7 @@ class GameDetector(QObject):
                 self.game_closed.emit(hwnd)
 
 
-# ---------------------------------------------------------------------------
 # Windows foreground game detector (ported from the legacy Windows build)
-# ---------------------------------------------------------------------------
 
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 GWL_STYLE = -16
@@ -280,12 +275,9 @@ class GameWindow:
 
     @property
     def capture_signature(self) -> tuple[int, int, int, int, bool]:
-        """Return geometry that can change the native capture contract.
+        """Include window and monitor dimensions in the capture signature.
 
-        Window capture is sized from the WGC item's content dimensions, while
-        anti-cheat games use the selected monitor and its dimensions. Keep both
-        values in the signature so a fullscreen game's display-mode change is
-        visible even when the HWND itself stays unchanged.
+        A fullscreen mode change can alter geometry without changing HWND.
         """
         return (
             self.width,

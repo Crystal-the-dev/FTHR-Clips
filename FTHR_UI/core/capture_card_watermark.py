@@ -1,10 +1,7 @@
-"""FFmpeg filter graph for the animated export/share Capture Card.
+"""FFmpeg filters for the animated export/share Capture Card.
 
-The watermark is deliberately assembled from FFmpeg primitives instead of a
-separate bitmap.  That keeps packaged builds self-contained and lets the card
-remain sharp at the bottom-right of every exported timeline.  The overlay
-slides in at time zero, holds briefly, then leaves without shortening the
-underlying video.
+The card slides in, holds, and exits without shortening the video. FFmpeg
+primitives provide the card geometry without a separate background bitmap.
 """
 from __future__ import annotations
 
@@ -71,8 +68,7 @@ def capture_card_watermark_filters(
     card = (
         f'color=c={card_bg}@0.92:s={CARD_WIDTH}x{CARD_HEIGHT}:r=60,'
         'format=rgba,colorchannelmixer=aa=0.92,'
-        # Compact CaptureCard geometry: a quiet left rail and a divider that
-        # separates the supplied brand mark from the two-line lockup.
+        # Match the notification card: left rail, brand mark, divider, and two text lines.
         f'drawbox=x=0:y=0:w=3:h=ih:color={card_accent}@1:t=fill,'
         f'drawbox=x=76:y=12:w=1:h=52:color={card_divider}@1:t=fill,'
         f"drawtext=fontfile='{font}':text='CAPTURED WITH':"
@@ -96,8 +92,7 @@ def capture_card_watermark_filters(
         f'[{composed_label}]'
     )
 
-    # Ease-out on entry, a quiet hold, and ease-in on exit. Keeping the whole
-    # expression quoted means its commas stay inside overlay's x option.
+    # Quote the animation expression so its commas stay inside overlay's x option.
     x_expr = (
         f"if(lt(t,0.38),W-(w+{CARD_MARGIN})*"
         "(1-pow(1-t/0.38,3)),"

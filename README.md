@@ -23,6 +23,9 @@ FTHR Clips records your screen in the background at all times. When something cl
 
 It runs as a tray icon. You forget it's there until you need it.
 
+For the September library, playback and idle-capture fixes, see the
+[reliability patch notes and validation results](RELIABILITY_PATCH.md).
+
 ---
 
 ## Features
@@ -35,7 +38,7 @@ It runs as a tray icon. You forget it's there until you need it.
 | **Capture** | H.264, HEVC and AV1 selection; Windows uses backend-defined presets |
 | **Capture** | Monitor selection and scaling modes |
 | **Hotkeys** | Global hotkeys via Hyprland binds (Linux) or system hooks (Windows); Windows supports controller chords |
-| **Hotkeys** | Save clip · Extended clip · Start/stop · Dismiss notification |
+| **Hotkeys** | Save clip · Start/stop · Dismiss notification |
 | **Audio** | System-output and microphone tracks; Windows 11 per-app stems are code-ready but still require hardware qualification |
 | **Post-processing** | Watermark overlay |
 | **Post-processing** | Webcam overlay (picture-in-picture) |
@@ -103,8 +106,7 @@ Wayland compositors because it can expose a black root window.
 | Key | Action |
 |-----|--------|
 | `F9` | Save clip (last 30 s) |
-| `F10` | Save extended clip (configurable length) |
-| `F11` | Save screenshot |
+| `F12` | Save screenshot |
 | `F8` | Confirm game detection prompt |
 
 ---
@@ -230,5 +232,6 @@ Licence texts: [`licenses/`](licenses/), also installed alongside the app.
 | [`BUILDING.md`](BUILDING.md) | Building the app and both engines, on Windows and Linux |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Tree layout, entry points, the shared-memory contract, conventions |
 | [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) | What is broken, unverified or missing — read before filing a bug |
+| [Recording reliability changes](docs/recording-reliability-2026-09-16.md) | Manual recording, faster finalization, focus recovery, and validation results |
 | [`SECURITY.md`](SECURITY.md) | Reporting a security issue |
 | [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | Every bundled component and its licence |

@@ -6,9 +6,7 @@
 
 namespace fthr {
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 static int64_t mono_ns_multi() {
     struct timespec ts;
@@ -32,9 +30,7 @@ static std::string make_sink_name(const std::string& name) {
     return s;
 }
 
-// ---------------------------------------------------------------------------
 // Static callbacks
-// ---------------------------------------------------------------------------
 
 void AudioMultiCapture::context_state_cb(pa_context*, void* userdata) {
     pa_threaded_mainloop_signal((pa_threaded_mainloop*)userdata, 0);
@@ -149,9 +145,6 @@ void AudioMultiCapture::subscribe_cb(pa_context* ctx,
     }
 }
 
-// ---------------------------------------------------------------------------
-// Start
-// ---------------------------------------------------------------------------
 
 bool AudioMultiCapture::Start(const std::vector<AudioCategoryConfig>& configs) {
     if (running_.load()) return true;
@@ -191,7 +184,6 @@ bool AudioMultiCapture::Start(const std::vector<AudioCategoryConfig>& configs) {
         pa_threaded_mainloop_wait(mainloop_);
     }
 
-    // Build category list
     categories_.clear();
     for (const auto& cfg : configs) {
         auto cs = std::make_unique<CategoryState>();
@@ -300,9 +292,6 @@ bool AudioMultiCapture::Start(const std::vector<AudioCategoryConfig>& configs) {
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Stop
-// ---------------------------------------------------------------------------
 
 void AudioMultiCapture::Stop() {
     if (!mainloop_) return;
@@ -349,9 +338,7 @@ void AudioMultiCapture::Stop() {
     mainloop_ = nullptr;
 }
 
-// ---------------------------------------------------------------------------
 // ExtractSegment — identical logic to AudioCapture::ExtractSegment
-// ---------------------------------------------------------------------------
 
 std::vector<float> AudioMultiCapture::ExtractSegment(
         const std::string& category_name,
@@ -401,9 +388,6 @@ std::vector<float> AudioMultiCapture::ExtractSegment(
     return result;
 }
 
-// ---------------------------------------------------------------------------
-// GetCurrentMappings
-// ---------------------------------------------------------------------------
 
 std::map<std::string, std::string> AudioMultiCapture::GetCurrentMappings() const {
     std::lock_guard<std::mutex> lk(mappings_mutex_);

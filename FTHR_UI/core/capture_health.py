@@ -1,9 +1,7 @@
-"""Capture-progress and privacy-safe content-health interpretation.
+"""Interpret native capture counters and health metrics for the UI.
 
-The native engines own low-level facts (backend state, produced-frame count and
-small derived content metrics).  This module owns the user-facing state machine.
-It never receives pixels in production and performs no I/O or sleeping, so it is
-safe to call from the existing 500 ms Qt status timer.
+This state machine runs from the Qt status timer without I/O or sleeps.
+It receives derived metrics, never captured pixels.
 """
 
 from __future__ import annotations
@@ -54,25 +52,21 @@ class CaptureHealthSnapshot:
     def save_allowed(self) -> bool:
         """Whether replay data is recent enough to permit a save."""
 
-        if self.state in {
-            CaptureHealthState.DEGRADED,
-            CaptureHealthState.STALLED,
-        }:
-            return self.fresh_buffer_seconds > 0.0
-        return self.state in {
-            CaptureHealthState.HEALTHY,
-            CaptureHealthState.CONTENT_SUSPECT,
+        # Polling observes capture progress, not the encoded replay contents.
+        # Startup/focus transitions can race a hotkey; let the native save
+        # boundary validate its actual ring instead of guessing its duration.
+        return self.state not in {
+            CaptureHealthState.STOPPED,
+            CaptureHealthState.FAILED,
+            CaptureHealthState.RECOVERING,
         }
 
 
 class CaptureHealthMonitor:
-    """Interpret frame progress without adding another polling loop.
+    """Interpret frame progress from the existing status poll.
 
-    Three seconds without a produced frame is a warning.  Eight seconds is a
-    stall.  The gap intentionally tolerates compositor hiccups, low-FPS sources
-    and loading screens while bounding how long the UI can claim ``CAPTURING``
-    over stale replay data.  A single automatic recovery is requested per
-    incident; 30 healthy seconds replenish that recommendation budget.
+    Warn after three seconds without a frame and mark a stall after eight.
+    Request one recovery per incident; 30 healthy seconds restore that budget.
     """
 
     WARNING_AFTER_S = 3.0
@@ -185,12 +179,9 @@ class CaptureHealthMonitor:
         if flags & CaptureHealthFlag.PAUSED:
             self.state = CaptureHealthState.DEGRADED
             self._last_progress_at = timestamp
-            # Focus-gated capture intentionally pauses while the user opens the
-            # clip UI or another window.  The native replay ring is retained, so
-            # preserve the amount of replay already known to be fresh.  Clearing
-            # it here made the first hotkey after returning to a game fail with
-            # "0 seconds of fresh replay" until another five seconds elapsed.
-            # poll_delta is deliberately not accumulated while paused.
+            # Preserve known replay age during focus-gated pauses, but don't add
+            # poll_delta while paused. Native admission checks the retained footage
+            # when a save is requested.
             self._healthy_since = None
             return self._snapshot("capture is intentionally paused", old_state, False, timestamp)
 
@@ -389,10 +380,12 @@ class SaveAdmission:
 def evaluate_save_admission(
     snapshot: CaptureHealthSnapshot | None,
     requested_seconds: int,
-    *,
-    minimum_seconds: int = 5,
 ) -> SaveAdmission:
-    """Reject stale capture and shorten only a genuinely warming replay ring."""
+    """Reject unavailable backends; let the native ring admit replay saves.
+
+    UI polling cannot measure retained footage across focus changes. The native
+    save boundary checks freshness, continuity, keyframes, and partial coverage.
+    """
 
     requested = max(1, int(requested_seconds))
     if snapshot is None:
@@ -400,21 +393,8 @@ def evaluate_save_admission(
     if not snapshot.save_allowed:
         if snapshot.state is CaptureHealthState.RECOVERING:
             reason = "Capture is recovering. Try again in a moment."
-        elif snapshot.state is CaptureHealthState.INITIALIZING:
-            reason = "Capture is still starting. Wait for fresh frames before saving."
         else:
             reason = "Capture is not receiving new frames. Restart capture before saving."
         return SaveAdmission(False, 0, reason)
 
-    available = int(snapshot.fresh_buffer_seconds)
-    if available < minimum_seconds:
-        return SaveAdmission(
-            False,
-            0,
-            f"Only {available} seconds of fresh replay are available; wait a moment.",
-        )
-    duration = min(requested, available)
-    reason = "" if duration == requested else (
-        f"Capture recently recovered; saving the {duration} fresh seconds currently available."
-    )
-    return SaveAdmission(True, duration, reason)
+    return SaveAdmission(True, requested, "")

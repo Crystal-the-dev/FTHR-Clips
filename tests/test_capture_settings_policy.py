@@ -3,14 +3,12 @@ from __future__ import annotations
 import pytest
 
 from core.capture_settings import (
-    EXTENDED_CLIP_VALUES,
     FPS_VALUES,
     NORMAL_CLIP_VALUES,
     ApplyStatus,
     CaptureConfig,
     CaptureConfigTracker,
     compute_buffer_seconds,
-    validate_extended_clip_length,
     validate_fps,
     validate_normal_clip_length,
 )
@@ -35,34 +33,28 @@ def _config(**overrides) -> CaptureConfig:
 
 def test_product_limits_have_one_authoritative_policy():
     assert max(NORMAL_CLIP_VALUES) == 300
-    # Both native engines cap the replay ring at 300 seconds.  An extended
-    # request above that limit cannot be fulfilled by the current ring.
-    assert max(EXTENDED_CLIP_VALUES) == 300
     assert max(FPS_VALUES) == 240
 
     assert validate_normal_clip_length(300) == 300
-    assert validate_extended_clip_length(300) == 300
     assert validate_fps(240) == 240
 
 
 def test_every_exposed_duration_fits_the_native_ring():
     for normal in NORMAL_CLIP_VALUES:
-        for extended in EXTENDED_CLIP_VALUES:
-            ring = compute_buffer_seconds(normal, extended)
-            assert max(normal, extended) <= ring <= 300
+        ring = compute_buffer_seconds(normal)
+        assert normal <= ring <= 300
 
 
 def test_python_microphone_history_matches_maximum_replay():
     from core.mic_recorder import KEEP_SECONDS
 
-    assert KEEP_SECONDS >= max(EXTENDED_CLIP_VALUES)
+    assert KEEP_SECONDS >= max(NORMAL_CLIP_VALUES)
 
 
 @pytest.mark.parametrize(
     ('validator', 'invalid'),
     [
         (validate_normal_clip_length, 301),
-        (validate_extended_clip_length, 301),
         (validate_fps, 241),
     ],
 )

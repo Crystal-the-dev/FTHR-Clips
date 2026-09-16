@@ -24,9 +24,7 @@ def _rules(findings):
     return {f.rule for f in findings}
 
 
-# ---------------------------------------------------------------------------
 # Must reject
-# ---------------------------------------------------------------------------
 
 def test_rejects_bare_except(tmp_path):
     src = _write(tmp_path, 'try:\n    f()\nexcept:\n    pass\n')
@@ -56,9 +54,7 @@ def test_rejects_diagnostically_empty_return(tmp_path):
     assert 'BROAD-SWALLOW' in _rules(check_file(src))
 
 
-# ---------------------------------------------------------------------------
 # Valid documented handlers must remain accepted.
-# ---------------------------------------------------------------------------
 
 def test_accepts_a_documented_cleanup_handler(tmp_path):
     src = _write(tmp_path,
@@ -104,9 +100,7 @@ def test_docstring_only_handler_is_still_silent(tmp_path):
     assert 'BROAD-SWALLOW' in _rules(check_file(src))
 
 
-# ---------------------------------------------------------------------------
 # The real tree and the ratchet
-# ---------------------------------------------------------------------------
 
 def test_production_tree_has_no_forbidden_handlers():
     """Bare except and BaseException fail the build outright, at zero."""

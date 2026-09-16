@@ -1,35 +1,8 @@
-"""
-mic_recorder.py — continuous microphone capture into a rolling in-memory ring.
+"""Microphone capture into a rolling in-memory buffer for Python finalization.
 
-Why this exists (a.k.a. why mic is recorded separately from desktop audio)
---------------------------------------------------------------------------
-The C++ engine only grabs system loopback — i.e. everything you HEAR. It has
-no idea your mic exists, so out of the box your clips are missing your voice,
-which kind of defeats the point of a hype-moment clipper. Properly teaching the
-engine to mix in a second audio device is a real architecture project. Nobody
-has time for that this sprint.
-
-So we cheat: Python keeps its own always-on mic recording in a ring buffer, and
-when you save a clip we yank out the matching time slice and ffmpeg-mux it onto
-the video the engine just wrote. Two separate captures, glued together after the
-fact. The hard part is timing alignment (see the frame-count clock below), which
-is why this file is way more paranoid about timestamps than it looks like it
-should be. This is fine.
-
-How it works
-------------
-- A `sounddevice.InputStream` runs at 48 kHz mono. Each chunk is appended
-  to a deque of (monotonic_timestamp, samples).
-- The deque is trimmed to keep only the last `keep_seconds` of audio
-  (default 90 s — comfortably more than any clip length the UI exposes).
-- `extract_segment(end_time, duration)` returns the slice of mic samples
-  that aligns with the time window the clip covers.
-
-Threading
----------
-- `sounddevice` runs the callback on its own audio thread. The deque is
-  guarded by a lock; callers from the UI thread can read safely.
-- Singleton pattern so the rest of the app shares one capture stream.
+A sounddevice stream captures 48 kHz mono audio. Frame-count timestamps let
+extract_segment() align samples with a saved clip. The singleton shares one
+stream, and a lock protects the deque across the audio and UI threads.
 """
 from __future__ import annotations
 
@@ -88,7 +61,7 @@ class MicRecorder:
     def is_available() -> bool:
         return _AVAILABLE
 
-    # ── Lifecycle ────────────────────────────────────────────────────────
+    # Lifecycle
 
     def start(self, device_index, gain: float = 1.0) -> bool:
         """
@@ -163,7 +136,7 @@ class MicRecorder:
             except ValueError:
                 pass
 
-    # ── Audio thread callback ────────────────────────────────────────────
+    # Audio thread callback
 
     def _on_audio(self, indata, frames, time_info, status):
         try:
@@ -181,18 +154,9 @@ class MicRecorder:
             rms = float(_np.sqrt(_np.mean(_np.square(samples, dtype=_np.float32))))
             normalized_level = min(max(rms * 4.0, 0.0), 1.0)
             with self._lock:
-                # Use frame-count-based time, NOT time.monotonic().
-                #
-                # time.monotonic() inside the callback reflects when Python
-                # scheduled this call, which can be seconds late if the GIL
-                # is held by the UI thread during a heavy game frame. That
-                # delay shifts every chunk's timestamp forward, making
-                # extract_segment() pull audio from the wrong window.
-                #
-                # Instead: t_end = stream_start + frames_delivered / SR.
-                # PortAudio delivers frames in lockstep with the hardware
-                # clock, so this is accurate to within a few microseconds
-                # regardless of Python scheduling latency.
+                # Derive timestamps from stream_start + delivered_frames / SR. Callback
+                # scheduling can lag the hardware clock, so time.monotonic() here would
+                # shift samples into the wrong extraction window.
                 self._total_frames += frames
                 t_end = self._stream_start_time + self._total_frames / SAMPLE_RATE
                 self._chunks.append((t_end, samples))
@@ -216,7 +180,7 @@ class MicRecorder:
             # wondering why the mic "randomly stopped working." swallow it.
             pass
 
-    # ── Extraction for save_clip ─────────────────────────────────────────
+    # Extraction for save_clip
 
     def extract_segment(self, end_time: float, duration: float):
         """

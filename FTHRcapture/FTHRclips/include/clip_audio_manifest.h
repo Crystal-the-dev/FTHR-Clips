@@ -1,9 +1,6 @@
-// clip_audio_manifest.h
-// Native producer for the versioned FTHR multi-audio sidecar contract.
-//
-// The sidecar is deliberately written from immutable SaveClipTask data, never
-// from live process handles or executable paths. It accompanies native clips
-// and binds source UUIDs to the exact MP4 bytes via SHA-256.
+// Write audio sidecars from immutable SaveClipTask metadata.
+// SHA-256 binds source UUIDs to the exact MP4 bytes without persisting
+// live process handles or executable paths.
 
 #pragma once
 #ifndef FTHR_CLIP_AUDIO_MANIFEST_H

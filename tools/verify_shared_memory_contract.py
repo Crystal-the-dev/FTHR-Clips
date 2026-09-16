@@ -1,35 +1,10 @@
 #!/usr/bin/env python3
-"""Verify the Python <-> C++ shared-memory contract, byte for byte.
+"""Verify Python/Windows/Linux shared-memory layouts and enum values.
 
-The UI and the capture engine communicate through one fixed-layout struct
-mapped into shared memory. There is no serialisation and no handshake: if the
-two definitions drift by a single byte, every field after the drift point
-reads garbage, and it fails silently at runtime rather than at build time.
-
-Three definitions must agree:
-
-    FTHR_UI/core/capture_bridge.py           Python ctypes, win32 + posix branch
-    FTHRcapture/FTHRclips/include/shared_memory.h        Windows engine
-    FTHRcapture_linux/src/shared_memory.h                Linux engine
-
-This script parses the two C++ headers, models their layout with the same
-alignment rules the compiler uses (MSVC x64 and GCC x86-64 agree for this
-struct: natural alignment, no packing pragmas), and compares field order,
-field types, array extents, offsets and total size against ctypes.
-
-    python tools/verify_shared_memory_contract.py
-
-Exit code 0 = contract intact, 1 = drift.
-
-Also checked:
-  - CommandType / ResponseType enum values match on all three sides
-  - the deprecated SET_* command slots 4..9 are still occupied, so a future
-    command cannot silently reuse a number an old engine still answers to
-  - the mapping name still carries a layout version suffix (_v4)
-
-Not checked (cannot be, from source alone):
-  - that the running engine binary was built from these headers. That is what
-    the versioned mapping name is for.
+Model native alignment and compare field order, types, extents, offsets,
+and size with ctypes. Also check retired command slots and mapping version.
+This cannot identify the headers used by a running binary.
+Exit 0 means agreement; 1 means drift.
 """
 
 from __future__ import annotations
@@ -89,9 +64,7 @@ class Report:
         print(f'        {msg}')
 
 
-# ---------------------------------------------------------------------------
 # C++ header parsing
-# ---------------------------------------------------------------------------
 
 _FIELD_RE = re.compile(
     r'^\s*(?:volatile\s+)?'
@@ -165,9 +138,7 @@ def layout_of(fields) -> tuple[list[tuple[str, int, int]], int, int]:
     return out, padded, struct_align
 
 
-# ---------------------------------------------------------------------------
 # Python side
-# ---------------------------------------------------------------------------
 
 def python_fields(struct_cls):
     """Return [(name, cpp_type, count_or_None)] for a ctypes Structure."""
@@ -210,9 +181,7 @@ def load_bridge_struct(platform: str):
     return mod.SharedMemoryLayout
 
 
-# ---------------------------------------------------------------------------
 # Comparison
-# ---------------------------------------------------------------------------
 
 # `enum class CommandType : uint32_t` has exactly the representation of a
 # uint32_t, which is what the Python side declares. Treat them as one type so
@@ -286,7 +255,6 @@ def main() -> int:
     print('Shared-memory contract verification')
     print()
 
-    # --- Windows -----------------------------------------------------------
     print('Windows layout (capture_bridge win32 branch vs shared_memory.h):')
     try:
         win_cpp = parse_struct(WIN_HEADER)
@@ -295,7 +263,6 @@ def main() -> int:
     except Exception as exc:
         rep.fail(f'win32: {exc}')
 
-    # --- Linux -------------------------------------------------------------
     print()
     print('Linux layout (capture_bridge posix branch vs FTHRcapture_linux):')
     try:
@@ -305,7 +272,7 @@ def main() -> int:
     except Exception as exc:
         rep.fail(f'linux: {exc}')
 
-    # --- Enums -------------------------------------------------------------
+    # Enums
     print()
     print('Command / response enums:')
     try:
@@ -333,7 +300,7 @@ def main() -> int:
     except Exception as exc:
         rep.fail(f'enums: {exc}')
 
-    # --- Mapping name ------------------------------------------------------
+    # Mapping name
     print()
     print('Mapping name:')
     try:

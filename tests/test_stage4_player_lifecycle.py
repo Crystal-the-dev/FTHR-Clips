@@ -94,6 +94,7 @@ def test_player_preparation_timeout_is_terminal(qtbot):
 def test_invalid_media_backend_result_is_terminal(qtbot):
     viewer = SimpleNamespace(
         _closing=False,
+        clip_path="clip.mp4", _playback_path="clip.mp4",
         _player_lifecycle_state=PlayerLifecycleState.PREPARING,
         _player_failure_detail='',
         _playback_ready=False,
@@ -325,6 +326,7 @@ def test_renderer_change_recreates_player_with_output_before_source(monkeypatch)
         _timeline_prepare_timer=_Timer(),
         trim_slider=SimpleNamespace(cancel_thumbnail_loading=lambda: None),
         clip_path='C:/clips/example.mp4',
+        _playback_path='C:/clips/example.mp4',
     )
     viewer._connect_media_player_signals = (
         ClipViewer._connect_media_player_signals.__get__(viewer))

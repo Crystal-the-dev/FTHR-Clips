@@ -52,13 +52,7 @@ def _so(subdir):
 
 
 def _find_lib(soname):
-    """Locate a system shared library across distro layouts.
-
-    A hardcoded '/usr/lib/libportaudio.so.2' used to sit in the binaries list.
-    That path is correct on Arch and wrong on every Debian-family distro, which
-    puts it under /usr/lib/<multiarch>/ — so `bash build_linux.sh` aborted with
-    "Unable to find '/usr/lib/libportaudio.so.2'". Verified on Ubuntu 24.04.
-    """
+    """Locate a system library in flat or multiarch distro layouts."""
     import ctypes.util
     for cand in (f'/usr/lib/{_MULTIARCH}/{soname}',
                  f'/usr/lib/{soname}',
@@ -97,19 +91,9 @@ def _asset_tree(source, destination):
         entries.append((str(path), target))
     return entries
 
-# ---------------------------------------------------------------------------
-# LGPL FFmpeg — AUDIT-014
-#
-# The engine is COMPILED against this tree (see FTHRcapture_linux/CMakeLists.txt,
-# FTHR_FFMPEG_ROOT) and must load it at runtime. Its SONAMEs are a different
-# generation from the distribution's (libavcodec.so.62 vs .so.60), so a system
-# FFmpeg cannot accidentally satisfy the engine — but PyInstaller will happily
-# collect the system copies as well, pulled in by cv2 and Qt, and the AppDir
-# would then contain GPL libraries even though nothing links them.
-#
-# So: ship these deliberately, and drop the GPL strays in a post-processing
-# step in build_linux.sh.
-# ---------------------------------------------------------------------------
+# Bundle the pinned FFmpeg used to compile the engine. PyInstaller may also
+# collect system FFmpeg through Qt/OpenCV; build_linux.sh removes unapproved
+# copies before packaging.
 _FFMPEG_ROOT = ROOT / 'FTHRcapture_linux' / 'third_party' / 'ffmpeg'
 _FFMPEG_LIB = _FFMPEG_ROOT / 'lib'
 
@@ -205,12 +189,8 @@ a = Analysis(
     hookspath=[],
     runtime_hooks=[],
     excludes=[
-        # imageio_ffmpeg is deliberately EXCLUDED (AUDIT-005).
-        # Its bundled binary is a gyan.dev build configured with
-        # --enable-gpl --enable-libx264 --enable-libx265, i.e. GPLv3.
-        # Shipping it would place this whole artifact under the GPL.
-        # FTHR uses the LGPL FFmpeg next to the engine — see
-        # FTHR_UI/core/ffmpeg_tools.py.
+        # Exclude imageio_ffmpeg; use the project-pinned FFmpeg runtime beside
+        # the engine. See core/ffmpeg_tools.py.
         'imageio_ffmpeg',
         # Qt modules we don't use (Widgets-only app)
         'PySide6.QtQuick', 'PySide6.QtQml', 'PySide6.QtWebEngine',

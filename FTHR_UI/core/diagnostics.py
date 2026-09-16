@@ -1,26 +1,7 @@
-"""Diagnostics: the logging the support strategy depends on (AUDIT-007).
+"""Structured, redacted logging with transition-based error reporting.
 
-The whole support strategy is "send us your log", so what is in that log is a
-product feature, not housekeeping. Three things make it useful and this module
-supplies all three:
-
-1. **Structure.** Time, level, module and thread on every line. A clip save
-   crosses the Qt main thread, a mux worker and an upload worker; without the
-   thread name an interleaved log is unreadable.
-
-2. **Redaction.** The upload feature stores a bearer token and posts to a
-   user-supplied URL. A log that helps us debug an upload must never be a log
-   the user cannot safely paste into a public issue.
-
-3. **Restraint.** Several code paths poll at 50 ms. An error there must be
-   reported once, not two hundred times a second, or the one interesting line
-   is buried and the log rotates away before anyone reads it.
-
-Relationship to `print()`. The app historically logged by printing, with
-stdout/stderr teed into `~/.fthr/logs/fthr.log` (see `_LogTee` in main.py).
-That file is what testers are told to send, so this module writes into the
-*same* file rather than starting a second one. Existing `print()` calls keep
-working and keep landing in the log; new diagnostics go through here.
+Writes to ~/.fthr/logs/fthr.log alongside main.py's stdout/stderr tee.
+StateLogger suppresses repeated polling failures and reports recovery.
 """
 
 from __future__ import annotations
@@ -45,13 +26,8 @@ _configured = False
 _configure_lock = threading.Lock()
 
 
-# ---------------------------------------------------------------------------
-# Redaction
-# ---------------------------------------------------------------------------
-#
-# These run over anything heading for the log. They are deliberately
-# conservative: a false positive costs a line of usefulness, a false negative
-# costs a leaked credential in a public bug report.
+# Redact credentials before logging; matching extra text is preferable to
+# exposing a token in a public bug report.
 
 _REDACTED = '<redacted>'
 
@@ -131,10 +107,9 @@ def sanitize_headers_for_log(headers) -> dict:
 
 
 class _RedactingFilter(logging.Filter):
-    """Last line of defence: redact every record on its way to the file.
+    """Redact every record before it reaches the file, including third-party logs.
 
-    Call sites are expected to redact deliberately. This catches the ones that
-    forget — including third-party libraries logging a request URL.
+    Call sites should still redact sensitive values before logging.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -161,17 +136,12 @@ class _RedactingFilter(logging.Filter):
         return True
 
 
-# ---------------------------------------------------------------------------
 # Setup
-# ---------------------------------------------------------------------------
 
 def configure(log_file: Path | None = None, level: int = logging.DEBUG) -> bool:
-    """Attach a rotating file handler to the root logger. Idempotent.
+    """Attach the rotating root log handler once and return whether it is active.
 
-    Returns True if file logging is active. Never raises: logging that
-    prevents startup is worse than no logging, which is why the original
-    `_setup_file_logging()` swallowed everything. The difference is that this
-    reports the failure to stderr instead of vanishing.
+    Report setup failures to stderr without preventing application startup.
     """
     global _configured
     with _configure_lock:
@@ -221,25 +191,13 @@ def reset_for_tests() -> None:
         _configured = False
 
 
-# ---------------------------------------------------------------------------
 # Restraint: report a recurring condition once, and report its recovery
-# ---------------------------------------------------------------------------
 
 class StateLogger:
-    """Log a condition on transition, not on every poll.
+    """Log the first failure, changed details, and recovery with elapsed time.
 
-    Several paths here poll at 50-500 ms. Logging a failure on each tick buries
-    everything else and rotates the interesting history out of the file within
-    minutes. This logs the first occurrence, stays silent while the condition
-    persists, and logs a single recovery line with how long it lasted.
-
-        engine = StateLogger(log, 'engine connection')
-        ...
-        engine.failed('shared memory not mapped')   # logged once
-        engine.failed('shared memory not mapped')   # silent
-        engine.ok()                                 # "recovered after 12.4 s"
-
-    Not thread-safe by intent: each instance belongs to one polling loop.
+    Repeated failures stay silent. Each instance belongs to one polling loop
+    and is not thread-safe.
     """
 
     def __init__(self, logger: logging.Logger, subject: str,
@@ -303,15 +261,10 @@ class StateLogger:
 
 def log_unexpected(logger: logging.Logger, operation: str, exc: BaseException,
                    **context) -> None:
-    """Report a failure that should not happen, with a stack trace.
+    """Log unexpected failures with a stack trace.
 
-    For category E — a violated invariant, an impossible state, a bug. The
-    trace is the point: without it the report says something failed and gives
-    no way to find out why.
-
-    Expected failures (a missing optional tool, an already-deleted temp file)
-    must NOT come through here; they belong at debug level without a trace, or
-    the log stops being readable and people stop reading it.
+    Use debug-level messages without a trace for expected failures such as
+    missing optional tools or temporary files already removed.
     """
     detail = ' '.join(f'{k}={redact_secret(v)}' for k, v in context.items())
     logger.exception('%s failed unexpectedly%s',

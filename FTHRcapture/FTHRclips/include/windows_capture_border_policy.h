@@ -1,4 +1,3 @@
-// windows_capture_border_policy.h
 // Compatibility policy for the Windows Graphics Capture session border.
 
 #pragma once

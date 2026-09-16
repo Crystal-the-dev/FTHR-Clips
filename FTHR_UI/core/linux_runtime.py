@@ -1,43 +1,8 @@
-"""Secure per-user runtime directory and hotkey socket path (AUDIT-003).
+"""Private per-user runtime paths for Linux hotkey IPC.
 
-The problem with the old path
------------------------------
-The hotkey socket lived at a fixed ``/tmp/fthr_hotkey.sock``. AUDIT-003 fixed
-the *mode* — umask 0177 around ``bind()`` plus an explicit chmod 0600 — so
-another user could no longer connect and trigger a screenshot of this user's
-screen. That fix is correct and is kept.
-
-It does not fix the *path*, and the path is the harder half:
-
-* ``/tmp`` is world-writable. Any local user can create ``/tmp/fthr_hotkey.sock``
-  first — as a regular file, a directory, or a symlink pointing anywhere.
-* The old code then ran ``os.unlink(path)`` unconditionally. Two outcomes, both
-  bad. With the sticky bit set (normal for /tmp) the unlink fails with EPERM,
-  ``bind()`` fails, and hotkeys are dead: **any local user can deny this user's
-  hotkeys indefinitely**. Without the sticky bit, FTHR happily deletes another
-  user's file.
-* A symlink at that path turns the unlink — or a later chmod — into an
-  operation on a file of the attacker's choosing.
-
-Moving into a directory that only this user can write removes the whole class:
-an attacker cannot create, replace or symlink a path inside a 0700 directory
-they do not own.
-
-Path selection
---------------
-1. ``$XDG_RUNTIME_DIR/fthr/`` — the correct location. The base directory is
-   created by the system per login session, owned by the user, mode 0700, and
-   cleaned up at logout. Sockets belong here.
-2. ``~/.fthr/run/`` — fallback when ``XDG_RUNTIME_DIR`` is unset (some
-   containers, ``su`` without a session, minimal init systems). Still
-   user-owned and 0700. Deliberately **not** ``/tmp``: a private fallback is
-   the point.
-
-Both are validated before use: must exist as a real directory (``lstat``, so a
-symlink is rejected rather than followed), owned by the current uid, with no
-group or other permission bits.
-
-Nothing here requires root, and nothing here should ever be made to.
+Use $XDG_RUNTIME_DIR/fthr, falling back to ~/.fthr/run. Directories must be
+owned by the current user, have mode 0700, and not be symlinks. A private
+parent prevents another user from replacing or pre-creating the socket.
 """
 
 from __future__ import annotations
@@ -84,12 +49,9 @@ def _candidate_bases() -> list[Path]:
 
 
 def runtime_dir(create: bool = True) -> Path:
-    """Return the private runtime directory, creating it if asked.
+    """Resolve $XDG_RUNTIME_DIR/fthr, falling back to ~/.fthr/run.
 
-    Tries ``$XDG_RUNTIME_DIR/fthr`` then ``~/.fthr/run``. Raises
-    RuntimeDirError only if *every* candidate is unusable — a broken
-    XDG_RUNTIME_DIR falls through to the home fallback rather than killing
-    hotkeys outright.
+    Create the directory if requested. Raise RuntimeDirError if both are unusable.
     """
     if not create:
         # Pure path query — used to *display* the socket location (generated
@@ -138,12 +100,10 @@ def _is_live_socket(path: str) -> bool:
 
 
 def prepare_socket_path(path: str) -> None:
-    """Make *path* safe to bind, or raise.
+    """Prepare a socket path for binding, or raise.
 
-    Removes only a socket that (a) is a socket, (b) is owned by this user, and
-    (c) has nobody listening on it. Anything else is left alone and reported:
-    deleting a file we did not create is exactly the behaviour this module
-    exists to remove.
+    Remove only a socket owned by this user with no listener. Leave other
+    files, symlinks, foreign sockets, and live sockets untouched.
     """
     try:
         st = os.lstat(path)

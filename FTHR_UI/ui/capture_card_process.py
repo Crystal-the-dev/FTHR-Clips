@@ -1,23 +1,7 @@
-"""
-Standalone host process for the CaptureCard widget.
+"""Host CaptureCard in its own Qt event loop.
 
-Spawned by CaptureCardClient; receives one-line commands on stdin and shows
-the card in its own Qt event loop — completely isolated from the main process.
-
-Protocol (one UTF-8 line per command):
-    clip|<duration_s>|<fps>|<resolution>[|<hold_duration_ms>]
-    screenshot[|<hold_duration_ms>]
-    error[|<detail>][|<hold_duration_ms>]
-    upload[|<filename>][|<hold_duration_ms>]
-    upload_failed[|<detail>][|<hold_duration_ms>]
-    recording_saved[|<filename>][|<hold_duration_ms>]
-    startup
-    prompt|<text>
-    capturing|<source>
-    background|<source>
-    background_hide
-    visuals|<0-or-1>
-    quit
+CaptureCardClient sends UTF-8, pipe-delimited commands on stdin.
+See handle() for command names, fields, and optional hold durations.
 """
 
 import sys
@@ -43,6 +27,9 @@ class _StdinReader(QThread):
 
     def run(self):
         try:
+            # Enforce the protocol in frozen hosts too, where Python's startup
+            # environment options may be ignored.
+            sys.stdin.reconfigure(encoding='utf-8', errors='replace')
             while True:
                 line = sys.stdin.readline()
                 if not line:

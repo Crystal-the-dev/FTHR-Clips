@@ -1,9 +1,7 @@
-"""Native Windows microphone endpoint discovery for the settings page.
+"""Discover Windows microphone IDs through the capture engine.
 
-The capture engine owns WASAPI.  This small adapter invokes its explicit
-``--list-microphones`` mode so settings persist the same endpoint ID that the
-engine will later open.  Friendly names remain display-only and are retained
-solely for safe one-time migration of old settings files.
+Persist the ID the engine opens. Friendly names are display-only, apart
+from one-time migration of older settings.
 """
 from __future__ import annotations
 
@@ -249,12 +247,9 @@ def _query_legacy_indices_bounded(
     timeout: float,
     cancel_event: threading.Event | None,
 ) -> dict[str, tuple[int, ...]]:
-    """Run PortAudio inventory away from Qt with a bounded wait.
+    """Run uncancellable PortAudio inventory in a daemon with a bounded wait.
 
-    PortAudio does not expose cancellation for its device query.  Running the
-    call in a daemon helper keeps the UI and discovery generation bounded even
-    when a third-party host API is stuck; a normal query always exits before
-    this helper is reclaimed.
+    A stalled device API must not block Qt or the discovery generation.
     """
     _raise_if_cancelled(cancel_event)
     result: list[object] = []

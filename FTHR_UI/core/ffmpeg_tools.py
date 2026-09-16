@@ -1,33 +1,7 @@
-"""
-ffmpeg_tools.py — one place that decides *which* ffmpeg we run and *which*
-software video encoder we ask it for.
+"""Resolve FFmpeg and construct encoder arguments shared by UI media jobs.
 
-Why this module exists
-----------------------
-Two separate problems collapsed into one fix (AUDIT-005):
-
-1. **Licensing.** FTHR used to shell out to the ffmpeg binary bundled inside
-   the ``imageio-ffmpeg`` wheel. That binary is a gyan.dev "essentials" build
-   configured with ``--enable-gpl --enable-version3 --enable-libx264
-   --enable-libx265`` — i.e. **GPLv3**. Shipping it inside an AppImage or
-   installer would place the whole distributed work under the GPL, which is
-   incompatible with releasing FTHR's own code under MIT.
-
-2. **It was already broken on Windows.** ``imageio_ffmpeg`` is not actually
-   present in the frozen Windows bundle (no package directory, no binary), so
-   every ``get_ffmpeg_exe()`` call raised and the watermark, webcam
-   overlay and clip-export paths silently degraded in the shipped build.
-
-Both are solved by using the **same LGPL FFmpeg that already ships next to the
-capture engine**. One copy, one licence, ~87 MB less to download.
-
-Consequence for encoders
-------------------------
-The LGPL build deliberately has no libx264/libx265. The software H.264 encoder
-is Cisco **OpenH264** (BSD-2-Clause). It is not a drop-in for x264 on the
-command line: it has no ``-preset`` and no ``-crf``, so the old
-``-c:v libx264 -preset ultrafast -crf 18`` invocations would fail outright.
-:func:`software_video_args` produces the correct arguments instead.
+Prefer the bundled LGPL build used by the capture engine. Its OpenH264
+encoder uses bitrate control and does not accept x264 preset/CRF options.
 """
 
 from __future__ import annotations
@@ -43,11 +17,8 @@ _NO_WINDOW = {'creationflags': 0x08000000} if sys.platform == 'win32' else {}
 _EXE_NAME = 'ffmpeg.exe' if sys.platform == 'win32' else 'ffmpeg'
 _PROBE_NAME = 'ffprobe.exe' if sys.platform == 'win32' else 'ffprobe'
 
-# The editor's normal transcode is intentionally bounded for optional
-# post-processing. Export and full-quality Share have a different contract:
-# when an edit makes a transcode unavoidable, they should preserve as much of
-# the source as the reviewed encoder can carry. OpenH264 has no CRF/lossless
-# mode, so this uses the largest bitrate accepted by the capture settings.
+# Full-quality export uses this bitrate ceiling when OpenH264 must re-encode.
+# OpenH264 doesn't support CRF or lossless encoding.
 MAXIMUM_QUALITY_VIDEO_BITRATE_KBPS = 200_000
 
 # Resolved lazily, then cached — resolution touches the filesystem and the
@@ -58,12 +29,7 @@ _cached_probe: Optional[str] = None
 
 
 class FFmpegUnavailable(RuntimeError):
-    """Raised when no usable ffmpeg binary can be found.
-
-    Callers are expected to surface the message to the user — a missing ffmpeg
-    disables watermark, crop, webcam overlay and export, and the old code
-    reported that as nothing at all.
-    """
+    """Raised when FFmpeg is unavailable; callers should display the reason."""
 
 
 def _candidate_paths() -> list[Path]:
@@ -75,19 +41,17 @@ def _candidate_paths() -> list[Path]:
     here = Path(__file__).resolve()
     out: list[Path] = []
 
-    # 1. Frozen bundle (PyInstaller). FTHR.spec places the engine and its
-    #    FFmpeg DLLs — and now ffmpeg.exe — into an "engine" subdirectory.
+    # Frozen bundle: FTHR.spec places FFmpeg beside the engine.
     meipass = getattr(sys, '_MEIPASS', None)
     if meipass:
         out.append(Path(meipass) / 'engine' / _EXE_NAME)
         out.append(Path(meipass) / _EXE_NAME)
 
-    # 2. Next to the executable (AppImage layout: engine sits beside AppRun).
+    # AppImage layout: the engine sits beside AppRun.
     out.append(Path(sys.executable).parent / _EXE_NAME)
     out.append(Path(sys.executable).parent / 'engine' / _EXE_NAME)
 
-    # 3. Development checkout: the LGPL build vendored for the C++ engine.
-    #    here = <root>/FTHR_UI/core/ffmpeg_tools.py  →  parents[2] = <root>
+    # Development runtime beside the native engine; parents[2] is the repo root.
     root = here.parents[2]
     out.append(root / 'FTHRcapture' / 'FTHRclips' / 'third_party' / 'ffmpeg' / 'bin' / _EXE_NAME)
 
@@ -95,23 +59,16 @@ def _candidate_paths() -> list[Path]:
 
 
 def _candidate_probe_paths() -> list[Path]:
-    """Return the ffprobe path beside each reviewed ffmpeg location."""
+    """Find ffprobe beside each supported FFmpeg location."""
 
     return [path.with_name(_PROBE_NAME) for path in _candidate_paths()]
 
 
 def get_ffmpeg_exe() -> str:
-    """Return a path to a usable ffmpeg binary.
+    """Return the bundled FFmpeg path, falling back to FFmpeg on PATH.
 
-    Resolution order: bundled LGPL build → system ``ffmpeg`` on PATH.
-
-    The PATH fallback exists for Linux, where distributions ship their own
-    FFmpeg and the user is expected to have one. That copy is *not* something
-    FTHR distributes, so its licence is not FTHR's to answer for — but it is
-    also not guaranteed to contain OpenH264, which is why
-    :func:`software_video_args` probes rather than assumes.
-
-    :raises FFmpegUnavailable: when nothing usable is found.
+    Raise FFmpegUnavailable if neither exists. System builds may lack OpenH264;
+    software_video_args probes their available encoders.
     """
     global _cached_exe
     if _cached_exe is not None:
@@ -123,8 +80,7 @@ def get_ffmpeg_exe() -> str:
                 _cached_exe = str(cand)
                 return _cached_exe
         except OSError:
-            # Candidate roots can disappear during a packaged-app update;
-            # probe the remaining reviewed locations instead of failing open.
+            # An update may remove a candidate directory; try the remaining locations.
             continue
 
     # System ffmpeg (typical on Linux; also fine for a dev box on Windows).
@@ -143,11 +99,9 @@ def get_ffmpeg_exe() -> str:
 
 
 def get_ffprobe_exe() -> str:
-    """Return the matching FFprobe binary used for read-only stream metadata.
+    """Resolve matching FFprobe for metadata reads on a worker.
 
-    Playback decoding never shells out: it runs through the in-process native
-    bridge. FFprobe is used once on a worker to label arbitrary imported
-    streams honestly before the viewer opens its editable source list.
+    Playback decoding uses the native bridge; only metadata probing shells out.
     """
 
     global _cached_probe
@@ -159,8 +113,7 @@ def get_ffprobe_exe() -> str:
                 _cached_probe = str(candidate)
                 return _cached_probe
         except OSError:
-            # Candidate roots can disappear during a packaged-app update;
-            # probe the remaining reviewed locations instead of failing open.
+            # An update may remove a candidate directory; try the remaining locations.
             continue
     from shutil import which
     found = which('ffprobe')
@@ -215,29 +168,33 @@ def _sdr_color_args() -> list[str]:
         '-colorspace', 'bt709',
         '-color_primaries', 'bt709',
         '-color_trc', 'bt709',
-        # OpenH264 retains range/matrix on AVCodecContext but does not copy
-        # primaries/transfer into its SPS. Patch the H.264 VUI in the reviewed
-        # post-encode bitstream stage so exports carry the complete contract.
+        # OpenH264 omits primaries/transfer from its SPS. Patch the H.264 VUI after
+        # encoding so exports retain the complete SDR color metadata.
         '-bsf:v',
         ('h264_metadata=video_full_range_flag=0:colour_primaries=1:'
          'transfer_characteristics=1:matrix_coefficients=1'),
     ]
 
 
+def _seekable_video_args() -> list[str]:
+    """Bound random-access decode work in every H.264 transcode.
+
+    OpenH264's default GOP can span an entire clip. Media Foundation decodes
+    that interval again on both seek and resume. Thirty frames also keeps
+    exports/imported low-FPS footage usable without trusting FPS metadata.
+    """
+    return ['-g', '30', '-bf', '0']
+
+
 def software_video_args(bitrate_kbps: int = 16000,
                         ffmpeg: Optional[str] = None) -> list[str]:
-    """ffmpeg arguments selecting the software H.264 encoder and its quality.
+    """Select software H.264 arguments.
 
-    Replaces the hardcoded ``['-c:v', 'libx264', '-preset', X, '-crf', '18']``
-    that appeared at six call sites.
-
-    ``-crf`` is intentionally not used: OpenH264 has no constant-quality mode,
-    so quality is expressed as a target bitrate. 16 Mbit/s is the engine's own
-    default for 1080p and is visually close to the old ``-crf 18`` for the
-    short, high-motion clips this tool produces.
+    OpenH264 uses a target bitrate (16 Mbit/s by default); system x264 uses
+    CRF 18. Include seekable-video and SDR color metadata options.
     """
     enc = software_h264_encoder(ffmpeg)
-    color_args = _sdr_color_args()
+    color_args = [*_seekable_video_args(), *_sdr_color_args()]
 
     if enc == 'libopenh264':
         return [
@@ -263,13 +220,9 @@ def software_video_args(bitrate_kbps: int = 16000,
 def postprocess_video_args(active_codec: object = '',
                            bitrate_kbps: int = 16000,
                            ffmpeg: Optional[str] = None) -> list[str]:
-    """Return fast H.264 args when the native recorder has a usable GPU.
+    """Use the active H.264 hardware backend for visual post-processing.
 
-    Visual overlays require decoding and re-encoding the saved clip. When the
-    native engine reports an H.264 hardware encoder, using that same FFmpeg
-    backend avoids making the post-process fall back to the much slower
-    OpenH264 path. Unknown, unavailable, and non-H.264 codecs retain the
-    reviewed software fallback.
+    Unknown, unavailable, or non-H.264 backends use the software fallback.
     """
     encoder = str(active_codec or '').strip().lower()
     hardware_encoders = {
@@ -287,28 +240,18 @@ def postprocess_video_args(active_codec: object = '',
         # P1 is NVENC's fastest preset; low-latency tuning is appropriate for
         # a short-lived clip finalizer and does not alter the source capture.
         args.extend(['-preset', 'p1', '-tune', 'll'])
-    return [*args, *_sdr_color_args()]
+    return [*args, *_seekable_video_args(), *_sdr_color_args()]
 
 
 def maximum_quality_video_args(ffmpeg: Optional[str] = None) -> list[str]:
-    """Return the highest-quality video arguments for editor exports.
+    """Choose video arguments for full-quality editor exports.
 
-    Untouched clips are stream-copied by the editor, which is the only way to
-    preserve every source bit. Once a crop, effect, stretch, watermark, or
-    timeline edit requires decoding and re-encoding, use a quality mode suited
-    to the encoder that is actually available:
-
-    * x264 can produce mathematically lossless H.264 with CRF 0;
-    * the shipped OpenH264 build has no constant-quality/lossless option, so
-      its 200 Mbps ceiling is used with frame skipping disabled;
-    * other H.264 encoders receive the same high bitrate fallback.
-
-    This helper is deliberately separate from :func:`software_video_args` so
-    bounded post-processing and size-constrained upload paths keep their
-    existing behavior.
+    Untouched video can be stream-copied by the caller. For re-encoding, x264
+    uses CRF 0; OpenH264 uses the 200 Mbps ceiling with frame skipping disabled.
+    Other H.264 encoders use the high-bitrate fallback.
     """
     enc = software_h264_encoder(ffmpeg)
-    color_args = _sdr_color_args()
+    color_args = [*_seekable_video_args(), *_sdr_color_args()]
     if enc == 'libx264':
         return [
             '-c:v', 'libx264',

@@ -1,21 +1,8 @@
-"""Animated capture-result notification.
+"""Animated capture-result window painted with QPainter.
 
-The card is one frameless translucent window. QPainter renders the icon, text,
-shimmer, and progress bar without child widgets, keeping the result themeable
-and inexpensive to animate. A QSequentialAnimationGroup owns the slide-in,
-hold, and slide-out keyframes; independent timers drive the progress and
-shimmer phases.
-
-The application runs this widget in a separate process so clip finalization
-cannot stall its event loop. ``capture_card_client.py`` owns that process and
-forwards the public commands below.
-
-Public API:
-    card = CaptureCard()
-    card.show_clip(duration_s, fps, resolution_label)
-    card.show_screenshot()
-    card.show_error(detail='')
-    card.show_recording_saved(filename='')
+A separate process keeps its Qt event loop responsive during finalization.
+CaptureCardClient forwards commands; animations control slide-in, hold,
+and slide-out while timers update shimmer and progress.
 """
 
 import os
@@ -36,9 +23,7 @@ from core.theme_manager import ThemeManager
 from ui.sound_playback import SoundPlayback
 
 
-# ---------------------------------------------------------------------------
 # Layout constants
-# ---------------------------------------------------------------------------
 
 _FULL_W, _FULL_H       = 340, 116
 _COMPACT_W, _COMPACT_H = 320, 76
@@ -103,9 +88,7 @@ def _resolve_sound(key: str) -> Path:
     return _SOUND_FILES[key]
 
 
-# ---------------------------------------------------------------------------
 # Sound helper
-# ---------------------------------------------------------------------------
 
 def _get_sound_playback() -> SoundPlayback:
     global _SOUND_PLAYBACK
@@ -135,9 +118,7 @@ def _notification_sounds_enabled() -> bool:
         return True
 
 
-# ---------------------------------------------------------------------------
 # CaptureCard widget
-# ---------------------------------------------------------------------------
 
 class CaptureCard(QWidget):
     """
@@ -216,9 +197,7 @@ class CaptureCard(QWidget):
             # Notification audio is optional; a later event retries initialization.
             pass
 
-    # ------------------------------------------------------------------
     # Public API
-    # ------------------------------------------------------------------
 
     def show_clip(self, duration_s: int, fps: int, resolution: str,
                   hold_duration_ms: int = _DEFAULT_HOLD_DURATION_MS) -> None:
@@ -319,9 +298,7 @@ class CaptureCard(QWidget):
         if self._display_kind == 'background':
             self._stop_display()
 
-    # ------------------------------------------------------------------
     # Internal
-    # ------------------------------------------------------------------
 
     def set_visuals_enabled(self, enabled: bool) -> None:
         """Toggle the card window while leaving notification sounds enabled."""
@@ -353,7 +330,6 @@ class CaptureCard(QWidget):
         self._base_w = _COMPACT_W if compact else _FULL_W
         self._base_h = _COMPACT_H if compact else _FULL_H
 
-        # Load theme colors once per show
         try:
             tm = ThemeManager()
             self._c_bg         = QColor(tm.get_capture_card_color('CAPTURE_CARD_BG'))
@@ -471,9 +447,7 @@ class CaptureCard(QWidget):
             self._shim_timer.stop()
         self.update()
 
-    # ------------------------------------------------------------------
     # Painting
-    # ------------------------------------------------------------------
 
     def paintEvent(self, _event) -> None:  # noqa: N802
         p = QPainter(self)
@@ -566,11 +540,11 @@ class CaptureCard(QWidget):
             if self._stats:
                 self._draw_stats(p, 54)
 
-        # ── Progress track ──
+        # Progress track ──
         p.setPen(Qt.PenStyle.NoPen)
         p.fillRect(0, h - 2, w, 2, self._c_prog_track)
 
-        # ── Progress fill ──
+        # Progress fill ──
         fill_w = int(w * self._progress)
         if fill_w > 0:
             p.fillRect(0, h - 2, fill_w, 2, self._c_prog_fill)

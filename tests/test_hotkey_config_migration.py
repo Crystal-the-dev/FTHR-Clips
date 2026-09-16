@@ -44,7 +44,6 @@ def test_load_hotkeys_migrates_legacy_nested_schema_without_losing_controller_bi
     manager.config_file = tmp_path / 'hotkeys.json'
     manager.hotkeys = {
         'save_clip': 'F9',
-        'save_extended_clip': 'F10',
         'save_screenshot': 'F11',
         'confirm_game_detection': 'F8',
         'dismiss_game_detection': 'F7',
@@ -60,14 +59,12 @@ def test_load_hotkeys_migrates_legacy_nested_schema_without_losing_controller_bi
 
     assert manager.hotkeys == {
         'save_clip': 'Ctrl+F9',
-        'save_extended_clip': 'F10',
         'save_screenshot': 'F10',
         'confirm_game_detection': 'Ctrl+F8',
         'dismiss_game_detection': 'Ctrl+F7',
     }
     assert manager.controller_hotkeys == {
         'save_clip': 'Back+X',
-        'save_extended_clip': '',
         'save_screenshot': '',
         'confirm_game_detection': '',
         'dismiss_game_detection': '',

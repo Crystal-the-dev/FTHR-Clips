@@ -1,10 +1,4 @@
-"""
-Settings Manager - load/save user preferences.
-
-User preferences are stored in a single human-readable JSON file at
-~/.fthr/settings.json. JSON keeps this small configuration portable and easy to
-recover; a database would add unnecessary schema and migration overhead.
-"""
+"""Load and save user preferences in ~/.fthr/settings.json."""
 import json
 import os
 from pathlib import Path
@@ -24,10 +18,22 @@ def clips_directory_from(settings_manager=None) -> Path:
         configured = settings_manager.get('clips_directory', default)
         if not configured:
             return default
-        return Path(configured).expanduser().resolve(strict=False)
+        return Path(os.path.expandvars(configured)).expanduser().resolve(strict=False)
     except (OSError, TypeError, ValueError):
         # User-editable settings may contain a malformed path; keep the app on
         # its known local library root instead of failing during startup.
+        return default
+
+
+def recording_directory_from(settings_manager=None) -> Path:
+    """Use the same absolute, environment-expanded path in the UI and engine."""
+    default = clips_directory_from(settings_manager) / 'Recordings'
+    try:
+        configured = (settings_manager.get('recording_directory', default)
+                      if settings_manager is not None else default)
+        return Path(os.path.expandvars(configured or default)).expanduser().resolve(
+            strict=False)
+    except (OSError, TypeError, ValueError):
         return default
 
 
@@ -47,7 +53,6 @@ class SettingsManager:
         """Load settings from config file"""
         default_settings = {
             'clip_length': 30,       # seconds
-            'extended_clip_length': 60,  # seconds — used by F10 / EXT. CLIP hotkey
             'framerate': 60,         # FPS
             'resolution': 'source',  # 480p/720p/1080p/1440p/source
             'bitrate_level': 'medium',  # low/medium/high/custom
@@ -64,7 +69,6 @@ class SettingsManager:
             'recording_custom_bitrate_kbps': 25000,
             'hotkeys': {
                 'save_clip': 'F9',
-                'save_extended_clip': 'F10',
                 'save_screenshot': 'F12'
             },
             'quick_crop': None,      # dict {x,y,w,h,src_w,src_h} or None
@@ -167,9 +171,8 @@ class SettingsManager:
             # Ordered image layers. The singular keys above remain as a
             # compatibility mirror for older themes/settings builds.
             'image_overlays': [],
-            # Windows-only external keyboard visualizer. The nested object is
-            # deliberately separate from the retired keyboard_overlay_* keys
-            # used by the shelved bitmap-input prototype.
+            # External keyboard-visualizer settings are separate from the retired
+            # keyboard_overlay_* bitmap-overlay settings.
             'third_party_keyboard': {
                 'enabled': False,
                 'hwnd': 0,
@@ -192,10 +195,8 @@ class SettingsManager:
         try:
             with open(self.config_file, 'r') as f:
                 loaded = json.load(f)
-            # Merge loaded-over-defaults so adding a NEW setting in a later
-            # version doesn't blow up on someone's old config file. Nested dicts
-            # (hotkeys, source_volumes) get merged one level deep too — otherwise
-            # adding one new key would silently drop the user's existing ones.
+            # Merge persisted settings over defaults, including one level of nested
+            # keys, so older files retain new defaults without losing user choices.
             merged = dict(default_settings)
             for k, v in loaded.items():
                 if isinstance(v, dict) and isinstance(merged.get(k), dict):
@@ -223,13 +224,15 @@ class SettingsManager:
                 if key in merged
             ]
             retired_feature_keys = [
-                key for key in ('auto_crop_enabled',)
+                key for key in ('auto_crop_enabled', 'extended_clip_length')
                 if key in merged
             ]
             for key in (*retired_overlay_keys, *retired_audio_keys,
                         *retired_feature_keys):
                 merged.pop(key, None)
+            retired_hotkey = merged.get('hotkeys', {}).pop('save_extended_clip', None)
             self._retired_settings_removed = bool(
+                retired_hotkey is not None or
                 retired_overlay_keys or retired_audio_keys or retired_feature_keys)
             if ('image_overlays' not in loaded
                     and str(loaded.get('image_overlay_path', '') or '')):
@@ -253,8 +256,7 @@ class SettingsManager:
             return merged
         except Exception as e:
             print(f"Failed to load settings: {e}")
-            # Keep the broken file for diagnosis instead of silently resetting
-            # everything — users WILL hand-edit this JSON and break it.
+            # Keep invalid settings for diagnosis before falling back to defaults.
             try:
                 self.config_file.replace(self.config_file.with_suffix('.json.corrupt'))
                 print(f"Corrupt settings backed up to {self.config_file.with_suffix('.json.corrupt')}")

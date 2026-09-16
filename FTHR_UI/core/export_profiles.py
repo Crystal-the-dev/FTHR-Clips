@@ -79,8 +79,7 @@ class ExportPreset:
         if fps is not None and (not math.isfinite(fps) or not 1 <= fps <= 240):
             raise ValueError('Target FPS must be between 1 and 240')
         codec = str(self.video_codec or 'h264').lower()
-        # The reviewed runtime currently guarantees H.264 only.  Keeping the
-        # field in the schema makes adding a reviewed codec non-breaking.
+        # Keep the codec field for future presets; this runtime supports H.264 exports.
         if codec not in {'h264', 'source'}:
             raise ValueError('This installation supports H.264 export only')
         audio = int(self.audio_bitrate_kbps)
@@ -215,7 +214,7 @@ class ExportPresetManager:
 
 
 def probe_media(path: str | Path, ffprobe: str | None = None) -> MediaInfo:
-    """Read authoritative stream metadata with the bundled FFprobe."""
+    """Read stream metadata with the bundled FFprobe."""
 
     media_path = Path(path)
     if not media_path.is_file():
@@ -438,7 +437,7 @@ def compress_media(source_path: str | Path, output_path: str | Path,
                     if progress:
                         progress(percent, plan.summary)
                 except ValueError:
-                    # A malformed progress line is non-authoritative FFmpeg telemetry.
+                    # Ignore malformed progress telemetry; it doesn't describe export success.
                     pass
         code = process.wait()
         stderr_thread.join(timeout=2.0)

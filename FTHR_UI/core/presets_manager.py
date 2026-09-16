@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 PRESET_KEYS = [
-    'clip_length', 'extended_clip_length', 'framerate',
+    'clip_length', 'framerate',
     'resolution', 'bitrate_level', 'encoder_pref', 'codec_pref',
     'encoder_preset', 'audio_capture_enabled',
 ]
@@ -20,7 +20,15 @@ class PresetsManager:
             return {}
         try:
             with open(self._path, 'r') as f:
-                return json.load(f)
+                presets = json.load(f)
+            removed = False
+            for values in presets.values():
+                if isinstance(values, dict) and 'extended_clip_length' in values:
+                    values.pop('extended_clip_length')
+                    removed = True
+            if removed:
+                self._write(presets)
+            return presets
         except Exception:
             return {}
 
@@ -48,7 +56,8 @@ class PresetsManager:
 
     def save(self, name: str, data: dict):
         presets = self._read()
-        presets[name] = data
+        presets[name] = {key: value for key, value in data.items()
+                         if key in PRESET_KEYS}
         self._write(presets)
 
     def delete(self, name: str):

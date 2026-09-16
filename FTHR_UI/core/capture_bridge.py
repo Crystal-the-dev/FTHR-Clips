@@ -1,18 +1,7 @@
-# capture_bridge.py - Python interface to the C++ capture engine.
-#
-# The heavy lifting (screen grab + NVENC/x264 encode + ring buffer) lives in a
-# native engine process. This file is the skinny Python side that talks to it.
-#
-# How they talk: a single fixed-layout struct mapped into shared memory. The UI
-# writes a command into the "ui_*" fields, the engine reads it, does the thing,
-# and writes back into the "engine_*" fields. No frame payload crosses this IPC
-# boundary, which keeps command and status traffic small.
-#
-# The catch is that Windows and Linux do shared memory completely differently:
-#   - Windows: OpenFileMapping + MapViewOfFile via kernel32, wide (utf-16) strings
-#   - Linux:   plain mmap of /dev/shm/<name>, plus narrow (utf-8) byte strings
-# Platform-specific mapping code is required, but the structure layout is a
-# shared contract. Changing field order requires a matching native-engine change.
+# Shared-memory command/status bridge to the native capture engine.
+# Windows uses kernel32 mappings and UTF-16 strings; Linux uses /dev/shm and
+# UTF-8 buffers. Each layout must match its native shared_memory.h byte for byte.
+# Frames remain in the engine; only commands and status cross this boundary.
 
 import sys
 import ctypes
@@ -24,8 +13,7 @@ if sys.platform == 'win32':
     from ctypes import c_wchar
 
 
-# Command/response codes are just plain ints on the wire. Keep these in lockstep
-# with the enums on the C++ side — they are not auto-generated, sadly.
+# Keep wire command/response values aligned with the native enums.
 class CommandType(IntEnum):
     NONE = 0
     START_RECORDING = 1
@@ -48,15 +36,12 @@ class ResponseType(IntEnum):
     CLIP_SAVED = 3
     STATUS_UPDATE = 4
     ERROR_OCCURRED = 5
-    SAVE_STARTED = 6       # Phase 3: async SaveClip queued
+    SAVE_STARTED = 6       # Save request queued; completion arrives separately
     MANUAL_RECORDING_ERROR = 7
 
 
-# THE struct. This binary layout is the entire API contract with the engine.
-# Windows uses wide chars (c_wchar) because the engine was born on Win32 and
-# everything there is utf-16. Linux uses plain bytes (c_char) and bigger string
-# buffers because paths on Linux can get long and weird. Field ORDER and SIZES
-# must match the C++ definition byte-for-byte or you'll read pure nonsense.
+# Windows strings use c_wchar; Linux uses c_char with larger UTF-8 buffers.
+# Field order, sizes, and alignment must match the platform C++ layout.
 if sys.platform == 'win32':
     class SharedMemoryLayout(Structure):
         _fields_ = [
@@ -179,17 +164,8 @@ class CaptureBridge:
 
         size = ctypes.sizeof(SharedMemoryLayout)
 
-        # Layout check BEFORE mapping. The struct is the entire contract and
-        # there is no version field inside it, so the region's size is the only
-        # signal available at runtime. If an engine built from a different
-        # shared_memory.h is running, every field past the drift point would
-        # otherwise be read as garbage — silently. Refusing with a message
-        # naming both sizes is the difference between a five-minute diagnosis
-        # and a week of "the encoder reports nonsense".
-        #
-        # The mapping NAME already carries a layout version (_v4), so an old
-        # engine and a new UI normally cannot meet at all. This catches the
-        # case where someone bumps the struct without bumping the name.
+        # Reject a size mismatch before mapping. This catches layout changes made
+        # without updating the versioned mapping name.
         try:
             actual = os.fstat(fd).st_size
         except OSError:
@@ -270,6 +246,8 @@ class CaptureBridge:
 
 
     def shutdown(self):
+        # Release the acknowledgement's layout reference before unmapping.
+        self._save_acknowledged_layout = None
         if sys.platform != 'win32':
             # Release the ctypes from_buffer reference before closing the mmap;
             # otherwise Python raises BufferError for the exported pointer.
@@ -300,29 +278,12 @@ class CaptureBridge:
 
 
     def save_clip(self, output_path: str, duration: int = 30) -> bool:
-        """
-        Hand the engine a SaveClip command and return immediately.
+        """Submit SaveClip without blocking the Qt thread.
 
-        **This is a command submit, not a save.** A True return means exactly
-        one thing: the path, the duration and the command code were written
-        into shared memory. It does *not* mean a clip exists, that the engine
-        read the command, or that anything was encoded. The only authority on
-        whether a clip was written is `CLIP_SAVED` arriving in
-        `engine_response` — which this method deliberately does not look at.
-
-        Do not add a wait loop here. This runs on the Qt main thread; the
-        previous version busy-waited up to a second for `SAVE_STARTED` and
-        froze the UI on every hotkey press against a slow engine (AUDIT-011).
-        The save poller in main.py owns the response side.
-
-        This method also must never write `engine_response`. `engine_response`
-        is a single-slot field with no queue; clearing it here destroyed the
-        still-unconsumed completion of the *previous* save (AUDIT-017). If a
-        stale response is pending, the poller processes it before this is
-        called — the ordering is enforced by the caller, not by a clear here.
-
-        Returns True if the command was submitted locally, False if the bridge
-        is not connected or the path cannot be represented in the layout.
+        True means submission succeeded; it doesn't confirm a saved file.
+        False means no connection or an unrepresentable path. The poller in main.py
+        owns responses and must process any pending result before submission.
+        Never clear engine_response here: it may hold the previous save result.
         """
         if not self.is_connected():
             print('Not connected to capture engine')
@@ -343,6 +304,7 @@ class CaptureBridge:
                 return False
             self._layout.ui_string = output_path
         self._layout.ui_param1 = duration
+        self._save_acknowledged_layout = None
         # Write the command code LAST. The engine polls ui_command, so once this
         # lands it may read every other field — they all need to be set already.
         self._layout.ui_command = CommandType.SAVE_CLIP
@@ -394,25 +356,10 @@ class CaptureBridge:
             self._log_read_error_once('request_engine_shutdown', e)
             return False
 
-    # -- The save response channel -------------------------------------------
-    #
-    # `engine_response` + `engine_string` have exactly ONE reader: the save
-    # poller in main.py. Reading is split into peek + consume on purpose.
-    #
-    # peek_save_response() returns the response *and* the string it belongs to
-    # as one value, without changing anything. The caller interprets it, and
-    # only then calls consume_save_response(). That ordering is what makes an
-    # unexpected or unattributable response loggable instead of silently
-    # swallowed, and it guarantees the string is never paired with the response
-    # of a *different* poll cycle.
-    #
-    # Engine write-order contract:
-    #   Success path — the engine clears engine_string at SAVE_CLIP and writes
-    #   engine_response last, so a peeked CLIP_SAVED always has a settled
-    #   string (usually empty).
-    #   Failure path — both engines write the bounded error payload before
-    #   publishing ERROR_OCCURRED. Callers still tolerate an empty detail as
-    #   defense in depth for an older engine or an unmapped/shutting-down IPC.
+    # The save poller in main.py owns this response channel. It peeks the code
+    # and detail together, interprets them, then consumes the result. The engine
+    # writes the payload before publishing the response; error details may be
+    # empty if the mapping is unavailable or an older engine is running.
 
     #: Responses that belong to a save. Everything else (STATUS_UPDATE,
     #: RECORDING_STARTED, …) is not ours and must be left in the field.
@@ -435,22 +382,37 @@ class CaptureBridge:
             kind = self._SAVE_RESPONSES.get(resp)
             if kind is None:
                 return None
+            if (resp == ResponseType.SAVE_STARTED
+                    and getattr(self, '_save_acknowledged_layout', None)
+                    is self._layout):
+                # Leave the acknowledgement in shared memory. The engine can
+                # replace it with a terminal result at any instant; clearing
+                # it here could erase that result. Hide our already-read ack
+                # locally so the poller can still advance its deadlines.
+                return None
             return (kind, self._read_engine_string())
         except Exception as e:
             self._log_read_error_once('peek_save_response', e)
             return None
 
-    def consume_save_response(self) -> bool:
-        """Clear a save response after it has been interpreted.
+    def consume_save_response(self, expected_kind: str | None = None) -> bool:
+        """Consume the result that the poller actually read.
 
-        Only clears if a save response is actually present, so a response that
-        arrived between peek and consume is never destroyed unread. This is the
-        only place in the codebase that writes `engine_response`.
+        Acknowledge SAVE_STARTED locally: completion can replace it between peek
+        and consume. Only terminal results are cleared in shared memory; one
+        outstanding save prevents a subsequent result from being erased.
         """
         if not self.is_connected():
             return False
         try:
-            if self._layout.engine_response not in self._SAVE_RESPONSES:
+            current_kind = self._SAVE_RESPONSES.get(self._layout.engine_response)
+            kind = expected_kind if expected_kind is not None else current_kind
+            if kind == 'started':
+                if getattr(self, '_save_acknowledged_layout', None) is self._layout:
+                    return False
+                self._save_acknowledged_layout = self._layout
+                return True
+            if kind not in ('saved', 'error') or current_kind != kind:
                 return False
             self._layout.engine_response = ResponseType.NONE
             return True

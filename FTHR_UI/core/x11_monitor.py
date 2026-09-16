@@ -1,10 +1,7 @@
-"""Native-X11 monitor discovery and capture-rectangle selection.
+"""Resolve X11 capture rectangles from RandR physical-pixel geometry.
 
-Qt screen geometry is expressed in device-independent coordinates.  FFmpeg's
-``x11grab`` input, however, reads physical root-window pixels.  On scaled or
-mixed-DPI desktops those coordinate systems are not interchangeable.  RandR's
-current output geometry is therefore the authority for the native X11 capture
-rectangle, while the persisted setting remains the stable connector name.
+Qt coordinates are device-independent and can differ on mixed-DPI desktops.
+Persist the connector name and resolve its current geometry.
 """
 
 from __future__ import annotations

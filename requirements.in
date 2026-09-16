@@ -1,34 +1,21 @@
-# requirements.in — DIRECT runtime dependencies of the FTHR Clips UI.
-#
-# This is the file humans edit. It lists only packages the code imports
-# directly, with the loosest constraint we are actually willing to support.
-# It is NOT what a release is built from.
-#
-# The release path is requirements-alpha.txt: a fully pinned lock covering the
-# whole transitive closure. Regenerate it after changing anything here:
-#
-#     python -m pip install -r requirements.in
-#     python -m pip freeze > /tmp/freeze.txt   # then curate into the lock
-#
-# Rationale (AUDIT-009): the old requirements.txt used `>=` throughout, so two
-# developers installing on different days got materially different Qt versions
-# and UI bug reports were not reproducible.
+# Direct runtime dependencies; maintain pins in requirements-alpha.txt after
+# changing this list. Release builds install from that lock for reproducibility.
 
-# --- GUI -------------------------------------------------------------------
+# GUI
 # PySide6 keeps the Python binding and the reviewed Qt runtime on the LGPLv3
 # path selected by AUDIT-013. Do not add a second Qt binding.
 PySide6>=6.11,<6.12
 
-# --- Capture / media -------------------------------------------------------
+# Capture / media
 # Headless build on purpose: the GUI is Qt, and full opencv-python would drag
 # in a second, conflicting Qt.
 opencv-python-headless>=4.13,<5
 numpy>=2.4,<3
 
-# --- Audio -----------------------------------------------------------------
+# Audio
 sounddevice>=0.5,<0.6
 
-# --- Input -----------------------------------------------------------------
+# Input
 # Windows global hotkeys. On Linux the app uses its own evdev/socket path
 # (core/hotkey_manager.py) and this is only a fallback.
 keyboard>=0.13.5,<0.14

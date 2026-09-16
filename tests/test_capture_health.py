@@ -62,7 +62,7 @@ def test_sustained_stall_requests_only_one_recovery() -> None:
     second = _observe(monitor, 10)
     assert first.state is CaptureHealthState.STALLED
     assert first.request_recovery
-    assert not first.save_allowed
+    assert first.save_allowed  # native ring checks stale packets
     assert not second.request_recovery
 
 
@@ -71,7 +71,7 @@ def test_progress_after_stall_recovers_and_save_is_allowed() -> None:
     monitor = CaptureHealthMonitor(clock=clock)
     _observe(monitor, 1)
     clock.advance(9.0)
-    assert not _observe(monitor, 1).save_allowed
+    assert _observe(monitor, 1).save_allowed
     clock.advance(0.1)
     recovered = _observe(monitor, 2)
     assert recovered.state is CaptureHealthState.HEALTHY
@@ -88,7 +88,7 @@ def test_one_post_recovery_frame_does_not_warm_buffer_by_wall_time() -> None:
     clock.advance(6.0)
     no_progress = _observe(monitor, 2)
     assert no_progress.fresh_buffer_seconds == 0
-    assert not evaluate_save_admission(no_progress, 30).allowed
+    assert evaluate_save_admission(no_progress, 30).allowed
 
 
 def test_process_alive_backend_failed_is_not_healthy() -> None:
@@ -98,14 +98,14 @@ def test_process_alive_backend_failed_is_not_healthy() -> None:
     assert not result.save_allowed
 
 
-def test_recovering_and_paused_capture_reject_saves() -> None:
+def test_recovery_is_rejected_but_native_owns_focus_pause_admission() -> None:
     monitor = CaptureHealthMonitor(clock=FakeClock())
     recovering = _observe(monitor, 10, int(CaptureHealthFlag.RECOVERING))
     paused = _observe(monitor, 10, int(CaptureHealthFlag.ACTIVE | CaptureHealthFlag.PAUSED))
     assert recovering.state is CaptureHealthState.RECOVERING
     assert not recovering.save_allowed
     assert paused.state is CaptureHealthState.DEGRADED
-    assert not paused.save_allowed  # no fresh buffer exists after an intentional pause
+    assert paused.save_allowed  # native focus flags are checked at the save instant
 
 
 def test_intentional_pause_preserves_an_already_warm_replay_ring() -> None:
@@ -126,7 +126,7 @@ def test_intentional_pause_preserves_an_already_warm_replay_ring() -> None:
     assert resumed.fresh_buffer_seconds == 7
     admitted = evaluate_save_admission(resumed, 30)
     assert admitted.allowed
-    assert admitted.duration_seconds == 7
+    assert admitted.duration_seconds == 30
 
 
 def test_static_wgc_source_keeps_verified_replay_saveable() -> None:
@@ -228,18 +228,18 @@ def test_generation_change_resets_fresh_buffer_age() -> None:
     assert reset.fresh_buffer_seconds == 0
 
 
-def test_save_is_rejected_while_stalled_and_accepted_after_recovery() -> None:
+def test_save_does_not_guess_native_replay_length_from_poll_timing() -> None:
     clock = FakeClock()
     monitor = CaptureHealthMonitor(clock=clock)
     _observe(monitor, 1)
     clock.advance(9)
     stalled = _observe(monitor, 1)
-    assert not evaluate_save_admission(stalled, 30).allowed
+    assert evaluate_save_admission(stalled, 30).allowed
 
     _observe(monitor, 2)
     clock.advance(6)
     healthy = _observe(monitor, 3)
     admitted = evaluate_save_admission(healthy, 30)
     assert admitted.allowed
-    assert admitted.duration_seconds == 6
-    assert "recently recovered" in admitted.reason
+    assert admitted.duration_seconds == 30
+    assert admitted.reason == ""

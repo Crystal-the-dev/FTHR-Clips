@@ -1,9 +1,7 @@
-"""Versioned, privacy-bounded audio-source manifests for FTHR-native clips.
+"""Audio-source sidecars mapping clip-local UUIDs to media streams.
 
-The MP4 stream title remains a useful human-readable fallback.  This sidecar is
-the authoritative mapping from a clip-local source UUID to its media stream.
-It deliberately never stores process paths, window titles, command lines, URLs,
-usernames, or live-device handles.
+Manifests exclude process paths, window titles, command lines, URLs, usernames,
+and live-device handles. Container stream titles are the fallback.
 """
 from __future__ import annotations
 
@@ -126,17 +124,11 @@ def write_manifest_atomic(manifest: dict[str, Any], media_path: str | Path) -> P
 
 
 def rebind_manifest_after_media_replace(media_path: str | Path) -> bool:
-    """Re-bind an existing native sidecar after a lossless media rewrite.
+    """Update the media hash after a rewrite that preserves every audio stream.
 
-    Video post-processing can replace the MP4 while stream-copying all of its
-    audio tracks. The source identities are still valid in that case, but the
-    media SHA-256 necessarily changes. Read and validate the old sidecar
-    *without* accepting it for playback, update only its exact-media binding,
-    and publish it atomically.
-
-    Returns ``False`` for legacy/imported clips and for an invalid sidecar. A
-    caller must only invoke this after a command which explicitly maps every
-    original audio stream in its original order.
+    Call only after copying all original audio streams in their original order.
+    The old sidecar is validated, rebound, and published atomically. Returns
+    False for missing or invalid sidecars, including legacy/imported clips.
     """
 
     media = Path(media_path)
@@ -177,12 +169,10 @@ def read_manifest_for_media(media_path: str | Path) -> dict[str, Any] | None:
 def verified_audio_tracks_for_export(
     media_path: str | Path,
 ) -> tuple[tuple[str, int, str], ...]:
-    """Return clip-local export tracks only from a hash-bound manifest.
+    """Return export tracks from a valid, hash-bound manifest.
 
-    ``stream_index`` in the manifest is an absolute MP4 index. FFmpeg's
-    ``0:a:N`` selector is audio-relative, so callers receive the semantic
-    ordering paired with a deterministic ``N``. An absent or stale sidecar
-    yields no tracks rather than inferred labels.
+    Convert absolute MP4 stream indices to audio-relative FFmpeg ``0:a:N``
+    selectors. Missing or stale sidecars yield no tracks.
     """
 
     manifest = read_manifest_for_media(media_path)

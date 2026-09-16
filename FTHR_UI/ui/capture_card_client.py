@@ -1,19 +1,7 @@
-"""Client proxy for the capture-card notification process.
+"""Forward CaptureCard methods to a separate notification process.
 
-The animated notification has its own process and Qt event loop so clip
-finalization and library refresh work in the main process cannot stall it. This
-class sends small, line-delimited commands over stdin and exposes the same public
-methods as the in-process CaptureCard widget.
-
-Public API is identical to the real CaptureCard so callers don't know the diff:
-    client.show_clip(duration_s, fps, resolution)
-    client.show_screenshot()
-    client.show_error(detail='')
-    client.show_upload(filename='')
-    client.show_upload_failed(detail='')
-    client.show_recording_saved(filename='')
-    client.show_background_capture(source)
-    client.close()
+Line-delimited stdin commands keep its Qt event loop independent of
+main-process finalization and library scans.
 """
 
 import os
@@ -51,6 +39,10 @@ class CaptureCardClient:
     def _launch(self):
         try:
             env = dict(os.environ)
+            # Popen's encoding controls the parent pipe only. The detached
+            # Python child otherwise decodes redirected stdin with the Windows
+            # locale (e.g. cp1252), corrupting names such as KovaaK’s.
+            env['PYTHONIOENCODING'] = 'utf-8'
             # Force XWayland only on Linux. Windows must retain its native Qt
             # platform plugin; setting xcb there makes the card process exit.
             if sys.platform != 'win32' and os.environ.get('WAYLAND_DISPLAY'):

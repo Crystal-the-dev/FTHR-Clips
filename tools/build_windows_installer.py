@@ -1,17 +1,9 @@
 #!/usr/bin/env python3
-"""Build the Windows onedir bundle and versioned Inno Setup installer safely.
+"""Build and verify the Windows bundle and Inno Setup installer.
 
-The script fetches only the Microsoft VC++ runtime through the existing
-documented downloader, verifies its Windows signature, runs the license and
-lifecycle gates, then compiles Inno Setup.  It deliberately has no embedded
-certificate, password, timestamp URL, or signing identity.
-
-For a signed release, provide an operator-owned command template containing
-``{file}`` through ``--sign-command`` or ``FTHR_SIGN_COMMAND``.  The command is
-run for FTHRClips.exe, the native capture engine, and then the final installer.
-
-    python tools/build_windows_installer.py
-    python tools/build_windows_installer.py --sign-command 'signtool sign ... {file}' --require-signed
+Fetch and verify the Microsoft runtime, then run license and lifecycle gates.
+For signing, provide a command containing ``{file}`` via --sign-command or
+FTHR_SIGN_COMMAND. Use --require-signed to require signed release outputs.
 """
 
 from __future__ import annotations

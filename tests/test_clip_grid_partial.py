@@ -353,12 +353,12 @@ def test_thumbnail_worker_rejects_partial_before_decoder(
     partial.write_bytes(b'partial')
     decoder_called = False
 
-    def unexpected_decoder(_path: str) -> object:
+    def unexpected_decoder(*_args) -> object:
         nonlocal decoder_called
         decoder_called = True
-        raise AssertionError('partial file reached cv2.VideoCapture')
+        raise AssertionError('partial file reached thumbnail decoder')
 
-    monkeypatch.setattr(clip_grid.cv2, 'VideoCapture', unexpected_decoder)
+    monkeypatch.setattr(clip_grid, '_decode_thumbnail_with_owned_process', unexpected_decoder)
     received: list[tuple[str, str, int]] = []
     worker = clip_grid._ThumbnailWorker(str(partial))
     worker.signals.finished.connect(
@@ -375,9 +375,11 @@ def test_thumbnail_failure_does_not_invalidate_the_saved_clip(
     saved = tmp_path / 'saved.mp4'
     saved.write_bytes(b'valid-core-clip')
     monkeypatch.setattr(
-        clip_grid.cv2, 'VideoCapture',
-        lambda _path: (_ for _ in ()).throw(
+        clip_grid, '_decode_thumbnail_with_owned_process',
+        lambda *_args: (_ for _ in ()).throw(
             RuntimeError('injected thumbnail decoder failure')))
+    monkeypatch.setattr(clip_grid, '_probe_with_owned_process', lambda *_: None)
+    monkeypatch.setattr(clip_grid, 'THUMB_CACHE_DIR', str(tmp_path / 'cache'))
     received: list[tuple[str, str, int]] = []
     worker = clip_grid._ThumbnailWorker(str(saved))
     worker.signals.finished.connect(
@@ -394,29 +396,9 @@ def test_metadata_enrichment_failure_does_not_invalidate_the_saved_clip(
     saved = tmp_path / 'saved.mp4'
     saved.write_bytes(b'valid-core-clip')
 
-    class _Capture:
-        def isOpened(self):
-            return True
-
-        def read(self):
-            return True, SimpleNamespace(shape=(18, 32, 3))
-
-        def get(self, property_id):
-            return {
-                clip_grid.cv2.CAP_PROP_FPS: 30.0,
-                clip_grid.cv2.CAP_PROP_FRAME_COUNT: 3.0,
-                clip_grid.cv2.CAP_PROP_FRAME_WIDTH: 32.0,
-                clip_grid.cv2.CAP_PROP_FRAME_HEIGHT: 18.0,
-            }.get(property_id, 0.0)
-
-        def release(self):
-            return None
-
-    monkeypatch.setattr(clip_grid.cv2, 'VideoCapture', lambda _path: _Capture())
-    monkeypatch.setattr(clip_grid.cv2, 'imwrite', lambda *_args, **_kwargs: True)
     monkeypatch.setattr(
-        clip_grid, 'probe_video_metadata',
-        lambda _path: (_ for _ in ()).throw(
+        clip_grid, '_probe_with_owned_process',
+        lambda *_args: (_ for _ in ()).throw(
             RuntimeError('injected metadata probe failure')))
     monkeypatch.setattr(clip_grid, 'THUMB_CACHE_DIR', str(tmp_path / 'cache'))
 

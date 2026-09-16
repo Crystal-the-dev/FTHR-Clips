@@ -1,11 +1,4 @@
-"""
-FTHR Clips - Main Application Entry Point
-
-Layout:
-    Top bar  — white, frameless drag region:
-               Logo | ■ status | [CAPTURE▼] [SOURCE▼] [HOTKEYS▼] | – ×
-    Body     — black, clip grid fills all remaining space
-"""
+"""Application entry point, main window, capture coordination, and save flow."""
 
 import sys
 import json
@@ -37,7 +30,6 @@ if sys.platform == 'win32':
     os.environ.setdefault('QT_MEDIA_BACKEND', 'windows')
 
 
-# ---------------------------------------------------------------------------
 # File logging - all output also goes to ~/.fthr/logs/fthr.log
 # Important for packaged apps (pythonw) which have no console
 
@@ -125,7 +117,6 @@ from core.alpha_capabilities import (
     focus_pause_supported,
 )
 from core.capture_settings import (
-    EXTENDED_CLIP_VALUES,
     FPS_VALUES,
     NORMAL_CLIP_VALUES,
     CaptureConfig,
@@ -134,7 +125,6 @@ from core.capture_settings import (
     AUDIO_CAPTURE_MODE_COMBINED,
     AUDIO_CAPTURE_MODE_SEPARATED,
     normalize_audio_capture_mode,
-    validate_extended_clip_length,
     validate_fps,
     validate_normal_clip_length,
 )
@@ -168,7 +158,10 @@ from core.engine_startup_diagnostics import (
     extract_startup_warnings,
     format_engine_launch_failure,
 )
-from core.clip_files import cleanup_stale_partial_clips, is_completed_video_path
+from core.clip_files import (
+    is_completed_video_path,
+    start_stale_partial_cleanup,
+)
 from core.audio_manifest import (
     manifest_path_for, read_manifest_for_media, rebind_manifest_after_media_replace,
 )
@@ -193,7 +186,9 @@ from core.game_detector import (
 )
 from core.focus_monitor import FocusMonitor
 from core.presets_manager import PresetsManager, PRESET_KEYS
-from core.settings_manager import SettingsManager, clips_directory_from
+from core.settings_manager import (
+    SettingsManager, clips_directory_from, recording_directory_from,
+)
 from core.theme_manager import ThemeManager
 from core.windows_monitor import (
     default_windows_monitor_path,
@@ -254,7 +249,10 @@ from core.ffmpeg_tools import (
     get_ffmpeg_exe, get_ffprobe_exe, postprocess_video_args,
     software_video_args, FFmpegUnavailable)
 from core.export_profiles import probe_media
-from core.media_metadata import probe_video_cfr, probe_video_metadata
+from core.media_metadata import (
+    probe_video_cfr_evidence,
+    probe_video_metadata,
+)
 from ui.capture_card_client import CaptureCardClient
 from ui.error_bar import ErrorBar
 from ui.clip_grid import ClipGrid, _show_in_file_manager
@@ -268,6 +266,7 @@ from ui.game_crop_dialog import GameCropDialog
 from ui.capture_settings_widget import (
     _enumerate_capturable_windows,
 )
+from ui.style import set_theme_style, refresh_theme_styles
 from ui.style import (
     Colors, Fonts, Sizes,
     label_display, label_uppercase, label_body,
@@ -609,29 +608,12 @@ def select_post_route(*, audio_on: bool, multiband_enabled: bool,
                       camera: bool, audio_capture_mode: str = 'combined',
                       native_audio: bool = False,
                       keyboard: bool = False) -> tuple[str, bool]:
-    """Decide which post-processing route a saved clip takes.
+    """Choose exactly one post-processing route and report asynchronous work.
 
-    Returns ``(route, has_async_mux)`` where route is exactly one of
-    ``'mic'`` or ``'finalize'``. ``'mic'`` now also covers the native Windows
-    audio finalization pass used to collapse system + microphone streams into
-    the default combined track. ``multiband_enabled`` remains in the
-    compatibility signature for callers using an older capture config, but
-    per-application audio is intentionally ignored.
-
-    The exclusivity matters: each route ends by setting the ``clip_ready``
-    event, and ``clip_ready`` is the single gate the upload manager waits on.
-    Two routes running for one clip set it twice, and the upload starts against
-    a half-written file — the mic mux's os.replace() racing the watermark
-    pass. This used to be three independent `if` blocks that could all fire;
-    it is a pure function now so the exclusivity can actually be tested.
-
-    ``has_async_mux`` says whether *any* route will touch the file after this
-    returns, which is what the upload manager needs in order to wait. Every
-    completed clip is asynchronous because the finalizer verifies and repairs
-    the physical MP4 sample cadence before publication. ``keyboard`` covers
-    the Windows external-window visualizer; ``watermark`` remains in the
-    compatibility signature, but Capture Card watermarking belongs to
-    export/share and never rewrites the source clip.
+    Return (route, has_async_mux); route is mic or finalize. The mic route also
+    handles native Windows combined audio. Each route owns clip_ready until
+    finalization finishes, preventing upload of a partially written file.
+    multiband_enabled is retained for caller compatibility.
     """
     del multiband_enabled
     mic_active = audio_on and mic_running
@@ -708,10 +690,8 @@ _NVENC_PRESET_OPTIONS = (
 )
 
 
-# ---------------------------------------------------------------------------
 # Custom QComboBox — shows icons/dropdown.png as the arrow indicator and
 # rotates it 180° while the popup is open, back to 0° when it closes.
-# ---------------------------------------------------------------------------
 
 class _DropdownCombo(WheelSafeComboBox):
     _custom_arrow_managed = True
@@ -719,6 +699,9 @@ class _DropdownCombo(WheelSafeComboBox):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._popup_open = False
+        self.refresh_theme_palette()
+
+    def refresh_theme_palette(self):
         # Force the popup list to use our dark colors via palette, because on
         # Qt6/Linux the stylesheet alone doesn't reliably override the system
         # palette for the floating item view (white-on-white issue).
@@ -751,9 +734,7 @@ class _DropdownCombo(WheelSafeComboBox):
         p.end()
 
 
-# ---------------------------------------------------------------------------
 # Compact numeric control — editable value with the original FTHR stepper.
-# ---------------------------------------------------------------------------
 
 class _NumberSpinBox(QSpinBox):
     """Keyboard-editable value with square minus/plus controls at the right."""
@@ -852,9 +833,7 @@ class _NumberSpinBox(QSpinBox):
         ''')
 
 
-# ---------------------------------------------------------------------------
 # Mic level meter — paints a horizontal RMS bar driven by a sounddevice stream
-# ---------------------------------------------------------------------------
 
 class _MicLevelMeter(QWidget):
     """Live mic-loudness bar. Updates at ~30Hz from an InputStream callback."""
@@ -1082,9 +1061,7 @@ class _MicLevelMeter(QWidget):
         p.end()
 
 
-# ---------------------------------------------------------------------------
 # Popup panel base — shared look for all dropdown panels
-# ---------------------------------------------------------------------------
 
 class _PopupPanel(QFrame):
     """Base class for top-bar dropdown panels (capture settings, source, hotkeys)."""
@@ -1244,15 +1221,12 @@ class _ToggleSwitch(QCheckBox):
         painter.end()
 
 
-# ---------------------------------------------------------------------------
 # Capture Settings popup
-# ---------------------------------------------------------------------------
 
 class CaptureSettingsPopup(_PopupPanel):
     """Dropdown panel for independent replay-clip and recording profiles."""
 
     clip_length_changed   = Signal(int)
-    extended_clip_changed = Signal(int)
     framerate_changed     = Signal(int)
     resolution_changed  = Signal(int, int)
     bitrate_changed     = Signal(int)
@@ -1261,8 +1235,6 @@ class CaptureSettingsPopup(_PopupPanel):
 
     _CLIP_VALUES  = list(NORMAL_CLIP_VALUES)
     _CLIP_LABELS  = ['5s','10s','15s','30s','45s','1m','1m 30s','2m','3m','4m','5m']
-    _EXT_VALUES   = list(EXTENDED_CLIP_VALUES)
-    _EXT_LABELS   = ['30s','45s','1m','1m 30s','2m','3m','4m','5m']
     _FPS_VALUES   = list(FPS_VALUES)
     _RES_LABELS   = ['480p','720p','1080p','1440p','Source']
     _RES_KEYS     = ['480p','720p','1080p','1440p','source']
@@ -1278,7 +1250,6 @@ class CaptureSettingsPopup(_PopupPanel):
         self._restart_pending = False
 
         self.cur_clip   = self.sm.get('clip_length',    30)
-        self.cur_ext    = self.sm.get('extended_clip_length',  60)
         self.cur_fps    = self.sm.get('framerate',       60)
         self.cur_res    = self.sm.get('resolution',   'source')
         self.cur_qual   = self.sm.get('bitrate_level', 'high')
@@ -1337,13 +1308,6 @@ class CaptureSettingsPopup(_PopupPanel):
         self.clip_combo = self._make_combo(self._CLIP_LABELS, clip_idx,
                                            self._on_clip_changed)
         clip_fields_layout.addLayout(_row('CLIP LENGTH', self.clip_combo))
-
-        # Extended clip length
-        ext_idx = self._EXT_VALUES.index(self.cur_ext) \
-            if self.cur_ext in self._EXT_VALUES else 2  # default index for '1m'
-        self.ext_combo = self._make_combo(self._EXT_LABELS, ext_idx,
-                                          self._on_ext_clip_changed)
-        clip_fields_layout.addLayout(_row('EXT. CLIP', self.ext_combo))
 
         # FPS
         fps_idx = self._FPS_VALUES.index(self.cur_fps) \
@@ -1498,7 +1462,7 @@ class CaptureSettingsPopup(_PopupPanel):
             combo.setStyleSheet(_COMBO_STYLE)
         for label in self.findChildren(QLabel):
             if label.text() in {
-                    'CLIP LENGTH', 'EXT. CLIP', 'FRAMERATE', 'RESOLUTION',
+                    'CLIP LENGTH', 'FRAMERATE', 'RESOLUTION',
                     'QUALITY', 'CUSTOM BITRATE'}:
                 label.setStyleSheet(_LABEL_STYLE)
         for button in (self.clips_profile_btn, self.recording_profile_btn):
@@ -1560,17 +1524,9 @@ class CaptureSettingsPopup(_PopupPanel):
         self.clip_length_changed.emit(self.cur_clip)
         self._update_summary()
 
-    def _on_ext_clip_changed(self, idx):
-        self.cur_ext = self._EXT_VALUES[idx]
-        self.sm.set('extended_clip_length', self.cur_ext)
-        self.sm.save_settings()
-        self._mark_restart()
-        self.extended_clip_changed.emit(self.cur_ext)
-        self._update_summary()
 
     def reload_from_settings(self):
         self.cur_clip = self.sm.get('clip_length', 30)
-        self.cur_ext  = self.sm.get('extended_clip_length', 60)
         self.cur_fps  = self.sm.get('framerate', 60)
         self.cur_res  = self.sm.get('resolution', 'source')
         self.cur_qual = self.sm.get('bitrate_level', 'high')
@@ -1588,7 +1544,6 @@ class CaptureSettingsPopup(_PopupPanel):
 
         for combo, values, val in [
             (self.clip_combo, self._CLIP_VALUES, self.cur_clip),
-            (self.ext_combo,  self._EXT_VALUES,  self.cur_ext),
             (self.fps_combo,  self._FPS_VALUES,   self.cur_fps),
         ]:
             idx = values.index(val) if val in values else 0
@@ -1789,9 +1744,7 @@ class CaptureSettingsPopup(_PopupPanel):
         return presets.get(self.recording_qual, presets['high'])
 
 
-# ---------------------------------------------------------------------------
 # Source popup
-# ---------------------------------------------------------------------------
 
 class SourcePopup(_PopupPanel):
     """Dropdown panel: desktop / window selector."""
@@ -2123,9 +2076,7 @@ class SourcePopup(_PopupPanel):
         return 'WINDOW'
 
 
-# ---------------------------------------------------------------------------
 # Key-capture button — click it, press any key, done.
-# ---------------------------------------------------------------------------
 
 
 class GameDetectionPopup(_PopupPanel):
@@ -2866,7 +2817,6 @@ class HotkeyPopup(_PopupPanel):
         layout.addWidget(label)
         actions = [
             ('CAPTURE CLIP', 'save_clip'),
-            ('EXTENDED CLIP', 'save_extended_clip'),
             ('SCREENSHOT', 'save_screenshot'),
         ]
         if sys.platform == 'win32':
@@ -2971,9 +2921,7 @@ class HotkeyPopup(_PopupPanel):
         super().hideEvent(event)
 
 
-# ---------------------------------------------------------------------------
 # TopBarButton — a styled button for the top bar dropdowns
-# ---------------------------------------------------------------------------
 
 class TopBarButton(ThemedDropdownButton):
     """Compact rounded-rect button for the dark status row that shows a summary + dropdown arrow."""
@@ -3025,9 +2973,7 @@ class TopBarButton(ThemedDropdownButton):
         ''')
 
 
-# ---------------------------------------------------------------------------
 # Stats strip
-# ---------------------------------------------------------------------------
 
 class _StatsStrip(QFrame):
     """28px bar below the top bar: encoder type | frame count | buffer fill bar."""
@@ -3065,8 +3011,7 @@ class _StatsStrip(QFrame):
 
         layout.addSpacing(12)
 
-        # Thin progress bar for buffer fill — track is a quiet hairline,
-        # fill is the brand accent so capture pressure reads at a glance.
+        # Buffer progress bar with a thin track and themed accent fill.
         bar_wrap = QFrame()
         bar_wrap.setFixedSize(120, 3)
         bar_wrap.setStyleSheet(
@@ -3145,9 +3090,6 @@ class _StatsStrip(QFrame):
 
 
 
-# ---------------------------------------------------------------------------
-# MainWindow
-# ---------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
 
@@ -3185,7 +3127,7 @@ class MainWindow(QMainWindow):
         self._diagnostic_engine_start_count = 0
         self._active_clip_viewer = None
 
-        # -- Frameless window --
+        # Frameless window --
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
 
@@ -3230,8 +3172,6 @@ class MainWindow(QMainWindow):
 
         self.clip_duration = _validated_setting(
             'clip_length', 30, validate_normal_clip_length)
-        self.extended_clip_duration = _validated_setting(
-            'extended_clip_length', 60, validate_extended_clip_length)
         self.capture_fps = _validated_setting(
             'framerate', 60, validate_fps)
 
@@ -3259,7 +3199,7 @@ class MainWindow(QMainWindow):
 
         self.capture_width, self.capture_height = _resolution_to_dims(saved_res)
         self.buffer_seconds = compute_buffer_seconds(
-            self.clip_duration, self.extended_clip_duration)
+            self.clip_duration)
         self._capture_config = CaptureConfigTracker()
 
         self.engine_process = None
@@ -3332,11 +3272,18 @@ class MainWindow(QMainWindow):
         # A hard kill can leave the engine's same-directory transaction file.
         # Only old, FTHR-named partials are removed; fresh files may belong to a
         # still-running save and unrelated *.mp4.partial files are user-owned.
-        partial_recovery = cleanup_stale_partial_clips(clips_root)
-        if partial_recovery.removed:
-            print(f'[Startup] Removed {len(partial_recovery.removed)} stale partial clip(s)')
-        for partial_path, error in partial_recovery.failures:
-            print(f'[Startup] Could not remove stale partial {partial_path.name}: {error}')
+        # Recovery walks can cover an entire user-selected drive, so they must
+        # not block construction of the Qt window.
+        def _report_partial_recovery(result):
+            if result.removed:
+                print(f'[Startup] Removed {len(result.removed)} stale partial clip(s)')
+            for partial_path, error in result.failures:
+                print(f'[Startup] Could not remove stale partial '
+                      f'{partial_path.name}: {error}')
+
+        (self._partial_cleanup_thread,
+         self._partial_cleanup_cancel) = start_stale_partial_cleanup(
+             clips_root, on_complete=_report_partial_recovery)
 
         self.hotkey_manager = HotkeyManager()
 
@@ -3417,9 +3364,7 @@ class MainWindow(QMainWindow):
         if not _check_linux_input_group():
             QTimer.singleShot(1500, self._warn_input_group)
 
-        # Start the always-on microphone recorder so saved clips can include
-        # the user's voice. The C++ engine doesn't capture mic — we record
-        # in Python and ffmpeg-mux it into each clip after save.
+        # Start Python microphone capture where needed; Windows uses native WASAPI.
         if self.settings_manager.get('audio_capture_enabled', True):
             self._start_mic_recorder()
 
@@ -3437,13 +3382,9 @@ class MainWindow(QMainWindow):
         self.status_timer.timeout.connect(self._update_status)
         self.status_timer.start(500)
 
-        # The save response channel. One state machine, one poller.
-        #
-        # The status timer's 500 ms is too coarse for save feedback — the ack
-        # deadline is 1 s — so a save gets its own short timer that runs only
-        # while something is outstanding. Each tick is a few shared-memory
-        # reads: no sleeping, no I/O, no waiting on threads or subprocesses.
-        # That is what keeps the event loop free (AUDIT-011).
+        # Poll saves every 50 ms while a request is outstanding; the 500 ms status
+        # timer is too coarse for the one-second acknowledgement deadline. Each
+        # tick reads shared memory without blocking Qt.
         self._save_state = SaveStateMachine()
         self._save_poll_timer = QTimer(self)
         self._save_poll_timer.setInterval(50)
@@ -3457,12 +3398,10 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._refresh_background_ui_pause_state)
 
     def ensure_main_ui(self) -> None:
-        """Build the heavy library/settings UI only when a window is needed.
+        """Build library and settings widgets on first window use.
 
-        The capture engine, hotkeys, upload queue and tray deliberately do not
-        depend on this tree.  A Windows-login ``--background`` launch can
-        therefore fill replay history without constructing thumbnails, editor
-        controls or settings widgets first.
+        Capture, hotkeys, uploads, and the tray run independently during
+        a --background launch.
         """
         if self._ui_ready:
             return
@@ -3613,10 +3552,9 @@ class MainWindow(QMainWindow):
                 'FTHR could not create the report. Choose another writable '
                 f'folder and try again.\n\n{type(error).__name__}: {error}')
             return
-        FthrMessageDialog.information(
-            self, 'Diagnostic report exported',
-            f'The privacy-redacted report was saved to:\n\n{exported}\n\n'
-            'Send this ZIP with your alpha bug report.')
+        from ui.diagnostic_report import DiagnosticReportDialog
+        self._settings_page_widget.diagnostic_report_file.set_file(exported)
+        DiagnosticReportDialog(exported, self).exec()
 
     def _current_capture_source_label(self) -> str:
         if self.settings_manager.get('capture_mode', 'desktop') != 'window':
@@ -3637,9 +3575,7 @@ class MainWindow(QMainWindow):
         self.restore_main_window()
         self.main_stack.setCurrentIndex(0)
 
-    # =======================================================================
     # UI layout
-    # =======================================================================
 
     def _setup_ui(self):
         central = QWidget()
@@ -3648,12 +3584,10 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # --
         # UNIFIED TOP BAR
         # logo  |  capture / source / hotkeys / gear  |  close-settings  |  — ✕
         # The mode-specific clusters (main vs settings) swap visibility when
         # _toggle_settings_page is called.
-        # --
         top_bar = QFrame()
         top_bar.setObjectName('topBar')
         top_bar.setFixedHeight(Sizes.UNIFIED_BAR_H)
@@ -3661,9 +3595,9 @@ class MainWindow(QMainWindow):
         tb.setContentsMargins(16, 0, 0, 0)
         tb.setSpacing(10)
 
-        # -- Logo — check theme override first, then fall back to default asset.
-        #    Default asset is black-on-white so we invert RGB for the dark bar.
-        #    Custom logos are used as-is (user provides the final look). --
+        # Logo — check theme override first, then fall back to default asset.
+        # Default asset is black-on-white so we invert RGB for the dark bar.
+        # Custom logos are used as-is (user provides the final look). --
         self._logo_label = QLabel()
         self._load_logo()
         self._logo_label.setAlignment(Qt.AlignmentFlag.AlignVCenter)
@@ -3681,7 +3615,7 @@ class MainWindow(QMainWindow):
         self.status_label.setMinimumWidth(118)
         tb.addWidget(self.status_label)
 
-        # -- Main-mode cluster: capture-settings dropdowns + gear --
+        # Main-mode cluster: capture-settings dropdowns + gear --
         self.main_mode_cluster = QFrame()
         self.main_mode_cluster.setObjectName('topClusterMain')
         mc = QHBoxLayout(self.main_mode_cluster)
@@ -3690,7 +3624,6 @@ class MainWindow(QMainWindow):
 
         self.cap_settings_popup = CaptureSettingsPopup(self.settings_manager, self)
         self.cap_settings_popup.clip_length_changed.connect(self._on_clip_length_changed)
-        self.cap_settings_popup.extended_clip_changed.connect(self._on_extended_clip_length_changed)
         self.cap_settings_popup.framerate_changed.connect(self._on_framerate_changed)
         self.cap_settings_popup.resolution_changed.connect(self._on_resolution_changed)
         self.cap_settings_popup.bitrate_changed.connect(self._on_bitrate_changed)
@@ -3765,7 +3698,7 @@ class MainWindow(QMainWindow):
 
         tb.addWidget(self.main_mode_cluster)
 
-        # -- Settings-mode cluster: just the close-settings button --
+        # Settings-mode cluster: just the close-settings button --
         self.settings_mode_cluster = QFrame()
         self.settings_mode_cluster.setObjectName('topClusterSettings')
         sc = QHBoxLayout(self.settings_mode_cluster)
@@ -3790,7 +3723,7 @@ class MainWindow(QMainWindow):
         tb.addWidget(self.settings_mode_cluster)
         self.settings_mode_cluster.setVisible(False)
 
-        # -- Window controls (always visible) --
+        # Window controls (always visible) --
         # Windows gets a dedicated full-shutdown control while X is configured
         # to hide the app to the notification area.
         self.power_btn = QPushButton()
@@ -3863,7 +3796,7 @@ class MainWindow(QMainWindow):
         top_bar.mouseDoubleClickEvent = self._bar_double_click
         self._top_bar = top_bar
 
-        # -- Main content stack --
+        # Main content stack --
         self.main_stack = QStackedWidget()
         self.main_stack.setObjectName('mainStack')
 
@@ -3938,7 +3871,7 @@ class MainWindow(QMainWindow):
         self.error_bar = ErrorBar()
         root.addWidget(self.error_bar)
 
-    # -- Drag support --
+    # Drag support --
 
     def _bar_mouse_press(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -3960,7 +3893,7 @@ class MainWindow(QMainWindow):
         else:
             self.showMaximized()
 
-    # -- Native Windows resize + Aero snap --
+    # Native Windows resize + Aero snap --
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -3983,15 +3916,10 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._refresh_background_ui_pause_state)
 
     def _prerealize_settings_page(self):
-        """Force Qt to do the deferred first-show work for the settings page.
+        """Polish and lay out settings pages before their first visible show.
 
-        Adding a widget to a QStackedWidget doesn't trigger a full layout +
-        style pass — that happens lazily on the first show. We pay that cost
-        upfront here so the visible click-to-show transition is instant.
-
-        ensurePolished() runs the QSS pass; adjustSize() forces a layout. We
-        call them on the page itself and on every descendant widget so nested
-        pages (the Audio sub-tab is the slowest) aren't deferred.
+        Apply ensurePolished/adjustSize to descendants too, since nested pages
+        otherwise defer this work until the user opens them.
         """
         page = self._settings_page_widget
         try:
@@ -4084,7 +4012,7 @@ class MainWindow(QMainWindow):
                 self._bar_double_click(event)
         return super().eventFilter(obj, event)
 
-    # -- Helpers --
+    # Helpers --
 
     def _vsep(self):
         sep = QFrame()
@@ -4095,7 +4023,7 @@ class MainWindow(QMainWindow):
         )
         return sep
 
-    # -- Popup toggles --
+    # Popup toggles --
 
     def _toggle_cap_settings(self):
         if self.cap_settings_popup.isVisible():
@@ -4198,9 +4126,7 @@ class MainWindow(QMainWindow):
             self._settings_fade_in = anim
             anim.start()
 
-    # =======================================================================
     # Hotkeys
-    # =======================================================================
 
     def _warn_input_group(self):
         self.push_error(
@@ -4226,8 +4152,6 @@ class MainWindow(QMainWindow):
 
     def _setup_hotkeys(self):
         self.hotkey_manager.save_clip_triggered.connect(self._on_hotkey_save_clip)
-        self.hotkey_manager.save_extended_clip_triggered.connect(
-            self._on_hotkey_save_extended_clip)
         self.hotkey_manager.save_screenshot_triggered.connect(
             self._on_hotkey_save_screenshot)
         self.hotkey_manager.start_recording_triggered.connect(
@@ -4258,11 +4182,6 @@ class MainWindow(QMainWindow):
         config = self._capture_config.active
         self._save_clip(config.normal_clip_seconds if config else self.clip_duration)
 
-    def _on_hotkey_save_extended_clip(self):
-        config = self._capture_config.active
-        self._save_clip(
-            config.extended_clip_seconds
-            if config else self.extended_clip_duration)
 
     def _on_hotkey_start_recording(self):
         if self._manual_record_state == 'idle':
@@ -4541,14 +4460,10 @@ class MainWindow(QMainWindow):
         )
 
     def _prepare_startup_capture_source(self) -> None:
-        """Start game-detection sessions from a clean desktop source.
+        """Start game detection from desktop capture.
 
-        Automatic game handoff is deliberately a runtime decision. A window
-        selected during a previous session may be closed, recycled by Windows,
-        or belong to a shell surface that was briefly misclassified. Persisting
-        that target as the next startup source lets the engine open directly on
-        the wrong HWND before detection has had a chance to observe the current
-        foreground window.
+        A persisted HWND may be closed, recycled, or misclassified. Wait for live
+        foreground detection before selecting a game source.
         """
         current = (
             self.settings_manager.get('capture_mode', 'desktop'),
@@ -4840,19 +4755,13 @@ class MainWindow(QMainWindow):
             # Resume is a request, not proof that fresh frames have returned.
             self._set_status('STARTING CAPTURE', status_idle_qss())
 
-    # =======================================================================
     # Settings handlers
-    # =======================================================================
 
     def _on_clip_length_changed(self, duration: int):
         self.clip_duration  = duration
         self.buffer_seconds = compute_buffer_seconds(
-            duration, self.extended_clip_duration)
+            duration)
 
-    def _on_extended_clip_length_changed(self, duration: int):
-        self.extended_clip_duration = duration
-        self.buffer_seconds = compute_buffer_seconds(
-            self.clip_duration, duration)
 
     def _on_framerate_changed(self, fps: int):        self.capture_fps = fps
     def _on_resolution_changed(self, w: int, h: int): self.capture_width, self.capture_height = w, h
@@ -4887,8 +4796,6 @@ class MainWindow(QMainWindow):
         try:
             clip = validate_normal_clip_length(
                 int(self.settings_manager.get('clip_length', 30)))
-            extended = validate_extended_clip_length(
-                int(self.settings_manager.get('extended_clip_length', 60)))
             fps = validate_fps(int(self.settings_manager.get('framerate', 60)))
         except (TypeError, ValueError) as exc:
             self.push_error(
@@ -4908,7 +4815,6 @@ class MainWindow(QMainWindow):
             )
             return False
         self.clip_duration = clip
-        self.extended_clip_duration = extended
         self.capture_fps = fps
         self.capture_width, self.capture_height = _resolution_to_dims(resolution)
         if quality == 'custom':
@@ -4920,7 +4826,7 @@ class MainWindow(QMainWindow):
             self.capture_bitrate = max(500, min(200_000, custom_bitrate))
         else:
             self.capture_bitrate = BITRATE_PRESETS[resolution][quality]
-        self.buffer_seconds = compute_buffer_seconds(clip, extended)
+        self.buffer_seconds = compute_buffer_seconds(clip)
         return True
 
     def _requested_capture_config(self, profile: str | None = None) -> CaptureConfig:
@@ -4976,7 +4882,7 @@ class MainWindow(QMainWindow):
         return CaptureConfig(
             fps=fps,
             buffer_seconds=compute_buffer_seconds(
-                self.clip_duration, self.extended_clip_duration),
+                self.clip_duration),
             width=width,
             height=height,
             bitrate_kbps=bitrate,
@@ -4997,7 +4903,6 @@ class MainWindow(QMainWindow):
             microphone_endpoint_id=str(
                 self.settings_manager.get('mic_device_id') or ''),
             normal_clip_seconds=self.clip_duration,
-            extended_clip_seconds=self.extended_clip_duration,
             crop_enabled=crop_enabled,
             crop_x=float(crop.get('x', 0.0)) if crop_enabled else 0.0,
             crop_y=float(crop.get('y', 0.0)) if crop_enabled else 0.0,
@@ -5006,8 +4911,7 @@ class MainWindow(QMainWindow):
         )
 
     def _apply_active_audio_state(self, config: CaptureConfig) -> None:
-        # Windows now owns the microphone natively inside the capture engine.
-        # The legacy Python recorder remains only for the Linux fallback path.
+        # Windows captures microphones natively; Python recording is for Linux.
         if sys.platform == 'win32':
             MicRecorder().stop()
             return
@@ -5018,9 +4922,7 @@ class MainWindow(QMainWindow):
         else:
             recorder.stop()
 
-    # =======================================================================
     # Engine lifecycle
-    # =======================================================================
 
     @staticmethod
     def _diagnostic_capture_config(config: CaptureConfig) -> dict:
@@ -5040,7 +4942,6 @@ class MainWindow(QMainWindow):
             'bitrate_kbps': values['bitrate_kbps'],
             'replay_duration_seconds': values['buffer_seconds'],
             'normal_clip_seconds': values['normal_clip_seconds'],
-            'extended_clip_seconds': values['extended_clip_seconds'],
             'encoder_backend': values['encoder'],
             'encoder_adapter': 'auto',
             'audio_enabled': values['audio_enabled'],
@@ -5293,14 +5194,9 @@ class MainWindow(QMainWindow):
                 self._restart_pending = False
                 self._set_capture_apply_state(False)
                 return False
-            # Poll for connection in a background thread so the UI stays responsive.
-            # Allow up to 10s total for large encoded ring buffers and slower
-            # hardware initialization before declaring startup failed.
-            # the main thread via the _ui_call signal (queued cross-thread).
-            #
-            # Generation guard: a restart while an old poll is still running
-            # must not let the stale thread touch the new bridge — its failure
-            # path would kill the freshly started engine.
+            # Poll for up to 10 seconds off the Qt thread during hardware startup.
+            # Dispatch UI changes through _ui_call. A generation check prevents an old
+            # polling worker from disconnecting a replacement engine after a restart.
             self._engine_gen = getattr(self, '_engine_gen', 0) + 1
             _my_gen = self._engine_gen
 
@@ -5502,9 +5398,7 @@ class MainWindow(QMainWindow):
                 self._fail_manual_recording(
                     'The recording quality profile could not be started.')
 
-    # =======================================================================
     # Microphone recorder
-    # =======================================================================
 
     def _start_mic_recorder(self):
         if sys.platform == 'win32':
@@ -5564,9 +5458,7 @@ class MainWindow(QMainWindow):
         print('[Gary] Recorder failed to start')
         return False
 
-    # =======================================================================
     # Gary Mode
-    # =======================================================================
 
     def _sync_gary_settings(self, restart_recorder: bool = True):
         """Pull persisted Gary settings into the live response loop."""
@@ -5618,9 +5510,7 @@ class MainWindow(QMainWindow):
             self._gary_current_intensity, target)
         self._gary_overlay.set_intensity(self._gary_current_intensity)
 
-    # =======================================================================
     # Manual recording
-    # =======================================================================
 
     @staticmethod
     def _manual_record_button_qss(active: bool) -> str:
@@ -5667,9 +5557,7 @@ class MainWindow(QMainWindow):
                 actions=[('RESTART CAPTURE', self._restart_capture_engine)],
             )
             return
-        target_dir = Path(os.path.expanduser(str(self.settings_manager.get(
-            'recording_directory', clips_directory_from(self.settings_manager)
-            / 'Recordings'))))
+        target_dir = recording_directory_from(self.settings_manager)
         try:
             target_dir.mkdir(parents=True, exist_ok=True)
             free_bytes = shutil.disk_usage(target_dir).free
@@ -5920,12 +5808,7 @@ class MainWindow(QMainWindow):
         if not publish_ui:
             try:
                 probe_media(recording)
-                normalize = getattr(self, '_normalize_clip_to_cfr', None)
-                if callable(normalize) and normalize(str(recording)) is False:
-                    raise RuntimeError(
-                        'Frame-rate repair failed; the recording was retained '
-                        'but not published.')
-            except (OSError, RuntimeError) as exc:
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
                 self._fail_manual_recording(
                     str(exc), keep_recording=True,
                     expected_recording=recording)
@@ -5939,12 +5822,7 @@ class MainWindow(QMainWindow):
                 # Validation is the only close-time work. Video and AAC are
                 # already in the destination file, fragment by fragment.
                 probe_media(recording)
-                normalize = getattr(self, '_normalize_clip_to_cfr', None)
-                if callable(normalize) and normalize(str(recording)) is False:
-                    raise RuntimeError(
-                        'Frame-rate repair failed; the recording was retained '
-                        'but not published.')
-            except (OSError, RuntimeError) as exc:
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
                 detail = str(exc)
                 self._ui_call.emit(
                     lambda detail=detail: self._fail_manual_recording(
@@ -6015,9 +5893,7 @@ class MainWindow(QMainWindow):
         self._restore_clip_capture_profile()
 
     def _open_recordings_folder(self):
-        folder = Path(os.path.expanduser(str(self.settings_manager.get(
-            'recording_directory', clips_directory_from(self.settings_manager)
-            / 'Recordings'))))
+        folder = recording_directory_from(self.settings_manager)
         folder.mkdir(parents=True, exist_ok=True)
         if sys.platform == 'win32':
             os.startfile(str(folder))
@@ -6026,9 +5902,7 @@ class MainWindow(QMainWindow):
             if opener:
                 subprocess.Popen([opener, str(folder)])
 
-    # =======================================================================
     # Save clip
-    # =======================================================================
 
     def _save_clip(self, duration_seconds: int = 30):
         if self._manual_record_state in ('preparing', 'starting', 'stopping'):
@@ -6063,19 +5937,9 @@ class MainWindow(QMainWindow):
             return
         duration_seconds = admission.duration_seconds
 
-        # Two admission gates, in order of cheapness:
-        #
-        # 1. The original 1-second debounce. Two saves in the same second
-        #    produce the same timestamped filename → the engine writes the same
-        #    file twice and two mux workers fight over it.
-        # 2. Single-flight. The engine reports through one response slot with no
-        #    correlation id, so a second concurrent save is untrackable: its
-        #    CLIP_SAVED would be indistinguishable from the first one's. Refuse
-        #    it rather than guess.
-        #
-        # Both refusals give the same visible feedback the debounce always gave
-        # — a silently dropped hotkey reads as "the extended-clip key sometimes
-        # doesn't work". Neither ever confirms a second clip.
+        # Debounce saves to avoid timestamped filename collisions, then enforce
+        # one in-flight request: the response slot has no correlation ID. Report
+        # refusals so a dropped hotkey is visible to the user.
         now = time.monotonic()
         if now - getattr(self, '_last_save_request', 0.0) < 1.0:
             print('[Save] Ignored — save already in progress (spam guard)')
@@ -6153,12 +6017,8 @@ class MainWindow(QMainWindow):
             requested_duration_seconds=duration_seconds,
             capture_mode=capture_mode)
 
-        # Capture the mic-window timestamp before requesting the save so the
-        # post-mux thread can pull the matching mic segment from the ring.
-        #
-        # Engine and microphone rings now use the accepted save instant as the
-        # common end boundary. The engine's PCM ring is mutex-protected, so no
-        # artificial 0.5-second audio tail trim is needed.
+        # Use the accepted save instant as the shared end boundary for engine
+        # and microphone rings, so post-processing extracts the matching interval.
         mic_end_time = time.monotonic()
         crop_profile = None
         active_game = getattr(self, '_active_game_window', None)
@@ -6188,10 +6048,8 @@ class MainWindow(QMainWindow):
                     crop_profile = None
 
         try:
-            # A response left over from the previous save may still be sitting
-            # in the field. Drain it *before* submitting, so its completion is
-            # attributed to the save it belongs to. Overwriting it — which the
-            # bridge used to do — silently lost that save's verdict (AUDIT-017).
+            # Consume the previous response before submitting another save, so its
+            # completion can't be attributed to the new request.
             self._pump_save_responses()
 
             if not self.bridge.save_clip(str(output_path), duration_seconds):
@@ -6257,12 +6115,9 @@ class MainWindow(QMainWindow):
             )
 
     def _show_clip_captured_feedback(self, duration_seconds: int) -> None:
-        """Acknowledge an accepted capture request without claiming it is saved.
+        """Show immediate feedback through the detached notification process.
 
-        The detached card has its own event loop, so sending this immediately
-        keeps hotkey/button feedback independent of the engine's write and
-        post-processing latency. Any later failure replaces it with the normal
-        CAPTURE FAILED card in _on_save_outcome().
+        This acknowledges the request; a later failure replaces it in _on_save_outcome.
         """
         config = self._capture_config.active
         fps = config.fps if config else self.capture_fps
@@ -6276,17 +6131,12 @@ class MainWindow(QMainWindow):
         self._set_status('SAVING', status_idle_qss())
         QTimer.singleShot(1000, self._update_status)
 
-    # -----------------------------------------------------------------------
     # The save response channel — single reader, single interpreter
-    # -----------------------------------------------------------------------
 
     def _pump_save_responses(self):
-        """Read at most one engine save response, interpret it, consume it.
+        """Read one save response, interpret it, then consume it.
 
-        This is the ONLY consumer of engine_response/engine_string. It reads
-        the response and its string together as one event, hands them to the
-        state machine, and clears the field only after the machine has
-        accepted the interpretation.
+        This poller alone consumes save events and reads each code with its detail.
         """
         if not self.bridge or not self.bridge.is_connected():
             return
@@ -6307,7 +6157,7 @@ class MainWindow(QMainWindow):
         }[kind]
         outcome = self._save_state.on_event(event, detail, now)
         # Consume only now: the event has been interpreted and attributed.
-        self.bridge.consume_save_response()
+        self.bridge.consume_save_response(kind)
         if outcome is not None:
             self._on_save_outcome(outcome)
 
@@ -6400,9 +6250,7 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # The engine said it wrote the file. Verify before telling the user —
-        # a CLIP_SAVED for a file that is not there is a bug we want to see,
-        # not a broken grid entry the user discovers days later.
+        # Verify the saved path before confirming success or adding a library card.
         try:
             if not output_path.exists() or output_path.stat().st_size == 0:
                 print(f'[Save] CLIP_SAVED but the file is missing or empty: '
@@ -6466,10 +6314,8 @@ class MainWindow(QMainWindow):
             elapsed_ms=round(
                 (time.monotonic() - op.requested_at) * 1000))
 
-        # Notify the upload manager and get the clip-ready event.
-        # The event is set immediately if there's no mux pending; otherwise the
-        # worker sets it after os.replace() completes. clip_ready stays the
-        # single upload gatekeeper.
+        # Get clip_ready from the upload manager. Finalization owns this event
+        # until the source file is ready for upload.
         clip_ready = self.upload_manager.notify_clip_saved(
             str(output_path), has_mic_mux=has_async_mux)
 
@@ -6623,7 +6469,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f'[UI] Could not open clips folder: {e}')
 
-    # -- Upload finished callback --
+    # Upload finished callback --
 
     def _on_upload_finished(self, path: str, success: bool, msg: str):
         if success:
@@ -6712,7 +6558,7 @@ class MainWindow(QMainWindow):
             actions=[('OPEN UPLOAD SETTINGS', self.restore_main_window)],
         )
 
-    # -- Mic post-mux --
+    # Mic post-mux --
 
     @staticmethod
     def _allow_completed_clip_pipeline(clip_path: str, clip_ready=None) -> bool:
@@ -6729,16 +6575,11 @@ class MainWindow(QMainWindow):
                            mic_end_time: float,
                            clip_ready=None, crop_profile=None,
                            *, audio_mode: str | None = None):
-        """
-        Finalize the capture's audio layout, then apply any other source-clip
-        post-processing. On Windows the native engine already captured the
-        system and microphone streams, so combined mode only needs a remux.
-        On Linux the microphone is still supplied by the Python recorder and
-        is either mixed or appended as a second stream here.
+        """Finalize audio, then run the remaining source-clip post-processing.
 
-        clip_ready is a threading.Event returned by UploadManager.notify_clip_saved().
-        The mux worker sets it after os.replace() so the upload can start.
-        If there is no mic to mux, the event is set here before returning.
+        Windows supplies native system/microphone tracks; Linux supplies Python
+        microphone samples for mixing or a separate track. clip_ready gates upload
+        until all finalization has finished.
         """
         if not self._allow_completed_clip_pipeline(clip_path, clip_ready):
             return
@@ -6814,10 +6655,29 @@ class MainWindow(QMainWindow):
                         self.normalized = True
                         original_ready.set()
 
+                def fail(self):
+                    """Release the completion gate without re-probing input."""
+                    if self._released:
+                        return
+                    self._released = True
+                    self.normalized = True
+                    original_ready.set()
+
             worker_args[3] = _CfrReadyGate()
 
         def _run_and_publish():
+            source_timeline_rejected = False
             try:
+                # Reject a proven sparse native source before a crop/overlay
+                # can rewrite its timestamps and before CFR repair could
+                # expand the hole into repeated frames. An inconclusive probe
+                # remains on the existing conservative finalization path.
+                if not MainWindow._source_timeline_is_safe(
+                        self, str(worker_args[0])):
+                    source_timeline_rejected = True
+                    if original_ready is not None:
+                        worker_args[3].fail()
+                    return
                 target(*worker_args)
             except Exception as exc:
                 worker_clip_path = str(worker_args[0])
@@ -6825,8 +6685,12 @@ class MainWindow(QMainWindow):
                 self._record_finalization_warning(
                     worker_clip_path, f'Optional clip processing failed: {exc}')
             finally:
-                already_normalized = False
-                if original_ready is not None:
+                already_normalized = source_timeline_rejected
+                if source_timeline_rejected:
+                    # The source guard already marked readiness failed and
+                    # deliberately skipped the normalization/rewrite path.
+                    pass
+                elif original_ready is not None:
                     worker_args[3].set()
                     already_normalized = bool(
                         getattr(worker_args[3], 'normalized', False))
@@ -6842,16 +6706,51 @@ class MainWindow(QMainWindow):
         t.start()
         return t
 
+    def _source_timeline_is_safe(self, clip_path: str) -> bool:
+        """Return false only when packet PTS proves a sparse source timeline.
+
+        This gate fails closed for unavailable/incomplete probe evidence: a
+        source must be proven safe before a crop/overlay can alter evidence.
+        It is scoped to saved clips entering this post-processing worker.
+        """
+        metadata = probe_video_metadata(clip_path)
+        fps = metadata.average_fps if metadata is not None else None
+        if (metadata is None or fps is None or not math.isfinite(fps)
+                or fps <= 0 or metadata.fps_source != 'fthr_frame_rate'):
+            message = (
+                'Post-processing refused because the source video timing '
+                'could not be proven from the saved replay metadata.')
+            self._clip_readiness.finalization_failed(
+                clip_path, message, base_clip_usable=False)
+            emit_event(
+                'clip_save', 'source_timeline_inconclusive', state='FAILED',
+                error=DiagnosticError.CLIP_FINALIZE_FAILED,
+                detail=message)
+            self._record_finalization_warning(clip_path, message)
+            return False
+        evidence = probe_video_cfr_evidence(clip_path, fps)
+        if evidence.physical_timeline_bounded is True:
+            return True
+        message = (
+            'Post-processing refused because the source video timeline '
+            'was missing or contains a large packet gap; the clip was not '
+            'published.')
+        self._clip_readiness.finalization_failed(
+            clip_path, message, base_clip_usable=False)
+        emit_event(
+            'clip_save', 'source_timeline_rejected', state='FAILED',
+            error=DiagnosticError.CLIP_FINALIZE_FAILED,
+            detail=message)
+        self._record_finalization_warning(clip_path, message)
+        return False
+
     def _combine_native_audio_worker(self, clip_path: str,
                                      duration_seconds: int,
                                      clip_end_time: float,
                                      clip_ready=None, crop_profile=None):
-        """Collapse native Windows audio sources into one combined AAC track.
+        """Mix native system and microphone tracks into one combined AAC stream.
 
-        The native engine keeps system and microphone packets separate while
-        the replay ring is alive so timing remains precise. The default user
-        facing format is simpler: one MP4 audio stream. This worker performs
-        that short, loss-bounded final mix after the native clip is committed.
+        Keep source packets separate during capture to retain their timing.
         """
         try:
             ffmpeg = get_ffmpeg_exe()
@@ -6994,12 +6893,9 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _cfr_video_args(clip_path: str) -> list[str]:
-        """Return output options that make every visual finalizer CFR.
+        """Use configured FPS and -fps_mode cfr for visual re-encodes.
 
-        Reading the configured value here protects visual re-encode paths from
-        inheriting a jittery input timestamp sequence. ``-r`` plus
-        ``-fps_mode cfr`` is intentional: Explorer reads the resulting MP4
-        sample timing, not FTHR's private tag.
+        The MP4 sample table must carry timing, not just a private metadata tag.
         """
         metadata = probe_video_metadata(clip_path)
         fps = metadata.average_fps if metadata is not None else None
@@ -7012,14 +6908,10 @@ class MainWindow(QMainWindow):
 
     def _normalize_clip_to_cfr(self, clip_path: str,
                                ffmpeg: str | None = None) -> bool:
-        """Publish a source clip with real CFR sample timing.
+        """Validate timing while preserving healthy variable-rate video.
 
-        The native replay engine intentionally retains wall-clock PTS so a
-        delayed capture cannot make video play faster. That can leave an MP4
-        whose private/configured FPS is 60 while its sample table contains
-        30-FPS gaps. Decode/re-encode only those files with FFmpeg CFR mode;
-        FFmpeg duplicates the last decoded frame into missing time slots and
-        therefore preserves the original duration.
+        Keep bounded cadence gaps without transcoding. Repair inconclusive CFR
+        evidence and reject proven large timeline gaps.
         """
         def fail(message: str) -> bool:
             self._clip_readiness.finalization_failed(
@@ -7033,8 +6925,19 @@ class MainWindow(QMainWindow):
                 'Frame-rate repair failed because the configured FPS could '
                 'not be read; the clip was not published.')
 
-        if probe_video_cfr(clip_path, fps) is True:
+        cfr_evidence = probe_video_cfr_evidence(clip_path, fps)
+        if (cfr_evidence.cfr is True
+                or cfr_evidence.physical_timeline_bounded is True):
             return True
+
+        # Do not let the CFR repair path expand a native replay that contains
+        # a multi-second physical PTS hole. Legitimate VFR clips remain
+        # repairable when their packet timeline is bounded; an inconclusive
+        # probe still follows the existing conservative repair path.
+        if cfr_evidence.physical_timeline_bounded is False:
+            return fail(
+                'Frame-rate repair refused because the source video timeline '
+                'contains a large packet gap; the clip was not published.')
 
         if ffmpeg is None:
             try:
@@ -7146,27 +7049,9 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            # Wait for the clip file to actually appear and stabilize. The engine
-            # runs SaveClipThread in the background; for short clips this is
-            # usually <1s, but worst-case x264 path can take ~clip-duration.
-            deadline = time.monotonic() + max(duration_seconds * 2, 15)
-            last_size = -1
-            while time.monotonic() < deadline:
-                try:
-                    if os.path.exists(clip_path):
-                        size = os.path.getsize(clip_path)
-                        if size > 0 and size == last_size:
-                            break
-                        last_size = size
-                except OSError:
-                    # A concurrent writer can make a stabilization stat transient.
-                    pass
-                time.sleep(0.25)
-            else:
-                print(f'[Mic] Clip {clip_path} did not stabilize — skipping mux')
-                self._record_finalization_warning(
-                    clip_path, 'Microphone mix was skipped because the clip did not stabilize.')
-                return
+            # The native save acknowledgement already guarantees a closed file.
+            if not os.path.isfile(clip_path) or os.path.getsize(clip_path) == 0:
+                raise OSError('The committed clip is missing or empty.')
 
             # Try to mix mic audio into the clip. Any failure is non-fatal:
             # watermark/crop/camera still apply to the original clip below.
@@ -7400,14 +7285,10 @@ class MainWindow(QMainWindow):
     def _apply_keyboard_overlay(self, clip_path: str, ffmpeg: str,
                                 clip_end_time: float,
                                 duration_sec: int) -> None:
-        """Composite the timestamp-matched external keyboard source.
+        """Composite timestamp-matched keyboard frames using the preview chroma key.
 
-        The source was sampled continuously by ``ThirdPartyKeyboardCapture``;
-        this pass streams the bounded ring segment as keyed RGBA directly into
-        the compositor, using the same chroma-key operation as the live
-        preview.  Settings changes never restart the native replay engine, and
-        a missing/closed source leaves the base clip intact with a visible
-        finalization warning.
+        Stream the source ring into the compositor. A missing source preserves
+        the base clip and produces a finalization warning.
         """
         config = third_party_keyboard_settings(self.settings_manager)
         if not config['enabled']:
@@ -7767,34 +7648,11 @@ class MainWindow(QMainWindow):
                 self._record_finalization_warning(
                     clip_path, 'Optional processing was skipped because FFmpeg is unavailable.')
                 return
-            deadline = time.monotonic() + max(duration_seconds * 2, 15)
-            stabilization_started = time.monotonic()
-            last_size = -1
-            while time.monotonic() < deadline:
-                try:
-                    if os.path.exists(clip_path):
-                        size = os.path.getsize(clip_path)
-                        if size > 0 and size == last_size:
-                            break
-                        last_size = size
-                except OSError:
-                    # A concurrent writer can make a stabilization stat transient.
-                    pass
-                time.sleep(0.25)
-            else:
-                print('[Finalize] Clip did not stabilize — skipping optional processing')
-                self._record_finalization_warning(
-                    clip_path, 'Optional processing was skipped because the clip did not stabilize.')
-                emit_event(
-                    'clip_save', 'file_stabilization_timeout', state='STALLED',
-                    error=DiagnosticError.CLIP_FINALIZE_FAILED,
-                    elapsed_ms=round(
-                        (time.monotonic() - stabilization_started) * 1000))
-                return
-            emit_event(
-                'clip_save', 'file_stabilized', state='FINALIZING',
-                elapsed_ms=round(
-                    (time.monotonic() - stabilization_started) * 1000))
+            # CLIP_SAVED is emitted after native close and atomic publication.
+            # Waiting for two equal file sizes here added latency without
+            # providing a stronger completion boundary.
+            if not os.path.isfile(clip_path) or os.path.getsize(clip_path) == 0:
+                raise OSError('The committed clip is missing or empty.')
             stage_started = time.monotonic()
             self._apply_crop(clip_path, ffmpeg, crop_profile)
             emit_event('clip_save', 'crop_stage_completed',
@@ -7820,9 +7678,7 @@ class MainWindow(QMainWindow):
             if clip_ready is not None:
                 clip_ready.set()
 
-    # =======================================================================
     # UI state
-    # =======================================================================
 
     def _update_status(self):
         # Detect an engine crash. The shared-memory mapping outlives the
@@ -8172,9 +8028,7 @@ class MainWindow(QMainWindow):
             if self._active_clip_viewer is viewer:
                 self._active_clip_viewer = None
 
-    # =======================================================================
     # Error bar
-    # =======================================================================
 
     def push_error(self, title: str, detail: str,
                    level: str = 'error',
@@ -8197,9 +8051,7 @@ class MainWindow(QMainWindow):
         else:
             print(f'[Lifecycle] {level.upper()}: {title}: {detail}')
 
-    # =======================================================================
     # Hardware encoding detection
-    # =======================================================================
 
     def _check_hardware_encoding_status(self):
         if not self.bridge or not self.bridge.is_connected():
@@ -8228,9 +8080,7 @@ class MainWindow(QMainWindow):
         else:
             print(f"[UI] Hardware encoding active: {codec or 'NVENC'}")
 
-    # =======================================================================
     # Styles
-    # =======================================================================
 
     def _load_saved_theme(self):
         """Patch Colors class with saved theme so all QSS uses custom values."""
@@ -8374,9 +8224,7 @@ class MainWindow(QMainWindow):
         self.update()
         QApplication.processEvents()
 
-    # =======================================================================
     # Shutdown
-    # =======================================================================
 
     _FINALIZATION_GRACE_SECONDS = 1.5
 
@@ -8496,8 +8344,19 @@ class MainWindow(QMainWindow):
             print(f'[Shutdown] Keyboard overlay release failed: {error}')
         self._shutdown_mark('KeyboardOverlayStopped')
 
+        partial_cancel = getattr(self, '_partial_cleanup_cancel', None)
+        if partial_cancel is not None:
+            partial_cancel.set()
+        partial_worker = getattr(self, '_partial_cleanup_thread', None)
+        if partial_worker is not None and partial_worker.is_alive():
+            # Recovery checks cancellation between directory entries; retain a
+            # hard bound if an underlying filesystem call is slow.
+            partial_worker.join(timeout=0.5)
         self.upload_manager.stop()
         self._shutdown_mark('UploadsStopped')
+        if hasattr(self, 'clip_grid'):
+            self.clip_grid.shutdown()
+            self._shutdown_mark('LibraryStopped')
         self.capture_card.close()
         self._shutdown_mark('CaptureCardStopped')
         self.stop_engine()
@@ -8578,9 +8437,7 @@ class MainWindow(QMainWindow):
         self.request_full_exit()
 
 
-# ---------------------------------------------------------------------------
 # Settings page — shared layout helpers
-# ---------------------------------------------------------------------------
 
 def _flat_section_header(title: str) -> QWidget:
     """Accent uppercase label with a thin extending line to the right."""
@@ -8590,16 +8447,15 @@ def _flat_section_header(title: str) -> QWidget:
     hl.setContentsMargins(0, 0, 0, 0)
     hl.setSpacing(10)
     lbl = QLabel(title.upper())
-    lbl.setStyleSheet(
-        f'color: {Colors.ACCENT}; font-size: {Fonts.SIZE_BODY_L}px; font-weight: 700;'
+    set_theme_style(lbl,
+        lambda: (f'color: {Colors.ACCENT}; font-size: {Fonts.SIZE_BODY_L}px; font-weight: 700;'
         f' letter-spacing: 2px; background: transparent; border: none;'
-        f' font-family: {Fonts.DISPLAY};'
-    )
+        f' font-family: {Fonts.DISPLAY};'))
     hl.addWidget(lbl)
     line = QFrame()
     line.setFrameShape(QFrame.Shape.HLine)
     line.setFixedHeight(1)
-    line.setStyleSheet(f'background: {Colors.SHELL_DIVIDER}; border: none;')
+    set_theme_style(line, lambda: (f'background: {Colors.SHELL_DIVIDER}; border: none;'))
     hl.addWidget(line, 1)
     return row
 
@@ -8609,7 +8465,7 @@ def _settings_hsep() -> QFrame:
     line = QFrame()
     line.setFrameShape(QFrame.Shape.HLine)
     line.setFixedHeight(1)
-    line.setStyleSheet(f'background: {Colors.SHELL_DIVIDER}; border: none;')
+    set_theme_style(line, lambda: (f'background: {Colors.SHELL_DIVIDER}; border: none;'))
     return line
 
 
@@ -8618,21 +8474,16 @@ def _settings_vsep() -> QFrame:
     line = QFrame()
     line.setFrameShape(QFrame.Shape.VLine)
     line.setFixedWidth(1)
-    line.setStyleSheet(f'background: {Colors.SHELL_DIVIDER}; border: none;')
+    set_theme_style(line, lambda: (f'background: {Colors.SHELL_DIVIDER}; border: none;'))
     return line
 
 
-# ---------------------------------------------------------------------------
 # Lightweight settings page stack
-# ---------------------------------------------------------------------------
 
 class SlidingStackedWidget(QWidget):
-    """Small QStackedWidget-compatible container with instant page changes.
+    """QStackedWidget-compatible container that lays out only the selected page.
 
-    Settings pages contain scroll areas, previews and many styled children.
-    Moving two complete pages every animation frame caused measurable CPU
-    spikes when tabs were clicked rapidly. Only the selected page is now
-    visible and laid out.
+    Instant changes avoid moving two full settings trees on each animation tick.
     """
 
     def __init__(self, parent=None):
@@ -8641,7 +8492,7 @@ class SlidingStackedWidget(QWidget):
         self._pages = []
         self._current = -1
 
-    # API mirrors QStackedWidget ------------------------------------------------
+    # API mirrors QStackedWidget
 
     def addWidget(self, widget):
         widget.setParent(self)
@@ -8685,7 +8536,7 @@ class SlidingStackedWidget(QWidget):
     def count(self):
         return len(self._pages)
 
-    # Sizing --------------------------------------------------------------------
+    # Sizing
 
     def sizeHint(self):
         s = QSize(0, 0)
@@ -8706,9 +8557,7 @@ class SlidingStackedWidget(QWidget):
             self._pages[self._current].setGeometry(0, 0, w, h)
 
 
-# ---------------------------------------------------------------------------
 # Full-screen settings page (embedded in main content stack)
-# ---------------------------------------------------------------------------
 
 class _SettingsSlider(QSlider):
     """Audio slider with absolute click-to-set and a forgiving hit area."""
@@ -8865,7 +8714,7 @@ class _SettingsPage(QWidget):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # -- Top category tab bar --
+        # Top category tab bar --
         tab_bar = QFrame()
         tab_bar.setObjectName('settingsTabBar')
         tab_layout = QHBoxLayout(tab_bar)
@@ -8917,7 +8766,7 @@ class _SettingsPage(QWidget):
         divider.setFixedHeight(1)
         main_layout.addWidget(divider)
 
-        # -- Content area --
+        # Content area --
         content = QWidget()
         content.setObjectName('settingsContent')
         self._settings_content = content
@@ -8992,11 +8841,11 @@ class _SettingsPage(QWidget):
         self.mic_level_meter.start(self._selected_mic_index())
 
     def _set_settings_content_surface(self) -> None:
-        """Keep the settings canvas black outside the raised category cards."""
+        """Keep the settings canvas on the selected background token."""
         if not hasattr(self, '_settings_content'):
             return
-        self._settings_content.setStyleSheet(
-            f'QWidget#settingsContent {{ background-color: {Colors.BG}; }}')
+        set_theme_style(self._settings_content,
+            lambda: (f'QWidget#settingsContent {{ background-color: {Colors.BG}; }}'))
 
     def _make_general_page(self):
         from ui.upload_settings_widget import UploadSettingsWidget
@@ -9008,7 +8857,7 @@ class _SettingsPage(QWidget):
         layout.setContentsMargins(0, 0, 16, 32)
         layout.setSpacing(0)
 
-        # -- System --
+        # System --
         layout.addWidget(_flat_section_header('System'))
         layout.addSpacing(12)
         self.autostart_check = QCheckBox('Autostart with Windows')
@@ -9023,7 +8872,7 @@ class _SettingsPage(QWidget):
 
         self.close_to_tray_check = QCheckBox(
             'Minimize to system tray when closing FTHR')
-        self.close_to_tray_check.setStyleSheet(checkbox_qss())
+        set_theme_style(self.close_to_tray_check, checkbox_qss)
         self.close_to_tray_check.setChecked(
             bool(self.sm.get('close_to_tray', True)))
         self.close_to_tray_check.setVisible(sys.platform == 'win32')
@@ -9035,13 +8884,13 @@ class _SettingsPage(QWidget):
         layout.addWidget(self.close_to_tray_check)
         layout.addSpacing(6)
 
-        # -- Notifications --
+        # Notifications --
         layout.addSpacing(24)
         layout.addWidget(_flat_section_header('Notifications'))
         layout.addSpacing(12)
         self.error_notifications_check = QCheckBox(
             'Show capture error messages')
-        self.error_notifications_check.setStyleSheet(checkbox_qss())
+        set_theme_style(self.error_notifications_check, checkbox_qss)
         self.error_notifications_check.setChecked(bool(self.sm.get(
             'error_notifications_enabled', True)))
         self.error_notifications_check.setToolTip(
@@ -9051,7 +8900,7 @@ class _SettingsPage(QWidget):
             self._on_error_notifications_toggled)
         layout.addWidget(self.error_notifications_check)
 
-        # -- Upload --
+        # Upload --
         layout.addSpacing(24)
         self._upload_settings_widget = UploadSettingsWidget(
             getattr(self.sm, '_upload_manager_ref', self.sm),
@@ -9061,7 +8910,7 @@ class _SettingsPage(QWidget):
             self.upload_connection_failed.emit)
         layout.addWidget(self._upload_settings_widget)
 
-        # -- Export presets --
+        # Export presets --
         layout.addSpacing(24)
         layout.addWidget(_flat_section_header('Export Presets'))
         layout.addSpacing(10)
@@ -9070,7 +8919,7 @@ class _SettingsPage(QWidget):
         self.export_presets_widget = ExportPresetsWidget(parent=page)
         layout.addWidget(self.export_presets_widget)
 
-        # -- Troubleshooting --
+        # Troubleshooting --
         layout.addSpacing(24)
         layout.addWidget(_flat_section_header('Troubleshooting'))
         layout.addSpacing(10)
@@ -9079,17 +8928,20 @@ class _SettingsPage(QWidget):
             'containing bounded hardware, capture, audio, playback, export, and '
             'library diagnostics. Nothing is uploaded automatically.')
         diagnostic_hint.setWordWrap(True)
-        diagnostic_hint.setStyleSheet(
-            label_body(Colors.TEXT_MUTED, Fonts.SIZE_BODY))
+        set_theme_style(diagnostic_hint, lambda: (label_body(Colors.TEXT_MUTED, Fonts.SIZE_BODY)))
         layout.addWidget(diagnostic_hint)
         layout.addSpacing(8)
         self.export_diagnostic_btn = QPushButton('EXPORT DIAGNOSTIC REPORT')
-        self.export_diagnostic_btn.setStyleSheet(button_outline_qss())
+        set_theme_style(self.export_diagnostic_btn, button_outline_qss)
         self.export_diagnostic_btn.setCursor(
             QCursor(Qt.CursorShape.PointingHandCursor))
         self.export_diagnostic_btn.clicked.connect(
             self.diagnostic_export_requested.emit)
         layout.addWidget(self.export_diagnostic_btn, 0,
+                         Qt.AlignmentFlag.AlignLeft)
+        from ui.diagnostic_report import DiagnosticReportFile
+        self.diagnostic_report_file = DiagnosticReportFile(page)
+        layout.addWidget(self.diagnostic_report_file, 0,
                          Qt.AlignmentFlag.AlignLeft)
 
         # Focus pause has no Windows replay implementation. Do not expose a
@@ -9101,14 +8953,14 @@ class _SettingsPage(QWidget):
 
             self.anticheat_check = QCheckBox(
                 'Pause recording when game is unfocused')
-            self.anticheat_check.setStyleSheet(checkbox_qss())
+            set_theme_style(self.anticheat_check, checkbox_qss)
             self.anticheat_check.setChecked(
                 self.sm.get('anticheat_detection_enabled', False))
             self.anticheat_check.toggled.connect(self._on_anticheat_toggled)
             layout.addWidget(self.anticheat_check)
             layout.addSpacing(4)
 
-        # -- Settings Presets --
+        # Settings Presets --
         layout.addSpacing(24)
         layout.addWidget(_flat_section_header('Settings Presets'))
         layout.addSpacing(12)
@@ -9117,32 +8969,32 @@ class _SettingsPage(QWidget):
         preset_row.setSpacing(8)
 
         self.preset_combo = _DropdownCombo()
-        self.preset_combo.setStyleSheet(_COMBO_STYLE)
+        set_theme_style(self.preset_combo, combo_qss)
         self.preset_combo.setMinimumWidth(160)
         self._refresh_preset_combo()
         preset_row.addWidget(self.preset_combo, 1)
 
         load_btn = QPushButton('LOAD')
-        load_btn.setStyleSheet(button_primary_qss())
+        set_theme_style(load_btn, button_primary_qss)
         load_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         load_btn.clicked.connect(self._on_preset_load)
         preset_row.addWidget(load_btn)
 
         save_btn = QPushButton('SAVE')
-        save_btn.setStyleSheet(button_outline_qss())
+        set_theme_style(save_btn, button_outline_qss)
         save_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         save_btn.clicked.connect(self._on_preset_save)
         preset_row.addWidget(save_btn)
 
         del_btn = QPushButton('DELETE')
-        del_btn.setStyleSheet(button_outline_qss())
+        set_theme_style(del_btn, button_outline_qss)
         del_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         del_btn.clicked.connect(self._on_preset_delete)
         preset_row.addWidget(del_btn)
 
         layout.addLayout(preset_row)
 
-        # -- App Credits --
+        # App Credits --
         layout.addSpacing(24)
         layout.addWidget(_flat_section_header('App Credits'))
         layout.addSpacing(10)
@@ -9162,7 +9014,7 @@ class _SettingsPage(QWidget):
             'For being labrats :D\n\n'
             'Much love to everyone testing our alpha :D')
         credits_hint.setWordWrap(True)
-        credits_hint.setStyleSheet(label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
+        set_theme_style(credits_hint, lambda: (label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY)))
         layout.addWidget(credits_hint)
 
         layout.addStretch()
@@ -9171,7 +9023,7 @@ class _SettingsPage(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setStyleSheet(scrollbar_qss())
+        set_theme_style(scroll, scrollbar_qss)
         scroll.setWidget(page)
 
         wrapper = QWidget()
@@ -9183,7 +9035,7 @@ class _SettingsPage(QWidget):
 
         return wrapper
 
-    # -- Import Clips helpers --
+    # Import Clips helpers --
 
     def _refresh_import_folders_list(self):
         while self._import_folders_layout.count():
@@ -9195,7 +9047,7 @@ class _SettingsPage(QWidget):
 
         if not folders:
             lbl = QLabel('No import folders added yet.')
-            lbl.setStyleSheet(label_body(Colors.TEXT_MUTED, Fonts.SIZE_BODY))
+            set_theme_style(lbl, lambda: (label_body(Colors.TEXT_MUTED, Fonts.SIZE_BODY)))
             self._import_folders_layout.addWidget(lbl)
             return
 
@@ -9204,10 +9056,8 @@ class _SettingsPage(QWidget):
 
     def _make_import_folder_row(self, path: str) -> QFrame:
         row = QFrame()
-        row.setStyleSheet(
-            f'QFrame {{ background: {Colors.SURFACE_1};'
-            f' border: 1px solid {Colors.BORDER}; }}'
-        )
+        set_theme_style(row, lambda: (f'QFrame {{ background: {Colors.SURFACE_1};'
+            f' border: 1px solid {Colors.BORDER}; }}'))
         rl = QHBoxLayout(row)
         rl.setContentsMargins(10, 6, 6, 6)
         rl.setSpacing(8)
@@ -9216,7 +9066,7 @@ class _SettingsPage(QWidget):
         if not os.path.isdir(path):
             display_path += '  —  MISSING (remove link or reconnect drive)'
         path_lbl = QLabel(display_path)
-        path_lbl.setStyleSheet(label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
+        set_theme_style(path_lbl, lambda: (label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY)))
         path_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         rl.addWidget(path_lbl, 1)
 
@@ -9224,12 +9074,10 @@ class _SettingsPage(QWidget):
         remove_btn.setFixedSize(22, 22)
         remove_btn.setToolTip('Remove this folder')
         remove_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        remove_btn.setStyleSheet(
-            f'QPushButton {{ background: transparent;'
+        set_theme_style(remove_btn, lambda: (f'QPushButton {{ background: transparent;'
             f' border: 1px solid {Colors.BORDER}; color: {Colors.TEXT_DIM};'
             f' font-size: 14px; font-weight: bold; }}'
-            f' QPushButton:hover {{ border-color: {Colors.ERROR}; color: {Colors.ERROR}; }}'
-        )
+            f' QPushButton:hover {{ border-color: {Colors.ERROR}; color: {Colors.ERROR}; }}'))
         remove_btn.clicked.connect(lambda _, p=path: self._remove_import_folder(p))
         rl.addWidget(remove_btn)
         return row
@@ -9257,7 +9105,6 @@ class _SettingsPage(QWidget):
         self.sm.set('imported_clip_folders', folders)
         self.sm.save_settings()
         self._refresh_import_folders_list()
-        # Remove from scan results if it was pending there
         self._scan_pending = [(n, p) for n, p in self._scan_pending if p != folder]
         self._rebuild_scan_results()
         self.imported_folders_changed.emit()
@@ -9335,7 +9182,7 @@ class _SettingsPage(QWidget):
         if not found:
             lbl = QLabel('No clip folders from other software were found on your system.')
             lbl.setWordWrap(True)
-            lbl.setStyleSheet(label_body(Colors.TEXT_MUTED, Fonts.SIZE_BODY))
+            set_theme_style(lbl, lambda: (label_body(Colors.TEXT_MUTED, Fonts.SIZE_BODY)))
             self._scan_results_layout.addWidget(lbl)
             self._scan_results_container.setVisible(True)
             self._scan_pending = []
@@ -9368,10 +9215,8 @@ class _SettingsPage(QWidget):
 
     def _make_scan_result_row(self, software_name: str, path: str) -> QFrame:
         row = QFrame()
-        row.setStyleSheet(
-            f'QFrame {{ background: {Colors.SURFACE_1};'
-            f' border: 1px solid {Colors.BORDER}; }}'
-        )
+        set_theme_style(row, lambda: (f'QFrame {{ background: {Colors.SURFACE_1};'
+            f' border: 1px solid {Colors.BORDER}; }}'))
         rl = QHBoxLayout(row)
         rl.setContentsMargins(10, 8, 8, 8)
         rl.setSpacing(10)
@@ -9379,13 +9224,11 @@ class _SettingsPage(QWidget):
         info = QVBoxLayout()
         info.setSpacing(1)
         name_lbl = QLabel(software_name)
-        name_lbl.setStyleSheet(
-            f'color: {Colors.TEXT}; font-size: {Fonts.SIZE_BODY}px;'
+        set_theme_style(name_lbl, lambda: (f'color: {Colors.TEXT}; font-size: {Fonts.SIZE_BODY}px;'
             f' font-family: {Fonts.DISPLAY}; font-weight: bold;'
-            f' background: transparent;'
-        )
+            f' background: transparent;'))
         path_lbl = QLabel(path)
-        path_lbl.setStyleSheet(label_body(Colors.TEXT_MUTED, Fonts.SIZE_LABEL))
+        set_theme_style(path_lbl, lambda: (label_body(Colors.TEXT_MUTED, Fonts.SIZE_LABEL)))
         info.addWidget(name_lbl)
         info.addWidget(path_lbl)
         rl.addLayout(info, 1)
@@ -9393,14 +9236,14 @@ class _SettingsPage(QWidget):
         add_btn = QPushButton('ADD')
         add_btn.setFixedWidth(60)
         add_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        add_btn.setStyleSheet(button_primary_qss())
+        set_theme_style(add_btn, button_primary_qss)
         add_btn.clicked.connect(lambda _, n=software_name, p=path: self._scan_add(n, p))
         rl.addWidget(add_btn)
 
         dismiss_btn = QPushButton('DISMISS')
         dismiss_btn.setFixedWidth(76)
         dismiss_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        dismiss_btn.setStyleSheet(button_outline_qss())
+        set_theme_style(dismiss_btn, button_outline_qss)
         dismiss_btn.clicked.connect(lambda _, n=software_name, p=path: self._scan_dismiss(n, p))
         rl.addWidget(dismiss_btn)
         return row
@@ -9438,24 +9281,24 @@ class _SettingsPage(QWidget):
             row.setSpacing(8)
             label = QLabel(label_text)
             label.setFixedWidth(180)
-            label.setStyleSheet(_LABEL_STYLE)
+            set_theme_style(label,
+                lambda: (label_uppercase(Colors.TEXT, Fonts.SIZE_MICRO, Fonts.TRACK_LABEL)))
             row.addWidget(label)
             edit = QLineEdit(str(current))
             edit.setReadOnly(True)
-            edit.setStyleSheet(
-                f'QLineEdit {{ background:{Colors.SURFACE_1}; '
+            set_theme_style(edit, lambda: (f'QLineEdit {{ background:{Colors.SURFACE_1}; '
                 f'color:{Colors.TEXT_DIM}; border:1px solid {Colors.BORDER}; '
-                f'padding:7px 9px; }}')
+                f'padding:7px 9px; }}'))
             row.addWidget(edit, 1)
             browse = QPushButton('BROWSE')
-            browse.setStyleSheet(button_outline_qss())
+            set_theme_style(browse, button_outline_qss)
             browse.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
             browse.setToolTip(browse_text)
             browse.clicked.connect(slot)
             row.addWidget(browse)
             return row_widget, edit
 
-        # -- Folders --
+        # Folders --
         layout.addWidget(_flat_section_header('Folders'))
         layout.addSpacing(12)
         storage_row, self.clips_directory_edit = _folder_row(
@@ -9471,7 +9314,7 @@ class _SettingsPage(QWidget):
             self._on_recording_folder_browse)
         layout.addWidget(recording_row)
 
-        # -- Import Clips --
+        # Import Clips --
         layout.addSpacing(24)
         layout.addWidget(_flat_section_header('Import Clips'))
         layout.addSpacing(10)
@@ -9480,13 +9323,13 @@ class _SettingsPage(QWidget):
         btn_row.setSpacing(8)
 
         add_btn = QPushButton('ADD FOLDER')
-        add_btn.setStyleSheet(button_outline_qss())
+        set_theme_style(add_btn, button_outline_qss)
         add_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         add_btn.clicked.connect(self._on_import_folder_add)
         btn_row.addWidget(add_btn)
 
         self._scan_btn = QPushButton('SCAN FOR CLIPS')
-        self._scan_btn.setStyleSheet(button_secondary_qss())
+        set_theme_style(self._scan_btn, button_secondary_qss)
         self._scan_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self._scan_btn.clicked.connect(self._on_import_folder_scan)
         btn_row.addWidget(self._scan_btn)
@@ -9511,7 +9354,7 @@ class _SettingsPage(QWidget):
         self._scan_results_layout.setSpacing(4)
         layout.addWidget(self._scan_results_container)
 
-        # -- Video Encoding --
+        # Video Encoding --
         layout.addSpacing(24)
         layout.addWidget(_settings_hsep())
         layout.addSpacing(18)
@@ -9526,7 +9369,8 @@ class _SettingsPage(QWidget):
             row.setSpacing(10)
             lbl = QLabel(label_text)
             lbl.setFixedWidth(140)
-            lbl.setStyleSheet(_LABEL_STYLE)
+            set_theme_style(lbl,
+                lambda: (label_uppercase(Colors.TEXT, Fonts.SIZE_MICRO, Fonts.TRACK_LABEL)))
             row.addWidget(lbl)
             row.addWidget(widget, 1)
             return row_widget
@@ -9534,21 +9378,21 @@ class _SettingsPage(QWidget):
         self.encoder_combo = _DropdownCombo()
         self.encoder_combo.addItem('Detecting available encoders…', 'auto')
         self.encoder_combo.setEnabled(False)
-        self.encoder_combo.setStyleSheet(_COMBO_STYLE)
+        set_theme_style(self.encoder_combo, combo_qss)
         layout.addWidget(_encoding_row('ENCODER', self.encoder_combo))
         layout.addSpacing(8)
 
         self.codec_combo = _DropdownCombo()
         self.codec_combo.addItem('Automatic', 'auto')
         self.codec_combo.setEnabled(False)
-        self.codec_combo.setStyleSheet(_COMBO_STYLE)
+        set_theme_style(self.codec_combo, combo_qss)
         layout.addWidget(_encoding_row('CODEC', self.codec_combo))
         layout.addSpacing(8)
 
         self.encoder_preset_combo = _DropdownCombo()
         for value, label in _NVENC_PRESET_OPTIONS:
             self.encoder_preset_combo.addItem(label, value)
-        self.encoder_preset_combo.setStyleSheet(_COMBO_STYLE)
+        set_theme_style(self.encoder_preset_combo, combo_qss)
         saved_preset = int(self.sm.get('encoder_preset', 4))
         self.encoder_preset_combo.setCurrentIndex(
             max(0, min(6, saved_preset - 1)))
@@ -9559,20 +9403,20 @@ class _SettingsPage(QWidget):
         layout.addSpacing(8)
 
         self.active_encoder_lbl = QLabel('—')
-        self.active_encoder_lbl.setStyleSheet(
-            label_body(Colors.ACCENT, Fonts.SIZE_BODY))
+        set_theme_style(self.active_encoder_lbl,
+            lambda: (label_body(Colors.ACCENT, Fonts.SIZE_BODY)))
         layout.addWidget(_encoding_row('ACTIVE ENCODER', self.active_encoder_lbl))
         layout.addSpacing(10)
 
         encoder_actions = QHBoxLayout()
         encoder_actions.setSpacing(10)
         self.encoder_apply_btn = QPushButton('APPLY')
-        self.encoder_apply_btn.setStyleSheet(button_primary_qss())
+        set_theme_style(self.encoder_apply_btn, button_primary_qss)
         self.encoder_apply_btn.setVisible(False)
         self.encoder_apply_btn.clicked.connect(self._on_encoder_apply)
         encoder_actions.addWidget(self.encoder_apply_btn)
         self.encoder_refresh_btn = QPushButton('REDETECT')
-        self.encoder_refresh_btn.setStyleSheet(button_outline_qss())
+        set_theme_style(self.encoder_refresh_btn, button_outline_qss)
         self.encoder_refresh_btn.setToolTip(
             'Recheck the GPU drivers after a hardware or driver change.')
         self.encoder_refresh_btn.clicked.connect(
@@ -9580,8 +9424,8 @@ class _SettingsPage(QWidget):
         encoder_actions.addWidget(self.encoder_refresh_btn)
         self.encoder_detection_lbl = QLabel('Checking this device…')
         self.encoder_detection_lbl.setWordWrap(True)
-        self.encoder_detection_lbl.setStyleSheet(
-            label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
+        set_theme_style(self.encoder_detection_lbl,
+            lambda: (label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY)))
         encoder_actions.addWidget(self.encoder_detection_lbl, 1)
         layout.addLayout(encoder_actions)
 
@@ -9591,14 +9435,14 @@ class _SettingsPage(QWidget):
             self._on_codec_setting_changed)
         self.encoder_preset_combo.currentIndexChanged.connect(
             self._on_encoder_setting_changed)
-        # -- Watermark --
+        # Watermark --
         layout.addSpacing(24)
         layout.addWidget(_flat_section_header('Watermark'))
         layout.addSpacing(12)
 
         self.watermark_check = QCheckBox(
             'Add animated Capture Card to exports and shares')
-        self.watermark_check.setStyleSheet(checkbox_qss())
+        set_theme_style(self.watermark_check, checkbox_qss)
         self.watermark_check.setChecked(self.sm.get('watermark_enabled', False))
         self.watermark_check.toggled.connect(self._on_watermark_toggled)
         layout.addWidget(self.watermark_check)
@@ -9610,7 +9454,7 @@ class _SettingsPage(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setStyleSheet(scrollbar_qss())
+        set_theme_style(scroll, scrollbar_qss)
         scroll.setWidget(page)
 
         wrapper = QWidget()
@@ -9635,7 +9479,7 @@ class _SettingsPage(QWidget):
         cols.setContentsMargins(0, 0, 0, 0)
         cols.setSpacing(0)
 
-        # -- Left: Microphone --
+        # Left: Microphone --
         left = QWidget()
         left.setStyleSheet('background: transparent;')
         left.setSizePolicy(
@@ -9755,7 +9599,7 @@ class _SettingsPage(QWidget):
             warn = QLabel(
                 '⚠  Mic features need the "sounddevice" Python package.\n'
                 '   Install it from your venv:  pip install sounddevice numpy')
-            warn.setStyleSheet(label_body(Colors.ERROR, Fonts.SIZE_BODY))
+            set_theme_style(warn, lambda: (label_body(Colors.ERROR, Fonts.SIZE_BODY)))
             left_layout.addSpacing(6)
             left_layout.addWidget(warn)
 
@@ -9763,7 +9607,7 @@ class _SettingsPage(QWidget):
 
         cols.addWidget(_settings_vsep())
 
-        # -- Right: Notification placement and playback levels. Custom sound
+        # Right: Notification placement and playback levels. Custom sound
         # files remain under Customize, but the everyday loudness controls
         # belong here beside the rest of the audio settings.
         right = QWidget()
@@ -9781,7 +9625,7 @@ class _SettingsPage(QWidget):
         right_layout.addSpacing(12)
 
         self.notification_sounds_check = QCheckBox('Enable notification sounds')
-        self.notification_sounds_check.setStyleSheet(checkbox_qss())
+        set_theme_style(self.notification_sounds_check, checkbox_qss)
         self.notification_sounds_check.setToolTip(
             'Toggle every FTHR notification sound on or off without changing '
             'the individual volume levels.')
@@ -9809,7 +9653,8 @@ class _SettingsPage(QWidget):
 
         right_layout.addSpacing(18)
         volume_heading = QLabel('NOTIFICATION VOLUME')
-        volume_heading.setStyleSheet(_LABEL_STYLE)
+        set_theme_style(volume_heading,
+            lambda: (label_uppercase(Colors.TEXT, Fonts.SIZE_MICRO, Fonts.TRACK_LABEL)))
         right_layout.addWidget(volume_heading)
         right_layout.addSpacing(8)
 
@@ -9832,7 +9677,7 @@ class _SettingsPage(QWidget):
             slider.setRange(0, 100)
             slider.setSingleStep(1)
             slider.setPageStep(10)
-            slider.setStyleSheet(slider_qss())
+            set_theme_style(slider, slider_qss)
             slider.setAccessibleName(f'{label_text} notification volume')
             sound_row.addWidget(slider, 1)
 
@@ -9854,15 +9699,12 @@ class _SettingsPage(QWidget):
 
         outer.addLayout(cols)
 
-        # Mic enumeration was synchronous here, which made the entire
-        # settings page wait on sounddevice.query_devices(). On systems with
-        # many audio devices this added 100–400 ms to the first open. We
-        # populate a placeholder now and run the real scan on the next event
-        # loop tick so widget construction stays I/O-free.
+        # Show a placeholder and defer device inventory until after widget
+        # construction; driver queries can block for hundreds of milliseconds.
         self.mic_combo.addItem('System Default', userData=None)
         QTimer.singleShot(0, self._populate_mic_devices)
 
-        # -- Audio Capture --
+        # Audio Capture --
         outer.addSpacing(24)
         outer.addWidget(_settings_hsep())
         outer.addSpacing(20)
@@ -9870,7 +9712,7 @@ class _SettingsPage(QWidget):
         outer.addSpacing(12)
 
         self.audio_capture_check = QCheckBox('Enable audio capture')
-        self.audio_capture_check.setStyleSheet(checkbox_qss())
+        set_theme_style(self.audio_capture_check, checkbox_qss)
         self.audio_capture_check.setChecked(self.sm.get('audio_capture_enabled', True))
         self.audio_capture_check.toggled.connect(self._on_audio_capture_toggled)
         outer.addWidget(self.audio_capture_check)
@@ -9879,7 +9721,7 @@ class _SettingsPage(QWidget):
         self.separate_audio_check = QCheckBox(
             'Keep system and microphone audio as separate tracks')
         self.separate_audio_check.setObjectName('separateAudioCheck')
-        self.separate_audio_check.setStyleSheet(checkbox_qss())
+        set_theme_style(self.separate_audio_check, checkbox_qss)
         self.separate_audio_check.setChecked(
             normalize_audio_capture_mode(self.sm.get(
                 'audio_capture_mode', AUDIO_CAPTURE_MODE_COMBINED))
@@ -9899,7 +9741,7 @@ class _SettingsPage(QWidget):
             'Combined audio is the default. Enable separate tracks only when '
             'you need independent system and microphone mixing in the editor.')
         mode_hint.setWordWrap(True)
-        mode_hint.setStyleSheet(label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
+        set_theme_style(mode_hint, lambda: (label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY)))
         outer.addWidget(mode_hint)
 
         return page
@@ -10401,10 +10243,10 @@ class _SettingsPage(QWidget):
         if not hasattr(self, 'keyboard_color_swatch'):
             return
         color = str(color or DEFAULT_KEYBOARD_COLOR).lower()
-        self.keyboard_color_swatch.setStyleSheet(
-            f'QPushButton {{ background: {color}; border: 1px solid '
+        set_theme_style(self.keyboard_color_swatch,
+            lambda color=color: (f'QPushButton {{ background: {color}; border: 1px solid '
             f'{Colors.BORDER_HI}; }} QPushButton:hover {{ border-color: '
-            f'{Colors.ACCENT}; }}')
+            f'{Colors.ACCENT}; }}'))
         self.keyboard_color_value.setText(color.upper())
 
     def _start_keyboard_color_picker(self) -> None:
@@ -10543,15 +10385,13 @@ class _SettingsPage(QWidget):
         self._presets_mgr.delete(name)
         self._refresh_preset_combo()
 
-    # -- Microphone helpers --
+    # Microphone helpers --
 
     def _populate_mic_devices(self):
-        """Start a cancellable microphone inventory off the Qt thread.
+        """Discover microphones on a worker and apply results on the Qt thread.
 
-        Both the native engine helper and the legacy PortAudio query can
-        enter device-driver code.  The settings page only starts a worker and
-        polls its completion; all widget and settings mutations happen in the
-        Qt thread after the generation check below.
+        Native and PortAudio queries can block in drivers; generation checks discard
+        stale results before updating widgets or settings.
         """
         self._cancel_mic_discovery()
         self._mic_discovery_generation += 1
@@ -10567,11 +10407,9 @@ class _SettingsPage(QWidget):
             if candidate and Path(candidate).is_file():
                 engine_path = candidate
 
-        # Native WASAPI inventory is authoritative on Windows.  PortAudio is
-        # a separate legacy recorder backend and querying it here can enter a
-        # host API that cannot be cancelled or reaped.  Keep it for Linux,
-        # where it remains the capture backend; Windows native capture does
-        # not need a second device inventory just to populate stable IDs.
+        # Use native WASAPI inventory on Windows so IDs match the capture engine.
+        # PortAudio queries can block in uncancellable host APIs; reserve them for
+        # Linux, where Python owns microphone capture.
         legacy_query = (
             _sd.query_devices
             if _SD_AVAILABLE and sys.platform != 'win32' else None)
@@ -11101,23 +10939,23 @@ class _SettingsPage(QWidget):
         options = QFrame()
         options.setObjectName('overlayOptionsPanel')
         options.setFixedWidth(380)
-        options.setStyleSheet(
-            f'QFrame#overlayOptionsPanel {{ background: {Colors.SURFACE_1}; '
-            f'border: 1px solid {Colors.BORDER}; }}')
+        set_theme_style(options,
+            lambda: (f'QFrame#overlayOptionsPanel {{ background: {Colors.SURFACE_1}; '
+            f'border: 1px solid {Colors.BORDER}; }}'))
         options_layout = QVBoxLayout(options)
         options_layout.setContentsMargins(16, 14, 16, 16)
         options_layout.setSpacing(0)
 
         def option_header(text: str) -> None:
             label = QLabel(text.upper())
-            label.setStyleSheet(label_uppercase(Colors.ACCENT, Fonts.SIZE_MICRO, 2))
+            set_theme_style(label, lambda: (label_uppercase(Colors.ACCENT, Fonts.SIZE_MICRO, 2)))
             options_layout.addWidget(label)
             options_layout.addSpacing(8)
 
         # Camera options
         option_header('Camera')
         self.camera_check = QCheckBox('Burn camera overlay into clips')
-        self.camera_check.setStyleSheet(checkbox_qss())
+        set_theme_style(self.camera_check, checkbox_qss)
         self.camera_check.setChecked(bool(self.sm.get('camera_enabled', False)))
         self.camera_check.toggled.connect(self._on_camera_toggled)
         options_layout.addWidget(self.camera_check)
@@ -11126,11 +10964,12 @@ class _SettingsPage(QWidget):
         cam_dev_row = QHBoxLayout()
         cam_dev_row.setSpacing(6)
         cam_label = QLabel('DEVICE')
-        cam_label.setStyleSheet(_LABEL_STYLE)
+        set_theme_style(cam_label,
+            lambda: (label_uppercase(Colors.TEXT, Fonts.SIZE_MICRO, Fonts.TRACK_LABEL)))
         cam_label.setFixedWidth(58)
         cam_dev_row.addWidget(cam_label)
         self.camera_device_combo = _DropdownCombo()
-        self.camera_device_combo.setStyleSheet(_COMBO_STYLE)
+        set_theme_style(self.camera_device_combo, combo_qss)
         self._populate_camera_devices()
         self.camera_device_combo.currentIndexChanged.connect(
             self._on_camera_device_changed)
@@ -11150,7 +10989,7 @@ class _SettingsPage(QWidget):
         image_enabled = bool(
             image_layers and self.sm.get('image_overlay_enabled', False))
         self.image_overlay_check = QCheckBox('Burn image layers into clips')
-        self.image_overlay_check.setStyleSheet(checkbox_qss())
+        set_theme_style(self.image_overlay_check, checkbox_qss)
         self.image_overlay_check.setChecked(image_enabled)
         self.image_overlay_check.toggled.connect(self._on_image_overlay_toggled)
         options_layout.addWidget(self.image_overlay_check)
@@ -11159,7 +10998,7 @@ class _SettingsPage(QWidget):
         selector_row = QHBoxLayout()
         selector_row.setSpacing(8)
         self.image_overlay_selector = _DropdownCombo()
-        self.image_overlay_selector.setStyleSheet(_COMBO_STYLE)
+        set_theme_style(self.image_overlay_selector, combo_qss)
         self.image_overlay_selector.currentIndexChanged.connect(
             self._on_image_layer_selected)
         selector_row.addWidget(self.image_overlay_selector, 1)
@@ -11167,8 +11006,8 @@ class _SettingsPage(QWidget):
         self.image_overlay_count.setFixedWidth(92)
         self.image_overlay_count.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.image_overlay_count.setStyleSheet(
-            label_uppercase(Colors.TEXT_MUTED, Fonts.SIZE_MICRO, 1))
+        set_theme_style(self.image_overlay_count,
+            lambda: (label_uppercase(Colors.TEXT_MUTED, Fonts.SIZE_MICRO, 1)))
         selector_row.addWidget(self.image_overlay_count)
         options_layout.addLayout(selector_row)
         options_layout.addSpacing(8)
@@ -11176,18 +11015,18 @@ class _SettingsPage(QWidget):
         image_actions = QHBoxLayout()
         image_actions.setSpacing(8)
         choose_image = QPushButton('ADD IMAGES')
-        choose_image.setStyleSheet(button_primary_qss())
+        set_theme_style(choose_image, button_primary_qss)
         choose_image.setMinimumHeight(36)
         choose_image.clicked.connect(self._choose_image_overlay)
         image_actions.addWidget(choose_image, 1)
         self.remove_image_overlay_btn = QPushButton('REMOVE')
-        self.remove_image_overlay_btn.setStyleSheet(button_outline_qss())
+        set_theme_style(self.remove_image_overlay_btn, button_outline_qss)
         self.remove_image_overlay_btn.setMinimumHeight(36)
         self.remove_image_overlay_btn.clicked.connect(
             self._remove_selected_image_overlay)
         image_actions.addWidget(self.remove_image_overlay_btn)
         self.clear_image_overlays_btn = QPushButton('CLEAR ALL')
-        self.clear_image_overlays_btn.setStyleSheet(button_secondary_qss())
+        set_theme_style(self.clear_image_overlays_btn, button_secondary_qss)
         self.clear_image_overlays_btn.setMinimumHeight(36)
         self.clear_image_overlays_btn.clicked.connect(self._clear_image_overlay)
         image_actions.addWidget(self.clear_image_overlays_btn)
@@ -11197,32 +11036,34 @@ class _SettingsPage(QWidget):
         image_controls = QHBoxLayout()
         image_controls.setSpacing(6)
         fit_label = QLabel('FIT')
-        fit_label.setStyleSheet(_LABEL_STYLE)
+        set_theme_style(fit_label,
+            lambda: (label_uppercase(Colors.TEXT, Fonts.SIZE_MICRO, Fonts.TRACK_LABEL)))
         fit_label.setFixedWidth(30)
         image_controls.addWidget(fit_label)
         self.image_overlay_fit = _DropdownCombo()
-        self.image_overlay_fit.setStyleSheet(_COMBO_STYLE)
+        set_theme_style(self.image_overlay_fit, combo_qss)
         self.image_overlay_fit.addItem('Inside frame', 'fit')
         self.image_overlay_fit.addItem('Fill frame', 'fill')
         self.image_overlay_fit.currentIndexChanged.connect(
             self._on_image_overlay_fit_changed)
         image_controls.addWidget(self.image_overlay_fit, 1)
         opacity_label = QLabel('OPACITY')
-        opacity_label.setStyleSheet(_LABEL_STYLE)
+        set_theme_style(opacity_label,
+            lambda: (label_uppercase(Colors.TEXT, Fonts.SIZE_MICRO, Fonts.TRACK_LABEL)))
         opacity_label.setFixedWidth(52)
         image_controls.addWidget(opacity_label)
         self.image_overlay_opacity = QSlider(Qt.Orientation.Horizontal)
         self.image_overlay_opacity.setRange(10, 100)
         self.image_overlay_opacity.setValue(100)
-        self.image_overlay_opacity.setStyleSheet(slider_qss())
+        set_theme_style(self.image_overlay_opacity, slider_qss)
         self.image_overlay_opacity.valueChanged.connect(
             self._on_image_overlay_opacity_changed)
         image_controls.addWidget(self.image_overlay_opacity, 1)
         self.image_overlay_opacity_value = QLabel(
             f"{self.image_overlay_opacity.value()}%")
         self.image_overlay_opacity_value.setFixedWidth(34)
-        self.image_overlay_opacity_value.setStyleSheet(
-            label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
+        set_theme_style(self.image_overlay_opacity_value,
+            lambda: (label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY)))
         image_controls.addWidget(self.image_overlay_opacity_value)
         options_layout.addLayout(image_controls)
         options_layout.addSpacing(20)
@@ -11236,7 +11077,7 @@ class _SettingsPage(QWidget):
         keyboard_config = third_party_keyboard_settings(self.sm)
         self.keyboard_overlay_check = QCheckBox(
             'Show external keyboard in clips')
-        self.keyboard_overlay_check.setStyleSheet(checkbox_qss())
+        set_theme_style(self.keyboard_overlay_check, checkbox_qss)
         self.keyboard_overlay_check.setChecked(keyboard_config['enabled'])
         self.keyboard_overlay_check.toggled.connect(
             self._on_keyboard_overlay_toggled)
@@ -11246,11 +11087,12 @@ class _SettingsPage(QWidget):
         keyboard_window_row = QHBoxLayout()
         keyboard_window_row.setSpacing(6)
         keyboard_window_label = QLabel('WINDOW')
-        keyboard_window_label.setStyleSheet(_LABEL_STYLE)
+        set_theme_style(keyboard_window_label,
+            lambda: (label_uppercase(Colors.TEXT, Fonts.SIZE_MICRO, Fonts.TRACK_LABEL)))
         keyboard_window_label.setFixedWidth(58)
         keyboard_window_row.addWidget(keyboard_window_label)
         self.keyboard_window_combo = _DropdownCombo()
-        self.keyboard_window_combo.setStyleSheet(_COMBO_STYLE)
+        set_theme_style(self.keyboard_window_combo, combo_qss)
         self.keyboard_window_combo.currentIndexChanged.connect(
             self._on_keyboard_window_changed)
         keyboard_window_row.addWidget(self.keyboard_window_combo, 1)
@@ -11275,7 +11117,8 @@ class _SettingsPage(QWidget):
         keyboard_color_row = QHBoxLayout()
         keyboard_color_row.setSpacing(6)
         keyboard_color_label = QLabel('KEY COLOR')
-        keyboard_color_label.setStyleSheet(_LABEL_STYLE)
+        set_theme_style(keyboard_color_label,
+            lambda: (label_uppercase(Colors.TEXT, Fonts.SIZE_MICRO, Fonts.TRACK_LABEL)))
         keyboard_color_label.setFixedWidth(58)
         keyboard_color_row.addWidget(keyboard_color_label)
         self.keyboard_color_swatch = QPushButton()
@@ -11284,12 +11127,12 @@ class _SettingsPage(QWidget):
             'Pick the color to remove from the live keyboard preview')
         keyboard_color_row.addWidget(self.keyboard_color_swatch)
         self.keyboard_color_value = QLabel(keyboard_config['color'].upper())
-        self.keyboard_color_value.setStyleSheet(
-            label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
+        set_theme_style(self.keyboard_color_value,
+            lambda: (label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY)))
         keyboard_color_row.addWidget(self.keyboard_color_value)
         keyboard_color_row.addStretch()
         self.keyboard_pick_color = QPushButton('PICK FROM PREVIEW')
-        self.keyboard_pick_color.setStyleSheet(button_outline_qss())
+        set_theme_style(self.keyboard_pick_color, button_outline_qss)
         self.keyboard_pick_color.setMinimumHeight(30)
         self.keyboard_pick_color.clicked.connect(
             self._start_keyboard_color_picker)
@@ -11300,21 +11143,22 @@ class _SettingsPage(QWidget):
         keyboard_intensity_row = QHBoxLayout()
         keyboard_intensity_row.setSpacing(6)
         keyboard_intensity_label = QLabel('INTENSITY')
-        keyboard_intensity_label.setStyleSheet(_LABEL_STYLE)
+        set_theme_style(keyboard_intensity_label,
+            lambda: (label_uppercase(Colors.TEXT, Fonts.SIZE_MICRO, Fonts.TRACK_LABEL)))
         keyboard_intensity_label.setFixedWidth(58)
         keyboard_intensity_row.addWidget(keyboard_intensity_label)
         self.keyboard_intensity = _SettingsSlider(Qt.Orientation.Horizontal)
         self.keyboard_intensity.setRange(0, 100)
         self.keyboard_intensity.setValue(keyboard_config['intensity'])
-        self.keyboard_intensity.setStyleSheet(slider_qss())
+        set_theme_style(self.keyboard_intensity, slider_qss)
         self.keyboard_intensity.valueChanged.connect(
             self._on_keyboard_intensity_changed)
         keyboard_intensity_row.addWidget(self.keyboard_intensity, 1)
         self.keyboard_intensity_value = QLabel(
             f"{keyboard_config['intensity']}%")
         self.keyboard_intensity_value.setFixedWidth(34)
-        self.keyboard_intensity_value.setStyleSheet(
-            label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
+        set_theme_style(self.keyboard_intensity_value,
+            lambda: (label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY)))
         keyboard_intensity_row.addWidget(self.keyboard_intensity_value)
         options_layout.addLayout(keyboard_intensity_row)
         options_layout.addSpacing(6)
@@ -11324,12 +11168,12 @@ class _SettingsPage(QWidget):
             'background above. Changes are applied to the live preview '
             'immediately.')
         keyboard_hint.setWordWrap(True)
-        keyboard_hint.setStyleSheet(label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
+        set_theme_style(keyboard_hint, lambda: (label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY)))
         options_layout.addWidget(keyboard_hint)
         if sys.platform != 'win32':
             keyboard_platform_hint = QLabel('WINDOWS ONLY')
-            keyboard_platform_hint.setStyleSheet(
-                label_uppercase(Colors.TEXT_MUTED, Fonts.SIZE_MICRO, 1))
+            set_theme_style(keyboard_platform_hint,
+                lambda: (label_uppercase(Colors.TEXT_MUTED, Fonts.SIZE_MICRO, 1)))
             options_layout.addWidget(keyboard_platform_hint)
             for control in (
                     self.keyboard_overlay_check, self.keyboard_window_combo,
@@ -11349,19 +11193,19 @@ class _SettingsPage(QWidget):
         self.input_overlay_preview_background_path.setToolTip(
             str(self._default_overlay_preview_background_path())
             if not preview_background_path else preview_background_path)
-        self.input_overlay_preview_background_path.setStyleSheet(_COMBO_STYLE)
+        set_theme_style(self.input_overlay_preview_background_path, combo_qss)
         options_layout.addWidget(self.input_overlay_preview_background_path)
         options_layout.addSpacing(6)
         source_buttons = QHBoxLayout()
         source_buttons.setSpacing(6)
         choose_preview = QPushButton('CHOOSE IMAGE')
-        choose_preview.setStyleSheet(button_outline_qss())
+        set_theme_style(choose_preview, button_outline_qss)
         choose_preview.setMinimumHeight(36)
         choose_preview.clicked.connect(
             self._choose_input_overlay_preview_background)
         source_buttons.addWidget(choose_preview)
         newest_preview = QPushButton('USE DEFAULT')
-        newest_preview.setStyleSheet(button_secondary_qss())
+        set_theme_style(newest_preview, button_secondary_qss)
         newest_preview.setMinimumHeight(36)
         newest_preview.clicked.connect(
             self._use_default_input_overlay_preview_background)
@@ -11372,22 +11216,22 @@ class _SettingsPage(QWidget):
         # Composite preview
         preview_panel = QFrame()
         preview_panel.setObjectName('overlayPreviewPanel')
-        preview_panel.setStyleSheet(
-            f'QFrame#overlayPreviewPanel {{ background: {Colors.SURFACE_1}; '
-            f'border: 1px solid {Colors.BORDER}; }}')
+        set_theme_style(preview_panel,
+            lambda: (f'QFrame#overlayPreviewPanel {{ background: {Colors.SURFACE_1}; '
+            f'border: 1px solid {Colors.BORDER}; }}'))
         preview_layout = QVBoxLayout(preview_panel)
         preview_layout.setContentsMargins(14, 14, 14, 14)
         preview_layout.setSpacing(8)
         preview_header = QHBoxLayout()
         preview_title = QLabel('COMPOSITE PREVIEW')
-        preview_title.setStyleSheet(label_uppercase(Colors.TEXT, Fonts.SIZE_LABEL, 2))
+        set_theme_style(preview_title, lambda: (label_uppercase(Colors.TEXT, Fonts.SIZE_LABEL, 2)))
         preview_header.addWidget(preview_title)
         preview_header.addStretch()
         self.input_overlay_preview_source = QLabel(
             Path(preview_background_path).name
             if preview_background_path else 'DEFAULT · DESKTOP')
-        self.input_overlay_preview_source.setStyleSheet(
-            label_uppercase(Colors.TEXT_DIM, Fonts.SIZE_MICRO, 1))
+        set_theme_style(self.input_overlay_preview_source,
+            lambda: (label_uppercase(Colors.TEXT_DIM, Fonts.SIZE_MICRO, 1)))
         self.input_overlay_preview_source.setToolTip(
             preview_background_path
             or str(self._default_overlay_preview_background_path()))
@@ -11432,7 +11276,7 @@ class _SettingsPage(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setStyleSheet(scrollbar_qss())
+        set_theme_style(scroll, scrollbar_qss)
         scroll.setWidget(page)
 
         wrapper = QWidget()
@@ -11454,12 +11298,12 @@ class _SettingsPage(QWidget):
         layout.setSpacing(0)
         preview_background = self._load_overlay_preview_background()
 
-        # -- Camera Overlay --
+        # Camera Overlay --
         layout.addWidget(_flat_section_header('Camera Overlay'))
         layout.addSpacing(12)
 
         self.camera_check = QCheckBox('Burn camera overlay into clips')
-        self.camera_check.setStyleSheet(checkbox_qss())
+        set_theme_style(self.camera_check, checkbox_qss)
         self.camera_check.setChecked(self.sm.get('camera_enabled', False))
         self.camera_check.toggled.connect(self._on_camera_toggled)
         layout.addWidget(self.camera_check)
@@ -11468,11 +11312,12 @@ class _SettingsPage(QWidget):
         cam_dev_row = QHBoxLayout()
         cam_dev_row.setSpacing(8)
         _dev_lbl = QLabel('DEVICE')
-        _dev_lbl.setStyleSheet(_LABEL_STYLE)
+        set_theme_style(_dev_lbl,
+            lambda: (label_uppercase(Colors.TEXT, Fonts.SIZE_MICRO, Fonts.TRACK_LABEL)))
         _dev_lbl.setFixedWidth(80)
         cam_dev_row.addWidget(_dev_lbl)
         self.camera_device_combo = _DropdownCombo()
-        self.camera_device_combo.setStyleSheet(_COMBO_STYLE)
+        set_theme_style(self.camera_device_combo, combo_qss)
         self._populate_camera_devices()
         self.camera_device_combo.currentIndexChanged.connect(self._on_camera_device_changed)
         cam_dev_row.addWidget(self.camera_device_combo, 1)
@@ -11500,7 +11345,7 @@ class _SettingsPage(QWidget):
         self._camera_preview_timer.setInterval(100)
         self._camera_preview_timer.timeout.connect(self._update_camera_preview)
 
-        # -- Image Overlay --
+        # Image Overlay --
         layout.addSpacing(28)
         layout.addWidget(_flat_section_header('Image Overlay'))
         layout.addSpacing(12)
@@ -11508,7 +11353,7 @@ class _SettingsPage(QWidget):
         image_path = str(self.sm.get('image_overlay_path', '') or '')
         image_enabled = bool(self.sm.get('image_overlay_enabled', False))
         self.image_overlay_check = QCheckBox('Burn an image into clips')
-        self.image_overlay_check.setStyleSheet(checkbox_qss())
+        set_theme_style(self.image_overlay_check, checkbox_qss)
         self.image_overlay_check.setChecked(image_enabled)
         self.image_overlay_check.toggled.connect(self._on_image_overlay_toggled)
         layout.addWidget(self.image_overlay_check)
@@ -11517,20 +11362,21 @@ class _SettingsPage(QWidget):
         image_row = QHBoxLayout()
         image_row.setSpacing(8)
         image_label = QLabel('IMAGE')
-        image_label.setStyleSheet(_LABEL_STYLE)
+        set_theme_style(image_label,
+            lambda: (label_uppercase(Colors.TEXT, Fonts.SIZE_MICRO, Fonts.TRACK_LABEL)))
         image_label.setFixedWidth(80)
         image_row.addWidget(image_label)
         self.image_overlay_path = QLineEdit(image_path)
         self.image_overlay_path.setReadOnly(True)
         self.image_overlay_path.setPlaceholderText('No image selected')
-        self.image_overlay_path.setStyleSheet(_COMBO_STYLE)
+        set_theme_style(self.image_overlay_path, combo_qss)
         image_row.addWidget(self.image_overlay_path, 1)
         choose_image = QPushButton('CHOOSE IMAGE')
-        choose_image.setStyleSheet(button_outline_qss())
+        set_theme_style(choose_image, button_outline_qss)
         choose_image.clicked.connect(self._choose_image_overlay)
         image_row.addWidget(choose_image)
         clear_image = QPushButton('CLEAR')
-        clear_image.setStyleSheet(button_secondary_qss())
+        set_theme_style(clear_image, button_secondary_qss)
         clear_image.clicked.connect(self._clear_image_overlay)
         image_row.addWidget(clear_image)
         layout.addLayout(image_row)
@@ -11539,11 +11385,12 @@ class _SettingsPage(QWidget):
         image_controls = QHBoxLayout()
         image_controls.setSpacing(8)
         fit_label = QLabel('PLACEMENT')
-        fit_label.setStyleSheet(_LABEL_STYLE)
+        set_theme_style(fit_label,
+            lambda: (label_uppercase(Colors.TEXT, Fonts.SIZE_MICRO, Fonts.TRACK_LABEL)))
         fit_label.setFixedWidth(80)
         image_controls.addWidget(fit_label)
         self.image_overlay_fit = _DropdownCombo()
-        self.image_overlay_fit.setStyleSheet(_COMBO_STYLE)
+        set_theme_style(self.image_overlay_fit, combo_qss)
         self.image_overlay_fit.addItem('Fit inside frame', 'fit')
         self.image_overlay_fit.addItem('Fill frame', 'fill')
         fit_index = self.image_overlay_fit.findData(
@@ -11553,22 +11400,23 @@ class _SettingsPage(QWidget):
             self._on_image_overlay_fit_changed)
         image_controls.addWidget(self.image_overlay_fit, 1)
         opacity_label = QLabel('OPACITY')
-        opacity_label.setStyleSheet(_LABEL_STYLE)
+        set_theme_style(opacity_label,
+            lambda: (label_uppercase(Colors.TEXT, Fonts.SIZE_MICRO, Fonts.TRACK_LABEL)))
         opacity_label.setFixedWidth(72)
         image_controls.addWidget(opacity_label)
         self.image_overlay_opacity = QSlider(Qt.Orientation.Horizontal)
         self.image_overlay_opacity.setRange(10, 100)
         self.image_overlay_opacity.setValue(
             int(self.sm.get('image_overlay_opacity', 100)))
-        self.image_overlay_opacity.setStyleSheet(slider_qss())
+        set_theme_style(self.image_overlay_opacity, slider_qss)
         self.image_overlay_opacity.valueChanged.connect(
             self._on_image_overlay_opacity_changed)
         image_controls.addWidget(self.image_overlay_opacity, 1)
         self.image_overlay_opacity_value = QLabel(
             f"{self.image_overlay_opacity.value()}%")
         self.image_overlay_opacity_value.setFixedWidth(38)
-        self.image_overlay_opacity_value.setStyleSheet(
-            label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
+        set_theme_style(self.image_overlay_opacity_value,
+            lambda: (label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY)))
         image_controls.addWidget(self.image_overlay_opacity_value)
         layout.addLayout(image_controls)
         layout.addSpacing(6)
@@ -11588,7 +11436,7 @@ class _SettingsPage(QWidget):
         layout.addSpacing(6)
         image_hint = QLabel('Transparent PNG and WebP files keep their alpha.')
         image_hint.setWordWrap(True)
-        image_hint.setStyleSheet(label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
+        set_theme_style(image_hint, lambda: (label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY)))
         layout.addWidget(image_hint)
 
         # Keyboard visualization is intentionally shelved while mouse input
@@ -11599,7 +11447,7 @@ class _SettingsPage(QWidget):
         coming_soon = QLabel(
             'Keyboard overlay coming soon.')
         coming_soon.setWordWrap(True)
-        coming_soon.setStyleSheet(label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
+        set_theme_style(coming_soon, lambda: (label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY)))
         layout.addWidget(coming_soon)
 
         layout.addStretch()
@@ -11607,7 +11455,7 @@ class _SettingsPage(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setStyleSheet(scrollbar_qss())
+        set_theme_style(scroll, scrollbar_qss)
         scroll.setWidget(page)
 
         wrapper = QWidget()
@@ -11643,6 +11491,9 @@ class _SettingsPage(QWidget):
         # Re-apply styles for this settings page
         self._apply_styles()
         self._set_settings_content_surface()
+        refresh_theme_styles(self.window())
+        for combo in self.findChildren(_DropdownCombo):
+            combo.refresh_theme_palette()
         # Rebuild the customize controls so their local QSS is generated from
         # the newly applied tokens. The preview remains the one intentional
         # pure-black sample of the customization surface.
@@ -11667,7 +11518,7 @@ class _SettingsPage(QWidget):
 
         self.performance_background_pause_check = QCheckBox(
             'Pause non-essential UI while in background')
-        self.performance_background_pause_check.setStyleSheet(checkbox_qss())
+        set_theme_style(self.performance_background_pause_check, checkbox_qss)
         self.performance_background_pause_check.setChecked(bool(
             self.sm.get('pause_ui_in_background', True)))
         self.performance_background_pause_check.setToolTip(
@@ -11682,8 +11533,7 @@ class _SettingsPage(QWidget):
             'Capture keeps running normally. Capture-card visibility and each '
             'notification volume remain controlled by their own options.')
         background_hint.setWordWrap(True)
-        background_hint.setStyleSheet(
-            label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
+        set_theme_style(background_hint, lambda: (label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY)))
         layout.addWidget(background_hint)
 
         layout.addSpacing(28)
@@ -11695,7 +11545,7 @@ class _SettingsPage(QWidget):
 
         self.performance_audio_check = QCheckBox(
             'Enable audio capture')
-        self.performance_audio_check.setStyleSheet(checkbox_qss())
+        set_theme_style(self.performance_audio_check, checkbox_qss)
         self.performance_audio_check.toggled.connect(
             self._on_audio_capture_toggled)
         layout.addWidget(self.performance_audio_check)
@@ -11708,7 +11558,7 @@ class _SettingsPage(QWidget):
 
         self.performance_capture_card_check = QCheckBox(
             'Enable capture card')
-        self.performance_capture_card_check.setStyleSheet(checkbox_qss())
+        set_theme_style(self.performance_capture_card_check, checkbox_qss)
         self.performance_capture_card_check.setChecked(bool(
             self.sm.get('capture_card_enabled', True)))
         self.performance_capture_card_check.setToolTip(
@@ -11739,13 +11589,14 @@ class _SettingsPage(QWidget):
         performance_encoder_row_layout.setSpacing(10)
         performance_encoder_label = QLabel('NVIDIA PRESET')
         performance_encoder_label.setFixedWidth(140)
-        performance_encoder_label.setStyleSheet(_LABEL_STYLE)
+        set_theme_style(performance_encoder_label,
+            lambda: (label_uppercase(Colors.TEXT, Fonts.SIZE_MICRO, Fonts.TRACK_LABEL)))
         performance_encoder_row_layout.addWidget(performance_encoder_label)
 
         self.performance_encoder_preset_combo = _DropdownCombo()
         for value, label in _NVENC_PRESET_OPTIONS:
             self.performance_encoder_preset_combo.addItem(label, value)
-        self.performance_encoder_preset_combo.setStyleSheet(_COMBO_STYLE)
+        set_theme_style(self.performance_encoder_preset_combo, combo_qss)
         saved_preset = int(self.sm.get('encoder_preset', 4))
         self.performance_encoder_preset_combo.setCurrentIndex(
             max(0, min(6, saved_preset - 1)))
@@ -11759,7 +11610,7 @@ class _SettingsPage(QWidget):
         performance_encoder_actions.setContentsMargins(0, 8, 0, 0)
         performance_encoder_actions.setSpacing(10)
         self.performance_encoder_apply_btn = QPushButton('APPLY')
-        self.performance_encoder_apply_btn.setStyleSheet(button_primary_qss())
+        set_theme_style(self.performance_encoder_apply_btn, button_primary_qss)
         self.performance_encoder_apply_btn.setVisible(False)
         self.performance_encoder_apply_btn.clicked.connect(
             self._on_encoder_apply)
@@ -11781,7 +11632,7 @@ class _SettingsPage(QWidget):
 
         self.performance_clip_preview_check = QCheckBox(
             'Show clip edits in real time')
-        self.performance_clip_preview_check.setStyleSheet(checkbox_qss())
+        set_theme_style(self.performance_clip_preview_check, checkbox_qss)
         self.performance_clip_preview_check.setChecked(bool(
             self.sm.get('clip_editor_live_preview', True)))
         self.performance_clip_preview_check.toggled.connect(
@@ -11927,7 +11778,7 @@ class _SettingsPage(QWidget):
         self.encoder_config_changed.emit()
 
     def _apply_styles(self):
-        self.setStyleSheet(f'''
+        set_theme_style(self, lambda: (f'''
             QWidget#settingsPage    {{ background-color: {Colors.BG}; }}
             QWidget#settingsContent {{ background-color: {Colors.BG}; }}
             QWidget#customizePage,
@@ -12045,12 +11896,10 @@ class _SettingsPage(QWidget):
                 background-color: {Colors.BG};
                 border: 1px solid {Colors.BORDER};
             }}
-        ''')
+        '''))
 
 
-# ===========================================================================
 # Entry point
-# ===========================================================================
 
 def _load_fonts():
     """Register bundled Oswald and user-imported theme fonts with Qt."""
@@ -12067,18 +11916,9 @@ def _load_fonts():
 
 
 def _prewarm_heavy_modules():
-    """Eagerly initialize heavy libs that the editor would otherwise pay for
-    on the first clip open.
+    """Warm OpenCV, QMediaPlayer, and FFmpeg resolution during the startup splash.
 
-    On first use, each of these triggers expensive one-time work:
-      - cv2: loads the OpenCV C++ extension and FFmpeg demux backend.
-      - QMediaPlayer: spins up Windows MediaFoundation and the H.264 codec.
-      - ffmpeg_tools: locates the bundled ffmpeg binary on disk.
-
-    Doing this at app startup (where the splash hides the latency) makes the
-    first ClipViewer open feel instantaneous. None of these are user-visible
-    in the warming step — the QMediaPlayer is constructed and immediately
-    deleted, just to pay the MediaFoundation initialization cost once.
+    This pays their one-time initialization cost before the first editor opens.
     """
     try:
         import cv2  # noqa: F401  — import alone is enough to load the .pyd
@@ -12115,8 +11955,7 @@ def main():
     background_start = '--background' in sys.argv
     print(f'Main.py successfully initiated background={background_start}')
 
-    # Which external helpers resolved to what, and from which PATH. Bug reports
-    # saying "screenshots don't work" used to arrive with nothing to go on.
+    # Log resolved helper paths so missing tools and PATH overrides are diagnosable.
     if sys.platform != 'win32':
         print(linux_tools.report())
 

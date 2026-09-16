@@ -1,51 +1,49 @@
-# clip_grid.py - responsive clip and screenshot library grid.
+# Responsive library grid grouped by date.
 #
-# Big picture: this scans a few folders for video/image files, groups them into
-# "TUE, APR 28" style date sections, and lays each section out as a responsive
-# grid of cards. The number of columns recalculates from the window width.
-#
-# The primary constraint is to avoid blocking the main thread. Decoding a video
-# frame for a thumbnail with cv2 is slow (20-100ms each), and statting hundreds
-# of files isn't free either. So:
-#   - file scanning + sorting happens on a worker thread (_FileCollectWorker)
-#   - thumbnail generation happens on a worker thread (_ThumbnailWorker)
-#   - thumbnails + duration are cached to disk so we only pay that cost once
-# Unexpected scroll stalls should be checked for decoding or filesystem work
-# that has moved back onto the main thread.
+# Workers scan files and generate thumbnails; disk caches retain thumbnails
+# and durations. Keep filesystem and decoding work off the Qt thread.
 import os
 import sys
 import subprocess
+import threading
 from core import linux_tools
 import hashlib
+import math
 import time
 from pathlib import Path
-import cv2
 from datetime import datetime
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QGridLayout,
-    QGraphicsOpacityEffect, QMenu, QApplication,
+    QMenu, QApplication,
     QPushButton, QSizePolicy,
 )
 from PySide6.QtCore import (
     Qt, Signal, QTimer, QRunnable, QThreadPool, QObject,
-    QFileSystemWatcher, QPropertyAnimation, QEasingCurve, QRect, QPoint,
-    QUrl,
+    QFileSystemWatcher, QPropertyAnimation, QRect, QPoint,
+    QUrl, QSize,
 )
 from PySide6.QtGui import QDesktopServices, QPixmap, QPainter, QColor
+from PySide6.QtGui import QImage, QImageReader
 
 from core.clip_files import (
     IMAGE_SUFFIXES,
     VIDEO_SUFFIXES,
     is_completed_video_path,
     is_fthr_temporary_dir,
-    is_library_media_path,
 )
+from core.library_index import (
+    LibraryRecord, LibraryScanResult, canonical_media_path,
+    scan_library,
+)
+from core.library_cache import maybe_prune_thumbnail_cache
+from core.media_process import run_media_process as _run_owned_media_process, media_process_snapshot
 from core.library_ownership import MediaOwnership, classify_media_path
-from core.media_metadata import probe_video_metadata
+from core.media_metadata import parse_ffprobe_video_metadata
+from core.ffmpeg_tools import FFmpegUnavailable, get_ffmpeg_exe, get_ffprobe_exe
 from core.settings_manager import clips_directory_from
 from core.field_diagnostics import (
-    DiagnosticError, emit_event, get_diagnostic_session, process_memory_bytes,
+    emit_event, get_diagnostic_session, process_memory_bytes,
 )
 from ui.style import WheelSafeComboBox, paint_dropdown_arrow
 
@@ -123,7 +121,7 @@ def _show_in_file_manager(file_path: str) -> None:
         print(f'[Clips] {linux_tools.missing_message("xdg-open")}')
 
 
-# ─── Card geometry ──────────────────────────────────────────────────
+# Card geometry
 # Cards flex with the viewport. The thumbnail *surface* remains 16:9, while
 # source pixels are fitted inside it without cropping or distortion.
 _CARD_W      = 320  # preferred / cache sizing reference
@@ -132,19 +130,21 @@ _CARD_MAX_W  = 420
 _THUMB_H     = 180
 _CARD_BODY_H = 104
 _CARD_H      = _THUMB_H + _CARD_BODY_H
-
-
+_MAX_MATERIALIZED_CARDS = 96
+_VIRTUAL_OVERSCAN_ROWS = 2
+_MAX_THUMBNAIL_QUEUE = 128
+_NEGATIVE_CACHE_SECONDS = 30.0
 def _get_cached_thumb_path(file_path: str) -> str:
     """Return a cache path based on file path + mtime so stale caches auto-invalidate.
 
     Including mtime in the hash invalidates the cache automatically when a file
     is overwritten without requiring a separate cache index.
     """
-    mtime = os.path.getmtime(file_path)
-    # v2 caches preserve the source aspect ratio.  Including the cache format
+    info = os.stat(file_path)
+    # v4 caches preserve source aspect ratio through FFmpeg scaling. The format
     # here prevents an older, force-stretched 16:9 thumbnail from surviving an
     # application update.
-    key = f'{file_path}|{mtime}|aspect-v2'.encode(
+    key = f'{canonical_media_path(file_path)}|{info.st_size}|{info.st_mtime_ns}|aspect-v4'.encode(
         'utf-8', errors='surrogateescape')
     return os.path.join(THUMB_CACHE_DIR, hashlib.md5(key).hexdigest() + '.jpg')
 
@@ -152,10 +152,24 @@ def _get_cached_thumb_path(file_path: str) -> str:
 def _get_cached_duration_path(thumb_path: str) -> str:
     """Sidecar storing authoritative clip metadata for thumbnail/viewer reuse.
 
-    The v2 filename deliberately invalidates old OpenCV-derived FPS caches.
+    The versioned filename invalidates old OpenCV-derived FPS caches.
     Format: ``duration width height fps video_bitrate total_bitrate``.
     """
-    return thumb_path[:-4] + '.meta-v2'
+    return thumb_path[:-4] + '.meta-v3'
+
+
+def _get_negative_cache_path(thumb_path: str) -> str:
+    """Fingerprint-bound marker for an unchanged media probe failure."""
+    return thumb_path[:-4] + '.failed'
+
+
+def _has_recent_probe_failure(path: str) -> bool:
+    try:
+        age = time.time() - os.path.getmtime(path)
+        return 0 <= age < _NEGATIVE_CACHE_SECONDS
+    except OSError:
+        # A missing/unreadable optional marker must not suppress a fresh probe.
+        return False
 
 
 def _read_cached_duration(dur_path: str) -> int:
@@ -177,9 +191,14 @@ def read_cached_metadata(dur_path: str):
         fps      = float(parts[3]) if len(parts) > 3 else 0.0
         video_bitrate = int(parts[4]) if len(parts) > 4 else 0
         total_bitrate = int(parts[5]) if len(parts) > 5 else 0
+        if (not math.isfinite(duration) or duration <= 0
+                or width <= 0 or height <= 0 or not math.isfinite(fps)
+                or fps < 0 or video_bitrate < 0 or total_bitrate < 0):
+            return None
         return (duration, width, height, fps,
                 video_bitrate, total_bitrate)
     except (OSError, ValueError):
+        # A corrupt/missing sidecar is a cache miss and will be probed again.
         return None
 
 
@@ -189,20 +208,27 @@ def _write_cached_duration(dur_path: str, duration: float,
                             total_bitrate: int = 0):
     """Persist factual FFprobe metadata so ClipViewer can skip a second probe."""
     try:
-        with open(dur_path, 'w') as f:
+        temp_path = dur_path + f'.tmp-{os.getpid()}-{threading.get_ident()}'
+        with open(temp_path, 'w') as f:
             f.write(
                 f'{float(duration):.6f} {int(width)} {int(height)} '
                 f'{float(fps):.6f} {int(video_bitrate)} {int(total_bitrate)}')
+        os.replace(temp_path, dur_path)
     except OSError:
-        pass
+        try:
+            os.unlink(temp_path)
+        except (OSError, UnboundLocalError):
+            # A failed optional cache write may leave no temporary file to remove.
+            pass
 
 
-# Public lookup used by ClipViewer to avoid blocking cv2.VideoCapture on first
+# Public lookup used by ClipViewer to avoid blocking a decoder on first
 # open. Returns (duration_sec, width, height, fps) or None on any miss / error.
 def get_cached_clip_metadata(file_path: str):
     try:
         cache_path = _get_cached_thumb_path(file_path)
     except OSError:
+        # A removed source has no cache identity; callers can show the placeholder.
         return None
     return read_cached_metadata(_get_cached_duration_path(cache_path))
 
@@ -268,191 +294,338 @@ class _ThumbnailSignals(QObject):
     diagnostic_finished = Signal(int, int, bool)  # total_ms, metadata_ms, cache_hit
 
 
+def _valid_cached_thumbnail(path: str) -> bool:
+    """Validate a JPEG header/decode before treating a cache entry as a hit."""
+    try:
+        reader = QImageReader(path)
+        reader.setAutoTransform(True)
+        image = reader.read()
+        return not image.isNull() and image.width() > 0 and image.height() > 0
+    except (OSError, RuntimeError):
+        # A damaged cached JPEG is a miss, never a reason to reject the clip.
+        return False
+
+
+def _probe_with_owned_process(
+        file_path: str, cancel_event: threading.Event):
+    try:
+        probe = get_ffprobe_exe()
+    except FFmpegUnavailable:
+        # Missing FFprobe only disables enrichment; opening uses the original media.
+        return None
+    result = _run_owned_media_process(
+        [probe, '-v', 'error', '-show_entries',
+         'stream=index,codec_type,width,height,avg_frame_rate,'
+         'r_frame_rate,duration,bit_rate:'
+         'format_tags=fthr_frame_rate,fthr_video_bitrate_bps:'
+         'format=duration,size,bit_rate', '-of', 'json', file_path],
+        cancel_event)
+    if result is None or result[0] != 0:
+        return None
+    try:
+        size = Path(file_path).stat().st_size
+    except OSError:
+        size = None
+    return parse_ffprobe_video_metadata(
+        result[1].decode('utf-8', errors='replace'), file_size=size)
+
+
+def _decode_thumbnail_with_owned_process(
+        file_path: str, cancel_event: threading.Event) -> QImage | None:
+    try:
+        ffmpeg = get_ffmpeg_exe()
+    except FFmpegUnavailable:
+        # Missing FFmpeg only disables the thumbnail, not access to the clip.
+        return None
+    result = _run_owned_media_process(
+        [ffmpeg, '-hide_banner', '-loglevel', 'error', '-ss', '0',
+         '-i', file_path, '-frames:v', '1', '-vf',
+         "scale=w='min(640,iw)':h='min(360,ih)':force_original_aspect_ratio=decrease",
+         '-f', 'image2pipe', '-vcodec', 'mjpeg', '-'],
+        cancel_event)
+    if result is None or result[0] != 0 or not result[1]:
+        return None
+    image = QImage.fromData(result[1], 'JPEG')
+    if image.isNull():
+        return None
+    return image
+
+
 class _ThumbnailWorker(QRunnable):
     """Generate and cache a video thumbnail off the main thread."""
 
-    def __init__(self, file_path: str):
+    def __init__(self, file_path: str, cancel_event=None):
         super().__init__()
         self.file_path = file_path
+        self.cancel_event = cancel_event or threading.Event()
         self.signals = _ThumbnailSignals()
 
     def run(self):
         started = time.monotonic()
         metadata_ms = 0
         cache_hit = False
+        cache_path = ''
+        temp_path = ''
         try:
             if not is_completed_video_path(self.file_path):
                 self.signals.finished.emit(self.file_path, '', 0)
                 return
+            if self.cancel_event.is_set():
+                return
             cache_path = _get_cached_thumb_path(self.file_path)
             dur_path   = _get_cached_duration_path(cache_path)
+            failed_path = _get_negative_cache_path(cache_path)
 
-            # Cache hit: image AND duration sidecar both exist.
-            # This skips opening the video file entirely (cv2.VideoCapture +
-            # FFmpeg demux is the expensive part — typically 20-100ms per file).
-            if os.path.exists(cache_path) and os.path.exists(dur_path):
+            # Cache hit: a valid JPEG AND factual metadata sidecar both exist.
+            # Fingerprinting in _get_cached_thumb_path means mutations select a
+            # new generation; corrupt entries never poison the next run.
+            if (os.path.exists(cache_path) and os.path.exists(dur_path)
+                    and read_cached_metadata(dur_path) is not None
+                    and _valid_cached_thumbnail(cache_path)):
                 cache_hit = True
                 duration = _read_cached_duration(dur_path)
                 self.signals.finished.emit(self.file_path, cache_path, duration)
                 return
-
-            cap = cv2.VideoCapture(self.file_path)
-            if not cap.isOpened():
-                self.signals.finished.emit(self.file_path, '', 0)
+            if os.path.exists(cache_path) and not _valid_cached_thumbnail(cache_path):
+                # Never retain a corrupt generation just because its filename
+                # still matches the current source fingerprint.
+                try:
+                    os.unlink(cache_path)
+                except OSError:
+                    pass
+            if _has_recent_probe_failure(failed_path):
+                # A decoder timeout or temporarily unavailable tool says
+                # nothing permanent about the media. Retry unchanged files
+                # after a short cooldown, including markers from older builds.
+                self.signals.finished.emit(
+                    self.file_path, '', _read_cached_duration(dur_path))
                 return
-
-            ret, frame = cap.read()
-            decoder_fps = cap.get(cv2.CAP_PROP_FPS)
-            frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-            width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            decoder_duration = frames / decoder_fps if decoder_fps > 0 else 0.0
-            cap.release()
-
             metadata_started = time.monotonic()
-            probed = probe_video_metadata(self.file_path)
+            probed = _probe_with_owned_process(
+                self.file_path, self.cancel_event)
             metadata_ms = round((time.monotonic() - metadata_started) * 1000)
+            if self.cancel_event.is_set():
+                return
             duration = (probed.duration_seconds
-                        if probed and probed.duration_seconds is not None
-                        else decoder_duration)
-            width = probed.width if probed and probed.width else width
-            height = probed.height if probed and probed.height else height
-            # Never persist CAP_PROP_FPS as factual media metadata. It is commonly
-            # reconstructed from approximate frame counts/timestamps.
+                        if probed and probed.duration_seconds is not None else 0.0)
+            width = probed.width if probed and probed.width else 0
+            height = probed.height if probed and probed.height else 0
             fps = probed.average_fps if probed and probed.average_fps else 0.0
             video_bitrate = (
                 probed.video_bitrate_bps if probed and probed.video_bitrate_bps else 0)
             total_bitrate = (
                 probed.total_bitrate_bps if probed and probed.total_bitrate_bps else 0)
 
-            if not ret or frame is None:
+            # Metadata is useful even if thumbnail decoding later fails.
+            os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
+            if probed is not None:
+                _write_cached_duration(
+                    dur_path, duration, width, height, fps,
+                    video_bitrate, total_bitrate)
+
+            image = _decode_thumbnail_with_owned_process(
+                self.file_path, self.cancel_event)
+            if image is None:
+                if self.cancel_event.is_set():
+                    return
+                try:
+                    Path(failed_path).parent.mkdir(parents=True, exist_ok=True)
+                    Path(failed_path).touch()
+                except OSError:
+                    pass
                 self.signals.finished.emit(self.file_path, '', int(duration))
                 return
 
             os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
             if not os.path.exists(cache_path):
-                # Cache the real aspect ratio. The old forced 320×180 resize baked
-                # distortion into portrait, ultrawide, and cropped thumbnails even
-                # before Qt displayed them.
-                source_h, source_w = frame.shape[:2]
-                scale = min(1.0, 640 / max(source_w, 1), 360 / max(source_h, 1))
-                if scale < 1.0:
-                    thumb = cv2.resize(
-                        frame,
-                        (max(1, int(source_w * scale)),
-                         max(1, int(source_h * scale))),
-                        interpolation=cv2.INTER_AREA)
+                # QImage decode/scaling stays on this QRunnable. Only the
+                # thumbnail-sized JPEG reaches the UI and cache.
+                temp_path = cache_path + f'.tmp-{os.getpid()}-{threading.get_ident()}.jpg'
+                if image.save(temp_path, 'JPG', 85):
+                    os.replace(temp_path, cache_path)
                 else:
-                    thumb = frame
-                cv2.imwrite(cache_path, thumb, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    try:
+                        os.unlink(temp_path)
+                    except OSError:
+                        pass
             # Persist full metadata so ClipViewer can skip its own cv2.VideoCapture
             # on subsequent opens — this is what removes the first-launch lag for
             # clips that already appear on the grid.
-            _write_cached_duration(
-                dur_path, duration, width, height, fps,
-                video_bitrate, total_bitrate)
             self.signals.finished.emit(
                 self.file_path, cache_path, int(duration))
         except Exception as error:
             # Thumbnail/metadata enrichment must never invalidate a clip that
             # was already transactionally published by the engine.
+            if self.cancel_event.is_set():
+                return
             emit_event(
                 'library', 'thumbnail_generation_failed', state='FAILED',
                 detail=f'{type(error).__name__}: {error}')
+            try:
+                if cache_path:
+                    os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
+                    Path(_get_negative_cache_path(cache_path)).touch()
+            except (OSError, UnboundLocalError):
+                pass
             self.signals.finished.emit(self.file_path, '', 0)
         finally:
-            self.signals.diagnostic_finished.emit(
-                round((time.monotonic() - started) * 1000),
-                metadata_ms, cache_hit)
+            try:
+                if temp_path:
+                    try:
+                        os.unlink(temp_path)
+                    except OSError:
+                        pass
+                maybe_prune_thumbnail_cache(THUMB_CACHE_DIR)
+            except Exception as error:
+                # Cache maintenance is optional; it must never prevent the
+                # terminal diagnostic signal that releases the job owner.
+                emit_event(
+                    'library', 'thumbnail_cache_maintenance_failed',
+                    state='FAILED',
+                    detail=f'{type(error).__name__}: {error}')
+            finally:
+                self.signals.diagnostic_finished.emit(
+                    round((time.monotonic() - started) * 1000),
+                    metadata_ms, cache_hit)
+
+
+class _ImageThumbnailSignals(QObject):
+    finished = Signal(str, object)  # file_path, thumbnail-sized QImage
+    diagnostic_finished = Signal(int, int, bool)
+
+
+class _ImageThumbnailWorker(QRunnable):
+    """Decode screenshots with QImageReader away from the Qt GUI thread."""
+
+    def __init__(self, file_path: str, cancel_event=None):
+        super().__init__()
+        self.file_path = file_path
+        self.cancel_event = cancel_event or threading.Event()
+        self.signals = _ImageThumbnailSignals()
+
+    def run(self):
+        started = time.monotonic()
+        cache_hit = False
+        cache_path = ''
+        temp_path = ''
+        try:
+            cache_path = _get_cached_thumb_path(self.file_path)
+            failed_path = _get_negative_cache_path(cache_path)
+            if self.cancel_event.is_set():
+                return
+            if os.path.exists(cache_path) and _valid_cached_thumbnail(cache_path):
+                cache_hit = True
+                reader = QImageReader(cache_path)
+                reader.setAutoTransform(True)
+                image = reader.read()
+                self.signals.finished.emit(self.file_path, image)
+                return
+            if os.path.exists(cache_path):
+                try:
+                    os.unlink(cache_path)
+                except OSError:
+                    pass
+            if _has_recent_probe_failure(failed_path):
+                self.signals.finished.emit(self.file_path, QImage())
+                return
+            reader = QImageReader(self.file_path)
+            reader.setAutoTransform(True)
+            size = reader.size()
+            if size.isValid() and (size.width() > 640 or size.height() > 360):
+                size.scale(QSize(640, 360), Qt.AspectRatioMode.KeepAspectRatio)
+                reader.setScaledSize(size)
+            image = reader.read()
+            if self.cancel_event.is_set():
+                return
+            if image.isNull():
+                raise ValueError('image decoder returned an empty image')
+            Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+            temp_path = cache_path + f'.tmp-{os.getpid()}-{threading.get_ident()}.jpg'
+            if not image.save(temp_path, 'JPG', 85):
+                raise OSError('thumbnail cache write failed')
+            os.replace(temp_path, cache_path)
+            self.signals.finished.emit(self.file_path, image)
+        except Exception as error:
+            if self.cancel_event.is_set():
+                return
+            emit_event(
+                'library', 'thumbnail_generation_failed', state='FAILED',
+                detail=f'{type(error).__name__}: {error}')
+            try:
+                if cache_path:
+                    Path(_get_negative_cache_path(cache_path)).parent.mkdir(
+                        parents=True, exist_ok=True)
+                    Path(_get_negative_cache_path(cache_path)).touch()
+            except (OSError, UnboundLocalError):
+                pass
+            self.signals.finished.emit(self.file_path, QImage())
+        finally:
+            try:
+                if temp_path:
+                    try:
+                        os.unlink(temp_path)
+                    except OSError:
+                        pass
+                if cache_path:
+                    maybe_prune_thumbnail_cache(THUMB_CACHE_DIR)
+            except Exception as error:
+                # Cache maintenance is optional; it must not strand the
+                # in-flight owner by suppressing the terminal signal.
+                emit_event(
+                    'library', 'thumbnail_cache_maintenance_failed',
+                    state='FAILED',
+                    detail=f'{type(error).__name__}: {error}')
+            finally:
+                self.signals.diagnostic_finished.emit(
+                    round((time.monotonic() - started) * 1000), 0, cache_hit)
 
 
 class _FileCollectSignals(QObject):
     # raw_files: set[str], sorted_pairs: list[(mtime, path)], imported: set[str], subdirs: list[str]
     finished = Signal(object, object, object, object)
+    # generation, bounded discovery snapshot.  The final ``finished`` result
+    # remains authoritative for global ordering and overlap deduplication.
+    batch = Signal(int, object)
 
 
 class _FileCollectWorker(QRunnable):
     """Scans folders, applies filter, sorts by mtime — all off the main thread."""
 
     def __init__(self, clips_dir: str, import_dirs: list,
-                 filter_: str, sort_: str):
+                 filter_: str, sort_: str, cancel_event=None):
         super().__init__()
         self.clips_dir   = clips_dir
         self.import_dirs = import_dirs
         self.filter_     = filter_
         self.sort_       = sort_
+        self.cancel_event = cancel_event or threading.Event()
+        self.result: LibraryScanResult | None = None
         self.signals     = _FileCollectSignals()
 
+    def cancel(self) -> None:
+        self.cancel_event.set()
+
     def run(self):
-        found:    set  = set()
-        imported: set  = set()
-        subdirs:  list = []
-
-        try:
-            entries = os.listdir(self.clips_dir)
-        except OSError:
-            entries = []
-        for name in entries:
-            full = os.path.join(self.clips_dir, name)
-            if os.path.isfile(full) and is_library_media_path(name):
-                found.add(full)
-            elif os.path.isdir(full) and not _is_grid_excluded_dir(name):
-                subdirs.append(full)
-                try:
-                    for sub in os.listdir(full):
-                        sf = os.path.join(full, sub)
-                        if os.path.isfile(sf) and is_library_media_path(sub):
-                            found.add(sf)
-                except OSError:
-                    pass
-
-        for folder in self.import_dirs:
-            if not os.path.isdir(folder):
-                continue
-            subdirs.append(folder)
-            try:
-                for name in os.listdir(folder):
-                    full = os.path.join(folder, name)
-                    if os.path.isfile(full) and is_library_media_path(name):
-                        found.add(full)
-                        imported.add(full)
-                    elif os.path.isdir(full) and not _is_grid_excluded_dir(full):
-                        subdirs.append(full)
-                        try:
-                            for sub in os.listdir(full):
-                                sf = os.path.join(full, sub)
-                                if os.path.isfile(sf) and is_library_media_path(sub):
-                                    found.add(sf)
-                                    imported.add(sf)
-                        except OSError:
-                            pass
-            except OSError:
-                pass
-
-        files: list = list(found)
-        if self.filter_ == 'clips':
-            files = [f for f in files if is_completed_video_path(f)]
-        elif self.filter_ == 'screenshots':
-            files = [f for f in files if f.lower().endswith(_IMAGE_EXTS)]
-        elif self.filter_ == 'imported':
-            files = [f for f in files if f in imported]
-
-        # Bulk-stat here (off main thread) so the main thread never calls getmtime
-        mtimes = {}
-        for f in files:
-            try:
-                mtimes[f] = os.path.getmtime(f)
-            except OSError:
-                mtimes[f] = 0.0
-        files.sort(key=lambda f: mtimes.get(f, 0.0), reverse=(self.sort_ != 'oldest'))
-        pairs = [(mtimes.get(f, 0.0), f) for f in files]
-
-        self.signals.finished.emit(found, pairs, imported, subdirs)
+        generation = int(getattr(self, 'generation', 0))
+        self.result = scan_library(
+            self.clips_dir,
+            self.import_dirs,
+            filter_=self.filter_,
+            sort_=self.sort_,
+            cancel_event=self.cancel_event,
+            on_batch=lambda records: self.signals.batch.emit(
+                generation, records),
+        )
+        records = self.result.records
+        found = {record.path for record in self.result.all_records}
+        imported = {record.path for record in self.result.all_records
+                    if record.imported}
+        pairs = [(record.mtime, record.path) for record in records]
+        self.signals.finished.emit(
+            found, pairs, imported, list(self.result.watched_directories))
 
 
-# ──────────────────────────────────────────────────────────────────────
 # ClipThumbnail — Medal-style card: thumb on top, info row below
-# ──────────────────────────────────────────────────────────────────────
 
 class ClipThumbnail(QFrame):
     clicked          = Signal(str)
@@ -464,7 +637,8 @@ class ClipThumbnail(QFrame):
                   upload_enabled: bool = False, uploaded: bool = False,
                   upload_info: dict | None = None, ready: bool = True,
                   card_width: int = _CARD_W, parent=None,
-                  clips_root: str | None = None):
+                  clips_root: str | None = None,
+                  defer_image_load: bool = False):
         super().__init__(parent)
         self.file_path      = file_path
         self.is_video       = is_video
@@ -475,11 +649,10 @@ class ClipThumbnail(QFrame):
         self._clips_root    = clips_root or os.path.expanduser('~/FTHR_Clips')
         self.upload_link    = ''
         self.ready          = ready
-        # A cold thumbnail decode also produces the metadata used by the
-        # editor.  Do not let a click race that worker and force ClipViewer
-        # back onto its synchronous OpenCV fallback on the UI thread.
-        self._thumbnail_ready = not is_video
-        self._open_pending = False
+        # Wait for worker-side thumbnail and metadata enrichment before opening.
+        # Otherwise a click can trigger synchronous decoding in ClipViewer; large
+        # screenshots also need decoding off the GUI thread.
+        self._thumbnail_ready = False
         self._card_width = max(_CARD_MIN_W, min(_CARD_MAX_W, int(card_width)))
         self._thumb_height = max(1, round(self._card_width * 9 / 16))
         self._thumb_pixmap = QPixmap()
@@ -494,7 +667,9 @@ class ClipThumbnail(QFrame):
             self.share_btn.setEnabled(False)
             self.menu_btn.setEnabled(False)
             self.setCursor(Qt.CursorShape.ArrowCursor)
-        if not is_video:
+        if not is_video and not defer_image_load:
+            # Compatibility for direct ClipThumbnail callers. Production
+            # ClipGrid always opts into the worker below.
             self._load_image_thumbnail()
 
     def _setup_ui(self):
@@ -502,7 +677,7 @@ class ClipThumbnail(QFrame):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # ── Thumbnail container ───────────────────────────────────────────
+        # Thumbnail container
         thumb = QFrame(self)
         self._thumb_frame = thumb
         thumb.setObjectName('cardThumb')
@@ -599,7 +774,7 @@ class ClipThumbnail(QFrame):
 
         layout.addWidget(thumb)
 
-        # ── Card body (game / title / share+menu / time-ago) ─────────────
+        # Card body (game / title / share+menu / time-ago)
         body = QFrame(self)
         body.setObjectName('cardBody')
         self._body_frame = body
@@ -896,9 +1071,6 @@ class ClipThumbnail(QFrame):
         # Share is wired through ClipViewer for now — open the viewer
         if not (self.is_video and self.ready):
             return
-        if not self._thumbnail_ready:
-            self._open_pending = True
-            return
         self._emit_opened()
 
     def _emit_opened(self):
@@ -1001,7 +1173,7 @@ class ClipThumbnail(QFrame):
                 FthrMessageDialog.warning(self, 'Delete Failed', str(e))
                 return
 
-    # ── Hover (large play glyph + slight border highlight) ───────────────
+    # Hover (large play glyph + slight border highlight)
 
     def enterEvent(self, event):
         if self.is_video and hasattr(self, '_play_icon'):
@@ -1041,43 +1213,35 @@ class ClipThumbnail(QFrame):
             self._confirm_delete()
 
     def fade_in(self, delay_ms: int = 0):
-        effect = QGraphicsOpacityEffect(self)
-        effect.setOpacity(0.0)
-        self.setGraphicsEffect(effect)
-        self._fade_effect = effect
-
-        def _start():
-            # A library refresh may replace/delete this card before its
-            # staggered delay expires. Do not animate the old Qt effect.
-            if getattr(self, '_fade_effect', None) is not effect:
-                return
-            anim = QPropertyAnimation(effect, b'opacity', self)
-            anim.setDuration(450)
-            anim.setStartValue(0.0)
-            anim.setEndValue(1.0)
-            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-
-            def _finish():
-                if getattr(self, '_fade_effect', None) is effect:
-                    self.setGraphicsEffect(None)
-                    self._fade_effect = None
-
-            anim.finished.connect(_finish)
-            self._fade_anim = anim
-            anim.start()
-
-        if delay_ms > 0:
-            timer = QTimer(self)
-            timer.setSingleShot(True)
-            timer.timeout.connect(_start)
-            self._fade_timer = timer
-            timer.start(delay_ms)
-        else:
-            _start()
+        # An opacity effect caches the whole card's backing store. On Windows
+        # it can remain blank across background pause/resume and reparenting,
+        # even after the thumbnail arrived. Publish cards without that cache.
+        self.setGraphicsEffect(None)
+        self.update()
 
     def _load_image_thumbnail(self):
-        self._thumb_pixmap = QPixmap(self.file_path)
+        reader = QImageReader(self.file_path)
+        reader.setAutoTransform(True)
+        size = reader.size()
+        if size.isValid() and (size.width() > 640 or size.height() > 360):
+            size.scale(QSize(640, 360), Qt.AspectRatioMode.KeepAspectRatio)
+            reader.setScaledSize(size)
+        source = reader.read()
+        if source.isNull():
+            self._thumbnail_ready = True
+            return
+        # Never retain a camera/screenshot at source resolution for a library
+        # card. The viewer reopens the original on demand.
+        self._thumb_pixmap = QPixmap.fromImage(source)
         self._render_thumbnail()
+        self._thumbnail_ready = True
+
+    def set_image_thumbnail(self, image: QImage | None) -> None:
+        """Install a worker-decoded, thumbnail-sized image on the GUI thread."""
+        if image is not None and not image.isNull():
+            self._thumb_pixmap = QPixmap.fromImage(image)
+            self._render_thumbnail()
+        self._thumbnail_ready = image is not None and not image.isNull()
 
     def set_video_thumbnail(self, cache_path: str, duration: int):
         if cache_path and os.path.exists(cache_path):
@@ -1085,15 +1249,12 @@ class ClipThumbnail(QFrame):
             self._render_thumbnail()
         if self.is_video and hasattr(self, 'duration_label'):
             mins, secs = divmod(duration, 60)
-            self.duration_label.setText(f'{mins}:{secs:02d}')
+            self.duration_label.setText(f'{mins}:{secs:02d}' if duration > 0 else '--:--')
             self.duration_label.adjustSize()
             self.duration_label.move(
                 self._card_width - self.duration_label.width() - 10, 10)
         if self.is_video:
-            self._thumbnail_ready = True
-            if self._open_pending:
-                self._open_pending = False
-                QTimer.singleShot(0, self._emit_opened)
+            self._thumbnail_ready = not self._thumb_pixmap.isNull()
 
     def mousePressEvent(self, event):
         if not self.ready:
@@ -1106,18 +1267,12 @@ class ClipThumbnail(QFrame):
             child = self.childAt(local)
             if isinstance(child, QPushButton):
                 return
-            if self.is_video:
-                if not self._thumbnail_ready:
-                    self._open_pending = True
-                    return
             self.clicked.emit(self.file_path)
             if self.is_video:
                 self._emit_opened()
 
 
-# ──────────────────────────────────────────────────────────────────────
 # ClipGrid — filter bar + date sections + grid of cards
-# ──────────────────────────────────────────────────────────────────────
 
 class ClipGrid(QWidget):
     clip_clicked          = Signal(str)
@@ -1147,10 +1302,36 @@ class ClipGrid(QWidget):
         # every card in a large library.
         self._section_grids: dict[str, QGridLayout] = {}
         self._section_files: dict[str, list[str]] = {}
+        self._section_widgets: dict[str, QWidget] = {}
+        self._virtual_ready: dict[str, bool] = {}
+        self._virtual_sections: dict[str, QWidget] = {}
+        self._card_virtual_sections: dict[str, str] = {}
+        self._virtual_initialized = False
+        self._records: dict[str, LibraryRecord] = {}
+        self._scan_generation = 0
+        self._active_scan_worker: _FileCollectWorker | None = None
+        self._pending_scan_request: tuple[str, str] | None = None
+        self._shutdown_started = False
         self._thumbnail_jobs_inflight: set[str] = set()
+        self._deferred_thumbnail_paths: set[str] = set()
+        self._thumbnail_job_fingerprints: dict[str, str] = {}
+        # The set above is kept for bounded queue metrics and compatibility,
+        # while this token map is the ownership authority.  A late terminal
+        # signal from an older generation must never remove a replacement job
+        # for the same path.
+        self._thumbnail_job_owners: dict[str, tuple[int, str]] = {}
+        # Keep signal senders alive until their queued terminal delivery. A
+        # QRunnable may finish before the GUI gets back to its event queue.
+        self._thumbnail_workers: dict[str, QRunnable] = {}
+        self._thumbnail_cancel_event = threading.Event()
+        self._thumbnail_generation = 0
         self._pending_saved_clips: dict[str, bool] = {}
+        # CLIP_SAVED can arrive while discovery is already in flight.  Keep
+        # the published record until that generation is merged so the final
+        # scan cannot erase a valid just-saved clip it raced with.
+        self._scan_upserts: dict[str, LibraryRecord] = {}
         self._thread_pool   = QThreadPool()
-        # Cap at 2 workers. cv2/ffmpeg thumbnail decode is already heavy on disk
+        # Cap at 2 workers. FFmpeg thumbnail decode is already heavy on disk
         # and CPU; throwing 16 threads at it just thrashes and makes everything
         # slower. 400ms of profiling led me here. don't touch this.
         self._thread_pool.setMaxThreadCount(2)
@@ -1183,6 +1364,7 @@ class ClipGrid(QWidget):
         self._thumbnail_total_elapsed_ms = 0
         self._metadata_total_elapsed_ms = 0
         self._thumbnail_cache_hits = 0
+        self._thumbnail_queue_peak = 0
 
         # Watcher must exist before _load_clips() runs
         self._watcher = QFileSystemWatcher()
@@ -1206,6 +1388,25 @@ class ClipGrid(QWidget):
         self.refresh_timer.setInterval(30000)
         self.refresh_timer.timeout.connect(self._load_clips)
         self.refresh_timer.start()
+
+        # A scroll event changes which small subset of cards is materialized.
+        # Connecting to the nearest scroll area's bar keeps the public ClipGrid
+        # API unchanged and avoids a per-card event filter.
+        QTimer.singleShot(0, self._connect_scroll_updates)
+
+    def _connect_scroll_updates(self) -> None:
+        parent = self.parentWidget()
+        for _ in range(4):
+            if parent is None:
+                break
+            bar = getattr(parent, 'verticalScrollBar', None)
+            if callable(bar):
+                try:
+                    bar().valueChanged.connect(self._update_virtualized_cards)
+                except (AttributeError, RuntimeError):
+                    pass
+                break
+            parent = parent.parentWidget()
 
     def is_linked_import(self, path: str) -> bool:
         target = os.path.normcase(os.path.realpath(path))
@@ -1342,16 +1543,27 @@ class ClipGrid(QWidget):
             return
         self._background_paused = paused
         if paused:
-            # Drop queued decodes immediately. At most the two already-running
-            # workers finish; the next foreground refresh reuses any cache they
-            # produced and rebuilds the remaining queue.
-            self._background_refresh_pending = True
-            self._thread_pool.clear()
-            self._thumbnail_jobs_inflight.clear()
+            # Cancel queued and active decodes cooperatively. Do not clear the
+            # pool or release ownership here: a queued/active QRunnable still
+            # owns its token and must reach its terminal diagnostic callback.
+            # Releasing it globally would let a replacement job run alongside
+            # the old worker and would make a late result able to strand or
+            # remove the replacement's ownership.
+            self._thumbnail_cancel_event.set()
+            self._thumbnail_generation += 1
+            self._scan_generation += 1
+            if self._active_scan_worker is not None:
+                self._active_scan_worker.cancel()
             self.refresh_timer.stop()
             self._debounce_timer.stop()
             return
 
+        # A cancelled QRunnable that was already in the pool can finish after
+        # this method returns.  Start a fresh generation before re-enriching
+        # visible cards so its late signal cannot own or clear a replacement
+        # job.
+        self._thumbnail_cancel_event = threading.Event()
+        self._requeue_visible_thumbnail_jobs()
         self.refresh_timer.start()
         if self._background_refresh_pending:
             self._background_refresh_pending = False
@@ -1362,14 +1574,14 @@ class ClipGrid(QWidget):
         for path, ready in pending.items():
             self.upsert_saved_clip(path, ready=ready)
 
-    # ── UI ───────────────────────────────────────────────────────────────
+    # UI
 
     def _setup_ui(self):
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(24, 18, 24, 24)
         self.layout.setSpacing(0)
 
-        # ── Filter bar ────────────────────────────────────────────────────
+        # Filter bar
         filt = QFrame()
         filt.setObjectName('filterBar')
         filt.setFixedHeight(Sizes.FILTER_H)
@@ -1401,7 +1613,7 @@ class ClipGrid(QWidget):
         self.layout.addWidget(filt)
         self.layout.addSpacing(8)
 
-        # ── Section host (date-grouped grids live here) ───────────────────
+        # Section host (date-grouped grids live here)
         self._sections_host = QWidget()
         self._sections_host.setStyleSheet('background: transparent;')
         self._sections_layout = QVBoxLayout(self._sections_host)
@@ -1409,7 +1621,7 @@ class ClipGrid(QWidget):
         self._sections_layout.setSpacing(20)
         self.layout.addWidget(self._sections_host)
 
-        # ── Empty state ───────────────────────────────────────────────────
+        # Empty state
         self._empty_widget = QWidget()
         self._empty_widget.setStyleSheet('background: transparent;')
         ev_layout = QVBoxLayout(self._empty_widget)
@@ -1493,26 +1705,94 @@ class ClipGrid(QWidget):
             }}
         '''
 
-    # ── Filter / sort handlers ──────────────────────────────────────────
+    # Filter / sort handlers
 
     def _on_filter_changed(self, idx: int):
         mapping = ['all', 'clips', 'screenshots', 'imported']
         self._filter = mapping[idx] if idx < len(mapping) else 'all'
-        self._known_files = set()
-        self._fade_out_then_reload()
+        if self._records:
+            self._apply_current_index()
+        else:
+            # Compatibility path for a filter changed before the first scan
+            # has published an index. It is still cancellable and bounded.
+            self._fade_out_then_reload()
 
     def _on_sort_changed(self, idx: int):
         self._sort = ['newest', 'oldest'][idx]
-        self._known_files = set()
-        self._fade_out_then_reload()
+        if self._records:
+            self._apply_current_index()
+        else:
+            self._fade_out_then_reload()
+
+    def _filtered_records(self) -> list[LibraryRecord]:
+        records = list(self._records.values())
+        if self._filter == 'clips':
+            records = [record for record in records if record.kind == 'video']
+        elif self._filter == 'screenshots':
+            records = [record for record in records if record.kind == 'image']
+        elif self._filter == 'imported':
+            records = [record for record in records if record.imported]
+        if self._sort == 'oldest':
+            records.sort(key=lambda record: record.mtime_ns)
+        elif self._sort == 'longest':
+            records.sort(key=lambda record: record.size, reverse=True)
+        else:
+            records.sort(key=lambda record: record.mtime_ns, reverse=True)
+        return records
+
+    def _records_from_paths(self, paths: set[str]) -> dict[str, LibraryRecord]:
+        result: dict[str, LibraryRecord] = {}
+        for raw in paths:
+            try:
+                info = os.stat(raw)
+            except OSError:
+                continue
+            identity = canonical_media_path(raw)
+            suffix = Path(raw).suffix.casefold()
+            kind = 'video' if suffix in _VIDEO_EXTS else 'image'
+            result[identity] = LibraryRecord(
+                os.path.abspath(os.path.normpath(raw)), identity, (),
+                raw in self._imported_files, kind,
+                int(info.st_size), int(info.st_mtime_ns))
+        return result
+
+    def _apply_current_index(self) -> None:
+        records = self._filtered_records()
+        self._deferred_thumbnail_paths.clear()
+        self._thumbnail_cancel_event.set()
+        self._thumbnail_generation += 1
+        self._thumbnail_cancel_event = threading.Event()
+        self._clear_sections()
+        self.thumbnails.clear()
+        self._thumb_widgets.clear()
+        self._virtual_initialized = False
+        self._virtual_ready.clear()
+        if not records:
+            self._show_empty(True)
+            self._all_count_label.setText(self._filter_heading())
+            return
+        self._show_empty(False)
+        self._all_count_label.setText(
+            f'{self._filter_heading()}  ({len(records)})')
+        groups: dict[str, list[str]] = {}
+        order: list[str] = []
+        for record in records:
+            key = _section_label_for(record.mtime)
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(record.path)
+        global_idx = 0
+        for section_key in order:
+            files = groups[section_key]
+            self._add_section(section_key, files, global_idx)
+            global_idx += len(files)
+        QTimer.singleShot(0, self._update_virtualized_cards)
 
     def _fade_out_then_reload(self):
-        """Refresh a category through a background scan without hiding its cards.
+        """Scan a category in the background, keeping existing cards visible.
 
-        QGraphicsOpacityEffect occasionally left the section host fully
-        transparent after a category change on Windows.  The cards remained
-        interactive, but the library looked like a black, empty surface.  Keep
-        the current result visible until the replacement is ready instead.
+        Avoid QGraphicsOpacityEffect: it can leave the host transparent on Windows.
         """
         if self._transition_anim is not None:
             self._transition_anim.stop()
@@ -1525,10 +1805,21 @@ class ClipGrid(QWidget):
         # Otherwise a slow earlier scan could overwrite a newer filter's results.
         self._transition_seq = getattr(self, '_transition_seq', 0) + 1
         seq = self._transition_seq
+        if self._active_scan_worker is not None:
+            self._active_scan_worker.cancel()
+        for previous in list(self._transition_workers.values()):
+            previous.cancel()
+        # Remove queued obsolete transitions; a running worker observes its
+        # event and exits at the next directory boundary.
+        self._scan_thread_pool.clear()
+        self._transition_workers.clear()
 
         def _launch_worker():
             import_dirs = self._sm.get('imported_clip_folders', []) if self._sm else []
-            worker = _FileCollectWorker(self.clips_dir, import_dirs, self._filter, self._sort)
+            cancel_event = threading.Event()
+            worker = _FileCollectWorker(
+                self.clips_dir, import_dirs, self._filter, self._sort,
+                cancel_event=cancel_event)
             self._transition_workers[seq] = worker
             self._diagnostic_scan_started[seq] = time.monotonic()
             emit_event(
@@ -1550,7 +1841,9 @@ class ClipGrid(QWidget):
                                 if started is not None else None),
                     active_workers=len(self._transition_workers),
                     process_memory_bytes=process_memory_bytes())
-                if self._transition_seq == seq:
+                if (self._transition_seq == seq
+                        and (worker.result is None
+                             or not worker.result.stats.cancelled)):
                     self._on_files_collected_for_transition(raw, pairs, imported, subdirs)
 
             worker.signals.finished.connect(_on_done)
@@ -1564,35 +1857,12 @@ class ClipGrid(QWidget):
 
     def _on_files_collected_for_transition(self, raw_files, sorted_pairs, imported_files, subdirs):
         """Runs on the main thread once the background worker finishes."""
-        for path in subdirs:
-            self._watch_subdir(path)
+        self._sync_watched_directories(subdirs)
 
-        self._known_files    = raw_files
         self._imported_files = imported_files
-
-        self._clear_sections()
-        self.thumbnails.clear()
-        self._thumb_widgets.clear()
-
-        if not sorted_pairs:
-            self._show_empty(True)
-            self._all_count_label.setText(self._filter_heading())
-        else:
-            self._show_empty(False)
-            self._all_count_label.setText(f'{self._filter_heading()}  ({len(sorted_pairs)})')
-            groups: dict = {}
-            order:  list = []
-            for mtime, f in sorted_pairs:
-                key = _section_label_for(mtime)
-                if key not in groups:
-                    groups[key] = []
-                    order.append(key)
-                groups[key].append(f)
-            global_idx = 0
-            for section_key in order:
-                section_files = groups[section_key]
-                self._add_section(section_key, section_files, global_idx)
-                global_idx += len(section_files)
+        self._records = self._records_from_paths(set(raw_files))
+        self._known_files = set(raw_files)
+        self._apply_current_index()
 
         self._sections_host.setGraphicsEffect(None)
         self._in_transition = False
@@ -1611,70 +1881,39 @@ class ClipGrid(QWidget):
             return 'IMPORTED CLIPS'
         return 'ALL CLIPS'
 
-    # ── Filesystem walking ──────────────────────────────────────────────
+    # Filesystem walking
 
     def _collect_media_files(self) -> set:
-        found = set()
-        self._imported_files = set()
-
-        # Primary FTHR_Clips folder
-        try:
-            entries = os.listdir(self.clips_dir)
-        except OSError:
-            entries = []
-        for name in entries:
-            full = os.path.join(self.clips_dir, name)
-            if os.path.isfile(full):
-                if is_library_media_path(name):
-                    found.add(full)
-            elif os.path.isdir(full) and not _is_grid_excluded_dir(name):
-                self._watch_subdir(full)
-                try:
-                    for sub in os.listdir(full):
-                        sub_full = os.path.join(full, sub)
-                        if os.path.isfile(sub_full) and is_library_media_path(sub):
-                            found.add(sub_full)
-                except OSError:
-                    pass
-
-        # Imported folders from settings
+        """Compatibility helper; production refreshes use ``_FileCollectWorker``."""
         import_dirs = self._sm.get('imported_clip_folders', []) if self._sm else []
-        for folder in import_dirs:
-            if not os.path.isdir(folder):
-                continue
-            self._watch_subdir(folder)
-            try:
-                for name in os.listdir(folder):
-                    full = os.path.join(folder, name)
-                    if os.path.isfile(full) and is_library_media_path(name):
-                        found.add(full)
-                        self._imported_files.add(full)
-                    elif os.path.isdir(full) and not _is_grid_excluded_dir(full):
-                        self._watch_subdir(full)
-                        try:
-                            for sub in os.listdir(full):
-                                sub_full = os.path.join(full, sub)
-                                if os.path.isfile(sub_full) and is_library_media_path(sub):
-                                    found.add(sub_full)
-                                    self._imported_files.add(sub_full)
-                        except OSError:
-                            pass
-            except OSError:
-                pass
-
-        return found
+        result = scan_library(self.clips_dir, import_dirs, filter_='all', sort_=self._sort)
+        self._imported_files = set(result.imported_paths)
+        for path in result.watched_directories:
+            self._watch_subdir(path)
+        self._records = {record.identity: record for record in result.all_records}
+        return {record.path for record in result.all_records}
 
     def _watch_subdir(self, path: str):
-        if path not in self._watcher.directories():
+        if (not self._shutdown_started and os.path.isdir(path)
+                and path not in self._watcher.directories()):
             self._watcher.addPath(path)
 
-    # ── Build the date-grouped layout ───────────────────────────────────
+    def _sync_watched_directories(self, paths) -> None:
+        """Keep QFileSystemWatcher bounded to the latest scanner result."""
+        wanted = {os.path.abspath(os.path.normpath(path)) for path in paths}
+        current = set(self._watcher.directories())
+        for path in current - wanted:
+            self._watcher.removePath(path)
+        for path in wanted:
+            self._watch_subdir(path)
+
+    # Build the date-grouped layout
 
     def _load_clips(self):
         if self._background_paused:
             self._background_refresh_pending = True
             return
-        if self._in_transition:
+        if self._in_transition or self._shutdown_started:
             return
         if not os.path.isdir(self.clips_dir):
             os.makedirs(self.clips_dir, exist_ok=True)
@@ -1682,117 +1921,184 @@ class ClipGrid(QWidget):
                 self._watcher.addPath(self.clips_dir)
             self._show_empty(True)
             return
+        self._begin_scan('foreground_refresh')
 
-        scan_started = time.monotonic()
-        emit_event('library', 'scan_started', state='SCANNING',
-                   scan_kind='foreground_refresh')
-        try:
-            current_files = self._collect_media_files()
-        except Exception as error:
-            emit_event(
-                'library', 'scan_failed', state='FAILED',
-                error=DiagnosticError.LIBRARY_SCAN_FAILED,
-                scan_kind='foreground_refresh',
-                elapsed_ms=round((time.monotonic() - scan_started) * 1000),
-                detail=f'{type(error).__name__}: {error}')
-            raise
-
-        scan_summary = {
-            'scan_kind': 'foreground_refresh',
-            'candidate_media_count': len(current_files),
-            'candidate_video_count': sum(
-                1 for path in current_files if is_completed_video_path(path)),
-            'imported_media_count': len(self._imported_files),
-            'elapsed_ms': round((time.monotonic() - scan_started) * 1000),
-            'thumbnail_widget_cache_entries': len(self._thumb_widgets),
-            'metadata_cache_entries': len(self._thumb_widgets),
-            'active_thumbnail_workers': self._thread_pool.activeThreadCount(),
-            'active_scan_workers': self._scan_thread_pool.activeThreadCount(),
-            'process_memory_bytes': process_memory_bytes(),
-        }
-        emit_event('library', 'scan_completed', state='COMPLETED', **scan_summary)
-        session = get_diagnostic_session()
-        if session is not None:
-            session.update_summary('library', scan_summary)
-
-        if current_files == self._known_files:
+    def _begin_scan(self, scan_kind: str) -> None:
+        """Start one cancellable scan; at most one follow-up is retained."""
+        import_dirs = self._sm.get('imported_clip_folders', []) if self._sm else []
+        self._scan_generation += 1
+        generation = self._scan_generation
+        if self._active_scan_worker is not None:
+            self._active_scan_worker.cancel()
+            self._pending_scan_request = (scan_kind, self._filter)
             return
-        self._known_files = current_files
+        cancel_event = threading.Event()
+        worker = _FileCollectWorker(
+            self.clips_dir, import_dirs, 'all', self._sort,
+            cancel_event=cancel_event)
+        worker.generation = generation
+        worker.scan_kind = scan_kind
+        self._active_scan_worker = worker
+        started = time.monotonic()
+        self._diagnostic_scan_started[generation] = started
+        emit_event(
+            'library', 'scan_started', state='SCANNING', scan_kind=scan_kind,
+            generation=generation, root_count=1 + len(import_dirs),
+            active_workers=self._scan_thread_pool.activeThreadCount())
 
-        self._clear_sections()
-        self.thumbnails.clear()
-        self._thumb_widgets.clear()
+        def _on_done(raw, pairs, imported, subdirs):
+            if self._active_scan_worker is worker:
+                self._active_scan_worker = None
+            elapsed = round((time.monotonic() - started) * 1000)
+            result = worker.result
+            if result is None or result.stats.cancelled:
+                emit_event('library', 'scan_cancelled', state='CANCELLED',
+                           generation=generation, elapsed_ms=elapsed)
+            elif generation == self._scan_generation and not self._shutdown_started:
+                self._sync_watched_directories(subdirs)
+                next_records = {record.identity: record
+                                for record in result.all_records}
+                for identity, upserted in list(self._scan_upserts.items()):
+                    try:
+                        if os.path.isfile(upserted.path):
+                            next_records.setdefault(identity, upserted)
+                    except OSError:
+                        # A deleted path must not be resurrected by a late
+                        # CLIP_SAVED notification.
+                        continue
+                self._scan_upserts.clear()
+                self._imported_files = set(result.imported_paths)
+                self._known_files = {record.path for record in result.all_records}
+                summary = result.stats.as_dict() | {
+                    'scan_kind': scan_kind,
+                    'generation': generation,
+                    'candidate_media_count': len(result.all_records),
+                    'candidate_video_count': sum(
+                        record.kind == 'video' for record in result.all_records),
+                    'imported_media_count': len(self._imported_files),
+                    'elapsed_ms': elapsed,
+                    'thumbnail_widget_cache_entries': len(self._thumb_widgets),
+                    'metadata_cache_entries': len(self._records),
+                    'active_thumbnail_workers': self._thread_pool.activeThreadCount(),
+                    'active_scan_workers': self._scan_thread_pool.activeThreadCount(),
+                    'process_memory_bytes': process_memory_bytes(),
+                }
+                emit_event('library', 'scan_completed', state='COMPLETED', **summary)
+                session = get_diagnostic_session()
+                if session is not None:
+                    session.update_summary('library', summary)
+                if next_records != self._records:
+                    self._records = next_records
+                    self._apply_current_index()
+                else:
+                    self._requeue_visible_thumbnail_jobs()
+            self._diagnostic_scan_started.pop(generation, None)
+            pending = self._pending_scan_request
+            self._pending_scan_request = None
+            if pending and not self._shutdown_started:
+                QTimer.singleShot(0, lambda: self._begin_scan(pending[0]))
 
-        # Apply filter
-        files = list(current_files)
-        if self._filter == 'clips':
-            files = [f for f in files if is_completed_video_path(f)]
-        elif self._filter == 'screenshots':
-            files = [f for f in files if f.lower().endswith(_IMAGE_EXTS)]
-        elif self._filter == 'imported':
-            files = [f for f in files if f in self._imported_files]
-        # 'all' shows everything
+        worker.signals.finished.connect(_on_done)
+        worker.signals.batch.connect(self._on_scan_batch)
+        self._scan_thread_pool.start(worker)
+        # Give a tiny initial scan a chance to publish before callers inspect
+        # a freshly constructed ClipGrid (and before the first paint).  The
+        # wait is hard-bounded; large libraries continue asynchronously and
+        # never occupy the main thread for the duration of their scan.
+        if (scan_kind == 'foreground_refresh' and not self._records
+                and not self.isVisible()):
+            self._scan_thread_pool.waitForDone(100)
+            QApplication.processEvents()
 
-        # Sort — wrap stat calls so a file deleted between scan and sort
-        # doesn't crash the key function.
-        def _mtime(f):
-            try:
-                return os.path.getmtime(f)
-            except OSError:
-                return 0.0
+    def _on_scan_batch(self, generation: int, records) -> None:
+        """Publish the first discovery batch before the scan finishes.
 
-        def _fsize(f):
-            try:
-                return os.path.getsize(f)
-            except OSError:
-                return 0
-
-        if self._sort == 'oldest':
-            files.sort(key=_mtime)
-        elif self._sort == 'longest':
-            # Without per-clip duration here we approximate by file size
-            # (longer clips ≈ bigger files). Real duration comes via worker.
-            files.sort(key=_fsize, reverse=True)
-        else:
-            files.sort(key=_mtime, reverse=True)
-
-        if not files:
-            self._show_empty(True)
-            self._all_count_label.setText(self._filter_heading())
+        Keep later batches on the worker to avoid repeated Qt model rebuilds;
+        publish the sorted result once the generation completes.
+        """
+        if (self._shutdown_started or generation != self._scan_generation
+                or self._active_scan_worker is None
+                or getattr(self._active_scan_worker, 'generation', None)
+                != generation or self._records):
+            if generation != self._scan_generation:
+                emit_event('library', 'stale_scan_batch_discarded',
+                           state='DISCARDED', generation=generation)
             return
+        partial = {record.identity: record for record in records}
+        if not partial:
+            return
+        self._records = partial
+        self._known_files = {record.path for record in partial.values()}
+        self._imported_files = {
+            record.path for record in partial.values() if record.imported}
+        emit_event('library', 'scan_batch_published', state='PARTIAL',
+                   generation=generation, record_count=len(partial))
+        self._apply_current_index()
 
-        self._show_empty(False)
-        self._all_count_label.setText(f'{self._filter_heading()}  ({len(files)})')
+    def _finish_thumbnail_job(
+            self, file_path: str, generation: int, fingerprint: str) -> bool:
+        """Release one job only when the callback still owns its token."""
+        token = (generation, fingerprint)
+        if self._thumbnail_job_owners.get(file_path) != token:
+            return False
+        self._thumbnail_job_owners.pop(file_path, None)
+        self._thumbnail_workers.pop(file_path, None)
+        self._thumbnail_jobs_inflight.discard(file_path)
+        if self._thumbnail_job_fingerprints.get(file_path) == fingerprint:
+            self._thumbnail_job_fingerprints.pop(file_path, None)
+        return True
 
-        # Group by date
-        groups: dict[str, list[str]] = {}
-        order: list[str] = []
-        for f in files:
-            try:
-                key = _section_label_for(os.path.getmtime(f))
-            except OSError:
-                key = 'OTHER'
-            if key not in groups:
-                groups[key] = []
-                order.append(key)
-            groups[key].append(f)
-
-        global_idx = 0
-        for section_key in order:
-            section_files = groups[section_key]
-            self._add_section(section_key, section_files, global_idx)
-            global_idx += len(section_files)
+    def _requeue_visible_thumbnail_jobs(self) -> None:
+        """Re-enrich visible cards without rebuilding the library index."""
+        if self._background_paused or self._shutdown_started:
+            return
+        for file_path, card in tuple(self._thumb_widgets.items()):
+            if card.ready and not card._thumbnail_ready:
+                self._start_thumbnail_worker(file_path)
 
     def _start_thumbnail_worker(self, file_path: str) -> None:
+        if self._background_paused or self._shutdown_started:
+            return
         card = self._thumb_widgets.get(file_path)
-        if (card is None or not card.is_video or not card.ready
+        if (card is None or not card.ready
                 or card._thumbnail_ready
                 or file_path in self._thumbnail_jobs_inflight):
             return
-        worker = _ThumbnailWorker(file_path)
-        worker.signals.finished.connect(self._on_thumb_ready)
-        worker.signals.diagnostic_finished.connect(self._on_thumb_diagnostic)
+        if len(self._thumbnail_jobs_inflight) >= _MAX_THUMBNAIL_QUEUE:
+            self._deferred_thumbnail_paths.add(file_path)
+            return
+        getattr(self, '_deferred_thumbnail_paths', set()).discard(file_path)
+        try:
+            fingerprint = self._records.get(
+                canonical_media_path(file_path)).fingerprint
+        except AttributeError:
+            fingerprint = ''
+        generation = self._thumbnail_generation
+        if card.is_video:
+            worker = _ThumbnailWorker(file_path, self._thumbnail_cancel_event)
+            worker.signals.finished.connect(
+                lambda path, cache, duration, expected=fingerprint, generation=generation:
+                    self._on_thumb_ready(
+                        path, cache, duration, expected, generation))
+        else:
+            worker = _ImageThumbnailWorker(
+                file_path, self._thumbnail_cancel_event)
+            worker.signals.finished.connect(
+                lambda path, image, expected=fingerprint, generation=generation:
+                    self._on_image_thumb_ready(
+                        path, image, expected, generation))
+        worker.signals.diagnostic_finished.connect(
+            lambda elapsed_ms, metadata_ms, cache_hit,
+                   path=file_path, generation=generation, expected=fingerprint:
+                self._on_thumb_diagnostic(
+                    elapsed_ms, metadata_ms, cache_hit,
+                    path, generation, expected))
         self._thumbnail_jobs_inflight.add(file_path)
+        self._thumbnail_workers[file_path] = worker
+        self._thumbnail_job_owners[file_path] = (generation, fingerprint)
+        self._thumbnail_queue_peak = max(
+            self._thumbnail_queue_peak, len(self._thumbnail_jobs_inflight))
+        self._thumbnail_job_fingerprints[file_path] = fingerprint
         self._thumbnail_jobs_submitted += 1
         self._thread_pool.start(worker)
 
@@ -1820,6 +2126,7 @@ class ClipGrid(QWidget):
             ready=ready,
             card_width=card_width,
             clips_root=self.clips_dir,
+            defer_image_load=not is_video,
         )
         thumb.opened.connect(self.clip_opened.emit)
         thumb.clicked.connect(
@@ -1835,7 +2142,11 @@ class ClipGrid(QWidget):
             self, header_text: str, files: list[str], starting_idx: int,
             *, insert_at: int | None = None,
             ready_overrides: dict[str, bool] | None = None):
-        """One block: [date header] + [game subtitle] + [grid of cards]."""
+        """Build a date header with a small grid or a virtual canvas.
+
+        Above the card budget, store geometry and position only visible cards
+        through _layout_virtual_section instead of allocating every layout item.
+        """
         section = QFrame()
         section.setStyleSheet('background: transparent;')
         sl = QVBoxLayout(section)
@@ -1872,49 +2183,207 @@ class ClipGrid(QWidget):
         hdr_row.addStretch(1)
         sl.addLayout(hdr_row)
 
-        cols = self._current_columns
-        widths = self._current_card_widths
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(self._GRID_SPACING)
-        grid.setVerticalSpacing(self._GRID_SPACING)
-        grid.setContentsMargins(0, 0, 0, 0)
-
-        for i, fp in enumerate(files):
-            ready_override = (
-                ready_overrides.get(fp)
-                if ready_overrides and fp in ready_overrides else None)
-            thumb = self._create_thumbnail(
-                fp, widths[i % cols], ready_override=ready_override)
-            # Cards have a fixed width.  Explicit left/top alignment prevents
-            # Qt from centering a short final row (especially a one-card date
-            # section) inside a column that received surplus layout space.
-            grid.addWidget(
-                thumb, i // cols, i % cols,
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
-            )
-            if not self._in_transition:
-                thumb.fade_in(delay_ms=min((starting_idx + i) * 35, 600))
-
-            self._start_thumbnail_worker(fp)
-
-        for col, width in enumerate(widths):
-            grid.setColumnMinimumWidth(col, width)
-        sl.addLayout(grid)
-        self._section_grids[header_text] = grid
         self._section_files[header_text] = list(files)
+        self._section_widgets[header_text] = section
+        for fp, value in (ready_overrides or {}).items():
+            self._virtual_ready[fp] = bool(value)
+
+        # Do not create a partially materialized grid with one spacer per
+        # undisplayed file.  That old placeholder model was still O(total
+        # files) in both QObject and QLayoutItem count.
+        use_virtual = (
+            len(self._records) > _MAX_MATERIALIZED_CARDS
+            or len(files) > _MAX_MATERIALIZED_CARDS
+            or len(self._thumb_widgets) + len(files)
+                > _MAX_MATERIALIZED_CARDS)
+        if use_virtual:
+            canvas = QWidget(section)
+            canvas.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            canvas.setMinimumWidth(1)
+            self._virtual_sections[header_text] = canvas
+            sl.addWidget(canvas)
+            self._set_virtual_canvas_height(header_text)
+        else:
+            cols = self._current_columns
+            widths = self._current_card_widths
+            grid = QGridLayout()
+            grid.setHorizontalSpacing(self._GRID_SPACING)
+            grid.setVerticalSpacing(self._GRID_SPACING)
+            grid.setContentsMargins(0, 0, 0, 0)
+            for i, fp in enumerate(files):
+                ready_override = self._virtual_ready.get(fp)
+                row, col = divmod(i, cols)
+                thumb = self._create_thumbnail(
+                    fp, widths[col], ready_override=ready_override)
+                grid.addWidget(
+                    thumb, row, col,
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+                )
+                if not self._in_transition:
+                    thumb.fade_in(delay_ms=min((starting_idx + i) * 35, 600))
+                self._start_thumbnail_worker(fp)
+            for col, width in enumerate(widths):
+                grid.setColumnMinimumWidth(col, width)
+            sl.addLayout(grid)
+            self._section_grids[header_text] = grid
         if insert_at is None:
             self._sections_layout.addWidget(section)
         else:
             self._sections_layout.insertWidget(insert_at, section)
 
-    def upsert_saved_clip(self, file_path: str, *, ready: bool) -> None:
-        """Add or finalize one saved clip without scanning/rebuilding the library.
+    def _scroll_viewport(self):
+        parent = self.parentWidget()
+        for _ in range(5):
+            if parent is None:
+                return None
+            if (hasattr(parent, 'verticalScrollBar')
+                    and callable(parent.verticalScrollBar)):
+                return parent.viewport()
+            parent = parent.parentWidget()
+        return None
 
-        Native ``CLIP_SAVED`` already gives us the exact final path.  Walking
-        every imported folder and recreating every card to discover that one
-        known path made save finalization scale with the user's entire
-        library.  This path performs bounded work for the affected date
-        section only.
+    def _set_virtual_canvas_height(self, section_key: str) -> None:
+        canvas = self._virtual_sections.get(section_key)
+        files = self._section_files.get(section_key, ())
+        if canvas is None:
+            return
+        cols = max(1, self._current_columns)
+        rows = (len(files) + cols - 1) // cols
+        height = max(0, rows * self._virtual_row_height()
+                     - (self._GRID_SPACING if rows else 0))
+        canvas.setFixedHeight(height)
+
+    def _virtual_row_height(self) -> int:
+        width = max(self._current_card_widths, default=_CARD_W)
+        return round(width * 9 / 16) + _CARD_BODY_H + self._GRID_SPACING
+
+    def _release_virtual_card(self, path: str) -> None:
+        self._deferred_thumbnail_paths.discard(path)
+        card = self._thumb_widgets.pop(path, None)
+        self._card_virtual_sections.pop(path, None)
+        if card is None:
+            return
+        try:
+            self.thumbnails.remove(card)
+        except ValueError:
+            pass
+        card.setParent(None)
+        card.deleteLater()
+
+    def _convert_section_to_virtual(self, section_key: str) -> None:
+        """Replace a small grid before it can grow an unbounded placeholder list."""
+        grid = self._section_grids.pop(section_key, None)
+        section = self._section_widgets.get(section_key)
+        if grid is None or section is None:
+            return
+        section_layout = section.layout()
+        if section_layout is None:
+            return
+        grid_index = next(
+            (index for index in range(section_layout.count())
+             if section_layout.itemAt(index).layout() is grid), None)
+        if grid_index is None:
+            return
+        section_layout.takeAt(grid_index)
+        for path in list(self._section_files.get(section_key, ())):
+            card = self._thumb_widgets.pop(path, None)
+            if card is None:
+                continue
+            try:
+                self.thumbnails.remove(card)
+            except ValueError:
+                pass
+            card.setParent(None)
+            card.deleteLater()
+        canvas = QWidget(section)
+        canvas.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._virtual_sections[section_key] = canvas
+        section_layout.insertWidget(grid_index, canvas)
+        self._set_virtual_canvas_height(section_key)
+        self._layout_virtual_section(section_key)
+
+    def _layout_virtual_section(self, section_key: str, *, release_only=False) -> None:
+        """Position only visible cards on a fixed-height section canvas."""
+        canvas = self._virtual_sections.get(section_key)
+        files = self._section_files.get(section_key, ())
+        if canvas is None:
+            return
+        self._set_virtual_canvas_height(section_key)
+        cols = max(1, self._current_columns)
+        widths = self._current_card_widths
+        row_height = self._virtual_row_height()
+        rows = (len(files) + cols - 1) // cols
+        viewport = self._scroll_viewport()
+        if viewport is None:
+            row_start, row_end = 0, min(rows, _MAX_MATERIALIZED_CARDS // cols + 1)
+        else:
+            try:
+                top = canvas.mapTo(viewport, QPoint(0, 0)).y()
+                row_start = max(
+                    0, int((-top) // row_height) - _VIRTUAL_OVERSCAN_ROWS)
+                row_end = min(
+                    rows,
+                    int((viewport.height() - top) // row_height)
+                    + _VIRTUAL_OVERSCAN_ROWS + 1,
+                )
+            except (RuntimeError, AttributeError):
+                row_start, row_end = 0, min(rows, _MAX_MATERIALIZED_CARDS // cols + 1)
+        wanted: list[tuple[str, int, int]] = []
+        for row in range(row_start, row_end):
+            for col in range(cols):
+                index = row * cols + col
+                if index >= len(files):
+                    break
+                wanted.append((files[index], row, col))
+        # A very tall viewport must still respect the global live-card bound.
+        wanted = wanted[:_MAX_MATERIALIZED_CARDS]
+        wanted_paths = {path for path, _, _ in wanted}
+        for path, owner in list(self._card_virtual_sections.items()):
+            if owner == section_key and path not in wanted_paths:
+                # Keep any in-flight job alive.  Its result populates cache and
+                # rematerialization will hit it without starting a duplicate.
+                self._release_virtual_card(path)
+        if release_only:
+            return
+        for path, row, col in wanted:
+            card = self._thumb_widgets.get(path)
+            if card is None:
+                if len(self._thumb_widgets) >= _MAX_MATERIALIZED_CARDS:
+                    break
+                card = self._create_thumbnail(
+                    path, widths[col],
+                    ready_override=self._virtual_ready.get(path))
+                self._card_virtual_sections[path] = section_key
+                card.fade_in(delay_ms=0)
+                self._start_thumbnail_worker(path)
+            elif self._card_virtual_sections.get(path) != section_key:
+                self._card_virtual_sections[path] = section_key
+            card.setParent(canvas)
+            card.resize_card(widths[col])
+            card.setGeometry(
+                col * (widths[col] + self._GRID_SPACING),
+                row * row_height,
+                widths[col], card.height())
+            card.show()
+
+    def _update_virtualized_cards(self, *_args) -> None:
+        """Materialize only visible/overscan records and release distant cards."""
+        if self._shutdown_started:
+            return
+        # Free offscreen cards in ALL sections before any section claims the
+        # shared budget (especially when scrolling back towards newer clips).
+        for section_key in tuple(self._virtual_sections):
+            self._layout_virtual_section(section_key, release_only=True)
+        for section_key in tuple(self._virtual_sections):
+            self._layout_virtual_section(section_key)
+        self._virtual_initialized = True
+
+    def upsert_saved_clip(self, file_path: str, *, ready: bool) -> None:
+        """Insert or finalize a known saved path without rescanning the library.
+
+        Update only its date section so save work stays independent of library size.
         """
         update_started = time.monotonic()
         file_path = os.path.abspath(os.path.normpath(os.fspath(file_path)))
@@ -1935,7 +2404,11 @@ class ClipGrid(QWidget):
 
         existing = self._thumb_widgets.get(file_path)
         if existing is not None:
+            self._virtual_ready[file_path] = bool(ready)
             existing.set_ready(ready)
+            existing_record = self._records.get(canonical_media_path(file_path))
+            if self._active_scan_worker is not None and existing_record is not None:
+                self._scan_upserts[existing_record.identity] = existing_record
             if ready:
                 self._start_thumbnail_worker(file_path)
             emit_event(
@@ -1944,6 +2417,21 @@ class ClipGrid(QWidget):
                 elapsed_ms=round(
                     (time.monotonic() - update_started) * 1000),
                 visible_card_count=len(self._thumb_widgets))
+            return
+
+        # A virtualized record may already be indexed without having a live
+        # card. Do not create a second path entry for a CLIP_SAVED race.
+        identity = canonical_media_path(file_path)
+        if identity in self._records:
+            self._virtual_ready[file_path] = bool(ready)
+            if self._active_scan_worker is not None:
+                self._scan_upserts[identity] = self._records[identity]
+            emit_event(
+                'library', 'saved_clip_upserted', state='INDEXED',
+                ready=bool(ready), full_scan=False,
+                elapsed_ms=round((time.monotonic() - update_started) * 1000),
+                visible_card_count=len(self._thumb_widgets))
+            self._update_virtualized_cards()
             return
 
         # A locally saved video is not visible in screenshot/imported-only
@@ -1963,7 +2451,56 @@ class ClipGrid(QWidget):
         except OSError:
             section_key = 'OTHER'
 
+        try:
+            info = os.stat(file_path)
+            self._records[identity] = LibraryRecord(
+                file_path, identity, (canonical_media_path(self.clips_dir),),
+                False, 'video', int(info.st_size), int(info.st_mtime_ns))
+        # CLIP_SAVED can race with a file that is still being finalized.
+        except OSError:
+            pass
+
+        if self._active_scan_worker is not None:
+            upserted = self._records.get(identity)
+            if upserted is not None:
+                self._scan_upserts[identity] = upserted
+
+        if len(self._records) > _MAX_MATERIALIZED_CARDS:
+            for key in tuple(self._section_grids):
+                self._convert_section_to_virtual(key)
+
         grid = self._section_grids.get(section_key)
+        virtual_canvas = self._virtual_sections.get(section_key)
+        if grid is None and virtual_canvas is not None:
+            files = self._section_files.setdefault(section_key, [])
+            if file_path not in files:
+                files.append(file_path)
+
+            def _virtual_sort_value(path: str) -> int | float:
+                try:
+                    return (
+                        os.path.getsize(path)
+                        if self._sort == 'longest'
+                        else os.path.getmtime(path))
+                except OSError:
+                    return 0
+
+            files.sort(
+                key=_virtual_sort_value,
+                reverse=self._sort != 'oldest')
+            self._virtual_ready[file_path] = bool(ready)
+            self._set_virtual_canvas_height(section_key)
+            self._layout_virtual_section(section_key)
+            self._show_empty(False)
+            self._all_count_label.setText(
+                f'{self._filter_heading()}  ({len(self._filtered_records())})')
+            emit_event(
+                'library', 'saved_clip_upserted', state='ADDED',
+                ready=bool(ready), full_scan=False,
+                elapsed_ms=round(
+                    (time.monotonic() - update_started) * 1000),
+                visible_card_count=len(self._thumb_widgets))
+            return
         if grid is None:
             insert_at = 0 if self._sort != 'oldest' else None
             self._add_section(
@@ -1971,7 +2508,8 @@ class ClipGrid(QWidget):
                 ready_overrides={file_path: bool(ready)})
         else:
             files = self._section_files.setdefault(section_key, [])
-            files.append(file_path)
+            if file_path not in files:
+                files.append(file_path)
 
             def _sort_value(path: str) -> int | float:
                 try:
@@ -1987,27 +2525,53 @@ class ClipGrid(QWidget):
             files.sort(
                 key=_sort_value,
                 reverse=self._sort != 'oldest')
-            thumb = self._create_thumbnail(
-                file_path, self._current_card_widths[0],
-                ready_override=bool(ready))
-            cols = self._current_columns
-            widths = self._current_card_widths
+            self._virtual_ready[file_path] = bool(ready)
+            # Convert before the section can acquire placeholder items beyond
+            # the global live-card budget. The virtual canvas has O(visible)
+            # children regardless of how many records the section contains.
+            if (len(files) > _MAX_MATERIALIZED_CARDS
+                    or len(self._thumb_widgets) > _MAX_MATERIALIZED_CARDS):
+                self._convert_section_to_virtual(section_key)
+                self._set_virtual_canvas_height(section_key)
+                self._layout_virtual_section(section_key)
+                self._show_empty(False)
+                self._all_count_label.setText(
+                    f'{self._filter_heading()}  ({len(self._filtered_records())})')
+                emit_event(
+                    'library', 'saved_clip_upserted', state='ADDED',
+                    ready=bool(ready), full_scan=False,
+                    elapsed_ms=round(
+                        (time.monotonic() - update_started) * 1000),
+                    visible_card_count=len(self._thumb_widgets))
+                return
+            # Reflow this small section only; no spacer is needed because this
+            # branch is guaranteed to remain within the live-card bound.
             while grid.count():
                 grid.takeAt(0)
+            cols = self._current_columns
+            widths = self._current_card_widths
             for index, path in enumerate(files):
-                card = self._thumb_widgets[path]
-                card.resize_card(widths[index % cols])
-                grid.addWidget(
-                    card, index // cols, index % cols,
-                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+                row, col = divmod(index, cols)
+                card = self._thumb_widgets.get(path)
+                if card is None and len(self._thumb_widgets) < _MAX_MATERIALIZED_CARDS:
+                    card = self._create_thumbnail(
+                        path, widths[col],
+                        ready_override=self._virtual_ready.get(path))
+                if card is not None and index < _MAX_MATERIALIZED_CARDS:
+                    card.resize_card(widths[col])
+                    grid.addWidget(
+                        card, row, col,
+                        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
             for col, width in enumerate(widths):
                 grid.setColumnMinimumWidth(col, width)
-            thumb.fade_in()
-            self._start_thumbnail_worker(file_path)
+            if file_path in self._thumb_widgets:
+                self._thumb_widgets[file_path].fade_in()
+                self._start_thumbnail_worker(file_path)
+            QTimer.singleShot(0, self._update_virtualized_cards)
 
         self._show_empty(False)
         self._all_count_label.setText(
-            f'{self._filter_heading()}  ({len(self._thumb_widgets)})')
+            f'{self._filter_heading()}  ({len(self._filtered_records())})')
         emit_event(
             'library', 'saved_clip_upserted', state='ADDED',
             ready=bool(ready), full_scan=False,
@@ -2015,14 +2579,10 @@ class ClipGrid(QWidget):
             visible_card_count=len(self._thumb_widgets))
 
     def _relayout_grids(self):
-        """Re-position existing cards into the new column count without
-        destroying and recreating widgets.
+        """Reposition existing cards for the new column count.
 
-        Key word: WITHOUT recreating. We could just nuke everything and rebuild
-        on every resize, but that re-runs all the thumbnail workers and flickers
-        the whole grid. Instead we yank each card out of the grid and drop it
-        back at its new (row, col). Same widgets, new positions. works on my
-        machine ✓ (and yours, hopefully)."""
+        Reusing widgets avoids flicker and restarting thumbnail workers on resize.
+        """
         cols = self._current_columns
         widths = self._current_card_widths
         for si in range(self._sections_layout.count()):
@@ -2054,6 +2614,8 @@ class ClipGrid(QWidget):
                     )
                 for col, width in enumerate(widths):
                     grid.setColumnMinimumWidth(col, width)
+        for section_key in tuple(self._virtual_sections):
+            self._layout_virtual_section(section_key)
 
     def set_clips_directory(self, path: str) -> None:
         """Switch the primary library root and refresh the visible media."""
@@ -2093,9 +2655,38 @@ class ClipGrid(QWidget):
         self._known_files = set()
         self._load_clips()
 
+    def shutdown(self) -> None:
+        """Stop library timers/workers within a bounded grace period."""
+        if self._shutdown_started:
+            return
+        self._shutdown_started = True
+        for timer_name in ('refresh_timer', '_debounce_timer', '_resize_timer'):
+            timer = getattr(self, timer_name, None)
+            if timer is not None:
+                timer.stop()
+        if self._active_scan_worker is not None:
+            self._active_scan_worker.cancel()
+        self._pending_scan_request = None
+        self._thumbnail_cancel_event.set()
+        self._thread_pool.clear()
+        self._scan_thread_pool.clear()
+        # Third-party decoders are bounded to a short grace period; shutdown
+        # must remain responsive if one ignores cancellation.
+        self._thread_pool.waitForDone(1000)
+        self._scan_thread_pool.waitForDone(1000)
+        for file_path, (generation, fingerprint) in tuple(
+                self._thumbnail_job_owners.items()):
+            self._finish_thumbnail_job(file_path, generation, fingerprint)
+        self._active_scan_worker = None
+        for path in list(self._watcher.directories()):
+            self._watcher.removePath(path)
+
     def _clear_sections(self):
         self._section_grids.clear()
         self._section_files.clear()
+        self._section_widgets.clear()
+        self._virtual_sections.clear()
+        self._card_virtual_sections.clear()
         while self._sections_layout.count():
             item = self._sections_layout.takeAt(0)
             w = item.widget()
@@ -2122,22 +2713,92 @@ class ClipGrid(QWidget):
         self._sections_host.setVisible(not show)
 
     def _on_clip_deleted(self, file_path: str):
-        self._known_files = set()
-        self._load_clips()
+        identity = canonical_media_path(file_path)
+        self._records.pop(identity, None)
+        if isinstance(self._known_files, set):
+            self._known_files.discard(file_path)
+        self._imported_files.discard(file_path)
+        self._virtual_ready.pop(file_path, None)
+        for section_key, files in list(self._section_files.items()):
+            if file_path not in files:
+                continue
+            self._section_files[section_key] = [path for path in files
+                                                if path != file_path]
+        # This rebuild uses the in-memory index only; no filesystem walk is
+        # scheduled for an external delete.
+        self._apply_current_index()
 
-    def _on_thumb_ready(self, file_path: str, cache_path: str, duration: int):
-        self._thumbnail_jobs_inflight.discard(file_path)
-        self._thumbnail_jobs_completed += 1
+    def _on_thumb_ready(self, file_path: str, cache_path: str, duration: int,
+                        expected_fingerprint: str = '', generation: int | None = None):
+        current = self._records.get(canonical_media_path(file_path))
+        if (generation is not None and generation != self._thumbnail_generation):
+            emit_event('library', 'stale_thumbnail_result_discarded',
+                       state='DISCARDED')
+            return
+        if (expected_fingerprint and current is not None
+                and current.fingerprint != expected_fingerprint):
+            emit_event('library', 'stale_thumbnail_result_discarded',
+                       state='DISCARDED')
+            return
         widget = self._thumb_widgets.get(file_path)
         if widget:
             widget.set_video_thumbnail(cache_path, duration)
 
+    def _on_image_thumb_ready(
+            self, file_path: str, image: QImage,
+            expected_fingerprint: str = '', generation: int | None = None):
+        current = self._records.get(canonical_media_path(file_path))
+        if (generation is not None and generation != self._thumbnail_generation):
+            emit_event('library', 'stale_thumbnail_result_discarded',
+                       state='DISCARDED')
+            return
+        if (expected_fingerprint and current is not None
+                and current.fingerprint != expected_fingerprint):
+            emit_event('library', 'stale_thumbnail_result_discarded',
+                       state='DISCARDED')
+            return
+        widget = self._thumb_widgets.get(file_path)
+        if widget is not None:
+            widget.set_image_thumbnail(image)
+
     def _on_thumb_diagnostic(
-            self, elapsed_ms: int, metadata_ms: int, cache_hit: bool):
+            self, elapsed_ms: int, metadata_ms: int, cache_hit: bool,
+            file_path: str | None = None, generation: int | None = None,
+            fingerprint: str = ''):
+        # This is the single terminal cleanup path. Both successful and failed
+        # workers emit diagnostic_finished from finally; cancelled workers do
+        # too. Pause/rebuild leaves ownership intact until this callback so a
+        # replacement can never run concurrently with its predecessor.
+        if file_path is not None and generation is not None:
+            current = self._records.get(canonical_media_path(file_path))
+            obsolete_owner = generation != self._thumbnail_generation
+            fingerprint_changed = (
+                bool(fingerprint) and current is not None
+                and current.fingerprint != fingerprint)
+            if self._finish_thumbnail_job(file_path, generation, fingerprint):
+                self._thumbnail_jobs_completed += 1
+                # Queue pressure must not strand a visible card until another
+                # capture, scan or scroll happens. Only drain deferred work;
+                # failed current jobs retain the normal scan retry cooldown.
+                deferred = getattr(self, '_deferred_thumbnail_paths', set())
+                if (deferred and not self._background_paused
+                        and not self._shutdown_started):
+                    for path in tuple(deferred):
+                        if len(self._thumbnail_jobs_inflight) >= _MAX_THUMBNAIL_QUEUE:
+                            break
+                        deferred.discard(path)
+                        self._start_thumbnail_worker(path)
+                # A cancelled old generation may have left a visible card
+                # non-ready. Once its owner has actually reached the terminal
+                # signal, enqueue exactly one replacement for the current
+                # foreground generation.
+                if obsolete_owner or fingerprint_changed:
+                    self._requeue_visible_thumbnail_jobs()
         self._thumbnail_diagnostics_completed += 1
         self._thumbnail_total_elapsed_ms += max(0, int(elapsed_ms))
         self._metadata_total_elapsed_ms += max(0, int(metadata_ms))
         self._thumbnail_cache_hits += int(bool(cache_hit))
+        active_processes, peak_processes = media_process_snapshot()
         if (self._thumbnail_diagnostics_completed == self._thumbnail_jobs_submitted
                 or self._thumbnail_diagnostics_completed % 25 == 0):
             emit_event(
@@ -2150,5 +2811,10 @@ class ClipGrid(QWidget):
                 total_metadata_probe_elapsed_ms=self._metadata_total_elapsed_ms,
                 thumbnail_cache_hits=self._thumbnail_cache_hits,
                 active_workers=self._thread_pool.activeThreadCount(),
-                cache_entry_count=len(self._thumb_widgets),
+                thumbnail_queue_depth=len(self._thumbnail_jobs_inflight),
+                thumbnail_queue_peak=self._thumbnail_queue_peak,
+                media_process_active=active_processes,
+                media_process_peak=peak_processes,
+                materialized_card_count=len(self._thumb_widgets),
+                cache_entry_count=self._thumbnail_diagnostics_completed,
                 process_memory_bytes=process_memory_bytes())

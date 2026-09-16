@@ -1,4 +1,3 @@
-// audio_ring_buffer.cpp
 // FTHR Capture Engine - raw PCM replay ring
 
 #include "audio_ring_buffer.h"

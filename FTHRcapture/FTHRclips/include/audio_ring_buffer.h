@@ -1,26 +1,7 @@
-// audio_ring_buffer.h
-// FTHR Capture Engine - Raw PCM audio ring buffer
-//
-// Stores raw interleaved float32 PCM samples from WASAPI loopback.
-// No encoding during gameplay - zero CPU overhead on the hot path.
-// AAC encoding happens once at clip-save time on SaveClipThread.
-//
-// This is the same approach Shadowplay uses: capture PCM into a ring,
-// encode only when the user actually saves a clip.
-//
-// Memory cost:
-//   48000 Hz * 2 ch * 4 bytes * 32s buffer = ~12 MB (negligible)
-//
-// Threading model:
-//   Push()         - called from AudioCaptureThread (~every 10ms, WASAPI callback)
-//                    Atomics + mutex for the write, same pattern as EncodedRingBuffer.
-//   TakeSnapshot() - called from SaveClipThread (rare, at clip save time)
-//                    Locks, copies the requested window, returns PCM snapshot.
-//
-// Save alignment:
-//   TakeSnapshot can end at an explicit QPC boundary shared with video. The
-//   configured safety margin remains only as a compatibility fallback when no
-//   endpoint is supplied; the mutex already makes copying race-free.
+// Legacy raw float32 PCM ring with mutex-protected writes and snapshots.
+// Snapshots own their data and can end at the video QPC boundary. Without an
+// explicit endpoint, selection uses the configured safety margin. Production
+// replay uses the encoded audio packet ring.
 
 #pragma once
 #ifndef FTHR_AUDIO_RING_BUFFER_H
@@ -35,14 +16,8 @@
 namespace fthr {
 
 
-    // ---------------------------------------------------------------------------
-    // AudioPCMSnapshot
-    //
-    // Returned by TakeSnapshot(). Caller owns all data.
-    // samples: interleaved float32 [L0,R0,L1,R1,...] covering ~duration_s.
-    // qpc_start_s/qpc_end_s preserve the selected PCM wall-clock interval so
-    // MuxEncodedClip can intersect it with the video presentation interval.
-    // ---------------------------------------------------------------------------
+    // Owned interleaved float32 samples and their QPC interval in seconds.
+    // MuxEncodedClip intersects this interval with the selected video.
     struct AudioPCMSnapshot {
         std::vector<float> samples;               // Interleaved float32 stereo
         uint32_t           sample_rate = 48000;
@@ -58,9 +33,6 @@ namespace fthr {
     };
 
 
-    // ---------------------------------------------------------------------------
-    // AudioRingBuffer
-    // ---------------------------------------------------------------------------
     class AudioRingBuffer {
     public:
         // capacity_frames: total stereo frames pre-allocated.
@@ -75,37 +47,22 @@ namespace fthr {
         AudioRingBuffer& operator=(const AudioRingBuffer&) = delete;
 
 
-        // -----------------------------------------------------------------------
-        // Push
-        //
-        // Write interleaved float32 PCM frames into the ring.
-        // Called ~every 10ms from AudioCaptureThread. Must be fast.
-        // qpc_100ns: WASAPI pu64QPCPosition for the first frame in this packet
-        //            (in 100-nanosecond units, as returned by GetBuffer).
-        //            Pass 0 if not available (alignment will be approximate).
-        // volume: linear gain applied before storing (1.0 = unity).
-        // -----------------------------------------------------------------------
+        // Store interleaved float32 frames from the capture thread. qpc_100ns is
+        // the first frame timestamp from WASAPI; zero permits approximate alignment.
+        // volume is linear gain, with 1.0 representing unity.
         void Push(const float* interleaved_data,
             uint32_t      frame_count,
             uint64_t      qpc_100ns,
             float         volume = 1.0f);
 
 
-        // -----------------------------------------------------------------------
-        // TakeSnapshot
-        //
-        // Copy duration_s seconds ending at end_qpc_s. If no endpoint is
-        // supplied, apply the configured legacy safety margin to the live end.
-        //
-        // Called from SaveClipThread - blocking is acceptable.
-        // -----------------------------------------------------------------------
+        // Copy duration_s ending at end_qpc_s, or apply the legacy safety margin
+        // when no endpoint is supplied. The save thread may block during the copy.
         AudioPCMSnapshot TakeSnapshot(
             double duration_s, double end_qpc_s = 0.0) const;
 
 
-        // -----------------------------------------------------------------------
         // Stats
-        // -----------------------------------------------------------------------
         uint32_t GetSampleRate()     const { return sample_rate_; }
         uint32_t GetChannels()       const { return channels_; }
         uint64_t GetFramesPushed()   const { return head_.load(std::memory_order_relaxed); }

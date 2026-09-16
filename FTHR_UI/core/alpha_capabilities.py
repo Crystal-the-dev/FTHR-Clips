@@ -19,8 +19,7 @@ def focus_pause_supported(platform: str) -> bool:
 
 
 def encoder_preset_supported(platform: str, encoder: str = 'nvenc') -> bool:
-    # Native NVENC now consumes the selected P1-P7 GUID on Windows. Linux's
-    # FFmpeg NVENC backend maps the same scale to its preset names.
+    # Windows maps P1-P7 to native NVENC GUIDs; Linux maps them to FFmpeg presets.
     return encoder == 'nvenc'
 
 

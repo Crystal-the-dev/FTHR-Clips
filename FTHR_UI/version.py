@@ -1,22 +1,7 @@
-# version.py — the single source of truth for the FTHR Clips product version.
+# Product version shared by the UI, bundles, installer, and build tools.
 #
-# the version used to be hardcoded in five unrelated places
-# (window title, About label, installer script, AppImage filename, docs) and
-# they had already drifted apart once. Everything that needs to state a
-# product version now derives it from here.
-#
-# Consumers:
-#   FTHR_UI/main.py            -> QApplication.setApplicationVersion + title
-#   FTHR.spec / FTHR_linux.spec-> PyInstaller bundle + Windows VERSIONINFO
-#   installer_windows.iss      -> MyAppVersion (checked by the verifier)
-#   build_linux.sh             -> AppImage filename
-#   tools/verify_version_consistency.py -> the gate that keeps them aligned
-#
-# What this file is NOT:
-#   It is not the shared-memory contract version. The IPC layout is versioned
-#   independently through CaptureBridge.SHARED_MEM_NAME ('FTHR_SharedMemory_v4')
-#   and must only change when the struct layout itself changes. Do not bump it
-#   because the product version moved.
+# verify_version_consistency.py checks consumers. The shared-memory layout
+# version is independent and changes only with the IPC contract.
 
 from __future__ import annotations
 
@@ -30,9 +15,7 @@ VERSION_INFO = (1, 0, 0)
 
 PRERELEASE = 'alpha'
 
-# Date the current source state was cut for release, ISO 8601. Shown in the
-# About page. Bump it together with __version__ — it used to be a separate
-# hardcoded literal in main.py and had drifted four months out of date.
+# ISO 8601 release date shown in About. Update alongside __version__.
 BUILD_DATE = '2026-08-24'
 
 # FTHR's application code uses GPLv3. Separately distributed third-party

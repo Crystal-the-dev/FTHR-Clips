@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.export_profiles import ExportPreset, ExportPresetManager
+from ui.style import set_theme_style
 from ui.style import (
     Colors, Fonts, button_outline_qss, button_primary_qss, checkbox_qss,
     combo_qss, label_body, WheelSafeComboBox,
@@ -53,7 +54,7 @@ class _PresetStepperMixin:
 
         self.valueChanged.connect(self._sync_stepper)
         self._sync_stepper()
-        self.setStyleSheet(f'''
+        set_theme_style(self, lambda: (f'''
             QSpinBox#presetStepper,
             QDoubleSpinBox#presetStepper {{
                 background-color: {Colors.SURFACE_1};
@@ -100,7 +101,7 @@ class _PresetStepperMixin:
                 color: {Colors.TEXT_MUTED};
                 background-color: {Colors.SURFACE_2};
             }}
-        ''')
+        '''))
 
     def resizeEvent(self, event):  # noqa: N802 - Qt API name
         super().resizeEvent(event)
@@ -141,7 +142,7 @@ class ExportPresetDialog(FthrDialog):
         form.setHorizontalSpacing(14)
         form.setVerticalSpacing(8)
         self.name = QLineEdit(preset.name if preset else '')
-        self.name.setStyleSheet(f'''
+        set_theme_style(self.name, lambda: (f'''
             QLineEdit {{
                 background: {Colors.SURFACE_1};
                 border: 1px solid {Colors.BORDER};
@@ -151,7 +152,7 @@ class ExportPresetDialog(FthrDialog):
                 padding: 7px 9px;
             }}
             QLineEdit:focus {{ border-color: {Colors.ACCENT}; }}
-        ''')
+        '''))
         form.addRow('Name', self.name)
         self.size = _PresetDoubleSpinBox()
         self.size.setRange(1, 10_000)
@@ -161,7 +162,7 @@ class ExportPresetDialog(FthrDialog):
         form.addRow('Target file size', self.size)
 
         self.limit_resolution = QCheckBox('Limit resolution')
-        self.limit_resolution.setStyleSheet(checkbox_qss())
+        set_theme_style(self.limit_resolution, checkbox_qss)
         self.limit_resolution.setChecked(bool(preset and preset.target_width))
         form.addRow('', self.limit_resolution)
         dimensions = QHBoxLayout()
@@ -179,7 +180,7 @@ class ExportPresetDialog(FthrDialog):
         form.addRow('Resolution', dimensions)
 
         self.limit_fps = QCheckBox('Limit frame rate')
-        self.limit_fps.setStyleSheet(checkbox_qss())
+        set_theme_style(self.limit_fps, checkbox_qss)
         self.limit_fps.setChecked(bool(preset and preset.target_fps))
         form.addRow('', self.limit_fps)
         self.fps = _PresetDoubleSpinBox()
@@ -191,7 +192,7 @@ class ExportPresetDialog(FthrDialog):
 
         self.codec = WheelSafeComboBox()
         self.codec.addItem('H.264 (reviewed runtime)', 'h264')
-        self.codec.setStyleSheet(combo_qss())
+        set_theme_style(self.codec, combo_qss)
         form.addRow('Video codec', self.codec)
         self.audio = _PresetSpinBox()
         self.audio.setRange(32, 512)
@@ -201,10 +202,10 @@ class ExportPresetDialog(FthrDialog):
         self.body_layout.addLayout(form)
 
         cancel = QPushButton('CANCEL')
-        cancel.setStyleSheet(button_outline_qss())
+        set_theme_style(cancel, button_outline_qss)
         cancel.clicked.connect(self.reject)
         save = QPushButton('SAVE PRESET')
-        save.setStyleSheet(button_primary_qss())
+        set_theme_style(save, button_primary_qss)
         save.clicked.connect(self._validate_and_accept)
         self.action_layout.addStretch()
         self.action_layout.addWidget(cancel)
@@ -251,24 +252,24 @@ class ExportPresetsWidget(QWidget):
         root.setSpacing(8)
         row = QHBoxLayout()
         self.combo = WheelSafeComboBox()
-        self.combo.setStyleSheet(combo_qss())
+        set_theme_style(self.combo, combo_qss)
         row.addWidget(self.combo, 1)
         self.new_btn = QPushButton('NEW')
-        self.new_btn.setStyleSheet(button_primary_qss())
+        set_theme_style(self.new_btn, button_primary_qss)
         self.new_btn.clicked.connect(self._new)
         row.addWidget(self.new_btn)
         self.edit_btn = QPushButton('EDIT')
-        self.edit_btn.setStyleSheet(button_outline_qss())
+        set_theme_style(self.edit_btn, button_outline_qss)
         self.edit_btn.clicked.connect(self._edit)
         row.addWidget(self.edit_btn)
         self.delete_btn = QPushButton('DELETE')
-        self.delete_btn.setStyleSheet(button_outline_qss())
+        set_theme_style(self.delete_btn, button_outline_qss)
         self.delete_btn.clicked.connect(self._delete)
         row.addWidget(self.delete_btn)
         root.addLayout(row)
         self.detail = QLabel()
         self.detail.setWordWrap(True)
-        self.detail.setStyleSheet(label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
+        set_theme_style(self.detail, lambda: (label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY)))
         root.addWidget(self.detail)
         self.combo.currentIndexChanged.connect(self._sync)
         self.refresh()

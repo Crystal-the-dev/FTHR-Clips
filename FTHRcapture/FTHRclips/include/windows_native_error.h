@@ -1,4 +1,3 @@
-// windows_native_error.h
 // Lossless, structured Win32/HRESULT diagnostics for startup failures.
 
 #pragma once

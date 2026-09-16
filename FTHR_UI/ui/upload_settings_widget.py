@@ -32,6 +32,7 @@ from core.uploader_bundle_manifest import (
     UPLOADER_PRIVACY_VERSION,
     UPLOADER_TERMS_VERSION,
 )
+from ui.style import set_theme_style
 from ui.style import (
     Colors,
     Fonts,
@@ -67,22 +68,22 @@ def _section_header(title: str) -> QWidget:
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(10)
     label = QLabel(title.upper())
-    label.setStyleSheet(
-        f'color: {Colors.ACCENT}; font-size: {Fonts.SIZE_BODY_L}px; font-weight: 700;'
+    set_theme_style(label,
+        lambda: (f'color: {Colors.ACCENT}; font-size: {Fonts.SIZE_BODY_L}px; font-weight: 700;'
         f' letter-spacing: 2px; background: transparent; border: none;'
-        f' font-family: {Fonts.DISPLAY};')
+        f' font-family: {Fonts.DISPLAY};'))
     layout.addWidget(label)
     line = QFrame()
     line.setFrameShape(QFrame.Shape.HLine)
     line.setFixedHeight(1)
-    line.setStyleSheet(f'background: {Colors.SHELL_DIVIDER}; border: none;')
+    set_theme_style(line, lambda: (f'background: {Colors.SHELL_DIVIDER}; border: none;'))
     layout.addWidget(line, 1)
     return row
 
 
 def _field_label(text: str) -> QLabel:
     label = QLabel(text)
-    label.setStyleSheet(label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY))
+    set_theme_style(label, lambda: (label_body(Colors.TEXT_DIM, Fonts.SIZE_BODY)))
     label.setMinimumWidth(90)
     return label
 
@@ -102,50 +103,49 @@ def _legal_install_dialog(
     layout.setSpacing(12)
 
     heading = QLabel(title.upper())
-    heading.setStyleSheet(label_uppercase(Colors.ACCENT, Fonts.SIZE_H3, 2))
+    set_theme_style(heading, lambda: (label_uppercase(Colors.ACCENT, Fonts.SIZE_H3, 2)))
     layout.addWidget(heading)
     summary = QLabel(explanation)
     summary.setWordWrap(True)
-    summary.setStyleSheet(label_body(Colors.TEXT, Fonts.SIZE_BODY_L))
+    set_theme_style(summary, lambda: (label_body(Colors.TEXT, Fonts.SIZE_BODY_L)))
     layout.addWidget(summary)
 
     terms_title = QLabel('TERMS OF SERVICE')
-    terms_title.setStyleSheet(label_uppercase(Colors.TEXT_DIM, Fonts.SIZE_LABEL, 1))
+    set_theme_style(terms_title, lambda: (label_uppercase(Colors.TEXT_DIM, Fonts.SIZE_LABEL, 1)))
     layout.addWidget(terms_title)
     terms_view = QTextEdit()
     terms_view.setReadOnly(True)
     terms_view.setPlainText(terms)
     terms_view.setMinimumHeight(150)
-    terms_view.setStyleSheet(
-        f'background: {Colors.SURFACE_1}; color: {Colors.TEXT}; '
-        f'border: 1px solid {Colors.BORDER}; padding: 8px;')
+    set_theme_style(terms_view, lambda: (f'background: {Colors.SURFACE_1}; color: {Colors.TEXT}; '
+        f'border: 1px solid {Colors.BORDER}; padding: 8px;'))
     layout.addWidget(terms_view, 1)
 
     privacy_title = QLabel('PRIVACY POLICY')
-    privacy_title.setStyleSheet(label_uppercase(Colors.TEXT_DIM, Fonts.SIZE_LABEL, 1))
+    set_theme_style(privacy_title, lambda: (label_uppercase(Colors.TEXT_DIM, Fonts.SIZE_LABEL, 1)))
     layout.addWidget(privacy_title)
     privacy_view = QTextEdit()
     privacy_view.setReadOnly(True)
     privacy_view.setPlainText(privacy)
     privacy_view.setMinimumHeight(150)
-    privacy_view.setStyleSheet(terms_view.styleSheet())
+    set_theme_style(privacy_view, terms_view._theme_style_factory)
     layout.addWidget(privacy_view, 1)
 
     accept_terms = QCheckBox('I have read and accept the Terms of Service.')
     accept_privacy = QCheckBox('I have read and accept the Privacy Policy.')
-    accept_terms.setStyleSheet(checkbox_qss())
-    accept_privacy.setStyleSheet(checkbox_qss())
+    set_theme_style(accept_terms, checkbox_qss)
+    set_theme_style(accept_privacy, checkbox_qss)
     layout.addWidget(accept_terms)
     layout.addWidget(accept_privacy)
 
     buttons = QHBoxLayout()
     buttons.addStretch()
     cancel = QPushButton('CANCEL')
-    cancel.setStyleSheet(button_outline_qss())
+    set_theme_style(cancel, button_outline_qss)
     cancel.clicked.connect(dialog.reject)
     buttons.addWidget(cancel)
     install = QPushButton(install_label)
-    install.setStyleSheet(button_primary_qss())
+    set_theme_style(install, button_primary_qss)
     install.setEnabled(False)
 
     def _update_install() -> None:
@@ -166,7 +166,7 @@ def _provider_consent_dialog(parent: QWidget, provider: str) -> bool:
     layout.setContentsMargins(28, 24, 28, 12)
     layout.setSpacing(14)
     title = QLabel(f'CONNECT {name.upper()}')
-    title.setStyleSheet(label_uppercase(Colors.ACCENT, Fonts.SIZE_H3, 2))
+    set_theme_style(title, lambda: (label_uppercase(Colors.ACCENT, Fonts.SIZE_H3, 2)))
     layout.addWidget(title)
 
     if provider == 'catbox':
@@ -198,25 +198,25 @@ def _provider_consent_dialog(parent: QWidget, provider: str) -> bool:
 
     description = QLabel(copy)
     description.setWordWrap(True)
-    description.setStyleSheet(label_body(Colors.TEXT, Fonts.SIZE_BODY_L))
+    set_theme_style(description, lambda: (label_body(Colors.TEXT, Fonts.SIZE_BODY_L)))
     layout.addWidget(description)
     links.setTextFormat(Qt.TextFormat.RichText)
     links.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
     links.setOpenExternalLinks(False)
-    links.setStyleSheet(label_body(Colors.ACCENT, Fonts.SIZE_BODY))
+    set_theme_style(links, lambda: (label_body(Colors.ACCENT, Fonts.SIZE_BODY)))
     layout.addWidget(links)
     acceptance = QCheckBox(accept_copy)
     acceptance.setWordWrap(True) if hasattr(acceptance, 'setWordWrap') else None
-    acceptance.setStyleSheet(checkbox_qss())
+    set_theme_style(acceptance, checkbox_qss)
     layout.addWidget(acceptance)
     buttons = QHBoxLayout()
     buttons.addStretch()
     cancel = QPushButton('CANCEL')
-    cancel.setStyleSheet(button_outline_qss())
+    set_theme_style(cancel, button_outline_qss)
     cancel.clicked.connect(dialog.reject)
     buttons.addWidget(cancel)
     accept = QPushButton('ACCEPT & CONTINUE')
-    accept.setStyleSheet(button_primary_qss())
+    set_theme_style(accept, button_primary_qss)
     accept.setEnabled(False)
     acceptance.toggled.connect(accept.setEnabled)
     accept.clicked.connect(dialog.accept)
@@ -266,7 +266,7 @@ class UploadSettingsWidget(QWidget):
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QFrame.Shape.NoFrame)
-            scroll.setStyleSheet(scrollbar_qss())
+            set_theme_style(scroll, scrollbar_qss)
             scroll.setWidget(page)
             outer.addWidget(scroll)
         else:
@@ -275,7 +275,7 @@ class UploadSettingsWidget(QWidget):
         layout.addWidget(_section_header('Upload'))
         layout.addSpacing(12)
         self.enable_check = QCheckBox('Enable optional clip uploader')
-        self.enable_check.setStyleSheet(checkbox_qss())
+        set_theme_style(self.enable_check, checkbox_qss)
         self.enable_check.stateChanged.connect(self._on_enabled_changed)
         layout.addWidget(self.enable_check)
 
@@ -328,11 +328,11 @@ class UploadSettingsWidget(QWidget):
         self.provider_combo.addItem('Catbox', 'catbox')
         self.provider_combo.addItem('Lustful', 'lustful')
         self.provider_combo.addItem('Your server', _CUSTOM_PROVIDER)
-        self.provider_combo.setStyleSheet(combo_qss())
+        set_theme_style(self.provider_combo, combo_qss)
         self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
         provider_row.addWidget(self.provider_combo, 1)
         self.website_btn = QPushButton('OPEN CATBOX')
-        self.website_btn.setStyleSheet(button_outline_qss())
+        set_theme_style(self.website_btn, button_outline_qss)
         self.website_btn.clicked.connect(self._open_provider)
         provider_row.addWidget(self.website_btn)
         body.addLayout(provider_row)
@@ -343,14 +343,14 @@ class UploadSettingsWidget(QWidget):
         catbox_row.addWidget(_field_label('User hash'))
         self.catbox_userhash = QLineEdit()
         self.catbox_userhash.setPlaceholderText('Optional Catbox account userhash')
-        self.catbox_userhash.setStyleSheet(lineedit_qss())
+        set_theme_style(self.catbox_userhash, lineedit_qss)
         catbox_row.addWidget(self.catbox_userhash, 1)
         body.addWidget(self.catbox_panel)
 
         self.custom_panel = QFrame()
-        self.custom_panel.setStyleSheet(
-            f'background: {Colors.SURFACE_1}; border: 1px solid {Colors.BORDER}; '
-            f'border-left: 3px solid {Colors.ACCENT};')
+        set_theme_style(self.custom_panel,
+            lambda: (f'background: {Colors.SURFACE_1}; border: 1px solid {Colors.BORDER}; '
+            f'border-left: 3px solid {Colors.ACCENT};'))
         custom_body = QVBoxLayout(self.custom_panel)
         custom_body.setContentsMargins(16, 14, 16, 14)
         custom_body.setSpacing(8)
@@ -360,7 +360,7 @@ class UploadSettingsWidget(QWidget):
         server_url_row.addWidget(_field_label('Server URL'))
         self.server_url_edit = QLineEdit()
         self.server_url_edit.setPlaceholderText('https://your-server.example.com/upload')
-        self.server_url_edit.setStyleSheet(lineedit_qss())
+        set_theme_style(self.server_url_edit, lineedit_qss)
         server_url_row.addWidget(self.server_url_edit, 1)
         custom_body.addLayout(server_url_row)
 
@@ -369,42 +369,43 @@ class UploadSettingsWidget(QWidget):
         server_auth_row.addWidget(_field_label('Auth header'))
         self.server_auth_edit = QLineEdit()
         self.server_auth_edit.setPlaceholderText('Bearer token123  (optional)')
-        self.server_auth_edit.setStyleSheet(lineedit_qss())
+        set_theme_style(self.server_auth_edit, lineedit_qss)
         server_auth_row.addWidget(self.server_auth_edit, 1)
         custom_body.addLayout(server_auth_row)
         body.addWidget(self.custom_panel)
 
         self.lustful_panel = QFrame()
-        self.lustful_panel.setStyleSheet(
-            f'background: {Colors.SURFACE_1}; border: 1px solid {Colors.BORDER}; '
-            f'border-left: 3px solid {Colors.ACCENT};')
+        set_theme_style(self.lustful_panel,
+            lambda: (f'background: {Colors.SURFACE_1}; border: 1px solid {Colors.BORDER}; '
+            f'border-left: 3px solid {Colors.ACCENT};'))
         account = QVBoxLayout(self.lustful_panel)
         account.setContentsMargins(16, 14, 16, 14)
         self.account_state = QLabel('NOT CONNECTED')
-        self.account_state.setStyleSheet(
-            label_uppercase(Colors.TEXT_MUTED, Fonts.SIZE_LABEL, 1))
+        set_theme_style(self.account_state,
+            lambda: (label_uppercase(Colors.TEXT_MUTED, Fonts.SIZE_LABEL, 1)))
         account.addWidget(self.account_state)
         self.account_edit = QLineEdit()
         self.account_edit.setPlaceholderText('Existing Lustful account ID for log in')
-        self.account_edit.setStyleSheet(lineedit_qss())
+        set_theme_style(self.account_edit, lineedit_qss)
         account_row = QHBoxLayout()
         account_row.addWidget(self.account_edit, 1)
         self.login_btn = QPushButton('LOG IN')
-        self.login_btn.setStyleSheet(button_outline_qss())
+        set_theme_style(self.login_btn, button_outline_qss)
         self.login_btn.clicked.connect(lambda: self._start_account_action('login'))
         account_row.addWidget(self.login_btn)
         self.register_btn = QPushButton('CREATE ACCOUNT')
-        self.register_btn.setStyleSheet(button_primary_qss())
+        set_theme_style(self.register_btn, button_primary_qss)
         self.register_btn.clicked.connect(lambda: self._start_account_action('register'))
         account_row.addWidget(self.register_btn)
         account.addLayout(account_row)
         self.account_status = QLabel(
             'Hardware Identity is installed separately only after Lustful consent.')
         self.account_status.setWordWrap(True)
-        self.account_status.setStyleSheet(label_body(Colors.TEXT_MUTED, Fonts.SIZE_BODY))
+        set_theme_style(self.account_status,
+            lambda: (label_body(Colors.TEXT_MUTED, Fonts.SIZE_BODY)))
         account.addWidget(self.account_status)
         self.logout_btn = QPushButton('LOG OUT LOCALLY')
-        self.logout_btn.setStyleSheet(button_outline_qss())
+        set_theme_style(self.logout_btn, button_outline_qss)
         self.logout_btn.clicked.connect(self._logout)
         account.addWidget(self.logout_btn, alignment=Qt.AlignmentFlag.AlignLeft)
         body.addSpacing(10)
@@ -413,11 +414,11 @@ class UploadSettingsWidget(QWidget):
         test_row = QHBoxLayout()
         test_row.setSpacing(12)
         self.test_btn = QPushButton('TEST CONNECTION')
-        self.test_btn.setStyleSheet(button_outline_qss())
+        set_theme_style(self.test_btn, button_outline_qss)
         self.test_btn.clicked.connect(self._on_test_connection)
         test_row.addWidget(self.test_btn)
         self._test_status = QLabel('Not tested')
-        self._test_status.setStyleSheet(label_body(Colors.TEXT_MUTED, Fonts.SIZE_BODY))
+        set_theme_style(self._test_status, lambda: (label_body(Colors.TEXT_MUTED, Fonts.SIZE_BODY)))
         test_row.addWidget(self._test_status)
         test_row.addStretch()
         body.addSpacing(12)
@@ -432,7 +433,7 @@ class UploadSettingsWidget(QWidget):
         self.mode_manual = QRadioButton('Manual only  (right-click a clip → Upload)')
         for index, radio in enumerate(
                 (self.mode_immediate, self.mode_interval, self.mode_manual)):
-            radio.setStyleSheet(radiobutton_qss())
+            set_theme_style(radio, radiobutton_qss)
             self._mode_group.addButton(radio, index)
         body.addWidget(self.mode_immediate)
         body.addSpacing(8)
@@ -441,16 +442,16 @@ class UploadSettingsWidget(QWidget):
         interval_row.setContentsMargins(28, 4, 0, 0)
         interval_row.setSpacing(10)
         every_label = QLabel('EVERY')
-        every_label.setStyleSheet(
-            label_uppercase(Colors.TEXT_DIM, Fonts.SIZE_MICRO, 1))
+        set_theme_style(every_label,
+            lambda: (label_uppercase(Colors.TEXT_DIM, Fonts.SIZE_MICRO, 1)))
         interval_row.addWidget(every_label)
         self.interval_value = WheelSafeComboBox()
         self.interval_value.addItems(['1', '2', '5', '10', '15', '30', '60'])
-        self.interval_value.setStyleSheet(combo_qss())
+        set_theme_style(self.interval_value, combo_qss)
         self.interval_value.setFixedWidth(96)
         self.interval_unit = WheelSafeComboBox()
         self.interval_unit.addItems(['minutes', 'hours', 'days'])
-        self.interval_unit.setStyleSheet(combo_qss())
+        set_theme_style(self.interval_unit, combo_qss)
         self.interval_unit.setFixedWidth(150)
         interval_row.addWidget(self.interval_value)
         interval_row.addWidget(self.interval_unit)
@@ -465,7 +466,7 @@ class UploadSettingsWidget(QWidget):
         body.addSpacing(12)
         self.auto_compress_check = QCheckBox(
             'Automatically compress oversized clips before upload')
-        self.auto_compress_check.setStyleSheet(checkbox_qss())
+        set_theme_style(self.auto_compress_check, checkbox_qss)
         body.addWidget(self.auto_compress_check)
 
         body.addSpacing(24)
@@ -473,11 +474,11 @@ class UploadSettingsWidget(QWidget):
         body.addSpacing(12)
         self.auto_delete_check = QCheckBox(
             'Auto-delete local clip after a confirmed successful upload')
-        self.auto_delete_check.setStyleSheet(checkbox_qss())
+        set_theme_style(self.auto_delete_check, checkbox_qss)
         body.addWidget(self.auto_delete_check)
         body.addSpacing(24)
         self.save_btn = QPushButton('SAVE UPLOAD SETTINGS')
-        self.save_btn.setStyleSheet(button_primary_qss())
+        set_theme_style(self.save_btn, button_primary_qss)
         self.save_btn.clicked.connect(self._on_save)
         body.addWidget(self.save_btn, alignment=Qt.AlignmentFlag.AlignLeft)
 
@@ -668,7 +669,7 @@ class UploadSettingsWidget(QWidget):
             FthrMessageDialog.warning(self, 'Uploader Settings', message)
             return
         self._test_status.setText('Settings saved')
-        self._test_status.setStyleSheet(label_body(Colors.SUCCESS, Fonts.SIZE_BODY))
+        set_theme_style(self._test_status, lambda: (label_body(Colors.SUCCESS, Fonts.SIZE_BODY)))
         QTimer.singleShot(3000, lambda: self._test_status.setText('Not tested'))
 
     def _on_test_connection(self) -> None:
@@ -677,7 +678,7 @@ class UploadSettingsWidget(QWidget):
             return
         if provider == _CUSTOM_PROVIDER and not self.server_url_edit.text().strip():
             self._test_status.setText('Enter a server URL first')
-            self._test_status.setStyleSheet(label_body(Colors.ERROR, Fonts.SIZE_BODY))
+            set_theme_style(self._test_status, lambda: (label_body(Colors.ERROR, Fonts.SIZE_BODY)))
             return
         self.test_btn.setEnabled(False)
         self._test_status.setText('Testing…')
@@ -703,8 +704,8 @@ class UploadSettingsWidget(QWidget):
         if not ok and not message:
             message = 'The upload provider did not return a reason.'
         self._test_status.setText(message)
-        self._test_status.setStyleSheet(label_body(
-            Colors.SUCCESS if ok else Colors.ERROR, Fonts.SIZE_BODY))
+        set_theme_style(self._test_status, lambda ok=ok: (label_body(
+            Colors.SUCCESS if ok else Colors.ERROR, Fonts.SIZE_BODY)))
         if not ok:
             self.connection_failed.emit(message)
 
@@ -751,13 +752,13 @@ class UploadSettingsWidget(QWidget):
         if account:
             self.account_edit.setText(str(account.get('account_id', '')))
             self.account_state.setText('CONNECTED')
-            self.account_state.setStyleSheet(
-                label_uppercase(Colors.SUCCESS, Fonts.SIZE_LABEL, 1))
+            set_theme_style(self.account_state,
+                lambda: (label_uppercase(Colors.SUCCESS, Fonts.SIZE_LABEL, 1)))
             self.logout_btn.setVisible(True)
         else:
             self.account_state.setText('NOT CONNECTED')
-            self.account_state.setStyleSheet(
-                label_uppercase(Colors.TEXT_MUTED, Fonts.SIZE_LABEL, 1))
+            set_theme_style(self.account_state,
+                lambda: (label_uppercase(Colors.TEXT_MUTED, Fonts.SIZE_LABEL, 1)))
             self.logout_btn.setVisible(False)
 
     def _logout(self) -> None:
@@ -773,13 +774,11 @@ class UploadSettingsWidget(QWidget):
         self._set_account_status('Local Lustful account removed.', True)
 
     def _set_account_status(self, message: str, ok: bool | None) -> None:
-        color = Colors.TEXT_DIM
-        if ok is True:
-            color = Colors.SUCCESS
-        elif ok is False:
-            color = Colors.ERROR
         self.account_status.setText(message)
-        self.account_status.setStyleSheet(label_body(color, Fonts.SIZE_BODY))
+        set_theme_style(self.account_status,
+            lambda ok=ok: label_body(
+                Colors.SUCCESS if ok is True else
+                Colors.ERROR if ok is False else Colors.TEXT_DIM, Fonts.SIZE_BODY))
 
     def _update_interval_controls(self) -> None:
         enabled = self.mode_interval.isChecked()

@@ -1,10 +1,8 @@
-"""In-process FFmpeg playback feeding one Qt ``QAudioSink``.
+"""Decode and mix audio in a worker for one Qt QAudioSink.
 
-``QMediaPlayer`` remains the viewer's video renderer and sole clock master.
-This module owns no video clock and never invokes FFmpeg on Qt's UI thread:
-one Python worker calls the small native bridge, which uses a single FFmpeg
-demuxer and one decoder per selected stream.  A bounded PCM queue is the only
-boundary between that worker and QAudioSink's pull callback.
+QMediaPlayer owns video playback and the master clock. The native bridge
+uses one demuxer and a decoder per selected stream; the audio callback
+only drains a bounded PCM queue.
 """
 from __future__ import annotations
 
@@ -49,13 +47,10 @@ _OUTPUT_BUFFER_MS = 40
 
 
 def _resample_pcm(pcm: bytes, playback_rate: float) -> tuple[bytes, int]:
-    """Time-scale interleaved float32 stereo PCM for the fixed-rate sink.
+    """Resample float32 stereo PCM for the fixed 48 kHz sink.
 
-    The native bridge decodes source-time frames. The Qt audio device always
-    consumes 48 kHz frames, so a fast clip needs more source frames per output
-    block while a slow clip needs fewer. Linear interpolation keeps the bridge
-    independent of an additional FFmpeg audio filter and preserves the same
-    mix/gain path at every speed.
+    Linear interpolation changes the number of source frames consumed per
+    output block while retaining the same mix/gain path at each speed.
     """
 
     rate = max(0.25, min(2.0, float(playback_rate)))
@@ -132,12 +127,10 @@ class BoundedPCMQueue:
 
 
 class _AudioPullDevice(QIODevice):
-    """Qt pull device whose callback touches only ``BoundedPCMQueue``.
+    """Qt pull device backed only by BoundedPCMQueue.
 
-    A pull device belongs to one QAudioSink generation.  Windows can perform
-    one late pull after ``QAudioSink.stop()`` returns; invalidating that old
-    device makes the late pull silent instead of letting two endpoint
-    generations consume fresh PCM at once.
+    Invalidate each stopped sink generation so a late Windows callback returns
+    silence instead of consuming PCM intended for the replacement sink.
     """
 
     def __init__(self, queue: BoundedPCMQueue, parent: QObject):
@@ -508,9 +501,8 @@ class _DecodeWorker(threading.Thread):
                     time.sleep(0.005)
                     continue
                 gains, master = self._mix_values()
-                # The native bridge's atempo pipeline returns sink-rate PCM
-                # when pitch is preserved.  The old resampling path instead
-                # needs source-rate PCM and deliberately shifts pitch.
+                # Pitch-preserving atempo returns sink-rate PCM. Resampling without pitch
+                # preservation consumes source-rate PCM and changes pitch with speed.
                 requested_frames = (_FRAMES_PER_BLOCK if native_pitch_compensation
                                     else max(1, round(
                                         _FRAMES_PER_BLOCK * playback_rate)))
@@ -671,13 +663,9 @@ class FFmpegPlaybackController(QObject):
             self._keep_sink_running()
 
     def refresh_mix(self, position_ms: int) -> None:
-        """Apply current gains at an explicit video-clock position.
+        """Apply new gains at the video clock after discarding queued old-mix PCM.
 
-        Gain is applied by the decoder worker, so queued/device PCM still has
-        the previous mix. The editor coalesces slider events and calls this at
-        most every 40 ms; clearing every buffer and seeking to QMediaPlayer's
-        exact clock makes mute/unmute and all gains deterministic without a
-        seek storm while a handle is dragged.
+        The editor coalesces changes to at most one call per 40 ms to limit seeks.
         """
 
         if not self._worker_started:
@@ -708,15 +696,9 @@ class FFmpegPlaybackController(QObject):
         self._sync_guard_until = time.monotonic() + _SYNC_RECOVERY_SECONDS
 
     def sync_to_video_position(self, position_ms: int) -> None:
-        # QMediaPlayer is the sole master.  The worker estimate already removes
-        # the Python queue, but QAudioSink owns another device buffer after it
-        # pulls those bytes.  Treating that buffered audio as already played
-        # made the controller seek unnecessarily and left stale pre-seek audio
-        # queued in the device, which was audible as short clicks under load.
-        # A hard seek resets decoder, Python queue and device queue.  Give that
-        # pipeline one bounded prebuffer interval before considering another
-        # correction; otherwise frequent QMediaPlayer position signals can
-        # create a seek storm while the sink is still restarting.
+        # Subtract both the Python queue and QAudioSink device buffer from the
+        # worker position before comparing it with QMediaPlayer. After a hard seek,
+        # allow one prebuffer interval before correcting again to avoid seek loops.
         if time.monotonic() < getattr(self, '_sync_guard_until', 0.0):
             return
         drift_ms = self._estimated_output_position_ms() - max(0, position_ms)
@@ -774,16 +756,9 @@ class FFmpegPlaybackController(QObject):
         return max(0, self._worker.estimated_position_ms - buffered_ms)
 
     def _discard_output_buffer(self) -> None:
-        # QAudioSink.reset() is not restartable on the Windows backend used by
-        # Qt 6: the state changes to StoppedState/NoError, but calling start()
-        # on that same sink never resumes device pulls.  A/V sync performs a
-        # corrective seek shortly after playback starts, so reusing the reset
-        # sink produced the characteristic one-to-two seconds of audio followed
-        # by permanent silence (including after seeking backwards).
-        #
-        # Dropping the sink is also the only reliable way to discard PCM that
-        # the platform endpoint already accepted.  Fresh decoded PCM causes
-        # _keep_sink_running() to create a fresh endpoint on the next timer tick.
+        # Recreate the sink after a seek: the Windows Qt backend may not resume
+        # pulls after reset(). Replacing it also discards device-buffered PCM.
+        # _keep_sink_running() opens the new endpoint once fresh PCM is available.
         self._release_sink()
 
     def _release_sink(self) -> None:

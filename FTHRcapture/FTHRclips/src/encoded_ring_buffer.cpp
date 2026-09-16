@@ -1,4 +1,3 @@
-// encoded_ring_buffer.cpp
 // FTHR Capture Engine - encoded packet replay ring
 
 #include "encoded_ring_buffer.h"
@@ -27,15 +26,25 @@ EncodedRingBuffer::EncodedRingBuffer(
               << capacity_ << " slots @ " << fps_ << " fps" << std::endl;
 }
 
-void EncodedRingBuffer::Push(
+bool EncodedRingBuffer::Push(
     const uint8_t* encoded_data,
     uint32_t size,
     int64_t pts,
     bool is_keyframe,
     int64_t wall_qpc) {
+    // Serialize publication against Clear(). Without this boundary a delayed
+    // old-generation encoder callback could race the reset, acquire the new
+    // generation token, and publish stale output into the fresh ring.
+    std::lock_guard<std::mutex> publication_lock(publication_mutex_);
+    const int64_t recovery_cutoff = recovery_cutoff_qpc_.load(
+        std::memory_order_acquire);
+    if (recovery_cutoff > 0 && wall_qpc <= recovery_cutoff) {
+        return false;
+    }
     const uint64_t write_pos = head_.load(std::memory_order_relaxed);
     const size_t slot_idx = static_cast<size_t>(write_pos % capacity_);
     std::lock_guard<std::mutex> slot_lock(slot_mutexes_[slot_idx]);
+    const uint64_t generation = generation_.load(std::memory_order_acquire);
 
     slot_states_[slot_idx].store(
         static_cast<uint32_t>(SlotState::WRITING),
@@ -46,6 +55,7 @@ void EncodedRingBuffer::Push(
         std::memcpy(slot.data.data(), encoded_data, size);
     slot.pts = pts;
     slot.wall_qpc = wall_qpc;
+    slot.generation = generation;
     slot.is_keyframe = is_keyframe;
     slot.valid = true;
     slot.absolute_position = write_pos;
@@ -59,6 +69,7 @@ void EncodedRingBuffer::Push(
         count_.fetch_add(1, std::memory_order_relaxed);
     latest_wall_qpc_.store(wall_qpc, std::memory_order_release);
     publication_cv_.notify_all();
+    return true;
 }
 
 bool EncodedRingBuffer::SetVideoConfig(const EncodedVideoConfig& config) {
@@ -70,6 +81,7 @@ bool EncodedRingBuffer::SetVideoConfig(const EncodedVideoConfig& config) {
     }
     video_config_ = config;
     video_config_set_ = true;
+    video_config_cv_.notify_all();
     std::cout << "[EncodedRingBuffer] Video config set: "
               << VideoCodecName(config.codec) << ' '
               << config.width << 'x' << config.height << ", "
@@ -80,6 +92,17 @@ bool EncodedRingBuffer::SetVideoConfig(const EncodedVideoConfig& config) {
 bool EncodedRingBuffer::HasVideoConfig() const {
     std::lock_guard<std::mutex> lock(video_config_mutex_);
     return video_config_set_;
+}
+
+bool EncodedRingBuffer::WaitForVideoConfig(
+    EncodedVideoConfig& config, std::chrono::milliseconds timeout) const {
+    std::unique_lock<std::mutex> lock(video_config_mutex_);
+    if (!video_config_cv_.wait_for(lock, timeout, [this] {
+            return video_config_set_ && IsValidEncodedVideoConfig(video_config_)
+                && !video_config_.codec_extradata.empty();
+        })) return false;
+    config = video_config_;
+    return true;
 }
 
 EncodedRingSnapshot EncodedRingBuffer::TakeSnapshotByTime(
@@ -94,6 +117,10 @@ EncodedRingSnapshot EncodedRingBuffer::TakeSnapshotByTime(
 
     for (int attempt = 0; attempt < 3; ++attempt) {
         EncodedRingSnapshot snapshot;
+        const uint64_t current_generation =
+            generation_.load(std::memory_order_acquire);
+        snapshot.capture_generation = current_generation;
+        snapshot.generation_continuous = true;
         {
             std::lock_guard<std::mutex> lock(video_config_mutex_);
             snapshot.video_config = video_config_;
@@ -118,6 +145,7 @@ EncodedRingSnapshot EncodedRingBuffer::TakeSnapshotByTime(
             if (state != static_cast<uint32_t>(SlotState::READY)
                 || !packet.valid
                 || packet.absolute_position != pos
+                || packet.generation != current_generation
                 || packet.wall_qpc <= 0) {
                 continue;
             }
@@ -141,13 +169,19 @@ EncodedRingSnapshot EncodedRingBuffer::TakeSnapshotByTime(
             const size_t slot_idx = static_cast<size_t>(pos % capacity_);
             std::lock_guard<std::mutex> lock(slot_mutexes_[slot_idx]);
             const auto& source = slots_[slot_idx];
-            if (!source.valid || source.absolute_position != pos) {
+            if (!source.valid || source.absolute_position != pos
+                || source.generation != current_generation) {
                 stale = true;
                 break;
             }
             snapshot.packets.push_back(source);
         }
         if (stale) continue;
+        if (generation_.load(std::memory_order_acquire) != current_generation) {
+            // Clear() may have invalidated the selected history while it was
+            // being copied. Never return a snapshot that crosses that boundary.
+            continue;
+        }
 
         snapshot.full_history = selection.full_history;
         int64_t requested_duration_ticks = DurationInVideoTicks(
@@ -195,10 +229,20 @@ bool EncodedRingBuffer::WaitUntilPublished(
     });
 }
 
-void EncodedRingBuffer::Clear() {
+void EncodedRingBuffer::Clear(int64_t recovery_cutoff_qpc) {
+    // Advance the token before invalidating slots. A concurrent save snapshot
+    // will either observe the new generation or retry after it sees the token
+    // change, so pre-recovery packets cannot be mixed into a post-recovery clip.
+    std::lock_guard<std::mutex> publication_lock(publication_mutex_);
+    if (recovery_cutoff_qpc > 0) {
+        recovery_cutoff_qpc_.store(recovery_cutoff_qpc,
+            std::memory_order_release);
+    }
+    generation_.fetch_add(1, std::memory_order_acq_rel);
     for (size_t i = 0; i < capacity_; ++i) {
         std::lock_guard<std::mutex> lock(slot_mutexes_[i]);
         slots_[i].valid = false;
+        slots_[i].generation = generation_.load(std::memory_order_relaxed);
         slots_[i].absolute_position = std::numeric_limits<uint64_t>::max();
         slot_states_[i].store(
             static_cast<uint32_t>(SlotState::EMPTY),

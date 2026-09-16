@@ -1,9 +1,7 @@
-"""Runtime encoder discovery for the capture-settings UI.
+"""Discover usable encoders with a one-frame in-memory encode.
 
-FFmpeg registering an encoder only proves that the backend was compiled in.  A
-short in-memory encode also verifies that the matching driver and hardware are
-usable on this device.  Discovery is intentionally called from a worker thread
-by the UI because driver initialization can take a few hundred milliseconds.
+FFmpeg registration alone does not prove that hardware or drivers work.
+Call discovery from a worker because driver initialization can block.
 """
 
 from __future__ import annotations
@@ -61,8 +59,8 @@ _BACKENDS: tuple[
 
 
 def _platform_backend_keys(platform: str) -> tuple[str, ...]:
-    # The Windows replay engine is hardware-only. Linux retains its reviewed
-    # OpenH264/Kvazaar/AV1 software path as an explicit selectable backend.
+    # Windows replay requires hardware encoding. Linux also exposes
+    # OpenH264, Kvazaar, and AV1 software backends.
     if platform.startswith('win'):
         return ('nvenc', 'amf', 'qsv')
     return ('nvenc', 'amf', 'qsv', 'software')

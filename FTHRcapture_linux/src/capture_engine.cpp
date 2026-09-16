@@ -13,16 +13,12 @@
 
 namespace fthr {
 
-// ---------------------------------------------------------------------------
 // CaptureEngine constructor/destructor — defined here so ICaptureBackend is complete
-// ---------------------------------------------------------------------------
 
 CaptureEngine::CaptureEngine() = default;
 CaptureEngine::~CaptureEngine() { Shutdown(); }
 
-// ---------------------------------------------------------------------------
 // CaptureEngine::Initialize
-// ---------------------------------------------------------------------------
 
 bool CaptureEngine::Initialize(const CaptureConfig& cfg) {
     cfg_ = cfg;
@@ -44,16 +40,13 @@ bool CaptureEngine::Initialize(const CaptureConfig& cfg) {
         }
     }
 
-    // Start capture loop thread
     running_.store(true);
     cap_thread_ = std::thread(&CaptureEngine::CaptureLoop, this);
 
     return true;
 }
 
-// ---------------------------------------------------------------------------
 // CaptureEngine::Shutdown
-// ---------------------------------------------------------------------------
 
 void CaptureEngine::Shutdown() {
     running_.store(false);
@@ -68,9 +61,7 @@ void CaptureEngine::Shutdown() {
     ring_ = nullptr;
 }
 
-// ---------------------------------------------------------------------------
 // CaptureEngine::CaptureLoop — backend-agnostic main loop
-// ---------------------------------------------------------------------------
 
 void CaptureEngine::CaptureLoop() {
     CaptureRecoveryPolicy recovery(static_cast<uint64_t>(cfg_.fps) * 10);
@@ -259,9 +250,7 @@ void CaptureEngine::SampleContent(const RawFrame& frame, uint64_t produced_frame
     capture_health_flags_.store(flags);
 }
 
-// ---------------------------------------------------------------------------
 // write_pcm_wav — writes IEEE float32 WAV file
-// ---------------------------------------------------------------------------
 
 static void write_pcm_wav(const std::string& path,
                             const std::vector<float>& pcm,
@@ -301,9 +290,7 @@ static void write_pcm_wav(const std::string& path,
     fclose(f);
 }
 
-// ---------------------------------------------------------------------------
 // CaptureEngine::SaveClip
-// ---------------------------------------------------------------------------
 
 bool CaptureEngine::SaveClip(const std::string& path, uint32_t duration_sec,
                                SharedMemoryLayout* shm,
@@ -388,9 +375,7 @@ bool CaptureEngine::SaveClip(const std::string& path, uint32_t duration_sec,
     );
 }
 
-// ---------------------------------------------------------------------------
 // CaptureEngine::Reconfigure — hot-swap codec/preset without full reinit
-// ---------------------------------------------------------------------------
 
 void CaptureEngine::Reconfigure(uint32_t codec_pref, int preset) {
     Shutdown();   // stops thread, deletes ring_, stops audio
@@ -421,9 +406,7 @@ void CaptureEngine::Reconfigure(uint32_t codec_pref, int preset) {
     cap_thread_ = std::thread(&CaptureEngine::CaptureLoop, this);
 }
 
-// ---------------------------------------------------------------------------
 // CaptureEngine::GetAudioMappingsJson
-// ---------------------------------------------------------------------------
 
 static std::string json_escape(const std::string& s) {
     std::string out;

@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
-"""Verify the Windows installer lifecycle contract and built release inputs.
+"""Verify installer lifecycle rules and optional built release inputs.
 
-The checks intentionally cover the installer source *and*, when paths are
-provided, the actual onedir bundle, Microsoft VC++ prerequisite, and generated
-Setup executable.  This is a release gate, not a replacement for a physical
-install/update/uninstall qualification.
-
-    python tools/verify_windows_installer_lifecycle.py
-    python tools/verify_windows_installer_lifecycle.py \
-        --bundle dist/FTHRClips --vcredist redist/vc_redist.x64.exe \
-        --installer Output/FTHRClips-Setup-1.0.0-alpha-x64.exe
+Use --bundle, --vcredist, and --installer to check artifacts. These checks
+supplement manual install, update, and uninstall qualification.
 """
 
 from __future__ import annotations

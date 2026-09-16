@@ -1,46 +1,6 @@
-﻿// main.cpp
-// FTHR Capture Engine - Entry point and command loop
-//
-// Encoded ring buffer update:
-//   NVENC is now initialized inside CaptureEngine::Initialize().
-//   Standalone detection here is informational only (GPU name / caps).
-//   The PART A TEST block has been removed (old signature, superseded).
-//
-// Responsibilities:
-//   - Parse startup configuration from command-line arguments
-//   - Initialize shared memory IPC channel
-//   - Initialize and own the CaptureEngine instance
-//   - Run the command loop (poll shared memory, dispatch to engine)
-//
-// argv contract (all provided by Python main.py start_engine()):
-//   argv[1]  fps            Capture framerate (1-360). Default: 60
-//   argv[2]  buffer_sec     Ring buffer duration in seconds (1-300). Default: 30
-//   argv[3]  target_width   Output width in pixels. 0 = native resolution. Default: 0
-//   argv[4]  target_height  Output height in pixels. 0 = native resolution. Default: 0
-//   argv[5]  bitrate_kbps   Encoder bitrate in kbps (500-60000). Default: 16000
-//   argv[6]  max_buffer_mb  Legacy raw-capacity diagnostic budget; no automatic fallback.
-//            Not used when NVENC is active - encoded ring buffer has no raw frame budget.
-//   argv[7]  capture_mode   0 = desktop (default), 1 = window
-//   argv[8]  target_hwnd    64-bit decimal HWND when capture_mode == 1, else 0
-//   argv[9]  scaling_mode   0 = stretch (default), 1 = fit (letterbox/pillarbox).
-//            Only meaningful when target_width/height are non-zero AND differ in
-//            aspect ratio from the captured source.
-//   argv[10] monitor_path   Stable normalized Windows monitor device path.
-//   argv[11] codec_pref     0 = auto/H.264, 1 = H.264, 2 = HEVC, 3 = AV1.
-//   argv[12] encoder_preset NVIDIA NVENC preset P1-P7. Default: P4.
-//   argv[13] multiband      Retired; retained as a zero-only ABI slot.
-//   argv[14] audio_enabled  0 = disable all audio capture.
-//   argv[15] microphone_endpoint_id  Empty = Default microphone; otherwise a
-//            stable native eCapture endpoint ID selected by the settings page.
-//   argv[16] microphone_gain_percent Capture-input gain, clamped to 0-200.
-//   argv[17] encoder_pref   0=Auto, 1=NVIDIA, 2=AMD, 3=Intel, 4=Software.
-//   argv[18] crop_enabled   1 applies argv[19..22] before encoder input.
-//   argv[19..22] crop_x, crop_y, crop_width, crop_height normalized to source.
-//   argv[23] audio_mode     0 = combined (default), 1 = separated tracks.
-//
-// Threading:
-//   This file runs entirely on the main thread.
-//   Heavy work (capture, encode, disk I/O) lives in CaptureEngine's threads.
+﻿// Native Windows startup and shared-memory command dispatch.
+// CaptureEngine owns capture, encoding, and save workers.
+// The positional startup contract is documented in docs/engine-startup.md.
 
 #include "shared_memory.h"
 #include "capture_engine.h"
@@ -56,9 +16,7 @@
 #include <Windows.h>
 
 
-// ---------------------------------------------------------------------------
 // Argument parsing helpers
-// ---------------------------------------------------------------------------
 
 static uint32_t ParseArgU32(int argc, char* argv[], int index, uint32_t default_val) {
     if (index >= argc) return default_val;
@@ -215,9 +173,7 @@ static void PrintConfig(const fthr::CaptureConfig& cfg) {
 }
 
 
-// ---------------------------------------------------------------------------
 // Entry point
-// ---------------------------------------------------------------------------
 
 int main(int argc, char* argv[]) {
     if (argc == 2 && std::strcmp(argv[1], "--list-microphones") == 0) {
@@ -245,9 +201,7 @@ int main(int argc, char* argv[]) {
               << (safe_session.empty() ? "unavailable:not_provided" : safe_session)
               << "\"}" << std::endl;
 
-    // ------------------------------------------------------------------
     // 1. Parse command-line arguments into CaptureConfig
-    // ------------------------------------------------------------------
     fthr::CaptureConfig config;
 
     config.framerate = ParseArgU32(argc, argv, 1, 60);
@@ -320,9 +274,7 @@ int main(int argc, char* argv[]) {
     config.crop_width = ParseArgDouble(argc, argv, 21, 1.0);
     config.crop_height = ParseArgDouble(argc, argv, 22, 1.0);
 
-    // ------------------------------------------------------------------
     // 2. Validate all parameters - clamp to safe ranges
-    // ------------------------------------------------------------------
     if (config.framerate == 0 || config.framerate > 360) {
         std::cerr << "[Config] Invalid framerate " << config.framerate
             << " - clamping to 60" << std::endl;
@@ -370,13 +322,8 @@ int main(int argc, char* argv[]) {
     std::cout << "Configuration:" << std::endl;
     PrintConfig(config);
 
-    // ------------------------------------------------------------------
-    // 2.5. NVENC Detection (informational)
-    //
-    // Logs GPU name and capabilities before engine init.
-    // CaptureEngine::Initialize() will attempt NVENC independently and
-    // fall back to x264 if it fails - this block does not affect that.
-    // ------------------------------------------------------------------
+    // Log NVENC capabilities for diagnostics. CaptureEngine independently
+    // selects and initializes the requested hardware backend.
     std::cout << "\n=== Hardware Encoding Detection ===" << std::endl;
 
     fthr::NVENCDetectionResult nvenc_info = fthr::DetectNVENC();
@@ -397,9 +344,7 @@ int main(int argc, char* argv[]) {
 
     std::cout << "====================================\n" << std::endl;
 
-    // ------------------------------------------------------------------
     // 3. Initialise shared memory IPC channel
-    // ------------------------------------------------------------------
     fthr::SharedMemory memory;
     if (!memory.Initialize(L"FTHR_SharedMemory_v4")) {
         std::cerr << "[Fatal] Failed to create shared memory" << std::endl;
@@ -438,18 +383,9 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Shared memory ready (is_initialized = false until engine starts)." << std::endl;
 
-    // ------------------------------------------------------------------
-    // 4. Initialise the capture engine
-    //
-    // CaptureEngine::Initialize() selects the hardware replay backend from the
-    // capture adapter (native NVENC on NVIDIA, FFmpeg AMF on AMD, FFmpeg QSV
-    // on Intel). Automatic cross-adapter and raw replay fallbacks are disabled.
-    // On hardware success: encoded ring buffer active, FramePool skipped.
-    // On failure: startup stops with a structured, user-visible reason.
-    //
-    // is_initialized is set to true ONLY after this succeeds. Python's
-    // CaptureBridge.initialize() checks this flag before connecting.
-    // ------------------------------------------------------------------
+    // Initialize NVENC, AMF, or QSV on the capture adapter without automatic
+    // cross-adapter or raw fallback. Set is_initialized only on success; the
+    // Python bridge checks it before connecting.
     std::cout << "Initializing capture engine..." << std::endl;
 
     fthr::CaptureEngine engine;
@@ -498,9 +434,7 @@ int main(int argc, char* argv[]) {
     std::cout << "  replay_capacity= " << config.buffer_seconds
               << "s configured compressed history" << std::endl;
 
-    // ------------------------------------------------------------------
     // 5. Command loop - polls shared memory for UI commands
-    // ------------------------------------------------------------------
     bool shutdown_requested = false;
     while (!shutdown_requested) {
 
@@ -555,11 +489,12 @@ int main(int argc, char* argv[]) {
             case fthr::CommandType::SAVE_CLIP:
                 std::wcout << L"[Cmd] SAVE_CLIP -> " << cmd_string
                     << L" (" << cmd_param1 << L"s)" << std::endl;
+                // Publish acceptance before making work visible to the save
+                // thread. A fast completion must never be overwritten by a
+                // late SAVE_STARTED (or have its error payload cleared).
+                fthr::SetEngineString(layout, L"");
+                layout->engine_response = fthr::ResponseType::SAVE_STARTED;
                 if (engine.SaveClip(cmd_string, cmd_param1, layout)) {
-                    // Clear the message channel before acknowledging, so a
-                    // save that follows a failed one cannot show its text.
-                    fthr::SetEngineString(layout, L"");
-                    layout->engine_response = fthr::ResponseType::SAVE_STARTED;
                     std::wcout << L"[Cmd] SAVE_CLIP queued" << std::endl;
                 }
                 else {

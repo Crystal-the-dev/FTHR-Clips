@@ -74,20 +74,23 @@ def test_codec_preference_persists_across_restart(tmp_path, monkeypatch, codec):
     assert restarted.get('codec_pref') == codec
 
 
-def test_extended_clip_length_default(tmp_path, monkeypatch):
+def test_extended_clips_are_not_in_defaults(tmp_path, monkeypatch):
     monkeypatch.setattr('pathlib.Path.home', lambda: tmp_path)
     sm = SettingsManager()
-    assert sm.get('extended_clip_length') == 60
+    assert sm.get('extended_clip_length') is None
+    assert 'save_extended_clip' not in sm.get('hotkeys')
 
 
-def test_old_config_gets_extended_clip_length_default(tmp_path, monkeypatch):
+def test_old_extended_clip_settings_are_removed(tmp_path, monkeypatch):
     monkeypatch.setattr('pathlib.Path.home', lambda: tmp_path)
     cfg_file = tmp_path / '.fthr' / 'settings.json'
     cfg_file.parent.mkdir(parents=True)
     with open(cfg_file, 'w') as f:
-        json.dump({'clip_length': 30}, f)
+        json.dump({'clip_length': 30, 'extended_clip_length': 120,
+                   'hotkeys': {'save_extended_clip': 'F10', 'save_clip': 'F8'}}, f)
     sm = SettingsManager()
-    assert sm.get('extended_clip_length') == 60
+    assert sm.get('extended_clip_length') is None
+    assert 'save_extended_clip' not in sm.get('hotkeys')
     assert sm.get('clip_length') == 30  # existing value unaffected
 
 
@@ -103,3 +106,19 @@ def test_console_failure_does_not_reclassify_a_successful_write(
 
     assert manager.save_settings() is True
     assert manager.config_file.is_file()
+
+
+def test_recording_and_library_paths_expand_environment(tmp_path, monkeypatch):
+    from core.settings_manager import recording_directory_from
+    monkeypatch.setenv('FTHR_TEST_STORAGE', str(tmp_path))
+    from types import SimpleNamespace
+    settings = {'clips_directory': '$FTHR_TEST_STORAGE/Library',
+                'recording_directory': '$FTHR_TEST_STORAGE/Recordings'}
+    sm = SimpleNamespace(get=lambda key, default=None: settings.get(key, default))
+    assert clips_directory_from(sm) == (tmp_path / 'Library').resolve()
+    assert recording_directory_from(sm) == (tmp_path / 'Recordings').resolve()
+    if sys.platform == 'win32':
+        settings['recording_directory'] = '%FTHR_TEST_STORAGE%/Recordings'
+        assert recording_directory_from(sm) == (tmp_path / 'Recordings').resolve()
+    settings['recording_directory'] = None
+    assert recording_directory_from(sm) == (tmp_path / 'Library/Recordings').resolve()

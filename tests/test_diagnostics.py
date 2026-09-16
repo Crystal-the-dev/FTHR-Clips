@@ -26,9 +26,7 @@ def _clean_logging():
     reset_for_tests()
 
 
-# ---------------------------------------------------------------------------
 # Redaction — a leaked credential in a public issue is unrecoverable
-# ---------------------------------------------------------------------------
 
 REAL_LOOKING_JWT = ('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.'
                     'eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r')
@@ -112,9 +110,7 @@ def test_handler_preserves_numeric_placeholder_types(tmp_path):
     assert 'frames=27 luma=12.50' in written
 
 
-# ---------------------------------------------------------------------------
 # Restraint — a 50 ms poll must not produce a 50 ms log
-# ---------------------------------------------------------------------------
 
 class _FakeClock:
     def __init__(self):
@@ -208,9 +204,7 @@ def test_failure_and_recovery_cycle_repeats():
     assert len(records) == 6, 'each cycle must report both edges'
 
 
-# ---------------------------------------------------------------------------
 # Unexpected failures must carry a stack trace
-# ---------------------------------------------------------------------------
 
 def test_log_unexpected_includes_a_traceback():
     logger, records = _capture()
@@ -235,9 +229,7 @@ def test_log_unexpected_redacts_its_context():
     assert REAL_LOOKING_JWT not in records[0].getMessage()
 
 
-# ---------------------------------------------------------------------------
 # Setup must degrade, not crash
-# ---------------------------------------------------------------------------
 
 def test_configure_is_idempotent(tmp_path):
     log_file = tmp_path / 'fthr.log'

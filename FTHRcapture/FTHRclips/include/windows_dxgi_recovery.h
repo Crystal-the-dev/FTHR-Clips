@@ -1,4 +1,3 @@
-// windows_dxgi_recovery.h
 // Bounded, same-device Desktop Duplication recovery primitives.
 
 #pragma once
@@ -13,7 +12,10 @@
 #include <dxgi.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <mutex>
+#include <vector>
 #include <string>
 #include <utility>
 
@@ -84,12 +86,15 @@ inline RecoveryDecision EvaluateRecovery(
     if (active.adapter_luid != observation.current.adapter_luid) {
         return RecoveryDecision::AdapterChanged;
     }
+    // A device-loss notification is never repaired by reopening only the
+    // duplication object. Check it before dimensions so a coincident resize
+    // cannot downgrade a device-removal boundary to a retry.
+    if (observation.device_removed_reason != S_OK) {
+        return RecoveryDecision::DeviceRemoved;
+    }
     if (active.width != observation.current.width
         || active.height != observation.current.height) {
         return RecoveryDecision::DimensionsChanged;
-    }
-    if (observation.device_removed_reason != S_OK) {
-        return RecoveryDecision::DeviceRemoved;
     }
     return RecoveryDecision::RecreateDuplication;
 }
@@ -100,6 +105,28 @@ enum class RecoveryAttemptResult {
     FatalFailure,
     StopRequested,
 };
+
+// A resize observed while handling ACCESS_LOST is retryable: Windows may
+// briefly report the new desktop bounds while the selected output is still
+// being reattached. Identity, adapter, and device changes remain fatal and
+// therefore require a fresh capture generation.
+inline RecoveryAttemptResult RecoveryAttemptForDecision(
+    RecoveryDecision decision) noexcept {
+    switch (decision) {
+    case RecoveryDecision::RecreateDuplication:
+        return RecoveryAttemptResult::Recovered;
+    case RecoveryDecision::StopRequested:
+        return RecoveryAttemptResult::StopRequested;
+    case RecoveryDecision::MonitorUnavailable:
+    case RecoveryDecision::DimensionsChanged:
+        return RecoveryAttemptResult::RetryableFailure;
+    case RecoveryDecision::MonitorIdentityChanged:
+    case RecoveryDecision::AdapterChanged:
+    case RecoveryDecision::DeviceRemoved:
+        return RecoveryAttemptResult::FatalFailure;
+    }
+    return RecoveryAttemptResult::FatalFailure;
+}
 
 enum class RecoveryOutcome {
     Recovered,
@@ -164,15 +191,20 @@ enum class PipelineStallBoundary {
 inline PipelineStallBoundary ClassifyPipelineStall(
     bool capture_stalled,
     bool any_frame_acquired,
-    bool encoder_received_recent_submission) noexcept {
+    bool encoder_received_recent_submission,
+    bool encoder_has_pending_work = false) noexcept {
+    // A pending NVENC submission proves capture handed work to the encoder.
+    // Prefer that evidence over the capture timer so driver/API stalls (such
+    // as pending 8039/8040 operations) are not mislabeled as capture stalls.
+    if (encoder_has_pending_work || encoder_received_recent_submission) {
+        return PipelineStallBoundary::EncoderOutputStalled;
+    }
     if (capture_stalled) {
         return any_frame_acquired
             ? PipelineStallBoundary::CaptureFrameStalled
             : PipelineStallBoundary::CaptureNoFrames;
     }
-    return encoder_received_recent_submission
-        ? PipelineStallBoundary::EncoderOutputStalled
-        : PipelineStallBoundary::EncoderSubmitFailed;
+    return PipelineStallBoundary::EncoderSubmitFailed;
 }
 
 inline const char* PipelineStallCode(
@@ -189,6 +221,59 @@ inline const char* PipelineStallCode(
     }
     return "CAPTURE_FRAME_STALLED";
 }
+
+// Bounded DXGI event history written by CaptureThread and read at recovery.
+// The mutex protects event copies: a seqlock check after a non-atomic copy
+// would still permit a C++ data race.
+struct RecentDxgiEvent {
+    int64_t acquire_start_qpc = 0;
+    int64_t acquire_end_qpc = 0;
+    int64_t last_present_qpc = 0;
+    int64_t presentation_gap_qpc = 0;
+    int32_t acquire_hresult = 0;
+    int32_t release_hresult = 0;
+    // Opaque per-capture-thread token. Never expose a raw COM pointer in a
+    // diagnostic bundle because pointer values disclose process addresses.
+    uint64_t resource_token = 0;
+    uint32_t generation = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t format = 0;
+    uint32_t output_index = 0xffffffffu;
+    bool acquired = false;
+    bool timed_out = false;
+    bool pointer_only = false;
+    bool release_attempted = false;
+};
+
+template <size_t Capacity = 32>
+class RecentDxgiEvidence final {
+    static_assert(Capacity > 0, "DXGI evidence capacity must be non-zero");
+
+public:
+    void Record(const RecentDxgiEvent& event) noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        slots_[next_ % Capacity] = event;
+        ++next_;
+    }
+
+    std::vector<RecentDxgiEvent> Snapshot() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<RecentDxgiEvent> result;
+        result.reserve(Capacity);
+        const uint64_t newest = next_;
+        const uint64_t first = newest > Capacity ? newest - Capacity : 0;
+        for (uint64_t sequence = first; sequence < newest; ++sequence) {
+            result.push_back(slots_[sequence % Capacity]);
+        }
+        return result;
+    }
+
+private:
+    std::array<RecentDxgiEvent, Capacity> slots_{};
+    uint64_t next_ = 0;
+    mutable std::mutex mutex_;
+};
 
 inline bool IsFatalDuplicationRecreateFailure(HRESULT result) noexcept {
     // ACCESS_DENIED is expected while Windows owns a secure desktop and can

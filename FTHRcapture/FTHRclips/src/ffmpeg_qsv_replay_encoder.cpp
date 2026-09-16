@@ -299,7 +299,7 @@ public:
         codec_context_->rc_min_rate = codec_context_->bit_rate;
         codec_context_->rc_max_rate = codec_context_->bit_rate;
         codec_context_->rc_buffer_size = static_cast<int>(codec_context_->bit_rate);
-        codec_context_->gop_size = static_cast<int>(config.fps * 4);
+        codec_context_->gop_size = static_cast<int>(config.fps);
         codec_context_->max_b_frames = 0;
         codec_context_->profile = selection.profile;
         codec_context_->flags |= AV_CODEC_FLAG_LOW_DELAY
@@ -968,7 +968,7 @@ EncodedVideoConfig BuildQsvVideoConfig(
     config.frame_rate = {static_cast<int32_t>(fps), 1};
     config.time_base = {1, static_cast<int32_t>(fps)};
     config.bitrate_kbps = bitrate_kbps;
-    config.max_keyframe_interval_frames = fps * 4;
+    config.max_keyframe_interval_frames = fps;
     config.max_b_frames = 0;
     const auto* selection = GetQsvCodecSelection(codec);
     if (selection) config.packet_format = selection->packet_format;
@@ -1103,7 +1103,7 @@ bool FfmpegQsvReplayEncoder::EncodeFrame(int64_t present_qpc) {
     }
 
     const int64_t pts = ComputePts(present_qpc);
-    const bool force_keyframe = last_forced_keyframe_pts_ < 0
+    const bool force_keyframe = ConsumeKeyframeRequest() || last_forced_keyframe_pts_ < 0
         || pts - last_forced_keyframe_pts_
             >= static_cast<int64_t>(fps_) * 4;
     if (!SubmitWithBackpressure(pts, force_keyframe)) return false;

@@ -1,41 +1,10 @@
 #!/usr/bin/env python3
-"""Verify that no exception is swallowed without saying why (AUDIT-007).
+"""Check that intentionally silent exception handlers explain why.
 
-The whole support strategy is "send us your log". A handler that catches an
-error and does nothing removes the one line that would have explained a bug
-report — and it does it invisibly, so nobody notices until a user says "it
-just doesn't save sometimes".
-
-Ruff's BLE001/S110 cover part of this, but not the rule that actually matters
-here: *an intentional silence must be justified in the source*. This gate
-enforces exactly that.
-
-Rules
------
-BARE-EXCEPT       `except:` — also catches KeyboardInterrupt and SystemExit.
-BROAD-SWALLOW     `except Exception:` (or BaseException) whose body only
-                  passes/continues/returns, with no comment explaining why.
-BASE-EXCEPTION    `except BaseException` — almost never what anyone means.
-UNDOCUMENTED-PASS a narrow `except SomeError:` that silently passes with no
-                  comment. Narrow handlers are usually deliberate, so a
-                  comment is all this asks for.
-
-An intentionally silent handler passes by carrying a comment inside or
-immediately above it:
-
-    except FileNotFoundError:
-        # The mux worker already cleaned this up; nothing to do.
-        pass
-
-Uses the AST, not regex, so a docstring or a test fixture containing the text
-"except: pass" is not a finding.
-
-Usage:
-    python tools/verify_exception_handling.py
-    python tools/verify_exception_handling.py --root some/dir
-    python tools/verify_exception_handling.py --baseline N
-
-Exit 0 = clean, 1 = violations (or the tree is empty).
+Reject bare except and BaseException handlers. Silent broad or narrow
+handlers need a comment inside or immediately above the handler. AST
+inspection excludes docstrings and fixtures. --root selects a tree;
+--baseline sets the allowed existing debt. Exit 1 reports violations.
 """
 
 from __future__ import annotations
@@ -51,17 +20,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_ROOTS = [REPO / 'FTHR_UI']
 
-#: Undocumented silent handlers still present in the tree.
-#:
-#: AUDIT-007 inventoried 232 handlers, of which 154 are silent and 92 carry no
-#: justification. Fixing all 92 in one pass would be a mechanical rewrite of
-#: code nobody re-read — exactly the change that turns a real handler into
-#: `logger.exception` in a 50 ms poll and floods the log.
-#:
-#: So this is a ratchet, not a target. The forbidden rules (bare except,
-#: BaseException) are already at zero and fail the build outright. This number
-#: only ever moves DOWN: a new silent handler pushes the count over the line
-#: and fails CI, while the existing debt is worked off deliberately.
+# : Ratchet for existing undocumented silent handlers. Only decrease this
+# : baseline as handlers are documented; new debt must fail CI. Bare except
+# : and BaseException are forbidden regardless of the baseline.
 BASELINE = 92
 
 #: Bodies that do nothing a reader can observe.

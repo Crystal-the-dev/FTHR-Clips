@@ -1,6 +1,7 @@
 #include "replay_encoder.h"
 #include "encoded_ring_buffer.h"
 #include "frame_rate_scheduler.h"
+#include "replay_health.h"
 #include "save_clip_task.h"
 
 #include <atomic>
@@ -166,6 +167,136 @@ void EncodedReplayCapacityHasBoundedHeadroom() {
     CheckPolicy(fthr::CalculateEncodedReplaySlotCapacity(0, 60) == 0
             && fthr::CalculateEncodedReplaySlotCapacity(30, 0) == 0,
         "invalid replay timing cannot allocate a ring");
+}
+
+fthr::replay_health::Input ReplayHealthFixture(
+    uint32_t seconds, uint32_t fps, bool full_history = true) {
+    fthr::replay_health::Input input;
+    input.requested_duration_seconds = seconds;
+    input.expected_fps = static_cast<double>(fps);
+    input.wall_qpc_frequency = 1'000'000;
+    input.full_history = full_history;
+    const int64_t frame_period = input.wall_qpc_frequency / fps;
+    const size_t frame_count = static_cast<size_t>(seconds) * fps + 1;
+    input.packets.reserve(frame_count);
+    for (size_t index = 0; index < frame_count; ++index) {
+        input.packets.push_back({
+            1'000'000 + static_cast<int64_t>(index) * frame_period,
+            static_cast<int64_t>(index),
+            4});
+    }
+    return input;
+}
+
+void ReplayHealthRejectsSparseNativeTimeline() {
+    auto sparse = ReplayHealthFixture(5, 60);
+    sparse.packets = {
+        {1'000'000, 0, 4},
+        {2'500'000, 1, 4},
+        {4'000'000, 2, 4},
+        {6'000'000, 3, 4},
+    };
+    const auto report = fthr::replay_health::Evaluate(sparse);
+    CheckPolicy(!report.accepted
+            && report.failure == fthr::replay_health::Failure::LargeTimelineGap
+            && report.packet_count == 4
+            && report.largest_gap_s >= 1.5,
+        "four packets across several seconds are rejected before muxing");
+
+    sparse.packets = {
+        {1'000'000, 0, 4},
+        {1'016'666, 1, 4},
+        {1'033'332, 2, 4},
+        {1'049'998, 3, 4},
+    };
+    const auto clustered = fthr::replay_health::Evaluate(sparse);
+    CheckPolicy(!clustered.accepted
+            && clustered.failure
+                == fthr::replay_health::Failure::InsufficientCoverage,
+        "four tightly clustered packets cannot claim full requested history");
+}
+
+void ReplayHealthAllowsHealthyAndPartialHistory() {
+    for (const uint32_t seconds : {5u, 30u, 60u}) {
+        const auto report = fthr::replay_health::Evaluate(
+            ReplayHealthFixture(seconds, 60));
+        CheckPolicy(report.accepted && report.generation_continuous
+                && report.effective_packet_rate > 59.0,
+            "normal 60 fps replay is accepted for the requested interval");
+    }
+
+    auto partial = ReplayHealthFixture(5, 60, false);
+    partial.packets.resize(4);
+    const auto partial_report = fthr::replay_health::Evaluate(partial);
+    CheckPolicy(!partial_report.accepted
+            && partial_report.failure
+                == fthr::replay_health::Failure::InsufficientCoverage,
+        "four packets cannot claim a requested replay even as partial history");
+
+    const auto dense_partial = fthr::replay_health::Evaluate(
+        ReplayHealthFixture(1, 30, false));
+    CheckPolicy(dense_partial.accepted && dense_partial.partial_history,
+        "dense one-second startup history remains valid as partial history");
+
+    auto short_gap = ReplayHealthFixture(5, 60);
+    // One missed scheduling deadline is bounded and must not reject the clip.
+    for (size_t index = 61; index < short_gap.packets.size(); ++index) {
+        short_gap.packets[index].wall_qpc += 2 * 16'666;
+    }
+    const auto short_gap_report = fthr::replay_health::Evaluate(short_gap);
+    CheckPolicy(short_gap_report.accepted
+            && short_gap_report.largest_gap_s < 0.250,
+        "a short bounded capture gap remains acceptable");
+}
+
+void ReplayHealthRejectsGenerationChange() {
+    auto input = ReplayHealthFixture(1, 60);
+    input.packets[30].generation = 5;
+    const auto report = fthr::replay_health::Evaluate(input);
+    CheckPolicy(!report.accepted
+            && report.failure
+                == fthr::replay_health::Failure::GenerationDiscontinuity,
+        "a replay crossing capture generations is rejected");
+}
+
+void ReplayHealthRejectsStaleSaveBoundary() {
+    auto input = ReplayHealthFixture(5, 60);
+    input.target_end_wall_qpc = input.packets.back().wall_qpc + 1'000'001;
+    const auto report = fthr::replay_health::Evaluate(input);
+    CheckPolicy(!report.accepted
+            && report.failure == fthr::replay_health::Failure::StaleEnd,
+        "a replay whose newest packet is stale at save time is rejected");
+}
+
+void EncodedRingGenerationIsolatedAcrossClear() {
+    fthr::EncodedRingBuffer ring(16, 60, 1'000'000);
+    const uint8_t packet = 0x01;
+    ring.Push(&packet, 1, 0, true, 1'000'000);
+    const auto before = ring.TakeSnapshotByTime(1, 1'000'000);
+    CheckPolicy(before.packets.size() == 1
+            && before.capture_generation == before.packets.front().generation,
+        "snapshot exposes the packet generation before recovery");
+
+    const uint64_t old_generation = ring.GetGeneration();
+    ring.Clear();
+    CheckPolicy(ring.GetGeneration() == old_generation + 1
+            && ring.GetCount() == 0,
+        "clearing the encoded ring advances its internal generation");
+    ring.Push(&packet, 1, 0, true, 2'000'000);
+    const auto after = ring.TakeSnapshotByTime(1, 2'000'000);
+    CheckPolicy(after.packets.size() == 1
+            && after.capture_generation == ring.GetGeneration()
+            && after.packets.front().generation != before.packets.front().generation,
+        "post-recovery snapshots contain only the fresh generation");
+
+    fthr::EncodedRingBuffer cutoff_ring(16, 60, 1'000'000);
+    cutoff_ring.Clear(1'500'000);
+    cutoff_ring.Push(&packet, 1, 0, true, 1'400'000);
+    CheckPolicy(cutoff_ring.GetCount() == 0,
+        "delayed pre-recovery output at the cutoff is rejected");
+    cutoff_ring.Push(&packet, 1, 1, true, 1'600'000);
+    CheckPolicy(cutoff_ring.GetCount() == 1,
+        "post-recovery output beyond the cutoff is accepted");
 }
 
 void ActiveTruthAndGenerationAreScoped() {
@@ -387,6 +518,11 @@ int RunWindowsReplayPolicyTests() {
     RawCapacityNeverOverclaimsConfiguredHistory();
     DeadlineSchedulerPreservesCadenceAcrossRefreshRates();
     EncodedReplayCapacityHasBoundedHeadroom();
+    ReplayHealthRejectsSparseNativeTimeline();
+    ReplayHealthAllowsHealthyAndPartialHistory();
+    ReplayHealthRejectsGenerationChange();
+    ReplayHealthRejectsStaleSaveBoundary();
+    EncodedRingGenerationIsolatedAcrossClear();
     ActiveTruthAndGenerationAreScoped();
     ProductionThreeByThreeMatrixAndRegressionsHold();
     SaveQueueIsBoundedAndRejectsWithoutBlocking();

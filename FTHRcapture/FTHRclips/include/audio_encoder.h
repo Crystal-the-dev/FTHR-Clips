@@ -1,39 +1,7 @@
-// audio_encoder.h
-// FTHR Capture Engine - AAC Audio Encoder
-//
-// Accepts raw PCM float32 interleaved stereo from WASAPI and encodes it
-// into AAC packets via FFmpeg's built-in AAC encoder. Each encoded packet
-// is delivered to a caller-supplied callback, which pushes it into the
-// AudioRingBuffer.
-//
-// Why float32 / 48kHz / stereo:
-//   WASAPI shared-mode loopback delivers audio in the device's mix format,
-//   which is almost always float32 48kHz stereo on modern Windows systems.
-//   Accepting this format natively avoids a resampling step.
-//
-// PCM accumulation:
-//   AAC encodes in fixed-size frames of exactly 1024 samples. WASAPI delivers
-//   variable-sized chunks (typically 480 or 960 samples at 48kHz / 10ms or
-//   20ms). The encoder maintains an internal accumulation buffer and only
-//   calls avcodec_send_frame when a full 1024-sample frame is ready.
-//   Remaining samples carry over to the next EncodeSamples() call.
-//
-// Extradata:
-//   FFmpeg writes the MPEG-4 AudioSpecificConfig (ASC) into codec_ctx->extradata
-//   after avcodec_open2 when AV_CODEC_FLAG_GLOBAL_HEADER is set.
-//   GetExtradata() returns a copy for the MP4 muxer to attach to the audio
-//   stream's codecpar->extradata.
-//
-// PTS:
-//   Tracks a monotonically increasing sample counter (pts_samples_).
-//   Each encoded packet carries its PTS in samples (48000Hz timebase).
-//   This matches AudioRingBuffer and makes muxer alignment straightforward.
-//
-// Threading:
-//   EncodeSamples() is called from AudioCapture's WASAPI callback thread.
-//   Not thread-safe for concurrent callers - single producer assumed.
-//   Finalize() must be called from the same thread as EncodeSamples(), or
-//   after that thread has exited.
+// Single-producer AAC encoder for interleaved float32 PCM.
+// Accumulate partial input until a full AAC frame is available; packet PTS
+// uses the input sample-rate timebase. GetExtradata() supplies the muxer ASC.
+// Finalize on the producer thread or after it has stopped.
 
 #pragma once
 #ifndef FTHR_AUDIO_ENCODER_H
@@ -53,9 +21,6 @@ struct AVPacket;
 namespace fthr {
 
 
-    // ---------------------------------------------------------------------------
-    // AudioEncoder
-    // ---------------------------------------------------------------------------
     class AudioEncoder {
     public:
         struct Stats {
@@ -64,13 +29,8 @@ namespace fthr {
             uint64_t encode_errors = 0;
             uint64_t flush_errors = 0;
         };
-        // Callback fired once per encoded AAC packet.
-        // data:     raw AAC frame bytes (no ADTS header)
-        // size:     byte count
-        // pts:      presentation timestamp in audio samples (48000Hz timebase)
-        //
-        // Callback runs on the WASAPI callback thread. Must be fast.
-        // Typically just calls AudioRingBuffer::Push().
+        // Receives raw AAC bytes without ADTS headers and PTS in audio samples.
+        // Runs on the capture thread; the callback must not block.
         using PacketCallback = std::function<void(const uint8_t* data,
                                                    uint32_t       size,
                                                    int64_t        pts)>;
@@ -78,27 +38,16 @@ namespace fthr {
         AudioEncoder();
         ~AudioEncoder();
 
-        // Initialize the FFmpeg AAC encoder.
-        // sample_rate:   input sample rate in Hz (native conversion is upstream)
-        // channels:      number of channels (1..8)
-        // bitrate_kbps:  target AAC bitrate (128 is a good default)
-        // callback:      receives every encoded packet - must not be null
-        //
-        // Returns true on success.
+        // Initialize AAC with the upstream PCM rate, 1..8 channels, and target kbps.
+        // The packet callback is required. Returns false if initialization fails.
         bool Initialize(uint32_t       sample_rate,
                         uint32_t       channels,
                         uint32_t       bitrate_kbps,
                         PacketCallback callback,
                         int64_t        initial_pts_samples = 0);
 
-        // Feed raw interleaved float32 PCM samples into the encoder.
-        // pcm_data:    pointer to interleaved samples (L,R,L,R,...) as float32
-        // num_samples: total sample count (frames * channels)
-        //              e.g. 960 frames stereo -> num_samples = 1920
-        //
-        // Internally accumulates samples until a full 1024-sample AAC frame
-        // is ready, then encodes and fires the callback.
-        // May fire the callback zero or multiple times per call.
+        // Feed interleaved float32 PCM; num_samples counts frames * channels.
+        // Buffer partial AAC frames. A call can emit zero or multiple packets.
         bool EncodeSamples(const float* pcm_data, uint32_t num_samples);
 
         // Flush any remaining buffered samples and free all FFmpeg resources.

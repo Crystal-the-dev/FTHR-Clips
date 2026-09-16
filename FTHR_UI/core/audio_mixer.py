@@ -31,13 +31,11 @@ def mix_multiband_clip(
     if not category_wavs:
         return False
 
-    # Build list of (category, wav_path) for existing files only
     valid = [(cat, wav) for cat, wav in category_wavs.items()
              if os.path.exists(wav)]
     if not valid:
         return False
 
-    # Build ffmpeg filter: volume-adjust each input then amix all
     inputs = []
     filter_parts = []
     for i, (cat, wav_path) in enumerate(valid):

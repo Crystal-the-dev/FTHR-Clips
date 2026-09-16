@@ -1,37 +1,8 @@
-"""Central resolution of the external Linux helper programs FTHR shells out to.
+"""Resolve and cache absolute paths for Linux helper programs.
 
-Why this exists
----------------
-The code used to invoke `hyprctl`, `xdotool`, `xprop`, `xrandr`, `grim`, `nc` and
-`xdg-open` by bare name, scattered across six modules. Three problems with
-that:
-
-1. **PATH is attacker-influenced.** `subprocess.run(['grim', ...])` executes
-   whatever `grim` the current PATH resolves to. A writable directory earlier
-   in PATH — a stale `~/.local/bin`, a game launcher that prepends its own
-   `bin/`, a Flatpak wrapper — silently substitutes the binary. Resolving once
-   through `shutil.which()` and then invoking the **absolute** path makes the
-   choice explicit and inspectable, and it is logged.
-
-2. **Missing tools produced confusing failures.** A missing `grim` surfaced as
-   `FileNotFoundError` inside a screenshot handler and got swallowed, so the
-   feature just did nothing. Callers can now ask whether a tool exists and say
-   so in the UI.
-
-3. **No diagnostics.** Bug reports said "screenshots don't work" with nothing
-   in the log. `report()` dumps the full resolution table into the log at
-   startup.
-
-Design notes
-------------
-* Resolution is cached — PATH does not change during a run, and `which()` on
-  every focus poll would be wasteful.
-* Nothing here ever uses `shell=True`. All callers pass argument lists.
-* Tools are classified REQUIRED (the feature owning them cannot work without
-  them) or OPTIONAL (there is a fallback). Neither classification is fatal to
-  startup: FTHR degrades, it does not refuse to run.
-* This module is import-safe on Windows. Everything simply reports "missing",
-  which is correct — none of these exist there and no caller uses them.
+Log resolved paths at startup so PATH overrides and missing tools are
+visible. Callers use argument lists and handle missing helpers per feature.
+On Windows, resolution reports these Linux tools as unavailable.
 """
 
 from __future__ import annotations

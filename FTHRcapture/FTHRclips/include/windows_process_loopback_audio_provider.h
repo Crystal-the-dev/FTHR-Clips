@@ -1,9 +1,5 @@
-// windows_process_loopback_audio_provider.h
-// Windows 11 process-loopback application stems for AUDIT-050.
-//
-// The common audio-source model deliberately stays free of COM details.  This
-// Windows-only adapter owns the documented process-loopback activation and
-// connects real PCM to the existing persistent AAC replay-ring contract.
+// Windows 11 process-loopback capture for application audio stems.
+// This adapter owns COM activation and feeds PCM to persistent AAC replay rings.
 
 #pragma once
 #ifndef FTHR_WINDOWS_PROCESS_LOOPBACK_AUDIO_PROVIDER_H

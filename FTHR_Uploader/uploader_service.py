@@ -142,9 +142,8 @@ def _account_action(
     if mode == 'login':
         data = client.verify(account_id, hardware_id)
     elif mode == 'register':
-        # Registration is deliberately a one-way account-creation action. A
-        # conflict must stay a registration error; verifying the same ID here
-        # turns a failed create into a confusing login/404 response.
+        # Keep registration conflicts as errors. Verifying identity here would
+        # turn account creation into an implicit login attempt.
         data = client.register(account_id, hardware_id)
     else:
         raise ValueError(f'Unsupported account action: {mode}')

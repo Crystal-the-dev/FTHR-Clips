@@ -1,4 +1,3 @@
-// encoded_video_config.h
 // Codec-neutral description of one compressed replay video stream.
 
 #pragma once

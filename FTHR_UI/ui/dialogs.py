@@ -1,10 +1,4 @@
-"""Frameless dialogs shared by the FTHR UI.
-
-Qt's stock input and message dialogs inherit the host window decoration. That
-is especially visible on Windows, where a rounded light title bar breaks the
-otherwise square, black FTHR shell. These small dialog primitives keep modal
-interactions in the same visual system as the rest of the app.
-"""
+"""Frameless input and message dialogs matching the application theme."""
 
 from __future__ import annotations
 

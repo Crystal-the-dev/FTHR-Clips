@@ -358,6 +358,17 @@ void PacketMetadataPropagates() {
         "AMF packet timestamp propagates through wrapper");
     CheckAmf(callback_keyframe,
         "AMF keyframe flag propagates through wrapper");
+    CheckAmf(encoder.PrepareGpuFrame(nullptr, 0) && encoder.EncodeFrame(2)
+            && !fake->submitted_force_keyframe,
+        "normal following frame does not force an IDR");
+    encoder.RequestKeyframe();
+    CheckAmf(encoder.PrepareGpuFrame(nullptr, 0) && encoder.EncodeFrame(3)
+            && fake->submitted_force_keyframe,
+        "recording start requests an immediate random-access frame");
+    CheckAmf(encoder.PrepareGpuFrame(nullptr, 0) && encoder.EncodeFrame(4)
+            && !fake->submitted_force_keyframe,
+        "keyframe request is consumed exactly once");
+
 }
 
 void ScaledAmfConfigUsesEncoderDimensions() {

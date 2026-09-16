@@ -1,10 +1,6 @@
-// In-process FFmpeg decoder/mixer for the FTHR clip viewer.
-//
-// The bridge demuxes every requested stream through one AVFormatContext,
-// resamples only when necessary to 48 kHz float32 stereo, retains a bounded
-// packet-derived segment queue, then supplies a single mixed PCM stream. It
-// is deliberately synchronous: the Python controller calls it only on its
-// decoder worker, never from the Qt UI or QAudioSink pull callback.
+// Synchronous FFmpeg decoder/mixer called only by the Python decoder worker.
+// One demuxer feeds selected streams into bounded segment queues and a single
+// 48 kHz float32 stereo mix. Never call from Qt UI or audio pull callbacks.
 
 #include "ffmpeg_playback_bridge.h"
 

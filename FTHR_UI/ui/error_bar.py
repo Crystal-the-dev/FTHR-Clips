@@ -81,9 +81,7 @@ class ErrorBar(QFrame):
         if self._current is not None:
             self._show(self._current)
 
-    # ------------------------------------------------------------------
     # Public API
-    # ------------------------------------------------------------------
 
     def push(self, title: str, detail: str,
              level: str = 'error',
@@ -118,9 +116,7 @@ class ErrorBar(QFrame):
         self._clear_action_buttons()
         self.setVisible(False)
 
-    # ------------------------------------------------------------------
     # Internal helpers (also called from tests)
-    # ------------------------------------------------------------------
 
     def _fire_action(self, callback: callable) -> None:
         """Execute the given callback then dismiss the current error."""

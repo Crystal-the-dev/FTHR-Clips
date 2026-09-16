@@ -1,25 +1,7 @@
-// video_encoder.h
-// FTHR Capture Engine - x264 encoder and disk writer
-//
-// Responsibilities:
-//   - Accept EncoderConfig describing source and target dimensions,
-//     framerate, bitrate, and x264 preset/tune
-//   - Configure libx264 via FFmpeg's AVCodec API
-//   - Scale frames from native BGRA (src_width x src_height) to
-//     target YUV420P (enc_width x enc_height) via libswscale
-//   - Encode frames and push encoded packets to a packet queue
-//   - Drain the packet queue on a dedicated DiskWriter thread so
-//     disk I/O latency never stalls the encode loop
-//
-// Threading model:
-//   EncodeFrame()       - called only by the legacy raw SaveClip fallback
-//   DiskWriterThread()  - private thread owned by VideoEncoder
-//                         started by Initialize(), joined by Finalize()
-//
-// What does NOT live here:
-//   - Frame grabbing / ring buffer  ->  capture_engine.h
-//   - IPC / shared memory           ->  shared_memory.h
-//   - D3D11 / DXGI                  ->  capture_engine.h
+// Legacy raw-frame encoder and asynchronous packet writer.
+// Scale BGRA to the output format, encode with FFmpeg, and hand packets to
+// DiskWriterThread. The save worker calls EncodeFrame; Finalize drains
+// and joins the writer.
 
 #pragma once
 #ifndef FTHR_VIDEO_ENCODER_H
@@ -59,25 +41,8 @@ namespace fthr {
 
 
 
-    // ---------------------------------------------------------------------------
-    // EncoderConfig
-    //
-    // All fields are set by CaptureEngine before calling VideoEncoder::Initialize().
-    // No field should have a default that could silently mask a misconfigured caller.
-    //
-    // Dimension contract:
-    //   src_width / src_height  - native DXGI capture resolution (always > 0)
-    //   enc_width / enc_height  - output encode resolution
-    //                             if 0, enc dimensions are set equal to src (no scale)
-    //
-    // Preset / tune contract:
-    //   preset  - x264 preset string. Recommended: "superfast"
-    //             Valid values: ultrafast, superfast, veryfast, faster, fast,
-    //                           medium, slow, slower, veryslow, placebo
-    //   tune    - x264 tune string. Pass nullptr or "" for gaming clips.
-    //             "film" is also acceptable. Never use "zerolatency" for SaveClip
-    //             (it disables B-frames and lookahead, reducing quality).
-    // ---------------------------------------------------------------------------
+    // Set source dimensions before Initialize; zero output dimensions use the
+    // source size. Preset/tune apply only to encoders supporting those options.
     struct EncoderConfig {
         uint32_t    src_width = 0;            // Native capture width  (must be > 0)
         uint32_t    src_height = 0;            // Native capture height (must be > 0)
@@ -96,21 +61,9 @@ namespace fthr {
     };
 
 
-    // ---------------------------------------------------------------------------
-    // EncodedPacket
-    //
-    // PHASE 1 UPDATE: Now uses packet buffer pool instead of std::vector
-    //
-    // A self-contained encoded video packet ready to write to disk.
-    // Copied out of AVPacket immediately after avcodec_receive_packet()
-    // so the AVPacket can be unref'd and the encode loop can continue
-    // without waiting for disk I/O.
-    //
-    // Phase 1: Uses pre-allocated buffers from PacketBufferPool to eliminate
-    // malloc/free in the encode hot path (60 allocations/sec at 60fps).
-    // ---------------------------------------------------------------------------
+    // Owned encoded packet copied from AVPacket into a pooled buffer.
+    // The encoder can release AVPacket while DiskWriterThread holds this data.
     struct EncodedPacket {
-        // Phase 1: Packet buffer pool fields
         std::vector<uint8_t>* buffer = nullptr;  // Pointer to pooled buffer (owned)
         size_t                size = 0;        // Actual packet size in buffer
         int64_t               pts = 0;
@@ -118,7 +71,7 @@ namespace fthr {
         int64_t               duration = 0;
         PacketBufferPool* pool_ref = nullptr;  // Non-owning ref for returning buffer
 
-        // Phase 1: RAII - return buffer to pool on destruction
+        // Return the owned buffer to its pool on destruction.
         ~EncodedPacket();
 
         // Move-only (no copy - we own a pooled buffer)
@@ -130,9 +83,6 @@ namespace fthr {
     };
 
 
-    // ---------------------------------------------------------------------------
-    // VideoEncoder
-    // ---------------------------------------------------------------------------
     class VideoEncoder {
     public:
         VideoEncoder();
@@ -163,9 +113,7 @@ namespace fthr {
 
 
     private:
-        // -----------------------------------------------------------------------
         // Disk writer thread
-        // -----------------------------------------------------------------------
         void DiskWriterThread();
 
         // Close/free resources left by either a completed encode or a partial
@@ -176,9 +124,7 @@ namespace fthr {
         // Called from EncodeFrame() after avcodec_receive_packet().
         void PushPacket(AVPacket* pkt);
 
-        // -----------------------------------------------------------------------
         // FFmpeg state
-        // -----------------------------------------------------------------------
         AVFormatContext* format_ctx_;
         AVStream* video_stream_;
         AVCodecContext* codec_ctx_;
@@ -186,9 +132,7 @@ namespace fthr {
         AVPacket* packet_;        // Temporary packet, copied into EncodedPacket
         SwsContext* sws_ctx_;
 
-        // -----------------------------------------------------------------------
         // Dimension state - set once by Initialize(), read-only after
-        // -----------------------------------------------------------------------
         uint32_t src_width_;    // Native BGRA input width
         uint32_t src_height_;   // Native BGRA input height
         uint32_t enc_width_;    // YUV420P encode width  (may differ from src)
@@ -203,21 +147,12 @@ namespace fthr {
         uint32_t fit_dst_w_;
         uint32_t fit_dst_h_;
 
-        // -----------------------------------------------------------------------
         // Encode state
-        // -----------------------------------------------------------------------
         int64_t pts_;
         bool    initialized_;
 
-        // -----------------------------------------------------------------------
-        // Disk writer thread state
-        //
-        // packet_queue_   - FIFO of packets waiting to be written to disk
-        // packet_mutex_   - guards packet_queue_
-        // packet_cv_      - signals DiskWriterThread when queue is non-empty
-        // disk_thread_    - the actual disk writer thread
-        // disk_running_   - set false by Finalize() to drain and exit the thread
-        // -----------------------------------------------------------------------
+        // packet_mutex_ protects the FIFO; packet_cv_ wakes the disk writer.
+        // Finalize clears disk_running_ so the writer drains the queue and exits.
         std::queue<EncodedPacket> packet_queue_;
         std::mutex                packet_mutex_;
         std::condition_variable   packet_cv_;
@@ -225,14 +160,10 @@ namespace fthr {
         std::atomic<bool>         disk_running_{ false };
         std::atomic<int>          disk_write_error_{ 0 };
 
-        // -----------------------------------------------------------------------
-        // Phase 1: Packet buffer pool (eliminates malloc/free in encode path)
-        // -----------------------------------------------------------------------
+        // Preallocated packet buffers shared with the writer.
         std::unique_ptr<PacketBufferPool> packet_pool_;
 
-        // -----------------------------------------------------------------------
         // Optional audio: pre-encoded AAC packets written in Finalize()
-        // -----------------------------------------------------------------------
         bool                              has_audio_           = false;
         std::vector<float>                audio_pcm_;
         uint32_t                          audio_sample_rate_   = 48000;

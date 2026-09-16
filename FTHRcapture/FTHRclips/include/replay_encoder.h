@@ -1,4 +1,3 @@
-// replay_encoder.h
 // Small Windows replay-encoder seam for codec-neutral hardware replay encoding.
 
 #pragma once
@@ -9,10 +8,12 @@
 #include "video_encoder.h"
 
 #include <cstdint>
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
@@ -90,8 +91,24 @@ struct ActiveEncoderInfo {
     std::string name;
 };
 
-// Lock-free progress snapshot used by CaptureEngine's diagnostic watchdog.
-// Backends that do not expose native resource pools keep the zero defaults.
+struct NvencSlotDiagnostic {
+    uint32_t slot_index = 0;
+    uint32_t state = 0;
+    uint64_t submitted_frame = 0;
+    int64_t submitted_pts = 0;
+    int64_t submitted_qpc = 0;
+    uint64_t generation = 0;
+    uint32_t submit_stage = 0;
+    uint32_t drain_stage = 0;
+    bool mapped = false;
+    bool completion_signaled = false;
+    bool output_locked = false;
+};
+
+// Progress snapshot used by CaptureEngine's diagnostic watchdog. Aggregate
+// counters stay lock-free; the bounded per-slot vector is populated only when
+// a stall snapshot is requested. Backends without native resource pools keep
+// the zero defaults.
 struct ReplayEncoderDiagnostics {
     uint64_t input_slots_acquired = 0;
     uint64_t map_attempts = 0;
@@ -115,7 +132,10 @@ struct ReplayEncoderDiagnostics {
     uint32_t locked_bitstreams = 0;
     uint32_t submit_stage = 0;
     uint32_t drain_stage = 0;
+    uint32_t active_submit_slot = 0xffffffffu;
+    uint32_t active_drain_slot = 0xffffffffu;
     int32_t last_nvenc_status = 0;
+    std::vector<NvencSlotDiagnostic> nvenc_slots;
 };
 
 constexpr ReplayEncoderBackend SelectProductionReplayBackend(
@@ -298,9 +318,26 @@ public:
     virtual ReplayEncoderDiagnostics GetDiagnostics() const noexcept {
         return {};
     }
+    // CaptureEngine supplies the internal capture generation for bounded
+    // per-slot evidence. Other backends do not need to implement this seam.
+    virtual void SetCaptureGeneration(uint64_t) noexcept {}
     virtual bool GetEncodeEpoch(
         int64_t& start_qpc, int64_t& qpc_frequency) const = 0;
     virtual bool IsInitialized() const = 0;
+
+    // Called from the command thread when recording starts, or from capture
+    // when a focus gap ends. Consume only on the encoder submission thread.
+    void RequestKeyframe() noexcept {
+        keyframe_requested_.store(true, std::memory_order_release);
+    }
+
+protected:
+    bool ConsumeKeyframeRequest() noexcept {
+        return keyframe_requested_.exchange(false, std::memory_order_acq_rel);
+    }
+
+private:
+    std::atomic<bool> keyframe_requested_{false};
 };
 
 const char* EncoderVendorName(EncoderVendor vendor) noexcept;

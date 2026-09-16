@@ -1,8 +1,5 @@
-// audio_timeline.h -- shared QPC-to-audio timeline and bounded drift policy.
-//
-// Every native Windows audio provider maps its device packets to the video
-// presentation clock through this small, platform-neutral contract.  It owns
-// no device handles and deliberately carries no shared-memory state.
+// Shared QPC-to-audio timing and drift policy for native providers.
+// This platform-neutral model carries no device handles or IPC state.
 
 #pragma once
 #ifndef FTHR_AUDIO_TIMELINE_H

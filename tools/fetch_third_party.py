@@ -1,29 +1,10 @@
 #!/usr/bin/env python3
-"""Download the third-party binaries that are not tracked in git.
+"""Fetch manifest-pinned FFmpeg and the Microsoft VC++ redistributable.
 
-These are kept out of the repository because they are large and
-re-downloadable, but a working build needs them:
-
-  1. Windows: the LGPL FFmpeg runtime (DLLs + ffmpeg.exe/ffprobe.exe, ~152 MB).
-     Pinned by version AND sha256 in tools/ffmpeg_manifest.json. The exact
-     build matters — AUDIT-005 was caused by a GPL FFmpeg being swapped in.
-     The *headers* and *import libs* are tracked, so the engine compiles from a
-     clean clone; this is only needed to link, run and package.
-  2. Windows: the MSVC 2022 x64 redistributable the Inno Setup installer bundles.
-  3. Linux: the LGPL FFmpeg the engine is COMPILED against and shipped with
-     (~57 MB, headers + libs together). Pinned in
-     tools/ffmpeg_manifest_linux.json. AUDIT-014: the distribution's FFmpeg is a
-     GPL build on every mainstream distro, and it is a different SONAME
-     generation, so headers and libraries must come from the same archive.
-
-    python tools/fetch_third_party.py --ffmpeg          # Windows runtime
-    python tools/fetch_third_party.py --ffmpeg-linux    # Linux headers + libs
-    python tools/fetch_third_party.py --vcredist
-    python tools/fetch_third_party.py --all             # what this platform needs
-
-Every downloaded FFmpeg file is checked against the sha256 recorded in the
-manifest. A mismatch aborts — it means either a corrupted download or a
-different build than the one the licence paperwork describes.
+--ffmpeg installs the Windows runtime; --ffmpeg-linux installs matching Linux
+headers and libraries; --vcredist fetches the Windows prerequisite. --all
+selects this platform's inputs. Verify FFmpeg files against manifest hashes
+and reject mismatches before packaging.
 """
 
 from __future__ import annotations
@@ -102,14 +83,11 @@ def _windows_powershell_module_path() -> str:
 
 
 def _verify_vcredist(path: Path) -> dict[str, str]:
-    """Verify the mutable Microsoft permalink before we package its result.
+    """Verify Microsoft's serviced redistributable before packaging.
 
-    Microsoft deliberately services the v14 redistributable at a stable URL,
-    so pinning one SHA-256 in git would either reject a supported security
-    update or encourage a blind manifest edit.  The trusted workflow is:
-    HTTPS to Microsoft's documented permalink, a valid Windows trust-chain
-    signature from Microsoft Corporation, and a locally recorded exact hash
-    and file/product version for the produced installer.
+    Require HTTPS and a trusted Microsoft Corporation signature, then record
+    the exact local hash and version. The stable URL changes with updates,
+    so a permanent hash pin would reject serviced binaries.
     """
     with path.open('rb') as fh:
         if fh.read(2) != b'MZ':
@@ -173,13 +151,10 @@ def _verify_vcredist(path: Path) -> dict[str, str]:
 def _ensure_linux_ffmpeg_aliases(
     lib_dir: Path, soname_map: dict[str, str]
 ) -> None:
-    """Materialize and verify FFmpeg SONAME/development-link aliases.
+    """Restore and verify FFmpeg development and SONAME aliases after extraction.
 
-    Python's tarfile extraction on Windows does not reliably preserve every
-    relative symlink in the upstream archive.  A missing ``libfoo.so`` makes
-    pkg-config fall through to /usr/lib at link time; a missing SONAME alias
-    makes an otherwise valid bundle fail at runtime.  Prefer symlinks, then
-    hard links, with a byte copy as the portable last resort.
+    Missing aliases can select system libraries or break runtime loading.
+    Prefer symlinks, then hard links, then byte copies for portability.
     """
     for versioned_name, soname in soname_map.items():
         source = lib_dir / versioned_name
@@ -289,13 +264,9 @@ def fetch_ffmpeg(force: bool) -> int:
 
 
 def fetch_ffmpeg_linux(force: bool) -> int:
-    """Install the pinned LGPL FFmpeg the Linux engine builds against (AUDIT-014).
+    """Install the pinned Linux FFmpeg headers and runtime from one archive.
 
-    Unlike the Windows side, this provides BOTH the headers/pkgconfig used at
-    compile time and the shared libraries shipped in the AppImage. They have to
-    come from the same archive: the replacement is a different SONAME generation
-    from the distribution's (libavcodec.so.62 vs .so.60), so building against
-    one and loading the other is not an option.
+    Compile-time and bundled libraries must agree on the ABI.
     """
     manifest = json.loads(MANIFEST_LINUX.read_text(encoding='utf-8'))
     src = manifest['source']
@@ -425,7 +396,7 @@ def main() -> int:
         ap.print_help()
         return 2
 
-    # --all is platform-aware: fetching the Windows runtime on Linux (or the
+    # all is platform-aware: fetching the Windows runtime on Linux (or the
     # reverse) downloads 150 MB nobody can use.
     on_windows = sys.platform == 'win32'
     rc = 0

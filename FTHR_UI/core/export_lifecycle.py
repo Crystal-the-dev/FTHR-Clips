@@ -1,9 +1,7 @@
-"""Bounded, cancellable lifecycle for one FFmpeg export.
+"""Cancellable FFmpeg exports with staged output and bounded waits.
 
-The UI owns the worker thread, while :class:`ExportJob` owns the child process
-and staged output for the duration of one export.  Keeping this class free of
-Qt makes the failure matrix deterministic and keeps cancellation usable from
-both the editor and the share dialog.
+The UI owns the worker thread; ExportJob owns its child process and files.
+The lifecycle is independent of Qt so editor and share paths can reuse it.
 """
 from __future__ import annotations
 
@@ -74,13 +72,10 @@ class ExportResult:
 
 
 class ExportJob:
-    """Run one export with bounded progress, cancellation and finalization.
+    """Run an export, validate its staged output, then publish the final path.
 
-    ``command`` must write to ``staged_path``.  The final path is published
-    only after the process exits successfully and ``validate_output`` accepts
-    the staged file.  The default validator checks existence and non-zero
-    size; callers should provide their authoritative ffprobe/first-frame
-    validator for media exports.
+    ``command`` must write to ``staged_path``. The default validator checks
+    only existence and size; media callers should supply a probe/decode check.
     """
 
     def __init__(

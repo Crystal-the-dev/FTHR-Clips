@@ -12,9 +12,7 @@ extern "C" {
 
 namespace fthr {
 
-// ---------------------------------------------------------------------------
 // wl_output listener helpers (file-scope, not class members)
-// ---------------------------------------------------------------------------
 
 static void output_geometry(void*, wl_output*, int32_t, int32_t, int32_t, int32_t,
                              int32_t, const char*, const char*, int32_t) {}
@@ -37,9 +35,7 @@ static const wl_output_listener kOutputListener = {
     output_description,
 };
 
-// ---------------------------------------------------------------------------
 // Registry callbacks
-// ---------------------------------------------------------------------------
 
 void WlrBackend::RegistryGlobal(void* data, wl_registry* registry,
                                  uint32_t name, const char* interface,
@@ -79,9 +75,7 @@ static const wl_registry_listener kRegistryListener = {
     WlrBackend::RegistryGlobalRemove,
 };
 
-// ---------------------------------------------------------------------------
 // Screencopy frame callbacks
-// ---------------------------------------------------------------------------
 
 void WlrBackend::ScFrameBuffer(void* data, zwlr_screencopy_frame_v1* /*frame*/,
                                 uint32_t format, uint32_t width, uint32_t height,
@@ -131,9 +125,7 @@ static const zwlr_screencopy_frame_v1_listener kScFrameListener = {
     WlrBackend::ScFrameBufferDone,
 };
 
-// ---------------------------------------------------------------------------
 // FrameBuffer helpers
-// ---------------------------------------------------------------------------
 
 bool WlrBackend::AllocFramebuffer() {
     fb_.size = static_cast<size_t>(fb_.stride) * fb_.height;
@@ -223,9 +215,6 @@ bool WlrBackend::Roundtrip(WaylandDeadline deadline, const char* operation) {
     return false;
 }
 
-// ---------------------------------------------------------------------------
-// Initialize
-// ---------------------------------------------------------------------------
 
 bool WlrBackend::Initialize(const CaptureConfig& cfg) {
     target_output_ = cfg.target_output;
@@ -350,9 +339,6 @@ bool WlrBackend::Initialize(const CaptureConfig& cfg) {
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// CaptureFrame
-// ---------------------------------------------------------------------------
 
 bool WlrBackend::CaptureFrame(RawFrame& out) {
     const auto deadline = std::chrono::steady_clock::now() + kFrameTimeout;
@@ -418,9 +404,6 @@ bool WlrBackend::CaptureFrame(RawFrame& out) {
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Shutdown
-// ---------------------------------------------------------------------------
 
 void WlrBackend::Shutdown() {
     DestroyPendingFrame();

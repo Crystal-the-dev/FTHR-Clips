@@ -1,21 +1,6 @@
-// hardware_encoder.cpp
-// FTHR Capture Engine - NVENC Hardware Encoder
-//
-// Encoded ring buffer update:
-//   HardwareEncoder is now a pure encode-only component.
-//   It no longer owns an FFmpeg muxer or writes directly to a file.
-//
-//   Changes from the per-clip version:
-//     - Initialize() takes EncoderConfig + PacketCallback, not an output path.
-//       The encoder lives for the full engine lifetime, not per clip.
-//     - Sequence headers are stored in the representation expected by the
-//       pinned MP4 muxer for the selected codec.
-//       No FFmpeg format context, no file open, no avformat_write_header.
-//     - RetrieveOutput() preserves HEVC Annex B and AV1 low-overhead OBUs;
-//       only H.264 retains its established Annex B -> AVCC conversion.
-//     - WritePacketToMuxer removed entirely.
-//     - Finalize() strips FFmpeg muxer teardown (nothing to tear down).
-//     - GetVideoConfig() returns codec-specific timing, packet format and config.
+// Persistent NVENC encoding with packet callbacks and codec configuration.
+// Convert H.264 Annex B to AVCC; retain HEVC Annex B and AV1 low-overhead OBUs
+// for the pinned MP4 muxer. CaptureEngine owns storage and file output.
 
 #ifdef _MSC_VER
 #if __has_include("pch.h")
@@ -43,13 +28,16 @@
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <sstream>
 #include <utility>
 
 #include "nvEncodeAPI.h"
 
-// libswscale removed: resolution scaling is now handled by NVENC natively
+extern "C" {
+#include <libswscale/swscale.h>
+}
 
 
 namespace fthr {
@@ -75,9 +63,7 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
 } // namespace
 
 
-    // ===========================================================================
     // NVENC Error Code to String
-    // ===========================================================================
 
     const char* NvencStatusToString(NVENCSTATUS status) {
         switch (status) {
@@ -125,22 +111,13 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
     }
 
 
-    // ===========================================================================
     // DLL typedef
-    // ===========================================================================
 
     typedef NVENCSTATUS(NVENCAPI* NVENCAPICREATEINSTANCE)(NV_ENCODE_API_FUNCTION_LIST*);
 
 
-    // ===========================================================================
-    // Annex B / AVCC helpers (file-local)
-    //
-    // The drain thread calls AnnexBToAvcc once per encoded packet. The original
-    // version returned a fresh std::vector every call (one heap alloc per frame
-    // ≈ 60/sec). The refactored version writes into a caller-provided scratch
-    // vector so the storage is reused — capacity stabilises after a few NAL
-    // counts and no allocation happens in the steady state.
-    // ===========================================================================
+    // Reuse caller-owned Annex B conversion scratch storage on the drain thread
+    // to avoid allocating a new vector for every encoded packet.
 
     using NalSpan = std::pair<const uint8_t*, int>;
 
@@ -256,9 +233,6 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
     }
 
 
-    // ===========================================================================
-    // DetectNVENC
-    // ===========================================================================
 
     NVENCDetectionResult DetectNVENC() {
         NVENCDetectionResult result = {};
@@ -424,9 +398,7 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
     }
 
 
-    // ===========================================================================
     // HardwareEncoder - Constructor
-    // ===========================================================================
 
     HardwareEncoder::HardwareEncoder(VideoCodec codec)
         : nvenc_encoder_(nullptr)
@@ -483,9 +455,6 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
     }
 
 
-    // ===========================================================================
-    // Initialize
-    // ===========================================================================
 
     bool HardwareEncoder::Initialize(const EncoderConfig&  config,
                                      ID3D11Device*         shared_device,
@@ -557,6 +526,8 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
         diag_queued_outputs_.store(0);
         diag_submit_stage_.store(0);
         diag_drain_stage_.store(0);
+        diag_submit_slot_.store(0xffffffffu);
+        diag_drain_slot_.store(0xffffffffu);
         diag_last_nvenc_status_.store(0);
 
         {
@@ -577,9 +548,6 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
             return false;
         }
 
-        // ------------------------------------------------------------------
-        // Step 1: Load NVENC DLL
-        // ------------------------------------------------------------------
         HMODULE nvenc_dll = LoadLibraryA("nvEncodeAPI64.dll");
         if (!nvenc_dll) {
             const DWORD native_error = ::GetLastError();
@@ -618,14 +586,8 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
         }
         nvenc_encoder_ = nvenc_api;
 
-        // ------------------------------------------------------------------
-        // Step 2: Use shared D3D11 device from CaptureEngine.
-        //
-        // CaptureEngine creates the device on the NVIDIA adapter, so both
-        // DXGI Desktop Duplication and NVENC encoding share one device on the
-        // same physical GPU. This eliminates the second D3D11 device and the
-        // cross-device (potentially cross-PCIe) texture copy that existed before.
-        // ------------------------------------------------------------------
+        // Share CaptureEngine's D3D11 device so same-adapter encoding avoids
+        // cross-device texture transfers.
         if (!shared_device || !shared_context) {
             last_error_ = "NVENC same-adapter D3D11 device/context is unavailable";
             std::cerr << "[HardwareEncoder] shared_device/context must not be null" << std::endl;
@@ -636,12 +598,10 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
         d3d11_device_   = shared_device;   // non-owning
         d3d11_context_  = shared_context;  // non-owning
         cpu_input_mode_ = cpu_input_mode;
+        // NVENC is an encoder, not a source-size converter. Always supply a
+        // target-sized surface, including STRETCH and upscaling a small window.
         gpu_scale_required_ = !cpu_input_mode_
-            && config.scaling_mode == 1
-            && (gpu_scale_geometry_.destination.width
-                    != gpu_scale_geometry_.target_width
-                || gpu_scale_geometry_.destination.height
-                    != gpu_scale_geometry_.target_height);
+            && (src_width_ != enc_width_ || src_height_ != enc_height_);
         if (gpu_scale_required_) {
             input_width_ = enc_width_;
             input_height_ = enc_height_;
@@ -650,9 +610,6 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
                   << (cpu_input_mode ? "Optimus CPU-input path" : "GPU zero-copy path")
                   << ")" << std::endl;
 
-        // ------------------------------------------------------------------
-        // Step 4: Open NVENC session
-        // ------------------------------------------------------------------
         NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS session_params = { NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER };
         session_params.device = d3d11_device_;
         session_params.deviceType = NV_ENC_DEVICE_TYPE_DIRECTX;
@@ -685,7 +642,7 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
         if (gpu_scale_required_) {
             std::string scale_error;
             if (!InitializeGpuScalePipeline(scale_error)) {
-                last_error_ = "NVIDIA FIT GPU scaling initialization failed: "
+                last_error_ = "NVIDIA GPU scaling initialization failed: "
                     + scale_error;
                 ReleaseGpuScalePipeline();
                 close_uninitialized_session();
@@ -735,9 +692,6 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
             return false;
         }
 
-        // ------------------------------------------------------------------
-        // Step 5: Load preset config + override rate control
-        // ------------------------------------------------------------------
         NV_ENC_PRESET_CONFIG preset_config = { NV_ENC_PRESET_CONFIG_VER };
         preset_config.presetCfg.version = NV_ENC_CONFIG_VER;
 
@@ -777,7 +731,7 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
         // slots and also blocks in WaitForFreeSlot — deadlock, 0 frames captured.
         encode_config.rcParams.enableLookahead = 0;
 
-        // Preserve the existing four-media-second keyframe bound and no-B-frame
+        // Preserve the existing one-media-second keyframe bound and no-B-frame
         // policy while selecting only the small codec-specific config union.
         if (!ConfigureNvencCodec(codec_, fps_, encode_config)) {
             last_error_ = "requested NVENC codec configuration is unsupported";
@@ -787,9 +741,6 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
             return false;
         }
 
-        // ------------------------------------------------------------------
-        // Step 6: Initialize encoder
-        // ------------------------------------------------------------------
         NV_ENC_INITIALIZE_PARAMS init_params = {};
         memset(&init_params, 0, sizeof(init_params));
         init_params.version = NV_ENC_INITIALIZE_PARAMS_VER;
@@ -824,26 +775,29 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
         std::cout << "[HardwareEncoder] " << VideoCodecName(codec_)
                   << " encoder initialized" << std::endl;
 
-        // ------------------------------------------------------------------
-        // Step 7: Allocate input buffer pool
-        //
-        // GPU zero-copy path: D3D11_USAGE_DEFAULT textures registered with NVENC.
-        //   CaptureEngine calls CopyResource(texture, dxgi_frame) — pure GPU op.
-        //   EncodeFrame() maps the registered resource; NVENC reads from VRAM directly.
-        //
-        // CPU-input (Optimus) path: system-memory NVENC input buffers.
-        //   CaptureEngine maps a staging texture and calls EncodeFrameCPU() with the
-        //   CPU pointer. We lock the NVENC buffer, memcpy, unlock, then submit.
-        //   Still hardware H.264 — only the copy touches the CPU.
-        // ------------------------------------------------------------------
-        // 32 slots: enough headroom for any NVENC preset pipeline depth and
-        // smooths out the bursty wakeup pattern that caused 15% CPU spikes
-        // (old value of 8 caused CaptureThread to batch-submit then stall).
+        // Allocate registered D3D11 textures for GPU input or system-memory buffers
+        // for legacy CPU input. The 32-slot pool absorbs encoder pipeline depth
+        // and bursty wakeups without repeatedly stalling capture.
         buffer_count_ = 32;
         output_buffers_ = new void*[buffer_count_];
         memset(output_buffers_, 0, sizeof(void*) * buffer_count_);
         slot_qpc_ = new int64_t[buffer_count_];
         memset(slot_qpc_, 0, sizeof(int64_t) * buffer_count_);
+        diagnostic_slot_frame_ = std::make_unique<
+            std::atomic<uint64_t>[]>(buffer_count_);
+        diagnostic_slot_pts_ = std::make_unique<
+            std::atomic<int64_t>[]>(buffer_count_);
+        diagnostic_slot_qpc_ = std::make_unique<
+            std::atomic<int64_t>[]>(buffer_count_);
+        diagnostic_slot_generation_ = std::make_unique<
+            std::atomic<uint64_t>[]>(buffer_count_);
+        for (uint32_t i = 0; i < buffer_count_; ++i) {
+            diagnostic_slot_frame_[i].store(0, std::memory_order_relaxed);
+            diagnostic_slot_pts_[i].store(0, std::memory_order_relaxed);
+            diagnostic_slot_qpc_[i].store(0, std::memory_order_relaxed);
+            diagnostic_slot_generation_[i].store(0, std::memory_order_relaxed);
+        }
+        diagnostic_generation_.store(0, std::memory_order_release);
 
         // Helper: clean up partially-allocated output buffers then destroy encoder/dll.
         auto cleanup_and_fail = [&](uint32_t allocated_outputs) {
@@ -860,7 +814,7 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
         };
 
         if (!cpu_input_mode) {
-            // --- GPU zero-copy path ---
+            // GPU zero-copy path
             input_textures_       = new ID3D11Texture2D*[buffer_count_];
             registered_resources_ = new void*[buffer_count_];
             memset(input_textures_,       0, sizeof(ID3D11Texture2D*) * buffer_count_);
@@ -948,14 +902,14 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
             input_slot_lifecycle_ = new NvencInputSlotLifecycle[buffer_count_];
         }
         else {
-            // --- CPU-input path (Optimus) ---
+            // CPU-input path (Optimus)
             cpu_input_buffers_ = new void*[buffer_count_];
             memset(cpu_input_buffers_, 0, sizeof(void*) * buffer_count_);
 
             for (uint32_t i = 0; i < buffer_count_; i++) {
                 NV_ENC_CREATE_INPUT_BUFFER create_input = { NV_ENC_CREATE_INPUT_BUFFER_VER };
-                create_input.width     = src_width_;
-                create_input.height    = src_height_;
+                create_input.width     = enc_width_;
+                create_input.height    = enc_height_;
                 create_input.bufferFmt = NV_ENC_BUFFER_FORMAT_ARGB; // BGRA byte order on x86
 
                 status = nvenc_api->nvEncCreateInputBuffer(nvenc_session_, &create_input);
@@ -1027,9 +981,7 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
                   << " NVENC completion events registered (Windows async mode)"
                   << std::endl;
 
-        // ------------------------------------------------------------------
-        // Step 8: Extract codec sequence/config data for the pinned MP4 muxer.
-        // ------------------------------------------------------------------
+        // Extract codec configuration for the MP4 muxer.
         std::vector<uint8_t> spspps_vec(NV_MAX_SEQ_HDR_LEN, 0);
         uint8_t* spspps_buf = spspps_vec.data();
         uint32_t  spspps_size = 0;
@@ -1091,10 +1043,8 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
                       << " bytes)" << std::endl;
         }
 
-        // STRETCH and aspect-matched FIT use NVENC's native input scaling. FIT
-        // with an aspect mismatch uses the already-created GPU VideoProcessor
-        // surface, so the registered input dimensions are target-sized without
-        // introducing a CPU full-frame copy.
+        // GPU scaling uses the target-sized VideoProcessor surface. Hybrid
+        // input scales into the target-sized NVENC CPU buffer when needed.
 
         if (codec_ == VideoCodec::H264) {
             avcc_buf_.reserve(static_cast<size_t>(enc_width_) * enc_height_ * 2);
@@ -1155,13 +1105,49 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
         result.locked_bitstreams = diag_locked_bitstreams_.load();
         result.submit_stage = diag_submit_stage_.load();
         result.drain_stage = diag_drain_stage_.load();
+        result.active_submit_slot = diag_submit_slot_.load(std::memory_order_acquire);
+        result.active_drain_slot = diag_drain_slot_.load(std::memory_order_acquire);
         result.last_nvenc_status = diag_last_nvenc_status_.load();
+        try {
+            result.nvenc_slots.reserve(buffer_count_);
+            for (uint32_t index = 0; index < buffer_count_; ++index) {
+                const auto state = input_slot_lifecycle_
+                    ? input_slot_lifecycle_[index].state()
+                    : NvencInputSlotState::Available;
+                const auto state_value = static_cast<uint32_t>(state);
+                result.nvenc_slots.push_back({
+                    index,
+                    state_value,
+                    diagnostic_slot_frame_
+                        ? diagnostic_slot_frame_[index].load(
+                            std::memory_order_acquire) : 0,
+                    diagnostic_slot_pts_
+                        ? diagnostic_slot_pts_[index].load(
+                            std::memory_order_acquire) : 0,
+                    diagnostic_slot_qpc_
+                        ? diagnostic_slot_qpc_[index].load(
+                            std::memory_order_acquire) : 0,
+                    diagnostic_slot_generation_
+                        ? diagnostic_slot_generation_[index].load(
+                            std::memory_order_acquire) : 0,
+                    result.active_submit_slot == index
+                        ? result.submit_stage : 0,
+                    result.active_drain_slot == index
+                        ? result.drain_stage : 0,
+                    state != NvencInputSlotState::Available,
+                    state >= NvencInputSlotState::CompletionSignaled,
+                    state == NvencInputSlotState::OutputLocked,
+                });
+            }
+        } catch (...) {
+            // Diagnostics must never turn a capture watchdog into a process
+            // termination if a one-time reporting allocation fails.
+            result.nvenc_slots.clear();
+        }
         return result;
     }
 
-    // ===========================================================================
     // ComputePts (private helper)
-    // ===========================================================================
 
     int64_t HardwareEncoder::ComputePts(int64_t dxgi_present_qpc) {
         int64_t frame_qpc;
@@ -1189,9 +1175,7 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
     }
 
 
-    // ===========================================================================
     // EncodeFrame (GPU zero-copy path)
-    // ===========================================================================
 
     bool HardwareEncoder::EncodeFrame(int64_t dxgi_present_qpc) {
         if (!initialized_) {
@@ -1199,7 +1183,7 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
             return false;
         }
         if (gpu_scale_required_ && !gpu_frame_prepared_) {
-            last_error_ = "NVIDIA FIT frame was submitted without GPU preparation";
+            last_error_ = "NVIDIA scaling frame was submitted without GPU preparation";
             std::cerr << "[EncodeFrame] " << last_error_ << std::endl;
             return false;
         }
@@ -1219,6 +1203,14 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
 
         pts_ = ComputePts(dxgi_present_qpc);
         slot_qpc_[idx] = last_frame_qpc_;
+        if (diagnostic_slot_frame_) {
+            diagnostic_slot_frame_[idx].store(
+                diag_input_slots_acquired_.load(std::memory_order_relaxed),
+                std::memory_order_release);
+            diagnostic_slot_pts_[idx].store(pts_, std::memory_order_release);
+            diagnostic_slot_qpc_[idx].store(
+                last_frame_qpc_, std::memory_order_release);
+        }
 
         NV_ENC_MAP_INPUT_RESOURCE map_res = { NV_ENC_MAP_INPUT_RESOURCE_VER };
         map_res.registeredResource = static_cast<NV_ENC_REGISTERED_PTR>(registered_resources_[idx]);
@@ -1255,8 +1247,8 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
         pic.pictureStruct   = NV_ENC_PIC_STRUCT_FRAME;
         pic.inputTimeStamp  = static_cast<uint64_t>(pts_);
         pic.completionEvent = completion_events_[idx];
-        const bool force_idr = last_forced_idr_pts_ < 0
-            || pts_ - last_forced_idr_pts_ >= static_cast<int64_t>(fps_) * 4;
+        const bool force_idr = ConsumeKeyframeRequest() || last_forced_idr_pts_ < 0
+            || pts_ - last_forced_idr_pts_ >= static_cast<int64_t>(fps_);
         if (force_idr) pic.encodePicFlags |= NV_ENC_PIC_FLAG_FORCEIDR;
 
         diag_submit_stage_.store(3);
@@ -1310,9 +1302,7 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
     }
 
 
-    // ===========================================================================
     // GetCurrentInputTexture
-    // ===========================================================================
 
     bool HardwareEncoder::RequiresBackendGpuPreparation() const noexcept {
         return gpu_scale_required_;
@@ -1331,12 +1321,12 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
             || !video_processor_enumerator_ || !gpu_scale_texture_
             || !gpu_scale_output_view_ || !input_textures_
             || !input_slot_lifecycle_) {
-            last_error_ = "NVIDIA FIT GPU conversion resources are unavailable";
+            last_error_ = "NVIDIA scaling GPU conversion resources are unavailable";
             return false;
         }
         const uint32_t slot = current_buf_idx_ % buffer_count_;
         if (!input_slot_lifecycle_[slot].is_available()) {
-            last_error_ = "NVIDIA FIT input slot is still pending output";
+            last_error_ = "NVIDIA scaling input slot is still pending output";
             return false;
         }
         ID3D11Device* source_device = nullptr;
@@ -1344,7 +1334,7 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
         const bool same_device = SameComObject(source_device, d3d11_device_);
         if (source_device) source_device->Release();
         if (!same_device) {
-            last_error_ = "NVIDIA FIT source texture belongs to a different D3D11 device";
+            last_error_ = "NVIDIA scaling source texture belongs to a different D3D11 device";
             return false;
         }
 
@@ -1356,7 +1346,7 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
             || source_description.Height != src_height_
             || source_description.Format != DXGI_FORMAT_B8G8R8A8_UNORM
             || source_subresource >= mip_levels * array_size) {
-            last_error_ = "NVIDIA FIT source texture geometry, format, or subresource is invalid";
+            last_error_ = "NVIDIA scaling source texture geometry, format, or subresource is invalid";
             return false;
         }
 
@@ -1370,7 +1360,7 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
             source, video_processor_enumerator_, &input_description, &input_view);
         if (FAILED(result) || !input_view) {
             last_error_ = diagnostics::FormatHResultFailure(
-                "ID3D11VideoDevice::CreateVideoProcessorInputView(NVIDIA FIT)",
+                "ID3D11VideoDevice::CreateVideoProcessorInputView(NVIDIA scaling)",
                 result);
             return false;
         }
@@ -1384,7 +1374,7 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
         input_view->Release();
         if (FAILED(result)) {
             last_error_ = diagnostics::FormatHResultFailure(
-                "ID3D11VideoContext::VideoProcessorBlt(NVIDIA FIT)", result);
+                "ID3D11VideoContext::VideoProcessorBlt(NVIDIA scaling)", result);
             return false;
         }
 
@@ -1394,7 +1384,7 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
         const HRESULT removed = d3d11_device_->GetDeviceRemovedReason();
         if (FAILED(removed)) {
             last_error_ = diagnostics::FormatHResultFailure(
-                "ID3D11Device::GetDeviceRemovedReason(NVIDIA FIT)", removed);
+                "ID3D11Device::GetDeviceRemovedReason(NVIDIA scaling)", removed);
             return false;
         }
         gpu_frame_prepared_ = true;
@@ -1410,15 +1400,30 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
     }
 
 
-    // ===========================================================================
     // EncodeFrameCPU (Optimus / CPU-input path)
-    // ===========================================================================
 
     bool HardwareEncoder::EncodeFrameCPU(const uint8_t* bgra_data, uint32_t src_stride,
                                          int64_t dxgi_present_qpc) {
         if (!initialized_ || !cpu_input_mode_) {
             std::cerr << "[EncodeFrameCPU] Not initialized or not in CPU input mode" << std::endl;
             return false;
+        }
+
+        if (!bgra_data || src_stride < src_width_ * 4) {
+            last_error_ = "NVENC CPU input has no complete BGRA rows";
+            return false;
+        }
+        const bool scale = src_width_ != enc_width_ || src_height_ != enc_height_;
+        if (scale && !cpu_scale_context_) {
+            const auto& destination = gpu_scale_geometry_.destination;
+            cpu_scale_context_ = sws_getContext(
+                src_width_, src_height_, AV_PIX_FMT_BGRA,
+                destination.width, destination.height, AV_PIX_FMT_BGRA,
+                SWS_BILINEAR, nullptr, nullptr, nullptr);
+            if (!cpu_scale_context_) {
+                last_error_ = "Could not initialize the hybrid recording scaler";
+                return false;
+            }
         }
 
         diag_submit_stage_.store(1);
@@ -1433,6 +1438,14 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
 
         pts_ = ComputePts(dxgi_present_qpc);
         slot_qpc_[idx] = last_frame_qpc_;
+        if (diagnostic_slot_frame_) {
+            diagnostic_slot_frame_[idx].store(
+                diag_input_slots_acquired_.load(std::memory_order_relaxed),
+                std::memory_order_release);
+            diagnostic_slot_pts_[idx].store(pts_, std::memory_order_release);
+            diagnostic_slot_qpc_[idx].store(
+                last_frame_qpc_, std::memory_order_release);
+        }
 
         // Lock the NVENC system-memory input buffer.
         NV_ENC_LOCK_INPUT_BUFFER lock_input = { NV_ENC_LOCK_INPUT_BUFFER_VER };
@@ -1440,6 +1453,9 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
 
         NVENCSTATUS status = api->nvEncLockInputBuffer(nvenc_session_, &lock_input);
         if (status != NV_ENC_SUCCESS) {
+            last_error_ = std::string("NVENC input buffer lock failed: ")
+                + NvencStatusToString(status);
+            diag_submit_stage_.store(0);
             std::cerr << "[EncodeFrameCPU] nvEncLockInputBuffer: " << NvencStatusToString(status) << std::endl;
             return false;
         }
@@ -1448,9 +1464,35 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
         // padding (RowPitch / pitch > width*4). Handle each independently.
         uint8_t*       dst        = static_cast<uint8_t*>(lock_input.bufferDataPtr);
         const uint32_t dst_stride = lock_input.pitch;
-        const uint32_t row_bytes  = src_width_ * 4;
+        const uint32_t row_bytes  = enc_width_ * 4;
 
-        if (src_stride == row_bytes && dst_stride == row_bytes) {
+        if (!dst || dst_stride < row_bytes) {
+            api->nvEncUnlockInputBuffer(nvenc_session_, lock_input.inputBuffer);
+            last_error_ = "NVENC input buffer pitch is smaller than the encoded frame";
+            diag_submit_stage_.store(0);
+            return false;
+        }
+
+        if (scale) {
+            const auto& destination = gpu_scale_geometry_.destination;
+            // Clear letterbox bars on each reused NVENC surface.
+            if (destination.width != enc_width_ || destination.height != enc_height_)
+                memset(dst, 0, static_cast<size_t>(dst_stride) * enc_height_);
+            const uint8_t* source_planes[] = {bgra_data, nullptr, nullptr, nullptr};
+            const int source_strides[] = {static_cast<int>(src_stride), 0, 0, 0};
+            uint8_t* target_planes[] = {
+                dst + static_cast<size_t>(destination.top) * dst_stride
+                    + destination.left * 4, nullptr, nullptr, nullptr};
+            const int target_strides[] = {static_cast<int>(dst_stride), 0, 0, 0};
+            if (sws_scale(cpu_scale_context_, source_planes, source_strides,
+                    0, src_height_, target_planes, target_strides)
+                != static_cast<int>(destination.height)) {
+                api->nvEncUnlockInputBuffer(nvenc_session_, lock_input.inputBuffer);
+                last_error_ = "Hybrid recording frame scaling failed";
+                diag_submit_stage_.store(0);
+                return false;
+            }
+        } else if (src_stride == row_bytes && dst_stride == row_bytes) {
             memcpy(dst, bgra_data, static_cast<size_t>(row_bytes) * src_height_);
         } else {
             for (uint32_t y = 0; y < src_height_; y++) {
@@ -1460,7 +1502,13 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
             }
         }
 
-        api->nvEncUnlockInputBuffer(nvenc_session_, lock_input.inputBuffer);
+        status = api->nvEncUnlockInputBuffer(nvenc_session_, lock_input.inputBuffer);
+        if (status != NV_ENC_SUCCESS) {
+            last_error_ = std::string("NVENC input buffer unlock failed: ")
+                + NvencStatusToString(status);
+            diag_submit_stage_.store(0);
+            return false;
+        }
 
         // Submit encode.
         NV_ENC_PIC_PARAMS pic = {};
@@ -1468,13 +1516,13 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
         pic.inputBuffer     = static_cast<NV_ENC_INPUT_PTR>(cpu_input_buffers_[idx]);
         pic.outputBitstream = static_cast<NV_ENC_OUTPUT_PTR>(output_buffers_[idx]);
         pic.bufferFmt       = NV_ENC_BUFFER_FORMAT_ARGB;
-        pic.inputWidth      = src_width_;
-        pic.inputHeight     = src_height_;
+        pic.inputWidth      = enc_width_;
+        pic.inputHeight     = enc_height_;
         pic.pictureStruct   = NV_ENC_PIC_STRUCT_FRAME;
         pic.inputTimeStamp  = static_cast<uint64_t>(pts_);
         pic.completionEvent = completion_events_[idx];
-        const bool force_idr = last_forced_idr_pts_ < 0
-            || pts_ - last_forced_idr_pts_ >= static_cast<int64_t>(fps_) * 4;
+        const bool force_idr = ConsumeKeyframeRequest() || last_forced_idr_pts_ < 0
+            || pts_ - last_forced_idr_pts_ >= static_cast<int64_t>(fps_);
         if (force_idr) pic.encodePicFlags |= NV_ENC_PIC_FLAG_FORCEIDR;
 
         diag_submit_stage_.store(3);
@@ -1507,9 +1555,7 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
     }
 
 
-    // ===========================================================================
     // RetrieveOutput (private)
-    // ===========================================================================
 
     bool HardwareEncoder::RetrieveOutput(uint32_t buf_idx) {
         NV_ENCODE_API_FUNCTION_LIST* api = static_cast<NV_ENCODE_API_FUNCTION_LIST*>(nvenc_encoder_);
@@ -1632,18 +1678,29 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
     }
 
 
-    // ===========================================================================
     // WaitForFreeSlot / DrainThread
-    // ===========================================================================
 
     bool HardwareEncoder::WaitForFreeSlot() {
         std::unique_lock<std::mutex> lk(drain_mutex_);
         // Leave at least one output buffer untouched by submit while drain holds it.
-        slot_cv_.wait(lk, [this] {
+        const auto deadline = std::chrono::steady_clock::now()
+            + std::chrono::milliseconds(500);
+        const auto available = [this] {
             return pending_count_ < buffer_count_
-                || drain_stop_.load()
-                || drain_failed_.load();
-        });
+                || drain_stop_.load(std::memory_order_acquire)
+                || drain_failed_.load(std::memory_order_acquire);
+        };
+        while (!available()) {
+            if (slot_cv_.wait_until(lk, deadline) == std::cv_status::timeout)
+                break;
+            if (std::chrono::steady_clock::now() >= deadline && !available())
+                break;
+        }
+        if (!available()) {
+            last_error_ = "NVENC input slot wait timed out while drain made no bounded progress";
+            std::cerr << "[HardwareEncoder] " << last_error_ << std::endl;
+            return false;
+        }
         return !drain_stop_.load() && !drain_failed_.load();
     }
 
@@ -1696,8 +1753,10 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
 
     void HardwareEncoder::DrainThread() {
         // SetThreadDescription for easier profiling.
-        // Runs at NORMAL priority and sleeps between non-blocking lock attempts,
-        // so driver failure cannot hold the thread indefinitely or burn CPU.
+        // Runs at NORMAL priority and sleeps between non-blocking lock attempts.
+        // The completion wait and lock polling have bounded policy timeouts;
+        // an individual vendor API call remains synchronous and is not
+        // claimed to be interruptible by this watchdog.
         while (true) {
             uint32_t idx;
             {
@@ -1736,9 +1795,7 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
     }
 
 
-    // ===========================================================================
     // Finalize
-    // ===========================================================================
 
     bool HardwareEncoder::InitializeGpuScalePipeline(std::string& error) {
         if (!gpu_scale_required_ || !d3d11_device_ || !d3d11_context_) {
@@ -1777,7 +1834,7 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
             &content, &video_processor_enumerator_);
         if (FAILED(result) || !video_processor_enumerator_) {
             error = diagnostics::FormatHResultFailure(
-                "ID3D11VideoDevice::CreateVideoProcessorEnumerator(NVIDIA FIT)",
+                "ID3D11VideoDevice::CreateVideoProcessorEnumerator(NVIDIA scaling)",
                 result);
             ReleaseGpuScalePipeline();
             return false;
@@ -1819,7 +1876,7 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
             video_processor_enumerator_, 0, &video_processor_);
         if (FAILED(result) || !video_processor_) {
             error = diagnostics::FormatHResultFailure(
-                "ID3D11VideoDevice::CreateVideoProcessor(NVIDIA FIT)", result);
+                "ID3D11VideoDevice::CreateVideoProcessor(NVIDIA scaling)", result);
             ReleaseGpuScalePipeline();
             return false;
         }
@@ -1837,7 +1894,7 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
             &converter_description, nullptr, &gpu_scale_texture_);
         if (FAILED(result) || !gpu_scale_texture_) {
             error = diagnostics::FormatHResultFailure(
-                "ID3D11Device::CreateTexture2D(NVIDIA FIT converter)", result);
+                "ID3D11Device::CreateTexture2D(NVIDIA scaling converter)", result);
             ReleaseGpuScalePipeline();
             return false;
         }
@@ -1850,7 +1907,7 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
             &output_description, &gpu_scale_output_view_);
         if (FAILED(result) || !gpu_scale_output_view_) {
             error = diagnostics::FormatHResultFailure(
-                "ID3D11VideoDevice::CreateVideoProcessorOutputView(NVIDIA FIT)",
+                "ID3D11VideoDevice::CreateVideoProcessorOutputView(NVIDIA scaling)",
                 result);
             ReleaseGpuScalePipeline();
             return false;
@@ -1901,6 +1958,8 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
     }
 
     void HardwareEncoder::Finalize() {
+        sws_freeContext(cpu_scale_context_);
+        cpu_scale_context_ = nullptr;
         if (!initialized_) {
             ReleaseGpuScalePipeline();
             return;
@@ -1930,7 +1989,6 @@ bool SameComObject(IUnknown* left, IUnknown* right) noexcept {
             }
         }
 
-        // Stop the drain thread.
         drain_stop_.store(true);
         drain_cv_.notify_all();
         slot_cv_.notify_all();

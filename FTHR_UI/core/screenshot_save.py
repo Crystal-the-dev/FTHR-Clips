@@ -1,9 +1,7 @@
-"""Transactional, collision-safe PNG publication for screenshots.
+"""Publish screenshots atomically without overwriting existing files.
 
-Screenshots are captured on the Qt GUI thread because QScreen requires it.  PNG
-encoding and filesystem I/O happen in :class:`ScreenshotPngSaveWorker`, and a
-completed image is only made visible at its final name after its staged file is
-fully written.
+QScreen capture runs on the Qt thread. ScreenshotPngSaveWorker encodes and
+stages the PNG before making the completed file visible.
 """
 
 from __future__ import annotations
@@ -86,12 +84,9 @@ def reserve_screenshot_paths(
     now: datetime | None = None,
     stem: str | None = None,
 ) -> ScreenshotPaths:
-    """Reserve a collision-safe final name and a controlled staging file.
+    """Reserve a timestamped output name and OS-allocated staging file.
 
-    The final filename is readable and timestamped down to microseconds.  The
-    sequential suffix is deterministic for the single-instance app if a file
-    with the same timestamp already exists.  The actual temporary filename is
-    allocated by the OS in the configured output directory.
+    Append a sequence suffix when the output name already exists.
     """
 
     output_directory = Path(directory)
@@ -132,13 +127,10 @@ def write_png_to_staged(image: _PngWritable, staged_path: str | Path) -> None:
 
 
 def publish_staged_png(staged_path: str | Path, final_path: str | Path) -> None:
-    """Atomically expose a fully-written staged PNG at its final path.
+    """Publish a staged PNG without overwriting a raced destination.
 
-    Windows rename is atomic and refuses an existing destination, including on
-    external filesystems that do not support hard links. POSIX rename replaces
-    by definition, so there a same-directory hard link publishes the fully
-    closed staging inode only when the final name does not already exist. Both
-    remain no-overwrite if another process races the reservation.
+    Use rename on Windows and a same-directory hard link on POSIX, where
+    rename would replace an existing file.
     """
 
     staged = Path(staged_path)

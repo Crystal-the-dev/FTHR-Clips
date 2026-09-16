@@ -7,7 +7,6 @@ from enum import Enum, auto
 
 
 NORMAL_CLIP_VALUES = (5, 10, 15, 30, 45, 60, 90, 120, 180, 240, 300)
-EXTENDED_CLIP_VALUES = (30, 45, 60, 90, 120, 180, 240, 300)
 FPS_VALUES = (30, 60, 90, 120, 144, 165, 180, 240)
 AUDIO_CAPTURE_MODE_COMBINED = 'combined'
 AUDIO_CAPTURE_MODE_SEPARATED = 'separated'
@@ -40,8 +39,6 @@ def validate_normal_clip_length(value: int) -> int:
     return _validate_int(value, name='normal clip length', minimum=5, maximum=300)
 
 
-def validate_extended_clip_length(value: int) -> int:
-    return _validate_int(value, name='extended clip length', minimum=5, maximum=300)
 
 
 def validate_fps(value: int) -> int:
@@ -68,7 +65,6 @@ class CaptureConfig:
     separate_audio_enabled: bool = False
     microphone_endpoint_id: str = ''
     normal_clip_seconds: int = 30
-    extended_clip_seconds: int = 60
     crop_enabled: bool = False
     crop_x: float = 0.0
     crop_y: float = 0.0
@@ -76,11 +72,10 @@ class CaptureConfig:
     crop_h: float = 1.0
 
 
-def compute_buffer_seconds(normal_seconds: int, extended_seconds: int) -> int:
+def compute_buffer_seconds(normal_seconds: int) -> int:
     """Return a native-safe ring size while retaining the usual safety margin."""
     normal = validate_normal_clip_length(normal_seconds)
-    extended = validate_extended_clip_length(extended_seconds)
-    return min(300, max(normal, extended) + 2)
+    return min(300, normal + 2)
 
 
 class ApplyStatus(Enum):

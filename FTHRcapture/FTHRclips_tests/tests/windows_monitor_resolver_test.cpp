@@ -6,6 +6,10 @@
 #include "encoded_video_config_ffmpeg.h"
 #include "nvenc_codec_config.h"
 #include "replay_encoder.h"
+#include "wgc_frame_lease.h"
+#include "capture_focus_policy.h"
+#include <thread>
+#include <chrono>
 
 #include <cstdlib>
 #include <cstring>
@@ -28,6 +32,29 @@ int RunWindowsCaptureBorderPolicyTests();
 int RunContinuousRecordingWriterTests();
 int RunNvencInputLifecycleTests();
 int RunCaptureScaleGeometryTests();
+
+void WgcFrameLeaseReturnsEveryPoolSlot() {
+    struct Frame {
+        int& closes;
+        void Close() { ++closes; }
+    };
+    int closes = 0;
+    // Exercise normal processing, rate/focus skips, exceptions and shutdown.
+    for (int index = 0; index < 100; ++index) {
+        try {
+            Frame frame{closes};
+            fthr::wgc::FrameLease lease(frame);
+            if (index % 3 == 0) continue;
+            if (index % 3 == 1) throw 1;
+        } catch (int) {}
+    }
+    if (closes != 100) std::abort();
+    {
+        Frame frame{closes};
+        fthr::wgc::FrameLease lease(frame);
+    }
+    if (closes != 101) std::abort();
+}
 
 namespace {
 
@@ -299,6 +326,37 @@ void DxgiFrameLeaseReleasesExactlyOnce() {
           "failed ReleaseFrame remains an exact-once ownership transition");
 }
 
+void RecentDxgiEvidencePublishesCompleteBoundedEvents() {
+    fthr::dxgi::RecentDxgiEvidence<> evidence;
+    fthr::dxgi::RecentDxgiEvent event;
+    event.acquire_start_qpc = 100;
+    event.acquire_end_qpc = 125;
+    event.acquire_hresult = S_OK;
+    event.acquired = true;
+    event.release_attempted = true;
+    event.release_hresult = S_OK;
+    event.resource_token = 7;
+    event.generation = 3;
+    evidence.Record(event);
+
+    const auto snapshot = evidence.Snapshot();
+    Check(snapshot.size() == 1
+              && snapshot.front().acquired
+              && snapshot.front().release_attempted
+              && snapshot.front().release_hresult == S_OK
+              && snapshot.front().resource_token == 7,
+          "one successful DXGI event retains acquire and release evidence");
+
+    for (uint32_t index = 0; index < 40; ++index) {
+        event.generation = index;
+        evidence.Record(event);
+    }
+    const auto bounded = evidence.Snapshot();
+    Check(bounded.size() == 32 && bounded.front().generation == 8
+              && bounded.back().generation == 39,
+          "DXGI evidence history remains bounded and chronologically ordered");
+}
+
 void DxgiFrameMetadataAndTextureContractsRejectFalseFrames() {
     Check(!fthr::dxgi::HasNewDesktopImage(0),
           "pointer-only update is not a newly presented desktop image");
@@ -390,12 +448,20 @@ void DxgiRecoveryEligibilityRequiresSameCaptureContract() {
     Check(fthr::dxgi::EvaluateRecovery(active, observation)
               == fthr::dxgi::RecoveryDecision::DimensionsChanged,
           "recovery rejects dimensions incompatible with the live encoder");
+    Check(fthr::dxgi::RecoveryAttemptForDecision(
+              fthr::dxgi::RecoveryDecision::DimensionsChanged)
+              == fthr::dxgi::RecoveryAttemptResult::RetryableFailure,
+          "a transient post-ACCESS_LOST resize remains retryable");
 
     observation.current = active;
     observation.device_removed_reason = DXGI_ERROR_DEVICE_REMOVED;
     Check(fthr::dxgi::EvaluateRecovery(active, observation)
               == fthr::dxgi::RecoveryDecision::DeviceRemoved,
           "device removal cannot reuse the live encoder device");
+    Check(fthr::dxgi::RecoveryAttemptForDecision(
+              fthr::dxgi::RecoveryDecision::DeviceRemoved)
+              == fthr::dxgi::RecoveryAttemptResult::FatalFailure,
+          "device removal remains a fatal recovery boundary");
 }
 
 void DxgiRecoveryRunnerIsBoundedAndInterruptible() {
@@ -429,6 +495,19 @@ void DxgiRecoveryRunnerIsBoundedAndInterruptible() {
               && exhausted.attempts == fthr::dxgi::kMaxRecoveryAttempts,
           "persistent duplication failure exhausts a finite retry budget");
 
+    const auto persistent_dimensions = fthr::dxgi::RunBoundedRecovery(
+        [] { return true; },
+        [](uint32_t) { return true; },
+        [](uint32_t) {
+            return fthr::dxgi::RecoveryAttemptForDecision(
+                fthr::dxgi::RecoveryDecision::DimensionsChanged);
+        });
+    Check(persistent_dimensions.outcome
+              == fthr::dxgi::RecoveryOutcome::AttemptsExhausted
+              && persistent_dimensions.attempts
+                  == fthr::dxgi::kMaxRecoveryAttempts,
+          "persistent dimension mismatch exhausts the bounded retry budget");
+
     int stopped_attempts = 0;
     const auto stopped = fthr::dxgi::RunBoundedRecovery(
         [&stopped_attempts] { return stopped_attempts == 0; },
@@ -440,6 +519,16 @@ void DxgiRecoveryRunnerIsBoundedAndInterruptible() {
     Check(stopped.outcome == fthr::dxgi::RecoveryOutcome::StopRequested
               && stopped.attempts == 1,
           "shutdown interrupts recovery before another duplication attempt");
+}
+
+void PendingEncoderWorkWinsStallClassification() {
+    Check(fthr::dxgi::ClassifyPipelineStall(true, true, false, true)
+              == fthr::dxgi::PipelineStallBoundary::EncoderOutputStalled,
+          "pending NVENC work is classified as encoder output stall");
+    Check(std::string(fthr::dxgi::PipelineStallCode(
+              fthr::dxgi::PipelineStallBoundary::EncoderOutputStalled))
+              == "ENCODER_OUTPUT_STALLED",
+          "pending encoder stall keeps its actionable diagnostic code");
 }
 
 void TenDxgiRecoveryCyclesDoNotAccumulateOwnedFrames() {
@@ -545,15 +634,15 @@ void NativeNvencLowLatencyConfigurationIsCodecSpecific() {
     Check(fthr::ConfigureNvencCodec(VideoCodec::AV1, 60, av1),
           "AV1 NVENC config is produced");
 
-    Check(h264.frameIntervalP == 1 && h264.gopLength == 240
-              && h264.encodeCodecConfig.h264Config.idrPeriod == 240,
+    Check(h264.frameIntervalP == 1 && h264.gopLength == 60
+              && h264.encodeCodecConfig.h264Config.idrPeriod == 60,
           "H.264 preserves no-B-frame four-second GOP behavior");
-    Check(hevc.frameIntervalP == 1 && hevc.gopLength == 240
-              && hevc.encodeCodecConfig.hevcConfig.idrPeriod == 240,
+    Check(hevc.frameIntervalP == 1 && hevc.gopLength == 60
+              && hevc.encodeCodecConfig.hevcConfig.idrPeriod == 60,
           "HEVC uses no B-frames and a four-second IDR bound");
-    Check(av1.frameIntervalP == 1 && av1.gopLength == 240
-              && av1.encodeCodecConfig.av1Config.idrPeriod == 240,
-          "AV1 uses no B-frames and a four-second keyframe bound");
+    Check(av1.frameIntervalP == 1 && av1.gopLength == 60
+              && av1.encodeCodecConfig.av1Config.idrPeriod == 60,
+          "AV1 uses no B-frames and a one-second keyframe bound");
     Check(av1.encodeCodecConfig.av1Config.outputAnnexBFormat == 0,
           "AV1 emits MP4-compatible low-overhead OBUs");
     Check(av1.encodeCodecConfig.av1Config.disableSeqHdr == 0
@@ -731,8 +820,47 @@ void ReplayEncoderInterfaceIsPolymorphic() {
 
 } // namespace
 
+void FocusPauseAndDeferredRecordingConfig() {
+    fthr::CaptureFocusPolicy focus;
+    auto transition = focus.Observe(false);
+    if (transition.paused || transition.resumed || transition.discard_queued_frames)
+        std::abort();
+    for (int cycle = 0; cycle < 10; ++cycle) {
+        for (int tick = 0; tick < 600; ++tick) {
+            transition = focus.Observe(true);
+            if (!transition.paused || transition.resumed || !transition.discard_queued_frames
+                || !fthr::ReplayWatchdogSuspended(
+                    fthr::CAPTURE_HEALTH_ACTIVE | fthr::CAPTURE_HEALTH_PAUSED))
+                std::abort();
+        }
+        transition = focus.Observe(false);
+        if (transition.paused || !transition.resumed || !transition.discard_queued_frames)
+            std::abort();
+        transition = focus.Observe(false);
+        if (transition.paused || transition.resumed || transition.discard_queued_frames
+            || fthr::ReplayWatchdogSuspended(fthr::CAPTURE_HEALTH_ACTIVE))
+            std::abort();
+    }
+    fthr::EncodedRingBuffer ring(8, 60, 1000);
+    fthr::EncodedVideoConfig output;
+    if (ring.WaitForVideoConfig(output, std::chrono::milliseconds(1))) std::abort();
+    fthr::EncodedVideoConfig config;
+    config.width = 1920;
+    config.height = 1080;
+    config.codec_extradata = {1, 2, 3, 4};
+    std::thread publisher([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        ring.SetVideoConfig(config);
+    });
+    const bool ready = ring.WaitForVideoConfig(output, std::chrono::seconds(1));
+    publisher.join();
+    if (!ready || !(output == config)) std::abort();
+}
+
 int main() {
+    FocusPauseAndDeferredRecordingConfig();
     OneMonitorOneAdapter();
+    WgcFrameLeaseReturnsEveryPoolSlot();
     TwoMonitorsSameAdapter();
     SecondaryMonitorSelected();
     TwoAdaptersOneMonitorEach();
@@ -747,10 +875,12 @@ int main() {
     NoFallbackToOutputZero();
     NativeError4551PreservesWin32AndHresultIdentity();
     DxgiFrameLeaseReleasesExactlyOnce();
+    RecentDxgiEvidencePublishesCompleteBoundedEvents();
     DxgiFrameMetadataAndTextureContractsRejectFalseFrames();
     DxgiRecoveryEligibilityRequiresSameCaptureContract();
     DxgiRecoveryRunnerIsBoundedAndInterruptible();
     TenDxgiRecoveryCyclesDoNotAccumulateOwnedFrames();
+    PendingEncoderWorkWinsStallClassification();
     NativeNvencCodecSelectionCoversNvidiaMatrix();
     UnsupportedNvencCodecIsRejected();
     NativeNvencLowLatencyConfigurationIsCodecSpecific();

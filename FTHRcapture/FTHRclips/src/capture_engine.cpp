@@ -1,4 +1,3 @@
-// capture_engine.cpp
 // FTHR Capture Engine - Implementation
 
 // Must be defined before ANY include that pulls in windows.h (including winrt/base.h)
@@ -6,40 +5,13 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-//
-// Capture backends (WGC is preferred, matching the old FTHR build; DXGI is the
-// fallback only when the live WGC session cannot suppress its indicator):
-//
-//   Desktop mode                  -> InitializeWGC() -> InitializeD3D11()
-//   Window mode (regular)         -> InitializeWindowCapture() (CreateForWindow)
-//   Window mode (anti-cheat exe)  -> InitializeWGC() + focus_gated_=true
-//
-// Why WGC is preferred when it is borderless: kernel anti-cheats like Vanguard
-// force the protected game into independent flip mode (frames go GPU->display
-// directly, bypassing DWM). DXGI OutputDuplication captures at the DWM level,
-// so the protected game shows up as black/stale frames. WGC hooks deeper at
-// the compositor level — it's the same path Xbox Game Bar uses, and the AC
-// vendors allow it.
-//
-//   WGC  path: InitializeWGC()/InitializeWindowCapture() -> CaptureThreadWGC()
-//   DXGI path: InitializeD3D11()                          -> CaptureThread()
-//
-// Encode backends:
-//   NVENC path: CaptureThread -> HardwareEncoder -> EncodedRingBuffer
-//               SaveClip -> TakeSnapshot -> MuxEncodedClip (no re-encoding)
-//               FramePool NOT allocated
-//   Raw replay code remains for non-production/legacy use, but public-alpha
-//   startup never selects it as an automatic fallback.
-//
-// Audio:
-//   AudioCapture (WASAPI loopback) -> raw float32 PCM -> AudioRingBuffer
-//   SaveClip snapshots AudioRingBuffer, encodes PCM->AAC on SaveClipThread.
+// WGC/DXGI capture feeds a compressed replay ring; the save worker muxes
+// packet snapshots. WASAPI feeds persistent AAC encoders and audio rings.
+// See capture_engine.h for backend selection and thread ownership.
 
-// ---------------------------------------------------------------------------
 // Windows Graphics Capture (WGC) includes
 // Must come before other Windows headers to avoid redefinition conflicts.
 // Requires C++17 (/std:c++17) and windowsapp.lib.
-// ---------------------------------------------------------------------------
 #pragma comment(lib, "windowsapp")
 
 #include <winrt/base.h>
@@ -51,6 +23,8 @@
 #include <Windows.Graphics.Capture.Interop.h>
 
 #include "capture_engine.h"
+#include "capture_focus_policy.h"
+#include "wgc_frame_lease.h"
 #include "hardware_encoder.h"
 #include "encoded_video_config_ffmpeg.h"
 #include "video_encoder.h"
@@ -65,6 +39,7 @@
 #include "windows_dxgi_recovery.h"
 #include "windows_native_error.h"
 #include "replay_interval.h"
+#include "replay_health.h"
 #include "frame_rate_scheduler.h"
 #include "capture_scale_geometry.h"
 #include <iostream>
@@ -89,16 +64,13 @@ extern "C" {
 
 namespace fthr {
 
-    // ===========================================================================
     // WGCState — WinRT types confined here so the header stays WinRT-free
-    // ===========================================================================
 
     struct CaptureEngine::WGCState {
         winrt::Windows::Graphics::Capture::GraphicsCaptureItem          item{ nullptr };
         winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool   frame_pool{ nullptr };
         winrt::Windows::Graphics::Capture::GraphicsCaptureSession        session{ nullptr };
         winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice  winrt_device{ nullptr };
-        winrt::event_token                                                frame_arrived_token{};
         winrt::event_token                                                item_closed_token{};
         bool                                                              item_closed_registered = false;
         bool                                                              monitor_item = false;
@@ -263,23 +235,9 @@ namespace fthr {
     }  // namespace
 
 
-    // ===========================================================================
-    // IsAntiCheatProtected — heuristic: known kernel-AC games by exe name
-    // ===========================================================================
-    //
-    // Returns true when the given window belongs to a process whose anti-cheat
-    // is known to interfere with normal capture paths (DXGI duplication, WGC
-    // CreateForWindow). For these games we route through WGC CreateForMonitor
-    // — the same path Xbox Game Bar uses, which the anti-cheats allow.
-    //
-    // Detection is by executable name. We avoid module enumeration because
-    // OpenProcess with PROCESS_VM_READ is denied against Vanguard-protected
-    // processes. PROCESS_QUERY_LIMITED_INFORMATION is enough for the exe path
-    // and is allowed by every kernel AC we care about.
-    //
-    // Add new entries here as they're confirmed in the field. Match is
-    // case-insensitive on the executable basename.
-    // ---------------------------------------------------------------------------
+    // Use executable basenames to select monitor capture for known protected games.
+    // Query with PROCESS_QUERY_LIMITED_INFORMATION; module enumeration may be
+    // blocked. Keep matching case-insensitive and add only confirmed titles.
     static bool IsAntiCheatProtected(HWND hwnd) {
         if (!hwnd) return false;
 
@@ -323,9 +281,6 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
-    // FramePool
-    // ===========================================================================
 
     void FramePool::Allocate(size_t frame_count, size_t bytes_per_frame) {
         frame_count_ = frame_count;
@@ -341,9 +296,7 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
     // Constructor / Destructor
-    // ===========================================================================
 
     CaptureEngine::CaptureEngine()
         : capture_thread_(nullptr)
@@ -360,7 +313,6 @@ namespace fthr {
         , nvenc_device_(nullptr)
         , nvenc_context_(nullptr)
         , wgc_active_(false)
-        , wgc_frame_ready_(false)
         , width_(0)
         , height_(0)
         , crop_enabled_(false)
@@ -395,6 +347,111 @@ namespace fthr {
 
     void CaptureEngine::SetCaptureFailure(std::string detail) {
         last_capture_failure_detail_ = std::move(detail);
+    }
+
+    void CaptureEngine::EmitRecentDxgiEvidence(const char* reason) const {
+        // Snapshot is intentionally taken only at a watchdog/recovery
+        // boundary.  It copies at most the fixed evidence capacity and keeps
+        // all AcquireNextFrame calls free of diagnostic I/O.
+        const auto events = dxgi_recent_evidence_.Snapshot();
+        monitor::MonitorTopologyEntry resolved_monitor;
+        monitor::DxgiOutputIdentity resolved_output;
+        monitor::AdapterLuid capture_luid;
+        monitor::AdapterLuid encoder_luid;
+        bool capture_luid_available = false;
+        bool encoder_luid_available = false;
+        RECT desktop_coordinates{};
+        bool desktop_coordinates_available = false;
+        {
+            std::lock_guard<std::mutex> lock(dxgi_context_mutex_);
+            resolved_monitor = resolved_monitor_;
+            resolved_output = resolved_dxgi_output_;
+            capture_luid = capture_device_adapter_luid_;
+            encoder_luid = encoder_adapter_luid_;
+            capture_luid_available = capture_device_adapter_luid_available_;
+            encoder_luid_available = encoder_adapter_luid_available_;
+            desktop_coordinates = resolved_desktop_coordinates_;
+            desktop_coordinates_available =
+                resolved_desktop_coordinates_available_;
+        }
+        std::ostringstream json;
+        json << "{\"subsystem\":\"capture\","
+             << "\"event\":\"dxgi_recent_evidence\","
+             << "\"reason\":\""
+             << diagnostics::JsonEscape(reason ? reason : "unknown")
+             << "\",\"event_count\":" << events.size()
+             << ",\"monitor_id\":\""
+             << diagnostics::JsonEscape(diagnostics::WideToUtf8(
+                    monitor_device_path_))
+             << "\",\"windows_display\":\""
+             << diagnostics::JsonEscape(diagnostics::WideToUtf8(
+                    resolved_output.source_gdi_name))
+             << "\",\"dxgi_output\":{\"index\":"
+             << resolved_output.output_index
+             << "},\"monitor_adapter_luid\":";
+        if (!resolved_monitor.monitor_device_path.empty()) {
+            json << AdapterLuidJson(resolved_monitor.adapter_luid);
+        } else {
+            json << "\"unavailable:not_resolved\"";
+        }
+        json << ",\"capture_device_luid\":"
+             << (capture_luid_available
+                 ? AdapterLuidJson(capture_luid)
+                 : "\"unavailable:not_resolved\"")
+             << ",\"encoder_adapter_luid\":"
+             << (encoder_luid_available
+                 ? AdapterLuidJson(encoder_luid)
+                 : "\"unavailable:not_resolved\"")
+             << ",\"capture_generation\":"
+             << capture_generation_.load(std::memory_order_relaxed)
+             << ",\"desktop_coordinates\":";
+        if (desktop_coordinates_available) {
+            const RECT& bounds = desktop_coordinates;
+            json << "{\"left\":" << bounds.left
+                 << ",\"top\":" << bounds.top
+                 << ",\"right\":" << bounds.right
+                 << ",\"bottom\":" << bounds.bottom << '}';
+        } else {
+            json << "\"unavailable:not_resolved\"";
+        }
+        json << ",\"events\":[";
+        for (size_t index = 0; index < events.size(); ++index) {
+            if (index != 0) json << ',';
+            const auto& event = events[index];
+            json << "{\"acquire_api\":\""
+                 << "IDXGIOutputDuplication::AcquireNextFrame\","
+                 << "\"acquire_start_qpc\":" << event.acquire_start_qpc
+                 << ",\"acquire_end_qpc\":" << event.acquire_end_qpc
+                 << ",\"last_present_qpc\":" << event.last_present_qpc
+                 << ",\"presentation_gap_qpc\":"
+                 << event.presentation_gap_qpc
+                 << ",\"acquire_hresult\":"
+                 << event.acquire_hresult
+                 << ",\"acquire_hresult_hex\":\"0x"
+                 << std::hex << static_cast<uint32_t>(event.acquire_hresult)
+                 << std::dec << "\",\"acquired\":"
+                 << (event.acquired ? "true" : "false")
+                 << ",\"timed_out\":"
+                 << (event.timed_out ? "true" : "false")
+                 << ",\"release_attempted\":"
+                 << (event.release_attempted ? "true" : "false")
+                 << ",\"release_api\":\""
+                 << "IDXGIOutputDuplication::ReleaseFrame\","
+                 << "\"release_hresult\":" << event.release_hresult
+                 << ",\"release_hresult_hex\":\"0x"
+                 << std::hex << static_cast<uint32_t>(event.release_hresult)
+                 << std::dec << "\",\"resource_token\":"
+                 << event.resource_token
+                 << ",\"generation\":" << event.generation
+                 << ",\"width\":" << event.width
+                 << ",\"height\":" << event.height
+                 << ",\"format\":" << event.format
+                 << ",\"output_index\":" << event.output_index
+                 << ",\"pointer_only\":"
+                 << (event.pointer_only ? "true" : "false") << '}';
+        }
+        json << "]}";
+        std::cout << "FTHR_DIAGNOSTIC_EVENT " << json.str() << std::endl;
     }
 
     std::string CaptureEngine::BuildStartupDiagnosticContext() const {
@@ -511,14 +568,8 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
-    // Initialize
-    //
-    // 1. Init D3D11 / DXGI (always)
-    // 2. Select the hardware encoder on the capture adapter
-    // 3. Refuse startup if that exact codec/backend cannot initialize
-    // 4. Start threads with a compressed replay ring
-    // ===========================================================================
+    // Initialize capture and a hardware encoder on the selected adapter.
+    // Refuse startup if the requested codec/backend cannot initialize.
 
     bool CaptureEngine::Initialize(const CaptureConfig& config) {
         last_startup_error_code_ = ReplayStartupError::None;
@@ -527,6 +578,8 @@ namespace fthr {
         active_replay_capability_ = {};
         resolved_monitor_ = {};
         resolved_dxgi_output_ = {};
+        resolved_desktop_coordinates_ = {};
+        resolved_desktop_coordinates_available_ = false;
         capture_device_adapter_luid_ = {};
         encoder_adapter_luid_ = {};
         capture_device_adapter_luid_available_ = false;
@@ -572,31 +625,10 @@ namespace fthr {
         std::cout << "  Codec      : " << VideoCodecName(config.video_codec)
                   << std::endl;
 
-        // ------------------------------------------------------------------
-        // Select capture backend based on config.capture_mode.
-        //
-        //   DESKTOP                     — WGC CreateForMonitor when borderless → DXGI
-        //   WINDOW (anti-cheat title)   — WGC CreateForMonitor + focus gate → DXGI fallback
-        //   WINDOW (regular)            — WGC CreateForWindow → WGC monitor → DXGI fallback
-        //
-        // WGC is preferred when it is borderless because it hooks at the
-        // DWM/compositor level and survives independent flip mode, where DXGI
-        // OutputDuplication returns black/stale frames (the game renders
-        // direct to display hardware, bypassing DWM entirely). This is the
-        // failure mode that hides Valorant from Snipping Tool and from
-        // DXGI-based capture. If WGC would show its privacy border, the engine
-        // intentionally accepts that tradeoff and uses the border-free DXGI
-        // path instead.
-        //
-        // For known kernel-anti-cheat games picked in WINDOW mode, we escalate
-        // to monitor capture (the path Xbox Game Bar uses, which the AC allows)
-        // and turn on the focus gate so we only encode while that game is
-        // actually foregrounded.
-        //
-        // DXGI OutputDuplication is also the intentional fallback when the
-        // WGC privacy border cannot be disabled. That keeps a successful
-        // capture visually quiet on unpackaged Windows 10 builds.
-        // ------------------------------------------------------------------
+        // Prefer borderless WGC, falling back to DXGI if its border remains required.
+        // Regular windows try CreateForWindow first, then monitor capture. Known
+        // protected games use monitor capture with a foreground gate to avoid
+        // recording the desktop after focus leaves the selected game.
         target_hwnd_ = config.target_hwnd;
         focus_gated_ = false;
         const auto report_wgc_fallback = [this](
@@ -678,13 +710,8 @@ namespace fthr {
             }
         }
 
-        // ------------------------------------------------------------------
-        // Select one compressed replay backend from the adapter that owns the
-        // capture source. Intel now stays on its selected D3D11 adapter for
-        // QSV. Hybrid-GPU policy remains a separate qualification task.
-        // ------------------------------------------------------------------
-        // Capture opened successfully. Do not attach a superseded WGC fallback
-        // error to a later encoder failure.
+        // Select the replay encoder on the capture adapter. Clear any earlier WGC
+        // fallback error so it cannot be reported as the cause of an encoder failure.
         last_capture_failure_detail_.clear();
         ConfigureCrop(config);
         CaptureScaleGeometry scale_geometry;
@@ -770,9 +797,12 @@ namespace fthr {
                     return;
                 }
             }
-            encoded_ring_->Push(data, size, pts, is_keyframe, wall_qpc);
+            const bool ring_inserted = encoded_ring_->Push(
+                data, size, pts, is_keyframe, wall_qpc);
             video_packets_produced_.fetch_add(1, std::memory_order_relaxed);
-            video_ring_insertions_.fetch_add(1, std::memory_order_relaxed);
+            if (ring_inserted) {
+                video_ring_insertions_.fetch_add(1, std::memory_order_relaxed);
+            }
 
             std::shared_ptr<ContinuousRecordingWriter> writer;
             {
@@ -893,18 +923,9 @@ namespace fthr {
                 << " slots. Raw FramePool: skipped." << std::endl;
         }
 
-        // ------------------------------------------------------------------
-        // Initialize audio capture pipeline BEFORE starting video thread.
-        //
-        // Persistent AAC replay design:
-        //   AudioCapture (WASAPI) -> AudioEncoder -> EncodedAudioPacketRing.
-        //   The bounded compressed ring protects 300-second replay memory.
-        //   Save snapshots packets directly; it never rebuilds a long raw-PCM
-        //   window on the save thread.
-        //
-        // Audio is optional - failure falls through to video-only mode.
-        // Skipped entirely when config.audio_enabled = false (user disabled in Settings).
-        // ------------------------------------------------------------------
+        // Initialize WASAPI -> AAC encoders -> bounded packet rings before video.
+        // Compressed audio keeps long replay windows bounded; saves snapshot packets.
+        // If optional audio initialization fails, continue with video only.
         if (!config.audio_enabled) {
             std::cout << "[CaptureEngine] Audio capture disabled by user settings." << std::endl;
         }
@@ -1177,7 +1198,7 @@ namespace fthr {
         capture_generation_.fetch_add(1);
         capture_health_flags_.store(CAPTURE_HEALTH_ACTIVE);
 
-        // Select capture thread function: WGC event-driven or DXGI polling loop.
+        // Select capture loop: WGC image sampling or DXGI acquisition.
         if (wgc_active_) {
             capture_thread_ = new std::thread(&CaptureEngine::CaptureThreadWGC, this);
         } else {
@@ -1195,9 +1216,6 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
-    // Shutdown
-    // ===========================================================================
 
     void CaptureEngine::Shutdown() {
         const bool has_resources = capture_thread_ || stall_watchdog_thread_
@@ -1318,11 +1336,12 @@ namespace fthr {
 
         while (running_.load(std::memory_order_relaxed)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            if ((capture_health_flags_.load(std::memory_order_relaxed)
-                    & CAPTURE_HEALTH_RECOVERING) != 0) {
+            if (ReplayWatchdogSuspended(
+                    capture_health_flags_.load(std::memory_order_relaxed))) {
                 // The capture thread owns DXGI recovery. The watchdog must not
                 // cancel its bounded backoff or diagnose the intentional gap
-                // as a second, unrelated pipeline stall.
+                // as a second, unrelated pipeline stall. A focus-gated game
+                // also intentionally stops submitting while tabbed out.
                 const auto recovering_now = clock::now();
                 last_stall_progress = recovering_now;
                 last_acquire_progress = recovering_now;
@@ -1585,11 +1604,18 @@ namespace fthr {
             const bool encoder_received_recent_submission =
                 submissions > 0
                 && now - last_submission_progress <= std::chrono::seconds(2);
+            const bool encoder_has_pending_work =
+                encoder.pending_resources > 0
+                || encoder.queued_outputs > 0
+                || encoder.locked_bitstreams > 0
+                || encoder.drain_stage != 0;
             const auto stall_boundary = dxgi::ClassifyPipelineStall(
                 capture_stalled, acquired > 0,
-                encoder_received_recent_submission);
+                encoder_received_recent_submission,
+                encoder_has_pending_work);
             const char* diagnostic_code = dxgi::PipelineStallCode(
                 stall_boundary);
+            EmitRecentDxgiEvidence("replay_stall_detected");
             std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"capture\","
                       << "\"event\":\"pipeline_stall_detected\","
                       << "\"state\":\"FAILED\",\"error_code\":\""
@@ -1612,9 +1638,7 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
     // StartRecording / StopRecording
-    // ===========================================================================
 
     bool CaptureEngine::StartRecording(const wchar_t* path) {
         if (is_recording_.load(std::memory_order_acquire) || !running_.load()
@@ -1634,10 +1658,12 @@ namespace fthr {
             }
         }
 
-        const EncodedVideoConfig video_config = replay_encoder_->GetVideoConfig();
-        if (!replay_encoder_->IsVideoConfigReady()
-            || !IsValidEncodedVideoConfig(video_config)
-            || video_config.codec_extradata.empty()) {
+        // Some hardware codecs publish decoder configuration with their first
+        // packet. Read the synchronized ring copy rather than racing that
+        // publication or rejecting a start immediately after a quality switch.
+        EncodedVideoConfig video_config;
+        if (!encoded_ring_->WaitForVideoConfig(
+                video_config, std::chrono::seconds(3)) || !running_.load()) {
             std::lock_guard<std::mutex> lock(record_writer_mutex_);
             last_recording_error_ =
                 "The hardware video stream is still starting. Try again in a moment.";
@@ -1664,6 +1690,7 @@ namespace fthr {
             last_recording_error_.clear();
         }
         is_recording_.store(true, std::memory_order_release);
+        replay_encoder_->RequestKeyframe();
         std::cout << "[CaptureEngine] Packet-stream recording started." << std::endl;
         return true;
     }
@@ -1712,12 +1739,10 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
     // SaveClip
     //
     // NVENC path:  TakeSnapshot from encoded ring -> queue encoded task
     // x264 path:   Snapshot raw ring indices -> queue raw task (unchanged)
-    // ===========================================================================
 
     bool CaptureEngine::SaveClip(const wchar_t* path, uint32_t duration_seconds,
         SharedMemoryLayout* shared_memory) {
@@ -1725,10 +1750,15 @@ namespace fthr {
         const auto save_request_started = std::chrono::steady_clock::now();
 
         const uint32_t health = capture_health_flags_.load();
+        if (health & CAPTURE_HEALTH_PAUSED) {
+            SetEngineError(shared_memory,
+                L"Game capture is paused while the game is in the background. "
+                L"Return to the game before saving.");
+            return false;
+        }
         if (!running_.load() ||
             (health & (CAPTURE_HEALTH_BACKEND_FAILED |
-                       CAPTURE_HEALTH_RECOVERING |
-                       CAPTURE_HEALTH_PAUSED))) {
+                       CAPTURE_HEALTH_RECOVERING))) {
             SetEngineError(shared_memory,
                 L"Capture is not receiving new frames. Restart capture before saving.");
             return false;
@@ -1744,9 +1774,7 @@ namespace fthr {
                 / static_cast<double>(save_qpc_frequency.QuadPart)
             : 0.0;
 
-        // ------------------------------------------------------------------
         // NVENC path - mux only, no encoding
-        // ------------------------------------------------------------------
         if (nvenc_active_) {
             const auto publish_timeout = std::chrono::milliseconds(
                 std::max<uint32_t>(100, 3000 / std::max<uint32_t>(fps_, 1)));
@@ -1761,6 +1789,9 @@ namespace fthr {
                 duration_seconds, save_qpc.QuadPart);
 
             if (snapshot.packets.empty()) {
+                SetEngineError(shared_memory,
+                    L"The replay buffer is rebuilding after a capture transition. "
+                    L"Let the game capture a moment of footage, then try again.");
                 std::cerr << "[SaveClip] Encoded ring buffer empty - nothing to save" << std::endl;
                 std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"clip_save\","
                           << "\"event\":\"ring_selection_failed\","
@@ -1768,6 +1799,75 @@ namespace fthr {
                           << "\"error_code\":\"CLIP_SAVE_FAILED\","
                           << "\"packet_count\":0}"
                           << std::endl;
+                return false;
+            }
+
+            // The encoded ring is selected by time, so a non-empty snapshot is
+            // not sufficient proof that it contains a continuous replay. Check
+            // the actual packet timeline before handing it to the mux worker;
+            // otherwise a handful of stale packets can be expanded into a
+            // misleading multi-second clip by downstream CFR processing.
+            const auto replay_config = snapshot.video_config;
+            replay_health::Input replay_health_input;
+            replay_health_input.requested_duration_seconds = duration_seconds;
+            replay_health_input.expected_fps =
+                replay_config.frame_rate.denominator > 0
+                ? static_cast<double>(replay_config.frame_rate.numerator)
+                    / static_cast<double>(replay_config.frame_rate.denominator)
+                : static_cast<double>(fps_);
+            replay_health_input.wall_qpc_frequency = save_qpc_frequency.QuadPart;
+            replay_health_input.target_end_wall_qpc = save_qpc.QuadPart;
+            replay_health_input.pts_per_second = replay_config.time_base.numerator > 0
+                ? static_cast<double>(replay_config.time_base.denominator)
+                    / static_cast<double>(replay_config.time_base.numerator)
+                : static_cast<double>(std::llround(
+                      replay_health_input.expected_fps));
+            replay_health_input.full_history = snapshot.full_history;
+            replay_health_input.packets.reserve(snapshot.packets.size());
+            for (const auto& packet : snapshot.packets) {
+                // Decoder keyframe pre-roll is intentionally part of the mux
+                // snapshot, but it is not presentation coverage. Excluding it
+                // keeps the health decision tied to the requested interval.
+                if (packet.pts < snapshot.presentation_start_pts) {
+                    continue;
+                }
+                replay_health_input.packets.push_back({
+                    packet.wall_qpc, packet.pts, packet.generation});
+            }
+            const auto replay_health_report = replay_health::Evaluate(
+                replay_health_input);
+            if (!replay_health_report.accepted) {
+                std::cerr << "[SaveClip] Replay video rejected: "
+                          << replay_health::FailureName(
+                                 replay_health_report.failure)
+                          << ", packets=" << replay_health_report.packet_count
+                          << ", coverage=" << replay_health_report.actual_coverage_s
+                          << "s, largest_gap=" << replay_health_report.largest_gap_s
+                          << "s, rate=" << replay_health_report.effective_packet_rate
+                          << " fps" << std::endl;
+                std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"clip_save\","
+                          << "\"event\":\"replay_health_rejected\","
+                          << "\"state\":\"FAILED\","
+                          << "\"error_code\":\"CLIP_REPLAY_VIDEO_INSUFFICIENT\","
+                          << "\"reason\":\""
+                          << replay_health::FailureName(replay_health_report.failure)
+                          << "\",\"packet_count\":"
+                          << replay_health_report.packet_count
+                          << ",\"requested_duration_seconds\":"
+                          << duration_seconds << ",\"actual_coverage_seconds\":"
+                          << replay_health_report.actual_coverage_s
+                          << ",\"largest_gap_seconds\":"
+                          << replay_health_report.largest_gap_s
+                          << ",\"effective_packet_rate\":"
+                          << replay_health_report.effective_packet_rate
+                          << ",\"full_history\":"
+                          << (replay_health_report.full_history ? "true" : "false")
+                          << ",\"generation_continuous\":"
+                          << (replay_health_report.generation_continuous
+                              ? "true" : "false") << "}" << std::endl;
+                SetEngineError(shared_memory,
+                    L"Replay video history is insufficient or discontinuous; "
+                    L"the clip was not written. Keep capture running and try again.");
                 return false;
             }
 
@@ -1938,9 +2038,7 @@ namespace fthr {
             return true;
         }
 
-        // ------------------------------------------------------------------
-        // x264 fallback path - snapshot raw ring indices (unchanged)
-        // ------------------------------------------------------------------
+        // Legacy raw replay: snapshot frame-pool indices.
         const size_t needed = static_cast<size_t>(duration_seconds) * fps_;
 
         size_t snap_head = 0;
@@ -2002,9 +2100,7 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
     // SaveClipThread - unchanged structure, ProcessSaveClipTask branches internally
-    // ===========================================================================
 
     void CaptureEngine::SaveClipThread() {
         std::cout << "[SaveClipThread] Started." << std::endl;
@@ -2018,13 +2114,8 @@ namespace fthr {
 
             const bool ok = ProcessSaveClipTask(task);
 
-            // AUDIT-021: this used to publish CLIP_SAVED unconditionally. Every
-            // failure path inside ProcessSaveClipTask had already written
-            // ERROR_OCCURRED — and this line overwrote it a moment later, so
-            // the UI was told every failed save had succeeded.
-            //
-            // Failures publish themselves via SetEngineError(), payload first.
-            // Success is published here, and only here.
+            // Failures already publish SetEngineError(). Publish success only after
+            // ProcessSaveClipTask confirms the file was written.
             if (ok && task.shared_memory) {
                 // Clear the message channel before announcing success so a clip
                 // that follows a failed one cannot carry the old error text.
@@ -2037,9 +2128,7 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
     // ProcessSaveClipTask - transactional wrapper around both media writers
-    // ===========================================================================
 
     bool CaptureEngine::ProcessSaveClipTask(const SaveClipTask& task) {
         if (task.use_encoded_path && !task.encoded_audio_tracks.empty()) {
@@ -2140,19 +2229,8 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
-    // MuxEncodedClip (NVENC path)
-    //
-    // No encoding. Packets and their codec-neutral stream configuration are
-    // copied from the replay ring and wrapped directly in MP4.
-    //
-    // Steps:
-    //   1. Open FFmpeg format context + video stream
-    //   2. Set codec ID and decoder configuration from EncodedVideoConfig
-    //   3. Open file + write header
-    //   4. Write each packet (rescale PTS to stream timebase)
-    //   5. Write trailer + close
-    // ===========================================================================
+    // Mux replay packets and their codec configuration directly into MP4.
+    // Rescale packet timestamps to the output stream timebase without re-encoding.
 
     bool CaptureEngine::MuxEncodedClip(
         const SaveClipTask& task, const std::wstring& output_path) {
@@ -2200,13 +2278,7 @@ namespace fthr {
             return false;
         }
 
-        // ------------------------------------------------------------------
-        // Step A: Find the first keyframe in the snapshot.
-        //
-        // Clips MUST physically start on a keyframe (IDR) for decoders to
-        // produce correct output. Timestamp snapshots normally guarantee this;
-        // the scan remains as defensive validation for legacy snapshots.
-        // ------------------------------------------------------------------
+        // Require a keyframe at the decode start, including for legacy snapshots.
         size_t keyframe_start = snap.packets.size();  // sentinel = not found
         for (size_t i = 0; i < snap.packets.size(); i++) {
             if (!snap.packets[i].data.empty() && snap.packets[i].is_keyframe) {
@@ -2221,28 +2293,9 @@ namespace fthr {
             keyframe_start = 0;
         }
 
-        // ------------------------------------------------------------------
-        // Step B: Trim to requested duration using PTS span (not frame count).
-        //
-        // The ring buffer stores N encoded frames regardless of the wall-clock
-        // time they span. With QPC-based timestamps, the actual capture frame
-        // rate matters:
-        //
-        //   60fps capture: 3600 ring slots = 60 seconds  (expected)
-        //   26fps capture: 3600 ring slots = 138 seconds (bug: too long)
-        //
-        // We limit the clip to the last (duration_seconds * fps) PTS ticks
-        // of footage. At 60fps with delta=1 per frame this equals exactly
-        // duration_seconds. At lower frame rates the PTS delta is larger,
-        // so we discard older frames to keep within the time budget.
-        //
-        // The new keyframe_start is the EARLIEST keyframe whose PTS puts
-        // the remaining clip within the requested duration.
-        // ------------------------------------------------------------------
-        // Timestamp snapshots already carry the last keyframe at/before the
-        // requested start. The legacy trim is retained only for an old-style
-        // snapshot without a presentation boundary; normal saves must never
-        // advance to the keyframe after the requested start.
+        // Timestamp-aware snapshots already retain the keyframe before the requested
+        // start. Only legacy snapshots need duration trimming by PTS span; packet
+        // count does not measure elapsed time when capture cadence varies.
         if (!snap.packets.empty() && snap.presentation_start_qpc_s <= 0.0) {
             const int64_t max_pts_span = DurationInVideoTicks(
                 video_config, task.duration_seconds);
@@ -2270,22 +2323,9 @@ namespace fthr {
             }
         }
 
-        // ------------------------------------------------------------------
-        // Step B2: Trim video start to audio ring coverage.
-        //
-        // Older replay generations could retain substantially more video than
-        // audio. Without this correction, both streams started at "sample 0"
-        // while representing different wall-clock moments, causing A/V desync.
-        // Current timestamp-aware snapshots and bounded GOP headroom avoid that
-        // imbalance; keep this branch only for old-style snapshots.
-        //
-        // Fix: advance keyframe_start to the oldest video frame covered by
-        // the audio ring. Uses the same QPC clock as the audio timestamps
-        // (WASAPI pu64QPCPosition = same domain as QueryPerformanceCounter).
-        // ------------------------------------------------------------------
-        // Timestamp-aware snapshots never shorten video to match an incomplete
-        // audio ring. Missing audio remains a shorter/late audio stream instead
-        // of deleting valid requested footage. This block is a legacy fallback.
+        // Only legacy snapshots trim video to raw-audio coverage using the shared
+        // QPC clock. Timestamp-aware saves retain the full video interval and allow
+        // shorter or late audio instead of discarding valid footage.
         if (snap.presentation_start_qpc_s <= 0.0
             && task.audio_snapshot.valid
             && task.audio_snapshot.qpc_start_s > 0.0
@@ -2342,13 +2382,8 @@ namespace fthr {
             }
         }
 
-        // ------------------------------------------------------------------
-        // Step C: Compute PTS normalization offset.
-        //
-        // The physical decode start can precede the requested presentation
-        // start. Subtract the logical boundary so pre-roll packets retain
-        // negative PTS and the MP4 edit list hides them without re-encoding.
-        // ------------------------------------------------------------------
+        // Subtract the presentation boundary, preserving negative PTS for decoder
+        // pre-roll. The MP4 edit list hides that pre-roll without re-encoding.
 
         // Legacy raw PCM remains only for the non-production compatibility path.
         // The normal AUDIT-050 contract carries one Default Mix plus actual
@@ -2372,20 +2407,8 @@ namespace fthr {
         const double video_clip_duration_s =
             static_cast<double>(video_clip_pts_span + 1) * video_tick_seconds;
 
-        // ------------------------------------------------------------------
-        // Step D: Align audio to video using per-packet QPC timestamps.
-        //
-        // Both snapshots carry wall-clock QPC boundaries (qpc_start_s / qpc_end_s)
-        // from the same QueryPerformanceCounter clock. We find the wall-clock
-        // time of the first video frame being written (after keyframe/duration
-        // trimming), then locate the matching audio sample in the snapshot.
-        //
-        // SaveClip requests 2s of extra audio beyond the clip duration, then
-        // this step intersects it with the exact video presentation interval.
-        //
-        // Fallback: if QPC data is unavailable (shouldn't happen on Win10+),
-        // align from the audio end, taking video_duration of audio.
-        // ------------------------------------------------------------------
+        // Intersect the PCM snapshot with the video presentation interval using QPC.
+        // If QPC timing is unavailable, align video_duration seconds from the audio end.
 
         int64_t audio_aligned_start_sample = 0;
         int64_t audio_output_pts_offset = 0;
@@ -2397,16 +2420,9 @@ namespace fthr {
 
             bool qpc_aligned = false;
 
-            // --- Primary path: per-packet QPC overlap alignment ---
-            //
-            // The video snapshot now carries qpc_start_s / qpc_end_s from the
-            // actual wall-clock timestamps stored with each encoded packet.
-            // We compute the wall-clock time of the first video packet after
-            // keyframe trimming, then find the corresponding audio sample.
-            //
-            // Both clocks are the same QPC domain:
-            //   Video: raw QPC ticks / qpc_freq → seconds
-            //   Audio: WASAPI pu64QPCPosition (100ns units) / 10_000_000 → seconds
+            // Both timestamps share the QPC clock: video uses raw ticks / qpc_freq;
+            // WASAPI uses 100 ns units / 10,000,000. Match the first video packet
+            // after trimming to the corresponding audio sample.
 
             // Presentation starts at the requested cutoff, not at the older
             // keyframe retained solely for decoder pre-roll.
@@ -2495,7 +2511,7 @@ namespace fthr {
                 }
             }
 
-            // --- Fallback: end-aligned duration-based ---
+            // Fallback: end-aligned duration-based
             // Used only when QPC data is completely unavailable.
             // Takes video_duration worth of audio from the end of the snapshot.
             if (!qpc_aligned) {
@@ -2525,9 +2541,6 @@ namespace fthr {
         WideCharToMultiByte(CP_UTF8, 0, output_path.c_str(), -1,
             output_utf8, sizeof(output_utf8) - 1, nullptr, nullptr);
 
-        // ------------------------------------------------------------------
-        // Step 1: Allocate format context
-        // ------------------------------------------------------------------
         AVFormatContext* fmt_ctx = nullptr;
         avformat_alloc_output_context2(&fmt_ctx, nullptr, "mp4", output_utf8);
         if (!fmt_ctx) {
@@ -2539,9 +2552,6 @@ namespace fthr {
         }
         fmt_ctx->avoid_negative_ts = AVFMT_AVOID_NEG_TS_DISABLED;
 
-        // ------------------------------------------------------------------
-        // Step 2: Create video stream
-        // ------------------------------------------------------------------
         AVStream* video_stream = avformat_new_stream(fmt_ctx, nullptr);
         if (!video_stream) {
             std::cerr << "[MuxEncodedClip] avformat_new_stream (video) failed" << std::endl;
@@ -2582,18 +2592,8 @@ namespace fthr {
                 << "file may not play everywhere" << std::endl;
         }
 
-        // ------------------------------------------------------------------
-        // Step 2b: Create audio stream + encode PCM -> AAC
-        //
-        // PCM-first design: raw float32 PCM is stored in the ring buffer
-        // during gameplay (zero encoding overhead). We encode to AAC here
-        // on SaveClipThread, once, only when the user actually saves a clip.
-        //
-        // The audio stream must be added before avformat_write_header().
-        // We initialize AudioEncoder here, encode the aligned PCM window,
-        // collect the resulting AAC packets, then set codecpar->extradata
-        // from the encoder's ASC before calling avformat_write_header().
-        // ------------------------------------------------------------------
+        // Legacy raw-PCM saves encode aligned audio to AAC on the save thread.
+        // Add the audio stream and encoder ASC before avformat_write_header().
         struct MuxAudioTrack {
             AudioSourceMetadata metadata;
             AVStream* stream = nullptr;
@@ -2760,9 +2760,6 @@ namespace fthr {
                 ? "fthr-audio-mode=separated"
                 : "fthr-audio-mode=combined", 0);
 
-        // ------------------------------------------------------------------
-        // Step 3: Open file + write header
-        // ------------------------------------------------------------------
         int ret = avio_open(&fmt_ctx->pb, output_utf8, AVIO_FLAG_WRITE);
         if (ret < 0) {
             std::cerr << "[MuxEncodedClip] avio_open failed: " << ret << std::endl;
@@ -2797,9 +2794,6 @@ namespace fthr {
             return false;
         }
 
-        // ------------------------------------------------------------------
-        // Step 4: Write video packets
-        // ------------------------------------------------------------------
         const AVRational encode_tb = {
             video_config.time_base.numerator,
             video_config.time_base.denominator};
@@ -2953,11 +2947,9 @@ namespace fthr {
         if (video_packet_count == 0)
             return fail_media_write(L"writing video data to", -1);
 
-        // ------------------------------------------------------------------
         // Step 4b: Write each pre-encoded AAC source track. Every source uses
         // its own sample-rate timebase and preserves its AAC packet duration;
         // there is no cross-source downmix or re-encode in the save path.
-        // ------------------------------------------------------------------
         int audio_packet_count = 0;
 
         for (const auto& audio : mux_audio_tracks) {
@@ -3022,9 +3014,6 @@ namespace fthr {
                 "all decodable media currently available." << std::endl;
         std::cout << "========================================\n" << std::endl;
 
-        // ------------------------------------------------------------------
-        // Step 5: Write trailer + close
-        // ------------------------------------------------------------------
         ret = av_write_trailer(fmt_ctx);
         if (ret < 0)
             return fail_media_write(L"finalizing the container for", ret);
@@ -3053,9 +3042,7 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
-    // EncodeRawClip (x264 fallback path - formerly ProcessSaveClipTask)
-    // ===========================================================================
+    // Encode and mux a legacy raw-frame snapshot.
 
     bool CaptureEngine::EncodeRawClip(
         const SaveClipTask& task, const std::wstring& output_path) {
@@ -3144,9 +3131,6 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
-    // GetStats
-    // ===========================================================================
 
     CaptureEngine::Stats CaptureEngine::GetStats() const {
         Stats s{};
@@ -3284,8 +3268,14 @@ namespace fthr {
         PublishContentMetrics(sum, sum_sq, kColumns * kRows);
     }
 
-    void CaptureEngine::ClearReplayForRecovery() {
-        if (encoded_ring_) encoded_ring_->Clear();
+    void CaptureEngine::ClearReplayForRecovery(int64_t recovery_cutoff_qpc) {
+        if (recovery_cutoff_qpc <= 0) {
+            LARGE_INTEGER now{};
+            if (QueryPerformanceCounter(&now)) {
+                recovery_cutoff_qpc = now.QuadPart;
+            }
+        }
+        if (encoded_ring_) encoded_ring_->Clear(recovery_cutoff_qpc);
         replay_config_publish_failed_.store(false);
         ring_head_.store(0, std::memory_order_release);
         ring_count_.store(0, std::memory_order_release);
@@ -3392,15 +3382,22 @@ namespace fthr {
             removed_reason};
         const auto decision = dxgi::EvaluateRecovery(
             active_identity, observation);
+        std::cout << "FTHR_DIAGNOSTIC_EVENT {"
+                  << "\"subsystem\":\"capture\","
+                  << "\"event\":\"recovery_dimensions_observed\","
+                  << "\"attempt\":" << attempt << ','
+                  << "\"decision\":\""
+                  << dxgi::RecoveryDecisionName(decision) << "\","
+                  << "\"active_width\":" << active_identity.width << ','
+                  << "\"active_height\":" << active_identity.height << ','
+                  << "\"current_width\":" << current_width << ','
+                  << "\"current_height\":" << current_height << "}"
+                  << std::endl;
         if (decision != dxgi::RecoveryDecision::RecreateDuplication) {
             detail = std::string("recovery contract rejected: ")
                 + dxgi::RecoveryDecisionName(decision);
             cleanup();
-            return decision == dxgi::RecoveryDecision::StopRequested
-                ? dxgi::RecoveryAttemptResult::StopRequested
-                : decision == dxgi::RecoveryDecision::MonitorUnavailable
-                    ? dxgi::RecoveryAttemptResult::RetryableFailure
-                    : dxgi::RecoveryAttemptResult::FatalFailure;
+            return dxgi::RecoveryAttemptForDecision(decision);
         }
 
         DXGI_ADAPTER_DESC1 adapter_desc{};
@@ -3447,8 +3444,13 @@ namespace fthr {
 
         duplication_ = candidate;
         candidate = nullptr;
-        resolved_monitor_ = current_monitor.monitor;
-        resolved_dxgi_output_ = output_identity;
+        {
+            std::lock_guard<std::mutex> lock(dxgi_context_mutex_);
+            resolved_monitor_ = current_monitor.monitor;
+            resolved_dxgi_output_ = output_identity;
+            resolved_desktop_coordinates_ = output_desc.DesktopCoordinates;
+            resolved_desktop_coordinates_available_ = true;
+        }
         detail = "duplication recreated on attempt " + std::to_string(attempt);
         cleanup();
         return dxgi::RecoveryAttemptResult::Recovered;
@@ -3456,7 +3458,17 @@ namespace fthr {
 
     bool CaptureEngine::RecoverDxgiDuplication(
         const char* api_call, HRESULT trigger) {
+        // Mark the boundary before clearing the ring. A delayed encoder
+        // callback must not be mistaken for current history while recovery is
+        // in progress; ClearReplayForRecovery also records this QPC cutoff.
         capture_health_flags_.store(CAPTURE_HEALTH_RECOVERING);
+        LARGE_INTEGER recovery_start_qpc{};
+        QueryPerformanceCounter(&recovery_start_qpc);
+        EmitRecentDxgiEvidence("dxgi_recovery_started");
+        // A duplication recovery starts a new replay history. Clear before
+        // releasing/recreating DXGI so a save racing this boundary can never
+        // publish packets from two device/output generations.
+        ClearReplayForRecovery(recovery_start_qpc.QuadPart);
         std::cout << "FTHR_DIAGNOSTIC_EVENT {\"subsystem\":\"capture\","
                   << "\"event\":\"recovery_started\","
                   << "\"state\":\"RECOVERING\","
@@ -3506,6 +3518,8 @@ namespace fthr {
             result.attempts, std::memory_order_relaxed);
 
         if (result.outcome == dxgi::RecoveryOutcome::Recovered) {
+            const uint32_t generation = capture_generation_.fetch_add(
+                1, std::memory_order_acq_rel) + 1;
             const uint32_t restart = capture_restart_count_.fetch_add(
                 1, std::memory_order_relaxed) + 1;
             last_capture_hresult_.store(S_OK, std::memory_order_relaxed);
@@ -3516,8 +3530,9 @@ namespace fthr {
                       << "\"attempts\":" << result.attempts << ','
                       << "\"capture_restart_count\":" << restart << ','
                       << "\"encoder_restart_count\":0,"
-                      << "\"stream_generation_preserved\":true,"
-                      << "\"replay_ring_preserved\":true,"
+                      << "\"stream_generation_preserved\":false,"
+                      << "\"replay_ring_reset\":true,"
+                      << "\"capture_generation\":" << generation << ','
                       << "\"monitor_id\":\""
                       << diagnostics::JsonEscape(diagnostics::WideToUtf8(
                              monitor_device_path_)) << "\","
@@ -3534,7 +3549,6 @@ namespace fthr {
         }
 
         capture_recovery_failures_.fetch_add(1, std::memory_order_relaxed);
-        ClearReplayForRecovery();
         capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
         SetCaptureFailure(last_detail.empty()
             ? "DXGI duplication recovery failed without backend detail"
@@ -3628,21 +3642,9 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
-    // CaptureThread
-    //
-    // Hot path. After acquiring and mapping a DXGI frame:
-    //
-    //   Compressed hardware path: copy BGRA on-GPU into the replay encoder
-    //               (native NVENC, FFmpeg AMF, or FFmpeg QSV), then EncodeFrame()
-    //               Callback fires -> EncodedRingBuffer::Push()
-    //               ring_head_ / ring_count_ NOT updated (encoded ring manages itself)
-    //
-    //   x264 path:  memcpy into frame_pool_ slot, advance ring_head_ / ring_count_
-    //               (unchanged from Phase 3)
-    //
-    // Frame rate limiting (QPC) is identical on both paths.
-    // ===========================================================================
+    // Capture DXGI frames at the QPC-driven cadence and submit to the replay
+    // encoder. Its callback publishes packets to EncodedRingBuffer; only the
+    // legacy raw path updates frame_pool_ and its indices.
 
     void CaptureEngine::CaptureThread() {
         // WGC disabled — DXGI-only path. No WinRT apartment needed.
@@ -3664,8 +3666,29 @@ namespace fthr {
             << " path" << std::endl;
 
         uint32_t consecutive_acquire_errors = 0;
+        int64_t previous_present_qpc = 0;
+        uint32_t previous_generation = capture_generation_.load(
+            std::memory_order_relaxed);
+        if (replay_encoder_) {
+            replay_encoder_->SetCaptureGeneration(previous_generation);
+        }
+        IDXGIResource* previous_resource_identity = nullptr;
+        uint64_t next_resource_token = 0;
 
         while (running_.load(std::memory_order_relaxed)) {
+
+            const uint32_t generation = capture_generation_.load(
+                std::memory_order_relaxed);
+            if (generation != previous_generation) {
+                // A recovery starts a fresh history. Do not report a
+                // presentation gap across the old and new duplication.
+                previous_generation = generation;
+                previous_present_qpc = 0;
+                previous_resource_identity = nullptr;
+                if (replay_encoder_) {
+                    replay_encoder_->SetCaptureGeneration(generation);
+                }
+            }
 
             capture_loop_iterations_.fetch_add(1, std::memory_order_relaxed);
 
@@ -3681,9 +3704,48 @@ namespace fthr {
                 running_.store(false);
                 break;
             }
+            LARGE_INTEGER acquire_start_qpc{};
+            QueryPerformanceCounter(&acquire_start_qpc);
             HRESULT hr = duplication_->AcquireNextFrame(33, &info, &resource);
+            LARGE_INTEGER acquire_end_qpc{};
+            QueryPerformanceCounter(&acquire_end_qpc);
             last_capture_hresult_.store(
                 static_cast<int32_t>(hr), std::memory_order_relaxed);
+
+            const int64_t present_qpc = info.LastPresentTime.QuadPart;
+            int64_t presentation_gap_qpc = 0;
+            if (present_qpc > 0 && previous_present_qpc > 0) {
+                presentation_gap_qpc = present_qpc - previous_present_qpc;
+            }
+            if (present_qpc > previous_present_qpc) {
+                previous_present_qpc = present_qpc;
+            }
+            dxgi::RecentDxgiEvent recent_event{};
+            recent_event.acquire_start_qpc = acquire_start_qpc.QuadPart;
+            recent_event.acquire_end_qpc = acquire_end_qpc.QuadPart;
+            recent_event.last_present_qpc = present_qpc;
+            recent_event.presentation_gap_qpc = presentation_gap_qpc;
+            recent_event.acquire_hresult = static_cast<int32_t>(hr);
+            if (resource && resource != previous_resource_identity) {
+                previous_resource_identity = resource;
+                ++next_resource_token;
+            }
+            recent_event.resource_token = resource ? next_resource_token : 0;
+            recent_event.generation = generation;
+            recent_event.width = width_;
+            recent_event.height = height_;
+            recent_event.format = static_cast<uint32_t>(
+                DXGI_FORMAT_B8G8R8A8_UNORM);
+            recent_event.output_index = resolved_dxgi_output_.output_index;
+            recent_event.acquired = SUCCEEDED(hr);
+            recent_event.timed_out = hr == DXGI_ERROR_WAIT_TIMEOUT;
+            // A successful acquire is recorded once, after ReleaseFrame has
+            // completed, so one event contains the complete ownership
+            // boundary. Timeouts/errors have no ReleaseFrame ownership and
+            // are recorded immediately.
+            if (FAILED(hr)) {
+                dxgi_recent_evidence_.Record(recent_event);
+            }
 
             if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
                 capture_timeouts_.fetch_add(1, std::memory_order_relaxed);
@@ -3730,10 +3792,13 @@ namespace fthr {
             capture_thread_stage_.store(2, std::memory_order_relaxed);
             dxgi::FrameLease<IDXGIResource, IDXGIOutputDuplication> frame(
                 resource, duplication_);
-            const auto finish_frame = [this, &frame]() {
+            const auto finish_frame = [this, &frame, &recent_event]() {
                 frame.ReleaseResource();
                 const bool owned = frame.owns_frame();
                 const HRESULT release = frame.ReleaseFrame();
+                recent_event.release_attempted = true;
+                recent_event.release_hresult = static_cast<int32_t>(release);
+                dxgi_recent_evidence_.Record(recent_event);
                 if (owned) {
                     capture_frames_released_.fetch_add(
                         1, std::memory_order_relaxed);
@@ -3777,6 +3842,7 @@ namespace fthr {
             // Encoding the returned old surface as a new frame creates a false
             // freeze and introduces a zero presentation timestamp.
             if (!dxgi::HasNewDesktopImage(info.LastPresentTime.QuadPart)) {
+                recent_event.pointer_only = true;
                 pointer_only_frames_.fetch_add(1, std::memory_order_relaxed);
                 frames_dropped_.fetch_add(1, std::memory_order_relaxed);
                 capture_thread_stage_.store(0, std::memory_order_relaxed);
@@ -3808,6 +3874,12 @@ namespace fthr {
                 if (!finish_frame()) break;
                 continue;
             }
+            D3D11_TEXTURE2D_DESC recent_texture_desc{};
+            tex->GetDesc(&recent_texture_desc);
+            recent_event.width = recent_texture_desc.Width;
+            recent_event.height = recent_texture_desc.Height;
+            recent_event.format = static_cast<uint32_t>(
+                recent_texture_desc.Format);
             if (!ValidateCaptureTexture(tex, "DXGI")) {
                 tex->Release();
                 finish_frame();
@@ -3820,11 +3892,9 @@ namespace fthr {
             capture_thread_stage_.store(3, std::memory_order_relaxed);
 
             if (nvenc_active_ && !replay_encoder_cpu_input_) {
-                // ----------------------------------------------------------
                 // Same-adapter compressed replay path (native NVENC or AMF).
                 // CopyResource is a pure GPU op; there is no full-frame CPU
                 // readback or upload on the normal AMD path.
-                // ----------------------------------------------------------
                 capture_thread_stage_.store(4, std::memory_order_relaxed);
                 conversion_submissions_.fetch_add(1, std::memory_order_relaxed);
                 ID3D11Texture2D* encode_texture = PrepareEncodeTexture(tex);
@@ -3841,18 +3911,9 @@ namespace fthr {
                 if (!encoded || !frame_finished) break;
             }
             else if (nvenc_active_ && replay_encoder_cpu_input_) {
-                // ----------------------------------------------------------
-                // NVENC CPU-input path (Optimus).
-                // DXGI on Intel adapter; NVENC on separate NVIDIA device.
-                // Map the staging texture on the Intel device and memcpy into
-                // the NVENC system-memory input buffer on the NVIDIA device.
-                // Still hardware H.264 — only the pixel copy touches the CPU.
-                //
-                // Blocking Map: the Intel GPU copy typically takes 1-2ms,
-                // well within the 16.7ms frame budget at 60fps. DO_NOT_WAIT
-                // was dropping 100% of frames because the copy never finished
-                // in the microseconds between CopyResource and Map.
-                // ----------------------------------------------------------
+                // Legacy cross-adapter NVENC input: read back the Intel staging texture
+                // for CPU transfer to NVIDIA. Map must wait for the GPU copy; DO_NOT_WAIT
+                // can reject every frame when called immediately after CopyResource.
                 context_->CopyResource(staging_texture_, tex);
                 tex->Release();
                 capture_thread_stage_.store(4, std::memory_order_relaxed);
@@ -3905,9 +3966,7 @@ namespace fthr {
                 if (!frame_finished) break;
             }
             else {
-                // ----------------------------------------------------------
-                // x264 fallback path: CopyResource -> staging -> Map -> memcpy
-                // ----------------------------------------------------------
+                // Legacy raw path: copy to staging, then map and copy to the frame pool.
                 context_->CopyResource(staging_texture_, tex);
                 tex->Release();
                 capture_thread_stage_.store(4, std::memory_order_relaxed);
@@ -4301,6 +4360,8 @@ namespace fthr {
         height_ = static_cast<uint32_t>(
             output_desc.DesktopCoordinates.bottom
             - output_desc.DesktopCoordinates.top);
+        resolved_desktop_coordinates_ = output_desc.DesktopCoordinates;
+        resolved_desktop_coordinates_available_ = true;
 
         capture_adapter->Release();
         factory->Release();
@@ -4313,18 +4374,8 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
-    // InitializeWGC
-    //
-    // Sets up Windows Graphics Capture for the exact persistent monitor selection.
-    //
-    // Key advantage over DXGI OutputDuplication:
-    //   - The D3D11 device is created on the exact selected monitor adapter.
-    //   - Event-driven (FrameArrived) — no 300 iteration/sec polling loop.
-    //
-    // Sets device_, context_, capture adapter identity, width_, height_.
-    // Does NOT create staging_texture_ or duplication_ (not needed on this path).
-    // ===========================================================================
+    // Create WGC monitor capture and D3D11 on the selected monitor adapter.
+    // Set the source dimensions without DXGI duplication or a staging texture.
 
     bool CaptureEngine::InitializeWGC() {
         startup_capture_backend_ = "WGC_MONITOR";
@@ -4362,7 +4413,7 @@ namespace fthr {
             resolved_monitor_.hmonitor);
         HRESULT hr = S_OK;
 
-        // --- Step 4-8: WinRT session setup (exception-safe) ---
+        // WinRT session setup
         wgc_state_ = std::make_unique<WGCState>();
         wgc_state_->monitor_item = true;
         monitor_source_invalidated_.store(false, std::memory_order_release);
@@ -4380,7 +4431,6 @@ namespace fthr {
             wgc_state_->winrt_device =
                 insp.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
 
-            // 4b. Create a capture item for the exact resolved monitor.
             current_api = "RoGetActivationFactory(GraphicsCaptureItem)";
             auto item_interop = winrt::get_activation_factory<
                 winrt::Windows::Graphics::Capture::GraphicsCaptureItem,
@@ -4401,19 +4451,8 @@ namespace fthr {
                 });
             wgc_state_->item_closed_registered = true;
 
-            // 5. Frame pool: 2 slots, free-threaded.
-            //
-            // IMPORTANT: Use CreateFreeThreaded, NOT Create.
-            //
-            // Direct3D11CaptureFramePool::Create delivers FrameArrived events via
-            // the calling thread's DispatcherQueue.  Initialize() runs on the C++
-            // main thread which has NO message pump (no DispatchMessage loop), so
-            // FrameArrived events are queued but never dispatched.  Result: the
-            // condition variable in CaptureThreadWGC waits forever → 0 frames.
-            //
-            // CreateFreeThreaded fires FrameArrived directly on the WinRT thread
-            // pool, bypassing the DispatcherQueue entirely.  This is the standard
-            // pattern for WGC capture on a dedicated background thread.
+            // Poll a two-slot free-threaded pool at video cadence; no dispatcher or
+            // message pump is required.
             current_api = "GraphicsCaptureItem::Size";
             auto sz = wgc_state_->item.Size();
             current_api = "Direct3D11CaptureFramePool::CreateFreeThreaded";
@@ -4424,9 +4463,8 @@ namespace fthr {
                     2,
                     sz);
 
-            // 6. Apply the version-adaptive WGC capture-border policy before
-            // StartCapture. If the indicator cannot be disabled, refuse this
-            // WGC session so Initialize() can fall back to border-free DXGI.
+            // Apply border policy before StartCapture; reject WGC if suppression fails
+            // so Initialize can select DXGI.
             current_api = "Direct3D11CaptureFramePool::CreateCaptureSession";
             wgc_state_->session =
                 wgc_state_->frame_pool.CreateCaptureSession(wgc_state_->item);
@@ -4439,18 +4477,7 @@ namespace fthr {
                 return false;
             }
 
-            // 7. Subscribe FrameArrived: only wakes CaptureThread, no encode work here.
-            current_api = "Direct3D11CaptureFramePool::FrameArrived(add handler)";
-            wgc_state_->frame_arrived_token =
-                wgc_state_->frame_pool.FrameArrived([this](auto&, auto&) {
-                    {
-                        std::lock_guard<std::mutex> lk(wgc_frame_mutex_);
-                        wgc_frame_ready_ = true;
-                    }
-                    wgc_frame_cv_.notify_one();
-                });
 
-            // 8. Start
             current_api = "GraphicsCaptureSession::StartCapture";
             wgc_state_->session.StartCapture();
 
@@ -4486,15 +4513,8 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
-    // ApplyCaptureBorderPolicy
-    //
-    // The Windows Graphics Capture border is an OS privacy indicator. Match the
-    // old FTHR behavior: ask the live WGC session to suppress the border before
-    // StartCapture, without requiring package identity or showing a permission
-    // prompt. A session is accepted only when the runtime reports that the
-    // border is no longer required; otherwise callers fall back to DXGI.
-    // ===========================================================================
+    // Request border suppression before StartCapture and verify the live session.
+    // If the runtime still requires a border, callers fall back to DXGI.
 
     bool CaptureEngine::ApplyCaptureBorderPolicy(const char* capture_target) {
         if (!wgc_state_ || !wgc_state_->session) return false;
@@ -4559,9 +4579,6 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
-    // ShutdownWGC
-    // ===========================================================================
 
     void CaptureEngine::ShutdownWGC() {
         if (!wgc_state_) return;
@@ -4572,7 +4589,6 @@ namespace fthr {
             }
             if (wgc_state_->session)    wgc_state_->session.Close();
             if (wgc_state_->frame_pool) {
-                wgc_state_->frame_pool.FrameArrived(wgc_state_->frame_arrived_token);
                 wgc_state_->frame_pool.Close();
             }
         } catch (...) {}
@@ -4581,18 +4597,9 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
-    // CaptureThreadWGC
-    //
-    // Replaces the DXGI polling loop on the WGC path.
-    // Waits on wgc_frame_cv_ (signalled by FrameArrived callback), applies the
-    // QPC frame rate limiter, extracts the ID3D11Texture2D from the WGC surface,
-    // and routes it into NVENC (GPU zero-copy) or the x264 frame pool.
-    //
-    // A supported public-alpha run always routes the WGC texture into the
-    // hardware encoder on that same D3D11 device. Legacy CPU-input/raw branches
-    // are unreachable because initialization fails closed before threads start.
-    // ===========================================================================
+    // Sample the newest WGC image at video cadence and copy it before releasing
+    // the borrowed frame. Reuse the owned image on idle ticks so video timing
+    // does not depend on desktop change notifications.
 
     void CaptureEngine::CaptureThreadWGC() {
         // WinRT calls (TryGetNextFrame, surface access) require the thread to be
@@ -4608,30 +4615,32 @@ namespace fthr {
                       : (nvenc_active_ ? "same-adapter GPU input" : "readback"))
                   << ")" << std::endl;
 
-        LARGE_INTEGER qpc_freq;
-        QueryPerformanceFrequency(&qpc_freq);
-
-        const double  target_ms  = 1000.0 / static_cast<double>(fps_);
-        const int64_t target_qpc = static_cast<int64_t>(
-            (target_ms / 1000.0) * static_cast<double>(qpc_freq.QuadPart));
-
-        FrameRateScheduler frame_scheduler(target_qpc);
+        // WGC publishes changes, not a continuous video clock. Keep one
+        // owned image and sample it at the encoder cadence, including an idle
+        // desktop. Never retain a surface borrowed from the WGC frame pool.
+        const auto interval = std::chrono::microseconds(1000000 / fps_);
+        auto next_tick = std::chrono::steady_clock::now();
+        winrt::com_ptr<ID3D11Texture2D> latest_texture;
+        uint64_t repeated_frames = 0;
+        if (replay_encoder_) {
+            replay_encoder_->SetCaptureGeneration(
+                capture_generation_.load(std::memory_order_relaxed));
+        }
         uint32_t consecutive_frame_errors = 0;
+        CaptureFocusPolicy focus_policy;
 
         while (running_.load(std::memory_order_relaxed)) {
 
-            // Wait for FrameArrived signal. All encode work happens here on
-            // CaptureThread — the callback only sets wgc_frame_ready_.
+            next_tick += interval;
             {
                 std::unique_lock<std::mutex> lk(wgc_frame_mutex_);
-                wgc_frame_cv_.wait(lk, [this] {
-                    return wgc_frame_ready_ ||
-                           monitor_source_invalidated_.load(
-                               std::memory_order_acquire) ||
-                           !running_.load(std::memory_order_relaxed);
+                wgc_frame_cv_.wait_until(lk, next_tick, [this] {
+                    return monitor_source_invalidated_.load(std::memory_order_acquire)
+                        || !running_.load(std::memory_order_relaxed);
                 });
-                wgc_frame_ready_ = false;
             }
+            const auto tick_now = std::chrono::steady_clock::now();
+            if (tick_now > next_tick + interval) next_tick = tick_now;
 
             if (!running_.load(std::memory_order_relaxed)) break;
             if (monitor_source_invalidated_.load(std::memory_order_acquire)) {
@@ -4665,104 +4674,127 @@ namespace fthr {
             const char* current_frame_api =
                 "Direct3D11CaptureFramePool::TryGetNextFrame";
             try {
-                // Consume the frame FIRST to return the buffer slot to the pool.
-                // WGC's Direct3D11CaptureFramePool has only 2 slots — if we
-                // skip TryGetNextFrame (e.g. via rate limiter 'continue'), the
-                // pool fills up and FrameArrived stops firing → 0 frames captured.
-                // Acquisition itself can throw after a device/source loss, so it
-                // belongs inside the same bounded error path as surface access.
-                auto frame = wgc_state_->frame_pool.TryGetNextFrame();
-                if (!frame) continue;
-
-                current_frame_api = "Direct3D11CaptureFrame::ContentSize";
-                const auto content_size = frame.ContentSize();
-                if (content_size.Width != static_cast<int32_t>(width_)
-                    || content_size.Height != static_cast<int32_t>(height_)) {
-                    const char* source_kind = wgc_state_->monitor_item
-                        ? "monitor" : "window";
-                    std::cerr << "[CaptureThread/WGC] capture " << source_kind
-                              << " dimensions changed" << std::endl;
-                    std::cout << "FTHR_DIAGNOSTIC_EVENT {"
-                              << "\"subsystem\":\"capture\","
-                              << "\"event\":\"runtime_failed\","
-                              << "\"state\":\"FAILED\","
-                              << "\"error_code\":\"CAPTURE_WGC_RUNTIME_FAILED\","
-                              << "\"api_call\":\"Direct3D11CaptureFrame::ContentSize\","
-                              << "\"source_kind\":\"" << source_kind << "\","
-                              << "\"expected_width\":" << width_ << ','
-                              << "\"expected_height\":" << height_ << ','
-                              << "\"actual_width\":" << content_size.Width << ','
-                              << "\"actual_height\":" << content_size.Height << "}"
+                current_frame_api = "ID3D11Device::GetDeviceRemovedReason";
+                winrt::check_hresult(device_->GetDeviceRemovedReason());
+                const auto focus = focus_policy.Observe(focus_gated_ && target_hwnd_ != 0
+                    && GetForegroundWindow() != reinterpret_cast<HWND>(target_hwnd_));
+                if (focus.paused) {
+                    latest_texture = nullptr;
+                    capture_health_flags_.fetch_or(CAPTURE_HEALTH_PAUSED);
+                } else if (focus.resumed) {
+                    // Start fresh history after a focus gap. Joining pre-tab
+                    // and post-tab packets creates a sparse timeline that the
+                    // save validator correctly rejects. Do not reuse an image
+                    // from the desktop while waiting for a new game frame.
+                    latest_texture = nullptr;
+                    ClearReplayForRecovery();
+                    capture_generation_.fetch_add(1, std::memory_order_acq_rel);
+                    if (replay_encoder_) replay_encoder_->SetCaptureGeneration(
+                        capture_generation_.load(std::memory_order_acquire));
+                    if (replay_encoder_) replay_encoder_->RequestKeyframe();
+                    capture_health_flags_.fetch_and(~CAPTURE_HEALTH_PAUSED);
+                    std::cout << "[CaptureThread/WGC] Game focus restored; rebuilding replay history."
                               << std::endl;
-                    SetCaptureFailure(std::string("WGC ") + source_kind
-                        + " dimensions changed; a fresh capture generation is required");
+                }
+                bool new_image = false;
+                // Drain both slots at each tick. Notifications can coalesce;
+                // TryGetNextFrame is the sole authority for queued images.
+                for (int slot = 0; slot < 2; ++slot) {
+                    auto frame = wgc_state_->frame_pool.TryGetNextFrame();
+                    if (!frame) break;
+                    wgc::FrameLease frame_lease(frame);
+                    if (focus.discard_queued_frames) continue;
+                    current_frame_api = "Direct3D11CaptureFrame::ContentSize";
+                    const auto content_size = frame.ContentSize();
+                    if (content_size.Width != static_cast<int32_t>(width_)
+                        || content_size.Height != static_cast<int32_t>(height_)) {
+                        const char* source_kind = wgc_state_->monitor_item
+                            ? "monitor" : "window";
+                        std::cerr << "[CaptureThread/WGC] capture " << source_kind
+                                  << " dimensions changed" << std::endl;
+                        std::cout << "FTHR_DIAGNOSTIC_EVENT {"
+                                  << "\"subsystem\":\"capture\","
+                                  << "\"event\":\"runtime_failed\","
+                                  << "\"state\":\"FAILED\","
+                                  << "\"error_code\":\"CAPTURE_WGC_RUNTIME_FAILED\","
+                                  << "\"api_call\":\"Direct3D11CaptureFrame::ContentSize\","
+                                  << "\"source_kind\":\"" << source_kind << "\","
+                                  << "\"expected_width\":" << width_ << ','
+                                  << "\"expected_height\":" << height_ << ','
+                                  << "\"actual_width\":" << content_size.Width << ','
+                                  << "\"actual_height\":" << content_size.Height << "}"
+                                  << std::endl;
+                        SetCaptureFailure(std::string("WGC ") + source_kind
+                            + " dimensions changed; a fresh capture generation is required");
+                        capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
+                        ClearReplayForRecovery();
+                        running_.store(false);
+                        break;
+                    }
+
+                    // Extract ID3D11Texture2D from the WGC surface
+                    current_frame_api = "Direct3D11CaptureFrame::Surface";
+                    auto surface = frame.Surface();
+
+                    // IDirect3DDxgiInterfaceAccess is a COM interface in
+                    // Windows::Graphics::DirectX::Direct3D11 — not a WinRT-projected
+                    // type, so winrt::as<>() cannot be used. QueryInterface directly.
+                    using DxgiAccess = Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess;
+                    winrt::com_ptr<DxgiAccess> interop;
+                    current_frame_api =
+                        "IDirect3DSurface::QueryInterface(IDirect3DDxgiInterfaceAccess)";
+                    winrt::check_hresult(
+                        reinterpret_cast<IUnknown*>(winrt::get_abi(surface))->QueryInterface(
+                            __uuidof(DxgiAccess), reinterpret_cast<void**>(interop.put())));
+
+                    winrt::com_ptr<ID3D11Texture2D> tex;
+                    current_frame_api =
+                        "IDirect3DDxgiInterfaceAccess::GetInterface(ID3D11Texture2D)";
+                    winrt::check_hresult(interop->GetInterface(IID_PPV_ARGS(tex.put())));
+                    if (!ValidateCaptureTexture(tex.get(), "WGC")) {
+                        ClearReplayForRecovery();
+                        capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
+                        running_.store(false);
+                        break;
+                    }
+                    if (!latest_texture) {
+                        D3D11_TEXTURE2D_DESC desc{};
+                        tex->GetDesc(&desc);
+                        desc.Usage = D3D11_USAGE_DEFAULT;
+                        desc.BindFlags = 0;
+                        desc.CPUAccessFlags = 0;
+                        desc.MiscFlags = 0;
+                        current_frame_api = "ID3D11Device::CreateTexture2D(latest WGC image)";
+                        winrt::check_hresult(device_->CreateTexture2D(
+                            &desc, nullptr, latest_texture.put()));
+                    }
+                    context_->CopyResource(latest_texture.get(), tex.get());
+                    source_textures_received_.fetch_add(1, std::memory_order_relaxed);
+                    new_image = true;
+                } // Close every borrowed frame before encoding the owned copy.
+                if (!running_.load(std::memory_order_relaxed)) break;
+                if (!latest_texture) continue;
+
+                // Do not publish a cached image after the item changes size.
+                current_frame_api = "GraphicsCaptureItem::Size";
+                const auto live_size = wgc_state_->item.Size();
+                if (live_size.Width != static_cast<int32_t>(width_)
+                    || live_size.Height != static_cast<int32_t>(height_)) {
+                    SetCaptureFailure("WGC source dimensions changed; restart required");
                     capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
                     ClearReplayForRecovery();
                     running_.store(false);
                     break;
                 }
-
-                // QPC frame rate limiter — frame already consumed above, so the
-                // pool slot is freed even when we skip processing this frame.
+                capture_health_flags_.fetch_or(CAPTURE_HEALTH_ACTIVE);
+                if (!new_image) ++repeated_frames;
+                const auto& tex = latest_texture;
                 LARGE_INTEGER now;
                 QueryPerformanceCounter(&now);
-                if (!frame_scheduler.ShouldCapture(now.QuadPart)) {
-                    frames_dropped_.fetch_add(1, std::memory_order_relaxed);
-                    continue;  // frame destructor returns buffer to pool
-                }
-
-            // Focus gate: when capturing for an anti-cheat game via monitor
-            // capture, only encode frames while that game is in the foreground.
-            // The frame has already been consumed above so the 2-slot pool is
-            // freed regardless. Without this we'd bake the user's desktop into
-            // saved clips whenever they alt-tab away mid-recording.
-            if (focus_gated_ && target_hwnd_ != 0) {
-                HWND fg = GetForegroundWindow();
-                if (fg != reinterpret_cast<HWND>(target_hwnd_)) {
-                    const uint32_t content = capture_health_flags_.load() &
-                        CAPTURE_HEALTH_CONTENT_SUSPECT;
-                    capture_health_flags_.store(
-                        CAPTURE_HEALTH_ACTIVE | CAPTURE_HEALTH_PAUSED | content);
-                    frames_dropped_.fetch_add(1, std::memory_order_relaxed);
-                    continue;
-                }
-            }
-            capture_health_flags_.fetch_and(~CAPTURE_HEALTH_PAUSED);
-            capture_health_flags_.fetch_or(CAPTURE_HEALTH_ACTIVE);
-
-                // Extract ID3D11Texture2D from the WGC surface
-                current_frame_api = "Direct3D11CaptureFrame::Surface";
-                auto surface = frame.Surface();
-
-                // IDirect3DDxgiInterfaceAccess is a COM interface in
-                // Windows::Graphics::DirectX::Direct3D11 — not a WinRT-projected
-                // type, so winrt::as<>() cannot be used. QueryInterface directly.
-                using DxgiAccess = Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess;
-                winrt::com_ptr<DxgiAccess> interop;
-                current_frame_api =
-                    "IDirect3DSurface::QueryInterface(IDirect3DDxgiInterfaceAccess)";
-                winrt::check_hresult(
-                    reinterpret_cast<IUnknown*>(winrt::get_abi(surface))->QueryInterface(
-                        __uuidof(DxgiAccess), reinterpret_cast<void**>(interop.put())));
-
-                winrt::com_ptr<ID3D11Texture2D> tex;
-                current_frame_api =
-                    "IDirect3DDxgiInterfaceAccess::GetInterface(ID3D11Texture2D)";
-                winrt::check_hresult(interop->GetInterface(IID_PPV_ARGS(tex.put())));
-                if (!ValidateCaptureTexture(tex.get(), "WGC")) {
-                    ClearReplayForRecovery();
-                    capture_health_flags_.store(CAPTURE_HEALTH_BACKEND_FAILED);
-                    running_.store(false);
-                    break;
-                }
-                source_textures_received_.fetch_add(
-                    1, std::memory_order_relaxed);
 
                 if (nvenc_active_ && !replay_encoder_cpu_input_) {
-                    // ----------------------------------------------------------
                     // Same-adapter compressed replay (native NVENC or AMF).
                     // A GPU CopyResource feeds the encoder-owned texture.
-                    // ----------------------------------------------------------
                     ID3D11Texture2D* encode_texture = PrepareEncodeTexture(tex.get());
                     if (!encode_texture || !EncodeGpuReplayTexture(
                             encode_texture, now.QuadPart,
@@ -4772,12 +4804,10 @@ namespace fthr {
                 }
                 else if (nvenc_active_ && replay_encoder_cpu_input_
                     && staging_texture_) {
-                    // ----------------------------------------------------------
                     // NVENC CPU-input path (Optimus).
                     // WGC on Intel adapter; NVENC on separate NVIDIA device.
                     // Map the staging texture on the Intel device and memcpy
                     // into the NVENC system-memory input buffer.
-                    // ----------------------------------------------------------
                     context_->CopyResource(staging_texture_, tex.get());
 
                     D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -4820,9 +4850,7 @@ namespace fthr {
                     }
                 }
                 else {
-                    // ----------------------------------------------------------
-                    // x264 fallback: CPU read path
-                    // ----------------------------------------------------------
+                    // Legacy raw-frame readback
                     context_->CopyResource(staging_texture_, tex.get());
 
                     D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -4893,7 +4921,8 @@ namespace fthr {
         }
 
         std::cout << "[CaptureThread/WGC] Stopped. Frames captured: "
-                  << frames_captured_.load() << std::endl;
+                  << frames_captured_.load() << " repeated idle frames: "
+                  << repeated_frames << std::endl;
         if (capture_health_flags_.load() != CAPTURE_HEALTH_BACKEND_FAILED)
             capture_health_flags_.store(CAPTURE_HEALTH_NONE);
 
@@ -4901,20 +4930,8 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
-    // InitializeWindowCapture
-    //
-    // WGC capture targeting a specific window (HWND stored in target_hwnd_).
-    //
-    // Architecture is identical to InitializeWGC (desktop) with two differences:
-    //   1. Capture item is created via CreateForWindow(hwnd) instead of
-    //      CreateForMonitor — captures the specific app even if partially occluded.
-    //   2. width_/height_ come from item.Size() (the window's content area) rather
-    //      than the monitor dimensions.
-    //
-    // Known limitation: if the window is resized after the engine starts, the
-    // captured frames will mismatch the NVENC texture dimensions. Restart required.
-    // ===========================================================================
+    // Create WGC capture for target_hwnd_ using the window content dimensions.
+    // The engine must restart if resizing changes the encoder input dimensions.
 
     bool CaptureEngine::InitializeWindowCapture() {
         startup_capture_backend_ = "WGC_WINDOW";
@@ -5040,11 +5057,10 @@ namespace fthr {
                       << capture_luid_diagnostic << std::endl;
         }
 
-        // --- Steps 3-8: WinRT capture session (exception-safe) ---
+        // Steps 3-8: WinRT capture session (exception-safe)
         wgc_state_ = std::make_unique<WGCState>();
         const char* current_api = "ID3D11Device::QueryInterface(IDXGIDevice)";
         try {
-            // 3. Wrap ID3D11Device as WinRT IDirect3DDevice
             winrt::com_ptr<IDXGIDevice> dxgi_dev;
             winrt::check_hresult(device_->QueryInterface(dxgi_dev.put()));
             winrt::com_ptr<IInspectable> insp;
@@ -5054,7 +5070,6 @@ namespace fthr {
             wgc_state_->winrt_device =
                 insp.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
 
-            // 4. Create capture item from the target window
             current_api = "RoGetActivationFactory(GraphicsCaptureItem)";
             auto item_interop = winrt::get_activation_factory<
                 winrt::Windows::Graphics::Capture::GraphicsCaptureItem,
@@ -5074,15 +5089,13 @@ namespace fthr {
                 });
             wgc_state_->item_closed_registered = true;
 
-            // 5. Get captured dimensions from the item (= window content size)
             current_api = "GraphicsCaptureItem::Size";
             auto sz = wgc_state_->item.Size();
             width_  = static_cast<uint32_t>(sz.Width);
             height_ = static_cast<uint32_t>(sz.Height);
             std::cout << "[WinCapture] Window content size: " << width_ << "x" << height_ << std::endl;
 
-            // 7. Frame pool: 2 slots, free-threaded.
-            //    See InitializeWGC() comment on why CreateFreeThreaded is required.
+            // Use the same free-threaded, two-slot pool as monitor capture.
             current_api = "Direct3D11CaptureFramePool::CreateFreeThreaded";
             wgc_state_->frame_pool =
                 winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
@@ -5091,10 +5104,8 @@ namespace fthr {
                     2,
                     sz);
 
-            // 8. Apply the same version-adaptive border policy as monitor
-            // capture. WGC ownership is independent of UI launch mode. If
-            // borderless capture is unavailable, return false so the caller
-            // can use the border-free DXGI fallback.
+            // Apply monitor capture border policy; return false for DXGI fallback
+            // if the runtime requires a border.
             current_api = "Direct3D11CaptureFramePool::CreateCaptureSession";
             wgc_state_->session =
                 wgc_state_->frame_pool.CreateCaptureSession(wgc_state_->item);
@@ -5107,18 +5118,7 @@ namespace fthr {
                 return false;
             }
 
-            // 9. FrameArrived: only wakes CaptureThreadWGC, no encoding work in callback
-            current_api = "Direct3D11CaptureFramePool::FrameArrived(add handler)";
-            wgc_state_->frame_arrived_token =
-                wgc_state_->frame_pool.FrameArrived([this](auto&, auto&) {
-                    {
-                        std::lock_guard<std::mutex> lk(wgc_frame_mutex_);
-                        wgc_frame_ready_ = true;
-                    }
-                    wgc_frame_cv_.notify_one();
-                });
 
-            // 10. Start
             current_api = "GraphicsCaptureSession::StartCapture";
             wgc_state_->session.StartCapture();
 
@@ -5151,9 +5151,7 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
     // InitializeD3D11 - exact selected adapter/output fallback
-    // ===========================================================================
 
     bool CaptureEngine::InitializeD3D11() {
         startup_capture_backend_ = "DXGI_OUTPUT_DUPLICATION";
@@ -5207,9 +5205,7 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
     // ShutdownD3D11 - unchanged
-    // ===========================================================================
 
     void CaptureEngine::ShutdownD3D11() {
         if (health_staging_texture_) {

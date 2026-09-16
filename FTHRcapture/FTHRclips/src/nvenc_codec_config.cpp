@@ -74,7 +74,7 @@ bool ConfigureNvencCodec(
     const auto* selection = GetNvencCodecSelection(codec);
     if (!selection || fps == 0) return false;
 
-    const uint32_t keyframe_interval = fps * 4;
+    const uint32_t keyframe_interval = fps;
     // H.264/HEVC VUI timing is part of the encoded stream metadata. Publish
     // the configured fixed rate explicitly so media-property readers do not
     // have to infer it from irregular capture timestamps.
@@ -179,7 +179,7 @@ EncodedVideoConfig BuildNvencVideoConfig(
     config.frame_rate = {static_cast<int32_t>(fps), 1};
     config.time_base = {1, static_cast<int32_t>(fps)};
     config.bitrate_kbps = bitrate_kbps;
-    config.max_keyframe_interval_frames = fps * 4;
+    config.max_keyframe_interval_frames = fps;
     config.max_b_frames = 0;
     if (selection) config.packet_format = selection->packet_format;
     config.codec_extradata = codec_extradata;

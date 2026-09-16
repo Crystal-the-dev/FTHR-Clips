@@ -1,32 +1,9 @@
 #!/usr/bin/env python3
-"""
-verify_release_licenses.py — fail the build if a release artifact carries
-unapproved GPL components, the wrong Qt binding, or incomplete paperwork.
+"""Verify release dependency licenses, Qt bindings, and required notices.
 
-Background: FTHR Clips used to bundle a GPLv3 FFmpeg build (with libx264 and
-libx265) while presenting itself as MIT, and shipped no third-party licence
-texts at all. That is a licence violation on the first download and cannot be
-corrected after the fact. This script exists so it cannot silently come back.
-
-Design notes
-------------
-Checks are deliberately *targeted*, not keyword grep over the whole tree:
-
-  * "GPL" appearing in documentation is normal and must not fail the build —
-    this file, THIRD_PARTY_NOTICES.md and the LGPL licence text all contain it.
-  * Binaries are inspected for FFmpeg's embedded configuration string and the
-    embedded ``libav* license:`` banner, which are authoritative.
-  * ``ffmpeg -buildconf`` is consulted when an executable is present, since
-    that is the build's own account of itself.
-
-Usage
------
-    python tools/verify_release_licenses.py --tree .
-    python tools/verify_release_licenses.py --windows-dist dist/FTHRClips
-    python tools/verify_release_licenses.py --appdir build/AppDir
-    python tools/verify_release_licenses.py --all          # tree + any artifacts found
-
-Exit code 0 = pass, 1 = at least one FAIL.
+Check FFmpeg binary configuration/license data rather than mentions of GPL
+in documentation. --tree checks source inputs; --windows-dist and --appdir
+check artifacts; --all checks available inputs. Exit 1 reports failures.
 """
 
 from __future__ import annotations
@@ -41,7 +18,7 @@ import sys
 from pathlib import Path
 
 # Build flags that place an FFmpeg build under the GPL (or make it undistributable).
-# --enable-version3 is deliberately NOT here: it yields LGPLv3, not GPL.
+# enable-version3 is deliberately NOT here: it yields LGPLv3, not GPL.
 FORBIDDEN_FLAGS = (
     b'--enable-gpl',
     b'--enable-nonfree',
@@ -89,13 +66,8 @@ PROJECT_LICENSE_SHA256 = (
 # Linux ships its own pinned LGPL FFmpeg (AUDIT-014) with its own manifest.
 LINUX_MANIFEST_REL = 'tools/ffmpeg_manifest_linux.json'
 
-# SONAMEs the distribution's (GPL) FFmpeg uses on current distros. Seeing one of
-# these inside an artifact means a system build got collected, which is the
-# AUDIT-014 failure mode.
-# Exactly the FFmpeg library names. Anchored, because 'libav*' also matches
-# libavif (the AV1 image codec) and libavc1394 (IEEE-1394) — treating those as
-# FFmpeg produced false failures, and an earlier over-broad *delete* based on
-# the same mistake removed libavif and broke the bundle's startup.
+# Recognize system FFmpeg SONAMEs and exact library basenames. Do not use
+# libav*: it also matches unrelated libavif and libavc1394 libraries.
 FFMPEG_SO_RE = re.compile(
     r'^lib(avcodec|avformat|avutil|avdevice|avfilter|swscale|swresample|postproc)'
     r'(-[0-9a-f]{8})?\.so[.0-9]*$')
@@ -707,12 +679,10 @@ def _elf_rpath(path):
 
 
 def check_linux_ffmpeg_libs(root, rep, label, manifest_root=None) -> None:
-    """Every FFmpeg .so in a Linux artifact must be a documented LGPL library.
+    """Require every bundled Linux FFmpeg library to have approved license metadata.
 
-    This is the check AUDIT-014 turns on. It is not enough that the engine links
-    the right thing: the artifact must not *contain* the wrong thing. PyInstaller
-    collects the system FFmpeg through cv2 and Qt whether or not anything uses it,
-    and a GPL library sitting in the AppDir is a GPL library shipped.
+    Include system libraries collected through Qt/OpenCV, even if unused by
+    the capture engine.
     """
     print(f'\n-- Linux FFmpeg libraries in {label} --')
     data = _read_manifest(manifest_root or root, LINUX_MANIFEST_REL, rep)
@@ -724,17 +694,9 @@ def check_linux_ffmpeg_libs(root, rep, label, manifest_root=None) -> None:
     for versioned, soname in (data.get('soname_map') or {}).items():
         alias_sources[soname] = versioned
         alias_sources[soname.split('.so.', 1)[0] + '.so'] = versioned
-    # Qt Multimedia ships its own FFmpeg inside the PyQt6-Qt6 wheel. It is a
-    # different SONAME generation, the engine never loads it, and it is LGPL —
-    # but it is still FFmpeg in the artifact, so it is checked rather than
-    # ignored. Its bytes are not pinned (that is the PyQt6-Qt6 pin's job); its
-    # licence is verified on every build.
-    # Python wheels bring their own FFmpeg: Qt Multimedia inside PyQt6-Qt6, and
-    # OpenCV inside opencv-python-headless (auditwheel renames those with an
-    # 8-hex-digit suffix). Both are legitimate and neither is loaded by the
-    # engine, but both are FFmpeg being distributed, so each is verified — by
-    # licence rather than by hash, because their bytes follow the wheel version
-    # rather than any decision made here.
+    # Qt Multimedia and OpenCV wheels may bundle separate FFmpeg libraries,
+    # including auditwheel-renamed files. Check their licenses; their bytes follow
+    # the pinned wheel versions rather than the native-engine FFmpeg manifest.
     providers = data.get('additional_providers') or []
     provider_names = set()
     provider_prefixes = []

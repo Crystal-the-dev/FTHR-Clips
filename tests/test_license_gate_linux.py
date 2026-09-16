@@ -1,12 +1,6 @@
-"""Negative tests for the Linux half of the licence gate (AUDIT-014).
+"""Reject Linux artifacts with unapproved FFmpeg libraries or metadata.
 
-The gate refusing to package a GPL FFmpeg is the only thing standing between
-this project and shipping a GPL AppImage while claiming otherwise. A gate that
-cannot fail is decoration, so these tests construct artifacts that *should* be
-rejected and assert that they are.
-
-Nothing here needs a real FFmpeg: the checks read manifests, file hashes and —
-where available — ELF headers, all of which can be faked in tmp_path.
+Fixtures use manifests, hashes, and ELF headers without requiring FFmpeg.
 """
 
 import hashlib
@@ -46,9 +40,7 @@ def _write_lib(directory: Path, name: str, payload: bytes = b'not a real elf'):
     return p
 
 
-# ---------------------------------------------------------------------------
 # The manifest itself
-# ---------------------------------------------------------------------------
 
 def test_real_manifest_passes(manifest_root):
     rep = vrl.Report()
@@ -86,9 +78,7 @@ def test_gpl_manifest_licence_fails(tmp_path):
     assert rep.failures
 
 
-# ---------------------------------------------------------------------------
 # The shipped libraries
-# ---------------------------------------------------------------------------
 
 def test_documented_library_with_correct_hash_passes(manifest_root, tmp_path):
     """A library whose bytes hash to the manifest value is accepted."""
@@ -206,9 +196,7 @@ def test_failed_ffmpeg_runtime_probe_cannot_report_clean(monkeypatch, tmp_path):
     assert not any('-buildconf: clean' in line for line in rep.warnings)
 
 
-# ---------------------------------------------------------------------------
 # Engine linkage
-# ---------------------------------------------------------------------------
 
 def test_engine_check_skips_when_absent(tmp_path):
     rep = vrl.Report()
@@ -262,9 +250,7 @@ def test_correctly_built_engine_passes(tmp_path, monkeypatch):
     assert not rep.failures, rep.failures
 
 
-# ---------------------------------------------------------------------------
 # The forbidden-flag list must stay intact
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize('flag', [b'--enable-gpl', b'--enable-nonfree',
                                   b'--enable-libx264', b'--enable-libx265'])
@@ -290,9 +276,7 @@ def test_gpl_flag_in_a_binary_is_detected(tmp_path):
     assert rep.failures
 
 
-# ---------------------------------------------------------------------------
 # Names that look like FFmpeg but are not
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize('name', ['libavif-cbf1e83c.so.16.3.0',
                                   'libavif.so.16',

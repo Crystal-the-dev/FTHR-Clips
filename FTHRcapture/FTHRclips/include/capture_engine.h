@@ -1,42 +1,9 @@
-﻿// capture_engine.h
-// FTHR Capture Engine - Core capture loop and ring buffer management
-//
-// Capture backend (selected at Initialize() time):
-//
-//   WGC path (wgc_active_ = true) — preferred when it is borderless:
-//     - Windows Graphics Capture API — event-driven, lower overhead than DXGI.
-//     - Hooks at the DWM/compositor level. Survives independent flip mode,
-//       so it captures kernel-anti-cheat games (Valorant/Vanguard, EAC/BE
-//       titles) that DXGI cannot see. Same path Xbox Game Bar uses.
-//     - Desktop monitor capture creates D3D11 on the adapter that owns the
-//       selected monitor and keeps encoding on that same device.
-//     - FrameArrived callback signals CaptureThread; no polling loop.
-//     - Automatic Optimus/cross-adapter encoder redirection is disabled.
-//     - Variants: CreateForMonitor (desktop + AC games), CreateForWindow
-//       (regular window mode).
-//
-//   DXGI path (wgc_active_ = false) — border-free fallback:
-//     - IDXGIOutputDuplication — polling loop in CaptureThread.
-//     - Used whenever WGC cannot prove that Windows will hide its privacy
-//       border, so an active capture never leaves a visible system outline.
-//     - Returns black/stale frames for AC games in independent flip mode.
-//
-// Encode backend (selected after capture backend):
-//
-//   Compressed hardware path (legacy nvenc_active_ flag = true):
-//     - Native NVENC, FFmpeg AMF, or FFmpeg QSV encodes every frame
-//     - Encoded AVCC packets pushed into EncodedRingBuffer via callback
-//     - Raw FramePool NOT allocated (~8GB saved at 1080p/60fps/30s)
-//     - SaveClip: TakeSnapshot() -> MuxEncodedClip() (no re-encoding)
-//
-//   Unsupported hardware path (legacy nvenc_active_ flag = false):
-//     - Capture startup is refused for the public alpha
-//     - Raw replay code remains non-production and is never selected silently
-//
-// Threading model:
-//   CaptureThread  - grabs frames (WGC or DXGI), routes to NVENC or FramePool
-//   SaveClipThread - muxes encoded snapshots OR encodes raw frames
-//   ContinuousRecordingWriter - durable packet tee to fragmented MP4
+﻿// Windows capture, compressed replay storage, and asynchronous clip saves.
+// Prefer borderless WGC; use DXGI when WGC cannot suppress its border. Capture
+// and hardware encoding stay on the selected monitor adapter. Public-alpha
+// startup requires NVENC, AMF, or QSV; raw replay is legacy-only. CaptureThread
+// feeds the ring, SaveClipThread muxes snapshots, and ContinuousRecordingWriter
+// can also write incoming packets to fragmented MP4.
 
 #pragma once
 #ifndef FTHR_CAPTURE_ENGINE_H
@@ -78,13 +45,9 @@
 namespace fthr {
 
 
-    // Forward declaration
     struct SharedMemoryLayout;
 
 
-    // ---------------------------------------------------------------------------
-    // CaptureConfig
-    // ---------------------------------------------------------------------------
     struct CaptureConfig {
         uint32_t framerate = 60;
         uint32_t buffer_seconds = 30;
@@ -92,8 +55,7 @@ namespace fthr {
         uint32_t target_height = 0;
         uint32_t bitrate_kbps = 16000;
         uint32_t max_buffer_mb = 512;
-        // argv[11]: Auto and explicit H.264 both resolve to H.264 for this
-        // NVIDIA stage; explicit HEVC/AV1 must never silently become H.264.
+        // argv[11]: Auto resolves to H.264; explicit HEVC/AV1 must not fall back to H.264.
         VideoCodec video_codec = VideoCodec::H264;
         EncoderPreference encoder_preference = EncoderPreference::Auto;
         uint32_t encoder_preset = 4;
@@ -141,9 +103,7 @@ namespace fthr {
     };
 
 
-    // ---------------------------------------------------------------------------
-    // FramePool - used only on x264 fallback path
-    // ---------------------------------------------------------------------------
+    // Legacy raw-frame storage; public-alpha replay uses encoded packets.
     class FramePool {
     public:
         FramePool() = default;
@@ -162,9 +122,6 @@ namespace fthr {
     };
 
 
-    // ---------------------------------------------------------------------------
-    // CaptureEngine
-    // ---------------------------------------------------------------------------
     class CaptureEngine {
     public:
         CaptureEngine();
@@ -222,30 +179,21 @@ namespace fthr {
 
 
     private:
-        // -----------------------------------------------------------------------
         // Thread entry points
-        // -----------------------------------------------------------------------
         void CaptureThread();       // dispatches to WGC or DXGI
-        void CaptureThreadWGC();    // WGC event-driven loop
+        void CaptureThreadWGC();    // WGC fixed-cadence image sampler
         void ReplayStallWatchdogThread();
         void SaveClipThread();
 
-        // -----------------------------------------------------------------------
-        // SaveClip worker implementations
-        // -----------------------------------------------------------------------
-        // These return false when the clip was NOT written, and publish the
-        // reason via SetEngineError() before returning. SaveClipThread used to
-        // ignore the outcome and report CLIP_SAVED unconditionally, so every
-        // Windows save failure reached the user as success (AUDIT-021).
+        // Save workers return false and publish SetEngineError() on failure.
+        // Publish CLIP_SAVED only after the transactional write succeeds.
         bool ProcessSaveClipTask(const SaveClipTask& task); // transactional wrapper
         bool MuxEncodedClip(const SaveClipTask& task,
-            const std::wstring& output_path);               // NVENC path: mux only
+            const std::wstring& output_path);               // Compressed replay: mux only
         bool EncodeRawClip(const SaveClipTask& task,
-            const std::wstring& output_path);               // x264 path: encode + mux
+            const std::wstring& output_path);               // Legacy raw path: encode + mux
 
-        // -----------------------------------------------------------------------
         // D3D11 / DXGI / WGC helpers
-        // -----------------------------------------------------------------------
         bool InitializeWGC();             // WGC capture of the resolved desktop monitor
         bool InitializeWindowCapture();   // WGC window/game capture
         // Returns true only when the WGC session read back as borderless.
@@ -267,7 +215,7 @@ namespace fthr {
             uint32_t width, uint32_t height, uint64_t produced_frame);
         void SampleContentTexture(ID3D11Texture2D* texture, uint64_t produced_frame);
         void PublishContentMetrics(uint64_t sum, uint64_t sum_sq, uint32_t count);
-        void ClearReplayForRecovery();
+        void ClearReplayForRecovery(int64_t recovery_cutoff_qpc = 0);
         bool ResolveSelectedMonitor(const char* backend_name);
         bool InitializeMonitorCaptureDevice(
             const char* backend_name, IDXGIOutput** selected_output);
@@ -280,15 +228,16 @@ namespace fthr {
             ID3D11Texture2D* source,
             int64_t present_qpc,
             uint64_t produced_frame);
+        // Emits the bounded in-memory DXGI evidence ring only at a recovery or
+        // watchdog boundary.  No per-frame diagnostic I/O is performed.
+        void EmitRecentDxgiEvidence(const char* reason) const;
         void FailReplayEncoder(const char* operation);
         void SetCaptureFailure(std::string detail);
         std::string BuildStartupDiagnosticContext() const;
         bool FailStartup(ReplayStartupError code, std::string detail);
 
-        // -----------------------------------------------------------------------
         // D3D11 state (shared by WGC and DXGI paths)
-        // -----------------------------------------------------------------------
-        ID3D11Device*           device_;           // D3D11 device (NVIDIA when WGC active)
+        ID3D11Device*           device_;           // D3D11 device on the selected capture adapter
         ID3D11DeviceContext*    context_;
         IDXGIOutputDuplication* duplication_;      // null when WGC is active
         ID3D11Texture2D*        staging_texture_;  // null on WGC+NVENC path
@@ -300,28 +249,21 @@ namespace fthr {
         ID3D11Device*        nvenc_device_;
         ID3D11DeviceContext* nvenc_context_;
 
-        // -----------------------------------------------------------------------
         // WGC state (PIMPL — WinRT types confined to capture_engine.cpp)
-        // -----------------------------------------------------------------------
         bool              wgc_active_;
         struct WGCState;                        // defined in capture_engine.cpp
         std::unique_ptr<WGCState> wgc_state_;
         std::mutex              wgc_frame_mutex_;
         std::condition_variable wgc_frame_cv_;
-        bool                    wgc_frame_ready_;
         std::atomic<bool>       monitor_source_invalidated_{false};
-        // -----------------------------------------------------------------------
         // Thread handles
-        // -----------------------------------------------------------------------
         std::thread* capture_thread_;
         std::thread* stall_watchdog_thread_;
         std::thread* save_clip_thread_;
         std::atomic<bool> running_;
         std::atomic<bool> is_recording_;
 
-        // -----------------------------------------------------------------------
         // Capture dimensions (set by whichever backend initializes first)
-        // -----------------------------------------------------------------------
         uint32_t  width_;
         uint32_t  height_;
         bool      crop_enabled_;
@@ -338,9 +280,7 @@ namespace fthr {
         // foreground so we don't bake the user's desktop into clips.
         bool focus_gated_;
 
-        // -----------------------------------------------------------------------
         // Config
-        // -----------------------------------------------------------------------
         uint32_t fps_;
         uint32_t buffer_seconds_;
         uint32_t target_width_;
@@ -362,11 +302,8 @@ namespace fthr {
         std::string startup_codec_ = "unavailable:not_requested";
         std::string last_capture_failure_detail_;
 
-        // -----------------------------------------------------------------------
-        // Compressed replay path. nvenc_active_ retains its legacy name because
-        // it is mirrored into the frozen shared-memory v4 contract; it now means
-        // "a hardware replay encoder is active" for NVENC, AMF, or QSV.
-        // -----------------------------------------------------------------------
+        // nvenc_active_ is the shared-memory v4 name for any active hardware
+        // replay encoder, including AMF and QSV. Retain it for ABI compatibility.
         bool                              nvenc_active_;
         bool                              nvidia_device_; // true when D3D11 device is on the NVIDIA adapter (GPU zero-copy enabled)
         bool                              replay_encoder_cpu_input_;
@@ -379,35 +316,21 @@ namespace fthr {
             ReplayStartupError::None;
         std::string                        last_startup_error_;
 
-        // -----------------------------------------------------------------------
-        // x264 fallback path
-        // -----------------------------------------------------------------------
+        // Legacy raw replay
         FramePool            frame_pool_;
         size_t               max_frames_;
         std::atomic<size_t>  ring_head_{ 0 };
         std::atomic<size_t>  ring_count_{ 0 };
         mutable std::mutex   ring_mutex_;
 
-        // -----------------------------------------------------------------------
         // Async SaveClip
-        // -----------------------------------------------------------------------
         SaveClipQueue          save_clip_queue_;
         std::atomic<uint32_t>  next_task_id_{ 1 };
 
-        // -----------------------------------------------------------------------
-        // Audio capture pipeline
-        //
-        // AudioCapture feeds a persistent AAC-LC encoder into a bounded packet
-        // ring. The source timeline starts at the first WASAPI QPC timestamp
-        // and is snapshotted with the selected video interval.
-        //
-        // audio_active_ is true only when all components initialized successfully.
-        //
-        // A/V sync epoch:
-        //   AudioCapture records the first WASAPI QPC position. SaveClip
-        //   converts the video presentation interval into source-sample PTS
-        //   from that common monotonic clock before snapshotting AAC packets.
-        // -----------------------------------------------------------------------
+        // AudioCapture feeds persistent AAC encoders and bounded packet rings.
+        // The first WASAPI QPC timestamp anchors source-sample PTS; saves select
+        // audio against the video presentation interval on that same clock.
+        // audio_active_ requires successful initialization of the pipeline.
         bool                             audio_active_;
         AudioCapture                     audio_capture_;
         AudioEncoder                      default_mix_audio_encoder_;
@@ -422,16 +345,12 @@ namespace fthr {
         // stopped before the system/microphone audio teardown.
         std::unique_ptr<WindowsApplicationAudioSourceManager>
             application_audio_source_manager_;
-        // -----------------------------------------------------------------------
         // Continuous recording state
-        // -----------------------------------------------------------------------
         mutable std::mutex record_writer_mutex_;
         std::shared_ptr<ContinuousRecordingWriter> record_writer_;
         std::string last_recording_error_;
 
-        // -----------------------------------------------------------------------
         // Stats
-        // -----------------------------------------------------------------------
         std::atomic<uint64_t> frames_captured_;
         std::atomic<uint64_t> frames_dropped_;
         std::atomic<uint64_t> capture_loop_iterations_{0};
@@ -452,6 +371,10 @@ namespace fthr {
         std::atomic<uint32_t> capture_restart_count_{0};
         std::atomic<uint32_t> capture_recovery_attempts_{0};
         std::atomic<uint32_t> capture_recovery_failures_{0};
+        dxgi::RecentDxgiEvidence<> dxgi_recent_evidence_;
+        mutable std::mutex dxgi_context_mutex_;
+        RECT resolved_desktop_coordinates_{};
+        bool resolved_desktop_coordinates_available_ = false;
         std::atomic<uint32_t> content_sample_sequence_{0};
         std::atomic<uint32_t> content_suspicious_streak_{0};
         std::atomic<float> content_luma_mean_{0.0f};

@@ -1,11 +1,7 @@
-"""
-Customize settings page — accordion-based UI for colors, icons, and sounds.
+"""Accordion settings for colors, icons, fonts, and sounds.
 
-Performance notes:
-- Color preview uses a small static mockup, not the live app.
-- Icons are loaded lazily via QPixmap with size caching.
-- Sounds store paths only; short cues are preloaded for reliable preview.
-- Theme is applied to the main app only on explicit "Apply" click (batch QSS regen).
+Use a static preview, lazy icon caches, and preloaded sound cues. Apply
+updates the main theme in one QSS pass.
 """
 from __future__ import annotations
 
@@ -356,9 +352,7 @@ def _fthr_message_box(parent, title: str, message: str,
     return dlg.exec() == _D.DialogCode.Accepted
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # Accordion Section — collapsible container matching fthrclips.com style
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class _AccordionSection(QFrame):
     """Collapsible section with an immediate, stable expand/collapse."""
@@ -374,7 +368,7 @@ class _AccordionSection(QFrame):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # ── Header (clickable trigger) ────────────────────────────────────
+        # Header (clickable trigger)
         self._header = QPushButton()
         self._header.setObjectName('accordionHeader')
         self._header.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
@@ -409,7 +403,7 @@ class _AccordionSection(QFrame):
 
         layout.addWidget(self._header)
 
-        # ── Body ──────────────────────────────────────────────────────────
+        # Body
         self._body = QWidget()
         self._body.setObjectName('accordionBody')
         self._body.setVisible(False)
@@ -508,9 +502,7 @@ class _AccordionSection(QFrame):
         return self._expanded
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # Color Swatch — clickable color picker tile
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class _ColorSwatch(QWidget):
     """Small clickable color tile that opens a QColorDialog on click."""
@@ -572,9 +564,7 @@ class _ColorSwatch(QWidget):
                 self.color_changed.emit(self.token, self._color)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # Color Preview Mockup — miniature app UI that reflects current theme colors
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class _ColorPreviewMockup(QFrame):
     """Miniature mockup of the app UI to preview color changes."""
@@ -770,9 +760,7 @@ class _ColorPreviewMockup(QFrame):
         self._rebuild()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # Icon Crop Dialog — crop imported image to match original icon dimensions
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class _IconCropWidget(QWidget):
     """Crop area selector with free resize via corner handles and scroll wheel."""
@@ -815,7 +803,7 @@ class _IconCropWidget(QWidget):
             Qt.TransformationMode.SmoothTransformation,
         )
 
-    # ── painting ──────────────────────────────────────────────────────
+    # painting
 
     def paintEvent(self, event: QPaintEvent):
         p = QPainter(self)
@@ -887,7 +875,7 @@ class _IconCropWidget(QWidget):
                 return i
         return -1
 
-    # ── interaction ───────────────────────────────────────────────────
+    # interaction
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() != Qt.MouseButton.LeftButton:
@@ -916,7 +904,6 @@ class _IconCropWidget(QWidget):
             self._crop_rect.moveTopLeft(QPoint(new_x, new_y))
             self.update()
         else:
-            # Update cursor based on hover
             if self._hit_corner(event.pos()) >= 0:
                 self.setCursor(QCursor(Qt.CursorShape.SizeFDiagCursor))
             else:
@@ -935,7 +922,7 @@ class _IconCropWidget(QWidget):
         self._resize_crop_centered(new_size)
         self.update()
 
-    # ── resize helpers ────────────────────────────────────────────────
+    # resize helpers
 
     def _handle_resize(self, pos: QPoint):
         dx = int((pos.x() - self._drag_start.x()) / self._display_scale)
@@ -985,9 +972,7 @@ class _IconCropWidget(QWidget):
         self._crop_rect = QRect(nx, ny, new_size, new_size)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # Icon Row — single icon customization entry
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class _IconRow(QFrame):
     """Row for customizing one icon: shows reference + current + import button."""
@@ -1133,7 +1118,6 @@ class _IconRow(QFrame):
         temp_path.unlink(missing_ok=True)
         self._theme.save()
 
-        # Update display
         self._load_current_icon()
         self.icon_changed.emit(self._filename)
 
@@ -1202,9 +1186,7 @@ class _IconRow(QFrame):
         self.icon_changed.emit(self._filename)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # Icon Tint Row — per-icon color control for recolorable default icons
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 def _tint_pixmap(pixmap: QPixmap, color: QColor) -> QPixmap:
@@ -1327,9 +1309,7 @@ class _IconTintRow(QFrame):
         self._refresh_preview()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # Sound Row — single sound customization entry with preview
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class _SoundRow(QFrame):
     """Row for customizing one sound: shows current + import + preview buttons."""
@@ -1517,9 +1497,7 @@ class _SoundRow(QFrame):
         self.sound_changed.emit(self._key)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # CustomizePage — full settings tab assembling all sections
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class CustomizePage(QWidget):
     """Complete Customize settings tab with accordion sections."""
@@ -1566,7 +1544,7 @@ class CustomizePage(QWidget):
         self._layout.setSpacing(12)
         self._layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        # ── Format info bar ───────────────────────────────────────────────
+        # Format info bar
         info_bar = QLabel(
             'Themes include typography, colors, icons, capture-card styling, and sounds  —  '
             f'Fonts: {", ".join(SUPPORTED_FONT_FORMATS)}  |  '
@@ -1582,37 +1560,37 @@ class CustomizePage(QWidget):
         self._info_bar = info_bar
         self._layout.addWidget(info_bar)
 
-        # ── Section 1: Typography ─────────────────────────────────────────
+        # Section 1: Typography
         self._typography_section = _AccordionSection('Typography', '01')
         self._build_typography_section()
         self._layout.addWidget(self._typography_section)
 
-        # ── Section 2: Colors ─────────────────────────────────────────────
+        # Section 2: Colors
         self._colors_section = _AccordionSection('Colors', '02')
         self._build_colors_section()
         self._layout.addWidget(self._colors_section)
 
-        # ── Section 3: Icon Colors ────────────────────────────────────────
+        # Section 3: Icon Colors
         self._icon_colors_section = _AccordionSection('Icon Colors', '03')
         self._build_icon_colors_section()
         self._layout.addWidget(self._icon_colors_section)
 
-        # ── Section 4: Icons ──────────────────────────────────────────────
+        # Section 4: Icons
         self._icons_section = _AccordionSection('Icons', '04')
         self._build_icons_section()
         self._layout.addWidget(self._icons_section)
 
-        # ── Section 5: Capture Card ───────────────────────────────────────
+        # Section 5: Capture Card
         self._capture_card_section = _AccordionSection('Capture Card', '05')
         self._build_capture_card_section()
         self._layout.addWidget(self._capture_card_section)
 
-        # ── Section 6: Sounds ─────────────────────────────────────────────
+        # Section 6: Sounds
         self._sounds_section = _AccordionSection('Sounds & Volumes', '06')
         self._build_sounds_section()
         self._layout.addWidget(self._sounds_section)
 
-        # ── Export / Import bar ───────────────────────────────────────────
+        # Export / Import bar
         self._layout.addSpacing(16)
         action_bar = QHBoxLayout()
         action_bar.setSpacing(10)
@@ -1646,7 +1624,7 @@ class CustomizePage(QWidget):
         scroll.setWidget(container)
         outer.addWidget(scroll)
 
-    # ── Typography section ────────────────────────────────────────────────
+    # Typography section
 
     def _build_typography_section(self):
         wrapper = QWidget()
@@ -1785,7 +1763,7 @@ class CustomizePage(QWidget):
             f'color: {Colors.TEXT}; padding: 10px; '
             f'font-family: "{display}", "{body}"; font-size: {Fonts.SIZE_BODY_L}px;')
 
-    # ── Colors section ────────────────────────────────────────────────────
+    # Colors section
 
     def _build_colors_section(self):
         wrapper = QWidget()
@@ -1856,19 +1834,16 @@ class CustomizePage(QWidget):
     def _on_color_changed(self, token: str, hex_value: str):
         self._theme.set_color(token, hex_value)
         self._theme.save()
-        # Update preview mockup
         self._preview.update_single_color(token, hex_value)
 
     def _on_reset_all_colors(self):
         self._theme.reset_all_colors()
         self._theme.save()
-        # Update all swatches
         for swatch in self._swatches:
             swatch.set_color(DEFAULT_COLORS.get(swatch.token, '#000000'))
-        # Update preview
         self._preview.update_colors(DEFAULT_COLORS)
 
-    # ── Icons section ─────────────────────────────────────────────────────
+    # Icons section
 
     def _build_icons_section(self):
         wrapper = QWidget()
@@ -1886,7 +1861,7 @@ class CustomizePage(QWidget):
     def _on_icon_changed(self, filename: str):
         pass  # Icons apply on next app restart or when Apply is clicked
 
-    # ── Icon Colors section ───────────────────────────────────────────────
+    # Icon Colors section
 
     def _build_icon_colors_section(self):
         wrapper = QWidget()
@@ -1980,7 +1955,7 @@ class CustomizePage(QWidget):
     def _on_tint_changed(self, filename: str):
         pass  # Tints apply when user clicks Apply Theme
 
-    # ── Capture Card section ──────────────────────────────────────────────
+    # Capture Card section
 
     def _build_capture_card_section(self):
         wrapper = QWidget()
@@ -2039,7 +2014,7 @@ class CustomizePage(QWidget):
             swatch.set_color(
                 DEFAULT_CAPTURE_CARD_COLORS.get(swatch.token, '#ffffff'))
 
-    # ── Sounds section ────────────────────────────────────────────────────
+    # Sounds section
 
     def _build_sounds_section(self):
         wrapper = QWidget()
@@ -2063,7 +2038,7 @@ class CustomizePage(QWidget):
     def _on_sound_changed(self, key: str):
         pass  # Sounds apply immediately (next time the event fires)
 
-    # ── Export / Import ───────────────────────────────────────────────────
+    # Export / Import
 
     def _on_export(self):
         dest, _ = QFileDialog.getSaveFileName(
@@ -2106,12 +2081,9 @@ class CustomizePage(QWidget):
             )
 
     def refresh_theme(self):
-        """Rebuild inline QSS after the shared theme tokens are updated.
+        """Rebuild local control QSS after shared theme tokens change.
 
-        Customize controls intentionally use local styles for their dense,
-        preview-like layout. Rebuilding the section bodies keeps those styles
-        in sync with the same Apply action that refreshes the rest of the app,
-        while preserving which accordions were open and the scroll position.
+        Preserve expanded accordions and scroll position through Apply.
         """
         scroll_value = self._scroll.verticalScrollBar().value()
         expanded = {
@@ -2170,7 +2142,6 @@ class CustomizePage(QWidget):
     def _refresh_all(self):
         """Reload all UI elements from current theme state."""
         colors = self._theme.get_all_colors()
-        # Update typography selectors and preview.
         if hasattr(self, '_font_combos'):
             for configured_family, font_path in (
                     self._theme.get_custom_font_paths().items()):
@@ -2194,18 +2165,14 @@ class CustomizePage(QWidget):
                 combo.blockSignals(False)
                 combo.setStyleSheet(combo_qss(background=Colors.SURFACE_3))
             self._update_font_preview()
-        # Update color swatches
         for swatch in self._swatches:
             swatch.set_color(colors.get(swatch.token, '#000000'))
-        # Update preview
         self._preview.update_colors(colors)
-        # Update icon tint swatches
         if hasattr(self, '_global_tint_swatch'):
             self._update_global_tint_swatch()
         if hasattr(self, '_tint_rows'):
             for row in self._tint_rows:
                 row.refresh()
-        # Update capture card swatches
         if hasattr(self, '_cc_swatches'):
             cc_colors = self._theme.get_all_capture_card_colors()
             for swatch in self._cc_swatches:

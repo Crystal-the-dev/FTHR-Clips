@@ -8,7 +8,6 @@ class _SettingsStub:
     def __init__(self) -> None:
         self.settings = {
             'clip_length': 60,
-            'extended_clip_length': 60,
             'framerate': 60,
             'resolution': 'source',
             'bitrate_level': 'custom',

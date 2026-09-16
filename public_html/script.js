@@ -1184,7 +1184,6 @@ const HCMode = {
             TeamCarousel.init();
             PlatformTabs.init();
 
-            // Build roadmap from JSON data block above
             const phases = await loadRoadmapData();
             const container = document.getElementById('roadmapContainer');
             const statusLabel = { done: 'Complete', active: 'In Progress', upcoming: 'Upcoming' };

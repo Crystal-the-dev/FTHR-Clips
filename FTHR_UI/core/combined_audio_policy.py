@@ -1,9 +1,6 @@
-"""Selection policy for the native combined-audio finalization pass.
+"""Choose which native audio streams need combined-track finalization.
 
-The native capture engine can retain system, microphone and application
-streams in one clip.  Combined mode must collapse only the streams that are
-not already represented by the recorded Default Mix.  This module is kept
-Qt-free so the policy can be tested without constructing the UI.
+Only add sources absent from Default Mix to avoid counting audio twice.
 """
 from __future__ import annotations
 
@@ -54,13 +51,11 @@ def select_combined_audio_streams(
     manifest: dict[str, Any] | None,
     streams: Iterable[AudioStreamDescriptor],
 ) -> tuple[int, ...]:
-    """Select audio ordinals that may be mixed into a combined track.
+    """Select audio ordinals for a combined track.
 
-    A validated FTHR manifest is authoritative.  If it contains only
-    application stems, returning an empty selection prevents those stems from
-    being summed on top of the Default Mix.  Legacy clips have no sidecar, so
-    the stable stream labels are used first; only an entirely unlabeled legacy
-    clip falls back to all audio streams for compatibility with older builds.
+    Prefer a validated manifest; application-only stems yield no selection
+    because Default Mix already includes them. Legacy clips use stream labels,
+    falling back to all streams only when none are labeled.
     """
     ordered = tuple(streams)
     if manifest is not None:

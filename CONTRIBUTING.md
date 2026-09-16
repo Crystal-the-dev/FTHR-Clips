@@ -1,11 +1,6 @@
 # Contributing to FTHR Clips
 
-Thanks for wanting to contribute. Here's everything you need to know.
-
-> **Before anything else:** read [`docs/SOURCE_OF_TRUTH.md`](docs/SOURCE_OF_TRUTH.md).
-> There are stale copies of this project on the original development machine,
-> one of which documents a directory layout that no longer exists. Make sure
-> you are in the git repository.
+Build and test instructions, repository layout, and contribution conventions.
 
 ## Authoritative layout
 
@@ -41,9 +36,6 @@ FTHR_Clips/
 ├── build_linux.sh              AppImage builder
 └── AppDir/                     AppImage .desktop + icon (source only)
 ```
-
-There is **no** `engine/` directory and **no** `ui/` directory at the top
-level. Any document telling you otherwise predates two refactors.
 
 ### Entry points
 
@@ -153,7 +145,7 @@ Rules:
    They are dead, but an engine built before they were retired still acts on
    those numbers — reusing one would make an old binary do the wrong thing
    instead of ignoring an unknown command.
-4. **Bump `CaptureBridge.SHARED_MEM_NAME`** (`FTHR_SharedMemory_v3` → `_v4`)
+4. **Bump `CaptureBridge.SHARED_MEM_NAME`** (`FTHR_SharedMemory_v4` → `_v5`)
    whenever the layout changes, so an old engine and a new UI cannot map the
    same region. Do **not** bump it for a product version change — it is not
    the product version.
@@ -168,7 +160,10 @@ Rules:
    struct — for both platforms, from any platform. It also runs as part of
    `pytest` (`tests/test_shared_memory_contract.py`).
 
-Current layout: 23 fields, 2712 B on Windows, 4248 B on Linux.
+Current layout: 29 fields, 2736 B on Windows, 4272 B on Linux.
+
+The positional engine arguments are documented in
+[`docs/engine-startup.md`](docs/engine-startup.md).
 
 ## Other conventions
 
@@ -211,7 +206,7 @@ build: pin alpha dependencies exactly (AUDIT-009)
 - Bug fixes
 - Linux hardware compatibility (AMD/Intel GPU capture, other Wayland compositors)
 - Windows testing and fixes
-- Test coverage — the C++ engines currently have **none**
+- Python and native C++ test coverage
 - Documentation improvements
 
 ## What to avoid
@@ -227,8 +222,34 @@ build: pin alpha dependencies exactly (AUDIT-009)
 - **Python:** match the surrounding code. `ruff` enforces a deliberately narrow
   rule set (real bugs, not cosmetics) — see `pyproject.toml`.
 - **C++:** C++17, 4-space indent, snake_case.
-- Comments only where the *why* is non-obvious.
 
-## Questions?
+### Comments and docstrings
 
-Open an issue with the `question` label.
+Write for someone who knows the language but doesn't know this project yet.
+Explain a module's role or a function's contract when its name isn't enough.
+Inside an implementation, focus on reasons, constraints, and surprising behavior.
+
+- Keep comments close to the code they explain, usually one to three lines.
+  Put longer architecture notes, protocols, and walkthroughs in `docs/` and
+  link them from the relevant code.
+- Preserve details a reader can't infer: units, ownership, thread affinity,
+  ordering, lifetime, compatibility rules, and why an error is safe to ignore.
+- Don't narrate assignments, repeat a function name, or add a docstring just
+  to fill a template. Short section labels can help navigate a long file;
+  decorative dividers and numbered step-by-step commentary usually don't.
+- Describe current behavior. Git history and issues hold development phases,
+  before/after stories, and abandoned approaches. Keep an issue reference when
+  it helps explain a constraint that still applies.
+- Use plain language. Contractions such as "can't" and "doesn't" are fine.
+  Avoid jokes, slogans, exaggerated guarantees, and unexplained emphasis.
+- Update comments with behavior changes. Preserve license notices, upstream
+  comments, generated files, and directives such as `noqa` and `type: ignore`.
+
+For example, `# Set the command` repeats the next assignment.
+`# Publish the command last; the engine may read its payload immediately.`
+explains an ordering rule worth keeping.
+
+These conventions follow the practical guidance in the
+[Google C++ style guide](https://google.github.io/styleguide/cppguide#Comments)
+and the [Linux kernel commenting guide](https://docs.kernel.org/process/coding-style.html#commenting).
+

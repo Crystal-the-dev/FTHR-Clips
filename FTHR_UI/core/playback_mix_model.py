@@ -1,9 +1,4 @@
-"""Data model and deterministic mix policy for editable clip audio.
-
-The viewer deliberately keeps this module independent of Qt and FFmpeg.  It
-defines the clip-local source list and the exact gain/headroom rule shared by
-live playback and derived mixed exports.
-"""
+"""Clip-local audio sources and gain/headroom rules shared by playback and export."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -93,13 +88,9 @@ def source_icon_key(source: PlaybackSource) -> str:
 
 
 def source_display_name(source: PlaybackSource) -> str:
-    """Return the viewer label for one clip-local source.
+    """Label the native Default Mix as system audio in the viewer.
 
-    The native Windows 10 manifest calls its system loopback source
-    ``Default Mix``.  That is correct container metadata but is not the best
-    control label: users are adjusting system audio, not a compatibility
-    implementation detail.  All other names remain the verified manifest or
-    container-provided name unchanged.
+    Other labels retain their manifest or container-provided names.
     """
 
     identity = (source.persistent_identity or '').casefold()
@@ -111,12 +102,9 @@ def source_display_name(source: PlaybackSource) -> str:
 
 
 def order_playback_sources(sources: Sequence[PlaybackSource]) -> tuple[PlaybackSource, ...]:
-    """Apply the deterministic source order used by the dynamic volume panel.
+    """Order application stems, editable system audio, microphone, then imports.
 
-    Application stems lead because they are the most specific editable audio.
-    The system source follows when it is genuinely editable, then microphone,
-    then generic imported tracks.  Container index is the stable tie-breaker;
-    display text is intentionally never used as identity.
+    Use container indices as stable tie-breakers; display names are not IDs.
     """
 
     priority = {'application': 0, 'system': 1, 'microphone': 2, 'track': 3}
@@ -135,18 +123,12 @@ def build_playback_sources(
     manifest: dict[str, Any] | None,
     streams: Sequence[ProbedAudioStream],
 ) -> tuple[PlaybackSource, ...]:
-    """Build an honest, data-driven editable source list.
+    """Build editable sources from verified manifests or container stream labels.
 
-    A hash-bound FTHR manifest is the only source of semantic identities.
-    Imported and legacy media use real stream titles, or generic track names.
-    A separated FTHR clip has ``Default Mix`` plus ``Microphone`` and both
-    remain editable because the manifest describes Default Mix as system
-    loopback only. Once application stems exist, ``Default Mix`` becomes the
-    hidden base of a reversible delta mix. An app slider then applies
-    ``base + (gain - 1) * app_stem`` so changing one application cannot change
-    another and unattributed system sounds remain intact. A combined capture
-    is identified by its container marker and deliberately exposes no source
-    sliders, even if an old sidecar is still present.
+    System and microphone tracks are independent unless application stems exist.
+    With stems, Default Mix is hidden and app sliders apply
+    ``base + (gain - 1) * app_stem``. Combined captures expose no source sliders,
+    even if an old sidecar remains.
     """
 
     by_container = {stream.container_index: stream for stream in streams}

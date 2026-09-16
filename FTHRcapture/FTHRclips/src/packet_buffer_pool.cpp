@@ -1,4 +1,3 @@
-// packet_buffer_pool.cpp
 // FTHR Capture Engine - Packet buffer pool implementation
 
 #include "packet_buffer_pool.h"
@@ -8,9 +7,7 @@
 namespace fthr {
 
 
-    // ---------------------------------------------------------------------------
     // Construction
-    // ---------------------------------------------------------------------------
 
     PacketBufferPool::PacketBufferPool(size_t pool_size, size_t buffer_capacity)
         : pool_size_(pool_size)
@@ -47,9 +44,7 @@ namespace fthr {
     }
 
 
-    // ---------------------------------------------------------------------------
     // Acquire - lock-free pop
-    // ---------------------------------------------------------------------------
 
     PacketBufferPool::PooledBuffer PacketBufferPool::Acquire() {
         while (true) {
@@ -84,9 +79,7 @@ namespace fthr {
     }
 
 
-    // ---------------------------------------------------------------------------
     // Release - lock-free push
-    // ---------------------------------------------------------------------------
 
     void PacketBufferPool::Release(std::vector<uint8_t>* buffer) {
         if (!buffer) return;
@@ -127,9 +120,7 @@ namespace fthr {
     }
 
 
-    // ---------------------------------------------------------------------------
     // GetAvailableCount - diagnostic only, inherently racy
-    // ---------------------------------------------------------------------------
 
     size_t PacketBufferPool::GetAvailableCount() const {
         uint64_t raw = free_list_.load(std::memory_order_relaxed);

@@ -1,39 +1,7 @@
-// audio_capture.h
-// FTHR Capture Engine - WASAPI Loopback Audio Capture
-//
-// Captures all desktop audio output (everything the user hears) using
-// Windows Audio Session API (WASAPI) in loopback mode. No driver install
-// required - loopback is a built-in Windows feature since Vista.
-//
-// How loopback capture works:
-//   WASAPI lets you open a render device (speakers/headphones) in loopback
-//   mode. Instead of recording a microphone, you record what the OS mixer
-//   is sending to the output device - i.e. all application audio mixed.
-//   This captures game audio, Discord, music, system sounds, everything.
-//
-// Format:
-//   The device mix format is queried at Initialize() time and converted by one
-//   persistent AudioFormatConverter to interleaved float32, 48 kHz, stereo.
-//   AudioEncoder therefore receives one canonical format even for integer,
-//   44.1/96 kHz, mono, 5.1 or 7.1 endpoints.
-//
-// Silence injection:
-//   WASAPI loopback only delivers packets when audio is actively playing.
-//   When nothing is playing (or the buffer comes back with SILENT flag),
-//   AudioCapture synthesizes zero-filled PCM frames for the elapsed period.
-//   This keeps the encoder PTS advancing continuously and prevents gaps in
-//   the audio ring buffer, which would cause audio/video desync in saved clips.
-//
-// Threading model:
-//   CaptureThread() runs on its own dedicated thread started by Start().
-//   It uses event-driven mode: the OS fires buffer_event_ every device
-//   period (~10ms), waking the thread to drain available packets.
-//   EncodeSamples() is called from this thread only.
-//
-// What does NOT live here:
-//   - AAC encoding       -> audio_encoder.h
-//   - Packet ring buffer -> audio_ring_buffer.h
-//   - Per-app mute/volume control -> AudioSessionManager (Phase 2)
+// WASAPI system-loopback capture on a dedicated event-driven thread.
+// Convert endpoint PCM to float32, 48 kHz stereo before encoding. Inject
+// silence during idle periods to keep the audio timeline continuous.
+// AudioEncoder handles AAC; the replay ring owns retained packets.
 
 #pragma once
 #ifndef FTHR_AUDIO_CAPTURE_H
@@ -51,14 +19,10 @@
 
 namespace fthr {
 
-    // Forward declaration
     class AudioRingBuffer;
     class AudioEncoder;
 
 
-    // ---------------------------------------------------------------------------
-    // AudioCaptureConfig
-    // ---------------------------------------------------------------------------
     struct AudioCaptureConfig {
         // Target sample rate and channel count for the canonical replay path.
         // The native endpoint is converted to this format before encoding.
@@ -68,15 +32,11 @@ namespace fthr {
         // AAC encode bitrate passed through to AudioEncoder
         uint32_t bitrate_kbps = 128;
 
-        // Device ID string for future per-device selection (Phase 2).
-        // Leave empty to use the system default render device.
+        // Render device ID; empty selects the system default.
         std::wstring device_id;
     };
 
 
-    // ---------------------------------------------------------------------------
-    // AudioCapture
-    // ---------------------------------------------------------------------------
     class AudioCapture {
     public:
         AudioCapture();
@@ -173,9 +133,7 @@ namespace fthr {
 
 
     private:
-        // -----------------------------------------------------------------------
         // Thread entry point
-        // -----------------------------------------------------------------------
         void CaptureThread();
 
         // Write 'num_frames' frames of silence to the encoder.
@@ -196,17 +154,10 @@ namespace fthr {
         // pointer). Does NOT touch ring_, silence_buf_, or the COM apartment.
         void TeardownWASAPISession();
 
-        // -----------------------------------------------------------------------
-        // WASAPI COM interfaces stored as void* to keep windows.h / mmdeviceapi.h
-        // out of this header. Cast back to their real types inside the .cpp.
-        //
-        //   enumerator_    IMMDeviceEnumerator*
-        //   device_        IMMDevice*
-        //   audio_client_  IAudioClient*
-        //   capture_client_ IAudioCaptureClient*
-        //   mix_format_    WAVEFORMATEX*       (heap-allocated by WASAPI, freed with CoTaskMemFree)
-        //   buffer_event_  HANDLE              (auto-reset event, signals when buffer is ready)
-        // -----------------------------------------------------------------------
+        // Opaque WASAPI interfaces keep Windows headers out of this header.
+        // Types: IMMDeviceEnumerator, IMMDevice, IAudioClient, IAudioCaptureClient.
+        // mix_format_ is a WAVEFORMATEX freed with CoTaskMemFree; buffer_event_
+        // is an auto-reset HANDLE.
         void* enumerator_;
         void* device_;
         void* audio_client_;
@@ -214,29 +165,23 @@ namespace fthr {
         void* mix_format_;
         void* buffer_event_;
 
-        // -----------------------------------------------------------------------
         // Ring buffer reference (not owned) - receives raw PCM float32
-        // -----------------------------------------------------------------------
         AudioRingBuffer* ring_;
         AudioEncoder* encoder_ = nullptr;
 
-        // -----------------------------------------------------------------------
         // Native endpoint format (read from mix_format_ during Initialize).
         uint32_t input_sample_rate_ = 0;
         uint32_t input_channels_ = 0;
         uint32_t input_bytes_per_frame_ = 0;
         std::string input_sample_format_ = "unavailable:not_resolved";
         // Canonical replay format.
-        // -----------------------------------------------------------------------
         uint32_t sample_rate_;
         uint32_t channels_;
         uint32_t requested_sample_rate_ = 48000;
         uint32_t requested_channels_ = 2;
         std::string friendly_name_ = "unavailable:not_resolved";
 
-        // -----------------------------------------------------------------------
         // Thread state
-        // -----------------------------------------------------------------------
         std::thread       capture_thread_;
         std::atomic<bool> running_{ false };
         std::atomic<bool> device_lost_{ false };
@@ -259,11 +204,9 @@ namespace fthr {
         // device (or fall back to default if empty).
         std::wstring device_id_;
 
-        // -----------------------------------------------------------------------
         // Silence injection scratch buffer
         // Pre-allocated in Initialize() to avoid heap alloc in the hot path.
         // Size: preferred_channels * max_expected_frames_per_callback floats.
-        // -----------------------------------------------------------------------
         std::vector<float> silence_buf_;
         std::vector<uint8_t> native_silence_buf_;
         std::vector<float> converted_samples_;

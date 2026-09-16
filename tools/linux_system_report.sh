@@ -1,20 +1,7 @@
 #!/usr/bin/env bash
-# FTHR Clips — Linux environment report.
-#
-# Collects everything needed to reproduce a Linux bug report: distribution,
-# kernel, session type, compositor, GPU, encoders, audio server, toolchain and
-# the FTHR-specific runtime state (socket, lock, shared memory).
-#
-# Attach the output to bug reports.
-#
-# PRIVACY: this deliberately does NOT collect the username, hostname, IP
-# addresses, MAC addresses, machine-id, environment variables other than the
-# handful of session variables that determine which capture backend is chosen,
-# or the contents of any config file. Paths under $HOME are printed as ~/… .
-# Read it before you run it; it only reads, it never changes anything.
-#
-#   bash tools/linux_system_report.sh            # human-readable
-#   bash tools/linux_system_report.sh > report.txt
+# Report Linux capture dependencies and runtime state without changing them.
+# Omit personal identifiers and config contents; abbreviate home paths.
+# Usage: bash tools/linux_system_report.sh > report.txt
 
 set -uo pipefail
 
@@ -27,7 +14,6 @@ _run()    { if _have "$1"; then "$@" 2>&1 | _redact | sed 's/^/  /'; else echo "
 printf 'FTHR Clips — Linux system report\n'
 printf 'generated: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
-# ---------------------------------------------------------------------------
 _h 'Distribution and kernel'
 if [ -r /etc/os-release ]; then
     . /etc/os-release
@@ -42,7 +28,6 @@ if grep -qi microsoft /proc/version 2>/dev/null; then
                            generalise to a bare-metal desktop'
 fi
 
-# ---------------------------------------------------------------------------
 _h 'Session, display server and compositor'
 _kv 'XDG_SESSION_TYPE'     "${XDG_SESSION_TYPE:-}"
 _kv 'XDG_CURRENT_DESKTOP'  "${XDG_CURRENT_DESKTOP:-}"
@@ -65,7 +50,6 @@ else
     _kv 'engine will try'  'no display backend (headless session)'
 fi
 
-# ---------------------------------------------------------------------------
 _h 'Monitors and scaling'
 if _have hyprctl && [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]; then
     hyprctl monitors 2>&1 | grep -E '^Monitor|^\s+[0-9]+x[0-9]+|scale:' | sed 's/^/  /'
@@ -80,7 +64,6 @@ _kv 'GDK_SCALE'          "${GDK_SCALE:-}"
 _kv 'QT_SCALE_FACTOR'    "${QT_SCALE_FACTOR:-}"
 _kv 'QT_ENABLE_HIGHDPI'  "${QT_ENABLE_HIGHDPI_SCALING:-}"
 
-# ---------------------------------------------------------------------------
 _h 'GPU and drivers'
 if _have lspci; then
     lspci -nn 2>/dev/null | grep -Ei 'vga|3d|display' | sed 's/^/  /' || echo '  (none reported)'
@@ -100,7 +83,6 @@ if _have nvidia-smi; then
     nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>&1 | sed 's/^/  /'
 fi
 
-# ---------------------------------------------------------------------------
 _h 'FFmpeg and available encoders'
 if _have ffmpeg; then
     ffmpeg -version 2>/dev/null | head -1 | sed 's/^/  /'
@@ -120,7 +102,6 @@ for lib in libavcodec libavformat libavutil libswscale libswresample libavdevice
     fi
 done
 
-# ---------------------------------------------------------------------------
 _h 'Audio'
 if _have pactl; then
     pactl info 2>&1 | grep -E 'Server String|Server Name|Server Version|Default Sink|Default Source' \
@@ -137,7 +118,6 @@ else
 fi
 pgrep -x pulseaudio >/dev/null 2>&1 && _kv 'pulseaudio' 'running (native)'
 
-# ---------------------------------------------------------------------------
 _h 'Build toolchain'
 _run cmake --version
 _run gcc --version
@@ -145,7 +125,6 @@ _run g++ --version
 _run pkg-config --version
 _have wayland-scanner && _kv 'wayland-scanner' "$(wayland-scanner --version 2>&1)"
 
-# ---------------------------------------------------------------------------
 _h 'Python'
 _kv 'python3' "$(python3 --version 2>&1)"
 python3 - <<'PY' 2>/dev/null | sed 's/^/  /' || echo '  (PySide6 not importable)'
@@ -163,13 +142,11 @@ for m in ('numpy', 'cv2', 'sounddevice', 'keyboard'):
         print(f'{m} MISSING ({type(e).__name__})')
 PY
 
-# ---------------------------------------------------------------------------
 _h 'FTHR external helper tools'
 for t in hyprctl xdotool xprop xrandr grim nc xdg-open wmctrl; do
     p=$(command -v "$t" 2>/dev/null) && _kv "$t" "$p" || _kv "$t" 'NOT FOUND'
 done
 
-# ---------------------------------------------------------------------------
 _h 'FTHR runtime state'
 sock="${XDG_RUNTIME_DIR:-$HOME/.fthr/run}/fthr/hotkey.sock"
 [ -n "${XDG_RUNTIME_DIR:-}" ] || sock="$HOME/.fthr/run/hotkey.sock"

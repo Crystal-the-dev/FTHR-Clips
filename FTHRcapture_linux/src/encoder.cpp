@@ -11,9 +11,7 @@ extern "C" {
 
 namespace fthr {
 
-// ---------------------------------------------------------------------------
 // ApplyPreset — maps P1–P7 to vendor-specific preset strings
-// ---------------------------------------------------------------------------
 
 bool ApplyPreset(AVCodecContext* ctx, const char* codec_name, int p) {
     if (p < 1) p = 1;
@@ -37,10 +35,8 @@ bool ApplyPreset(AVCodecContext* ctx, const char* codec_name, int p) {
         av_opt_set(ctx->priv_data, "preset",     kQsv[p - 1], 0);
         av_opt_set(ctx->priv_data, "look_ahead", "0",         0);
     } else if (strstr(codec_name, "openh264")) {
-        // OpenH264 has no speed preset — it is fast by construction. It does
-        // need explicit rate control, or it ignores bit_rate entirely and the
-        // clip size swings wildly. Frame skipping must stay off: dropped
-        // frames desync the clip against the audio muxed in afterwards.
+        // Set explicit OpenH264 rate control so bit_rate is respected. Disable
+        // frame skipping to keep video aligned with audio muxed after capture.
         av_opt_set(ctx->priv_data, "rc_mode",           "bitrate", 0);
         av_opt_set(ctx->priv_data, "allow_skip_frames", "0",       0);
         av_opt_set(ctx->priv_data, "profile",           "high",    0);
@@ -65,16 +61,14 @@ bool ApplyPreset(AVCodecContext* ctx, const char* codec_name, int p) {
         snprintf(ps, sizeof(ps), "%d", kSvt[p - 1]);
         av_opt_set(ctx->priv_data, "preset", ps, 0);
     } else if (strstr(codec_name, "libaom")) {
-        // libaom-av1: no numeric preset supported — open without preset, this is fine
+        // libaom-av1 has no mapping for this preset scale.
     } else {
         return false;   // unrecognised codec_name
     }
     return true;
 }
 
-// ---------------------------------------------------------------------------
 // TryOpen — attempt to open one codec by name
-// ---------------------------------------------------------------------------
 
 bool Encoder::TryOpen(const char* codec_name, const EncoderConfig& cfg) {
     const AVCodec* codec = avcodec_find_encoder_by_name(codec_name);
@@ -116,9 +110,7 @@ bool Encoder::TryOpen(const char* codec_name, const EncoderConfig& cfg) {
     return true;
 }
 
-// ---------------------------------------------------------------------------
 // Build priority list for Open()
-// ---------------------------------------------------------------------------
 
 static void BuildCodecList(
     CodecPref codec_pref,
@@ -164,9 +156,7 @@ static void BuildCodecList(
     add_backend(EncoderPref::Software);
 }
 
-// ---------------------------------------------------------------------------
 // Open — try codecs in priority order
-// ---------------------------------------------------------------------------
 
 bool Encoder::Open(const EncoderConfig& cfg, std::string& codec_used_out) {
     std::vector<const char*> candidates;
@@ -236,9 +226,6 @@ bool Encoder::Open(const EncoderConfig& cfg, std::string& codec_used_out) {
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Close
-// ---------------------------------------------------------------------------
 
 void Encoder::Close() {
     if (pkt_)       { av_packet_free(&pkt_);       }
@@ -252,9 +239,6 @@ void Encoder::Close() {
     pending_timings_.clear();
 }
 
-// ---------------------------------------------------------------------------
-// EncodeFrame
-// ---------------------------------------------------------------------------
 
 bool Encoder::EncodeFrame(const uint8_t* bgra, uint32_t stride,
                            int64_t wall_time_ns, PushFn push_fn) {
@@ -344,9 +328,6 @@ bool Encoder::EncodeFrame(const uint8_t* bgra, uint32_t stride,
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// GetExtradata
-// ---------------------------------------------------------------------------
 
 std::vector<uint8_t> Encoder::GetExtradata() const {
     if (!codec_ctx_ || !codec_ctx_->extradata || codec_ctx_->extradata_size <= 0)

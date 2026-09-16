@@ -7,7 +7,6 @@ class _SettingsStub:
     def __init__(self) -> None:
         self.settings = {
             'clip_length': 30,
-            'extended_clip_length': 60,
             'framerate': 60,
             'resolution': 'source',
             'bitrate_level': 'high',
@@ -124,7 +123,6 @@ def test_recording_profile_builds_the_encoder_config(monkeypatch):
         capture_height=0,
         capture_bitrate=50_000,
         clip_duration=30,
-        extended_clip_duration=60,
         _active_game_window=None,
     )
     monkeypatch.setattr(main, 'default_windows_monitor_path', lambda choices=None: '')
@@ -148,7 +146,6 @@ def test_invalid_stored_monitor_falls_back_to_primary_monitor(monkeypatch):
         capture_height=1080,
         capture_bitrate=25_000,
         clip_duration=30,
-        extended_clip_duration=60,
         _active_game_window=None,
     )
 

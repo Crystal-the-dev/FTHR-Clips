@@ -15,11 +15,9 @@ if sys.platform == 'win32':
     import ctypes.wintypes as wintypes
 
 
-# ---------------------------------------------------------------------------
 # Window enumeration — Windows only.
 # Returns empty list on Linux: the Linux engine only supports full-desktop
 # capture via wlr-screencopy; per-window targeting is not available.
-# ---------------------------------------------------------------------------
 
 def _get_exe_info(exe_path: str, size: int = 16) -> 'tuple[str | None, QIcon | None]':
     if sys.platform != 'win32':
@@ -86,15 +84,10 @@ def _get_hwnd_exe_path(hwnd: int) -> 'str | None':
 
 
 def _enumerate_capturable_windows():
-    """
-    Return a list of dicts for every visible, titled window that is a
-    reasonable capture target.  Each dict has:
-        hwnd         : int        — Windows window handle / address
-        title        : str        — raw window title bar text
-        display_name : str        — friendly app name
-        is_game      : bool       — heuristic: borderless or full-screen window
-        icon         : QIcon|None — app icon (Windows only)
-    On Linux, uses hyprctl/xdotool instead of Win32 APIs.
+    """List visible, titled capture targets using Win32, hyprctl, or xdotool.
+
+    Records contain hwnd, title, display_name, is_game, and icon (QIcon or None).
+    is_game is a borderless/fullscreen heuristic.
     """
     if sys.platform != 'win32':
         from core.game_detector import _enumerate_linux_windows
@@ -244,9 +237,7 @@ def _restart_style() -> str:
 '''
 
 
-# ---------------------------------------------------------------------------
 # SettingBlock — expandable tile replacing the label+combobox pattern
-# ---------------------------------------------------------------------------
 
 class SettingBlock(QWidget):
     """
@@ -270,7 +261,6 @@ class SettingBlock(QWidget):
         self._option_labels: list[QLabel] = []
         self._setup()
 
-    # ------------------------------------------------------------------
     def _setup(self):
         self.setFixedWidth(self._BLOCK_W)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.MinimumExpanding)
@@ -280,7 +270,7 @@ class SettingBlock(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # --- header (always visible) ---
+        # header (always visible)
         self._header = QFrame()
         self._header.setObjectName('settingHeader')
         self._header.setFixedHeight(52)
@@ -315,7 +305,7 @@ class SettingBlock(QWidget):
         h_layout.addWidget(self._value_widget)
         outer.addWidget(self._header)
 
-        # --- options panel (hidden by default) ---
+        # options panel (hidden by default)
         self._options_frame = QFrame()
         self._options_frame.setObjectName('settingOptions')
         self._options_frame.setStyleSheet(
@@ -343,7 +333,6 @@ class SettingBlock(QWidget):
 
         self._header.mousePressEvent = lambda e: self.toggle()
 
-    # ------------------------------------------------------------------
     def _header_style(self, expanded: bool) -> str:
         border_color = Colors.ACCENT if expanded else Colors.BORDER_HI
         bg = Colors.SURFACE_3 if expanded else Colors.SURFACE_2
@@ -381,7 +370,6 @@ class SettingBlock(QWidget):
         for i, label in enumerate(self._option_labels):
             label.setStyleSheet(self._option_style(self._options[i] == self._current))
 
-    # ------------------------------------------------------------------
     def toggle(self):
         if self._expanded:
             self.collapse()
@@ -407,7 +395,6 @@ class SettingBlock(QWidget):
         self._options_frame.setVisible(False)
         self.updateGeometry()
 
-    # ------------------------------------------------------------------
     def _select(self, option: str):
         self._current = option
         self._value_widget.setText(option)
@@ -466,7 +453,7 @@ class CaptureSettingsWidget(QWidget):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(8)
 
-        # --- Row 1: four expandable setting blocks ---
+        # Row 1: four expandable setting blocks
         settings_row = QHBoxLayout()
         settings_row.setSpacing(8)
         settings_row.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -525,9 +512,7 @@ class CaptureSettingsWidget(QWidget):
 
         main_layout.addLayout(settings_row)
 
-        # ------------------------------------------------------------------
         # Capture source row: Desktop | Window/Game picker
-        # ------------------------------------------------------------------
         source_row = QHBoxLayout()
         source_row.setSpacing(12)
 
@@ -586,9 +571,7 @@ class CaptureSettingsWidget(QWidget):
             if self.current_target_hwnd != prev_hwnd:
                 self._show_restart_button()
 
-        # ------------------------------------------------------------------
         # Hardware encoding status bar (hidden by default)
-        # ------------------------------------------------------------------
         self.hw_status_bar = QFrame()
         self.hw_status_bar.setObjectName('hwStatusBar')
         self._hardware_status_success = False
@@ -661,18 +644,14 @@ class CaptureSettingsWidget(QWidget):
         combo.currentIndexChanged.connect(callback)
         return combo
 
-    # ------------------------------------------------------------------
     # Block management
-    # ------------------------------------------------------------------
 
     def _on_block_opened(self, opened_block):
         for block in self._setting_blocks:
             if block is not opened_block:
                 block.collapse()
 
-    # ------------------------------------------------------------------
     # Signal handlers (block-based)
-    # ------------------------------------------------------------------
 
     def _on_clip_block_changed(self, label: str):
         label_to_sec = {'5s': 5, '10s': 10, '15s': 15, '30s': 30, '45s': 45,
@@ -839,9 +818,7 @@ class CaptureSettingsWidget(QWidget):
                 '1080p': (1920, 1080), '1440p': (2560, 1440),
                 'source': (0, 0)}.get(name, (0, 0))
 
-    # ------------------------------------------------------------------
-    # NEW: Public methods to control hardware encoding status bar
-    # ------------------------------------------------------------------
+    # Hardware encoding status
 
     def show_hardware_encoding_error(self, message: str = None):
         """Show the red error bar when hardware encoding fails"""
@@ -863,9 +840,7 @@ class CaptureSettingsWidget(QWidget):
         from PySide6.QtCore import QTimer
         QTimer.singleShot(3000, self.hide_hardware_encoding_error)
 
-    # ------------------------------------------------------------------
     # Getters
-    # ------------------------------------------------------------------
 
     def get_clip_length(self):    return self.current_clip_length
     def get_framerate(self):      return self.current_framerate

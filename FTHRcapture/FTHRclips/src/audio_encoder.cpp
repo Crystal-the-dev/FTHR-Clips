@@ -1,13 +1,5 @@
-// audio_encoder.cpp
-// FTHR Capture Engine - AAC Audio Encoder implementation
-//
-// Accepts interleaved float32 PCM from WASAPI loopback and encodes it
-// to AAC via FFmpeg's built-in encoder. Accumulates samples until a full
-// 1024-sample frame is ready, then encodes and fires the packet callback.
-//
-// WASAPI delivers interleaved PCM (L,R,L,R,...).
-// FFmpeg's AAC encoder expects planar float (all L, then all R).
-// De-interleaving happens inside EncodeFrame() before avcodec_send_frame.
+// AAC encoding with partial-frame accumulation. Convert interleaved PCM to
+// FFmpeg planar float inside EncodeFrame before submitting each full frame.
 
 #ifdef _MSC_VER
 #if __has_include("pch.h")
@@ -33,9 +25,7 @@ extern "C" {
 namespace fthr {
 
 
-    // ===========================================================================
     // Constructor / Destructor
-    // ===========================================================================
 
     AudioEncoder::AudioEncoder()
         : codec_ctx_(nullptr)
@@ -55,17 +45,6 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
-    // Initialize
-    //
-    // Steps:
-    //   1. Find FFmpeg's built-in AAC encoder
-    //   2. Allocate and configure AVCodecContext
-    //   3. Open codec (writes ASC extradata to codec_ctx_->extradata)
-    //   4. Extract ASC for muxer
-    //   5. Allocate AVFrame + AVPacket
-    //   6. Pre-size accumulation buffer
-    // ===========================================================================
 
     bool AudioEncoder::Initialize(uint32_t       sample_rate,
         uint32_t       channels,
@@ -94,18 +73,12 @@ namespace fthr {
         pts_samples_ = initial_pts_samples;
         accum_frames_ = 0;
 
-        // ------------------------------------------------------------------
-        // Step 1: Find encoder
-        // ------------------------------------------------------------------
         const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
         if (!codec) {
             std::cerr << "[AudioEncoder] AAC encoder not found - check FFmpeg build" << std::endl;
             return false;
         }
 
-        // ------------------------------------------------------------------
-        // Step 2: Configure codec context
-        // ------------------------------------------------------------------
         codec_ctx_ = avcodec_alloc_context3(codec);
         if (!codec_ctx_) {
             std::cerr << "[AudioEncoder] avcodec_alloc_context3 failed" << std::endl;
@@ -122,12 +95,8 @@ namespace fthr {
         // in stream->codecpar->extradata for the MP4 container.
         codec_ctx_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
-        // Set channel layout (new FFmpeg 5.x+ API)
         av_channel_layout_default(&codec_ctx_->ch_layout, static_cast<int>(channels_));
 
-        // ------------------------------------------------------------------
-        // Step 3: Open codec
-        // ------------------------------------------------------------------
         int ret = avcodec_open2(codec_ctx_, codec, nullptr);
         if (ret < 0) {
             std::cerr << "[AudioEncoder] avcodec_open2 failed: " << ret << std::endl;
@@ -136,10 +105,7 @@ namespace fthr {
             return false;
         }
 
-        // ------------------------------------------------------------------
-        // Step 4: Extract ASC extradata
-        // Populated by avcodec_open2 when AV_CODEC_FLAG_GLOBAL_HEADER is set.
-        // ------------------------------------------------------------------
+        // avcodec_open2 supplies ASC when AV_CODEC_FLAG_GLOBAL_HEADER is set.
         if (codec_ctx_->extradata && codec_ctx_->extradata_size > 0) {
             extradata_.assign(codec_ctx_->extradata,
                 codec_ctx_->extradata + codec_ctx_->extradata_size);
@@ -151,9 +117,6 @@ namespace fthr {
                 << "audio stream may not play in all players" << std::endl;
         }
 
-        // ------------------------------------------------------------------
-        // Step 5: Allocate AVFrame + AVPacket
-        // ------------------------------------------------------------------
         frame_ = av_frame_alloc();
         if (!frame_) {
             std::cerr << "[AudioEncoder] av_frame_alloc failed" << std::endl;
@@ -187,10 +150,7 @@ namespace fthr {
             return false;
         }
 
-        // ------------------------------------------------------------------
-        // Step 6: Pre-size accumulation buffer
-        // Maximum content: one full 1024-sample frame, all channels, interleaved.
-        // ------------------------------------------------------------------
+        // Reserve one full AAC frame of interleaved samples for every channel.
         accum_buf_.resize(static_cast<size_t>(channels_) * 1024, 0.0f);
         accum_frames_ = 0;
 
@@ -205,14 +165,8 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
-    // EncodeSamples
-    //
-    // Accepts arbitrary-length interleaved float32 PCM.
-    // Accumulates into accum_buf_ until a full 1024-sample frame is ready,
-    // then calls EncodeFrame(). May produce zero, one, or multiple callbacks
-    // per call depending on how many full frames are available.
-    // ===========================================================================
+    // Accumulate interleaved float32 PCM and encode each full AAC frame.
+    // One input chunk can produce zero or multiple packet callbacks.
 
     bool AudioEncoder::EncodeSamples(const float* pcm_data, uint32_t num_samples)
     {
@@ -247,12 +201,10 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
     // EncodeFrame (private)
     //
     // De-interleave accum_buf_ into planar AVFrame, send to codec,
     // drain any output packets and fire the callback.
-    // ===========================================================================
 
     bool AudioEncoder::EncodeFrame()
     {
@@ -311,12 +263,10 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
     // Finalize
     //
     // Flushes any partial frame (zero-padded), drains the codec,
     // and frees all FFmpeg resources.
-    // ===========================================================================
 
     bool AudioEncoder::Finalize()
     {
@@ -375,9 +325,6 @@ namespace fthr {
     }
 
 
-    // ===========================================================================
-    // GetExtradata
-    // ===========================================================================
 
     std::vector<uint8_t> AudioEncoder::GetExtradata() const {
         return extradata_;

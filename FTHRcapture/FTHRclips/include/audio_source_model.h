@@ -1,9 +1,5 @@
-// audio_source_model.h
-// Common, clip-local audio-source contracts for AUDIT-050.
-//
-// This file deliberately contains no Windows process handles, executable paths,
-// or shared-memory fields.  Those are runtime-provider details; a completed
-// clip needs only durable, privacy-bounded source semantics.
+// Clip-local audio identities and states, independent of Windows handles,
+// paths, and shared memory. Only portable metadata belongs in manifests.
 
 #pragma once
 #ifndef FTHR_AUDIO_SOURCE_MODEL_H

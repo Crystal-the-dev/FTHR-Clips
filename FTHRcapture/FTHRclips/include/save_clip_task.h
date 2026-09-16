@@ -1,19 +1,7 @@
-// save_clip_task.h
-// FTHR Capture Engine - Async SaveClip task queue
-//
-// SaveClipTask supports two video paths and a bounded set of audio tracks:
-//
-//   VIDEO - use_encoded_path = false (x264 fallback):
-//     start_frame_idx / frame_count index into the raw FramePool.
-//
-//   VIDEO - use_encoded_path = true (NVENC path):
-//     encoded_snapshot holds a deep copy of packets from EncodedRingBuffer.
-//     MuxEncodedClip() wraps them in an MP4 with no re-encoding.
-//
-//   AUDIO:
-//     encoded_audio_tracks holds clip-local persistent AAC snapshots.  Each
-//     track owns real source metadata and is muxed without re-encoding.  The
-//     legacy raw-PCM fields remain only for non-production compatibility.
+// Queued clip-save data owned by the save worker.
+// Compressed saves carry video packets, codec configuration, and per-source
+// AAC snapshots for muxing. Raw frame indices and PCM fields support the
+// legacy path only.
 
 #pragma once
 #ifndef FTHR_SAVE_CLIP_TASK_H
@@ -35,7 +23,6 @@
 namespace fthr {
 
 
-    // Forward declarations
     struct SharedMemoryLayout;
 
     // A source exists here only after its provider has emitted real packets for
@@ -55,37 +42,25 @@ namespace fthr {
     };
 
 
-    // ---------------------------------------------------------------------------
-    // SaveClipTask
-    // ---------------------------------------------------------------------------
     struct SaveClipTask {
         std::wstring output_path;
         uint32_t     duration_seconds = 0;
 
-        // ------------------------------------------------------------------
         // VIDEO: Encoded path (NVENC) - use_encoded_path = true
-        // ------------------------------------------------------------------
         bool                use_encoded_path = false;
         EncodedRingSnapshot encoded_snapshot;
         uint32_t            enc_width = 0;
         uint32_t            enc_height = 0;
 
-        // ------------------------------------------------------------------
-        // VIDEO: Raw frame path (x264 fallback) - use_encoded_path = false
-        // ------------------------------------------------------------------
+        // Legacy raw-frame path: use_encoded_path = false.
         size_t   start_frame_idx = 0;
         size_t   frame_count = 0;
         uint32_t src_width = 0;
         uint32_t src_height = 0;
 
-        // ------------------------------------------------------------------
-        // AUDIO: Raw PCM snapshot - present on both video paths.
-        //
-        // has_audio = false: audio capture not running, mux video-only.
-        // has_audio = true:  audio_snapshot contains float32 PCM.
-        //   MuxEncodedClip() encodes it to AAC on SaveClipThread.
-        //   audio_bitrate_kbps: AAC target bitrate (default 128).
-        // ------------------------------------------------------------------
+        // Legacy PCM fallback: has_audio selects the owned float32 snapshot.
+        // MuxEncodedClip encodes it using audio_bitrate_kbps; production saves use
+        // encoded_audio_tracks.
         bool             has_audio = false;
         AudioPCMSnapshot audio_snapshot;
         uint32_t         audio_bitrate_kbps = 128;
@@ -107,29 +82,17 @@ namespace fthr {
         // UI's combined-mode finalizer collapses those streams after commit.
         bool separate_audio_enabled = false;
 
-        // ------------------------------------------------------------------
         // Shared fields
-        // ------------------------------------------------------------------
         uint32_t fps = 60;
         uint32_t bitrate_kbps = 16000;
 
-        // 0 = stretch, 1 = fit/letterbox. Forwarded to VideoEncoder for the
-        // x264 fallback path; ignored on the NVENC mux-only path.
+        // 0 = stretch, 1 = fit/letterbox for legacy raw encoding.
+        // Encoded snapshots already have their final geometry.
         uint32_t scaling_mode = 0;
 
-        // ------------------------------------------------------------------
-        // Video QPC epoch (NVENC path only).
-        //
-        // Video PTS P was captured at real wall-clock time:
-        //   qpc_of_packet = video_qpc_epoch + (P * video_qpc_freq / fps)
-        //
-        // WASAPI stores audio timestamps in 100ns units (pu64QPCPosition).
-        // To convert a raw QPC value to 100ns units: raw * 10_000_000 / qpc_freq.
-        // To convert audio 100ns to seconds: value / 10_000_000.
-        //
-        // MuxEncodedClip uses these to compute audio_aligned_start_sample
-        // without any estimation - pure clock arithmetic in the same domain.
-        // ------------------------------------------------------------------
+        // Legacy video clock mapping: QPC = epoch + PTS * qpc_freq / fps.
+        // WASAPI timestamps use 100 ns units: divide by 10,000,000 for seconds, or
+        // multiply raw QPC by 10,000,000 / qpc_freq to compare in the same domain.
         int64_t  video_qpc_epoch = 0;   // encode_start_qpc_ from HardwareEncoder
         int64_t  video_qpc_freq = 0;   // qpc_freq_ (counts/second)
 
@@ -138,9 +101,6 @@ namespace fthr {
     };
 
 
-    // ---------------------------------------------------------------------------
-    // SaveClipQueue
-    // ---------------------------------------------------------------------------
     class SaveClipQueue {
     public:
         static constexpr size_t kMaxPendingTasks = 4;

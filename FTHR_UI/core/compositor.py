@@ -1,13 +1,6 @@
-"""
-Detect the running compositor/display server once at startup.
+"""Detect and cache the compositor/display server.
 
-Return values (str):
-  'hyprland'        — Hyprland (wlroots-based)
-  'kwin'            — KDE Plasma / KWin (Wayland or X11)
-  'gnome'           — GNOME / Mutter
-  'x11'             — Pure X11 session (any compositor)
-  'wayland-unknown' — Wayland but compositor not recognised
-  'none'            — No display at all (headless, CI)
+Results: hyprland, kwin, gnome, x11, wayland-unknown, or none (headless).
 """
 import os
 import shutil

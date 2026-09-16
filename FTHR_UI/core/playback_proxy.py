@@ -1,0 +1,140 @@
+"""Disposable seek-friendly previews for old media with long GOPs.
+
+Original media, editor metadata and exports always keep their original path.
+Failures simply retain original playback; only complete previews enter cache.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import threading
+
+from core.ffmpeg_tools import get_ffmpeg_exe, get_ffprobe_exe, software_video_args
+from core.media_process import run_media_process
+
+CACHE_DIR = Path.home() / '.fthr' / 'playback'
+
+
+def _cache_path(source: str) -> Path:
+    info = os.stat(source)
+    identity = f'{os.path.normcase(os.path.abspath(source))}|{info.st_size}|{info.st_mtime_ns}|gop30-v1'
+    return CACHE_DIR / (hashlib.sha256(identity.encode('utf-8')).hexdigest() + '.mp4')
+
+
+def cached_playback_path(source: str) -> str:
+    try:
+        path = _cache_path(source)
+        if path.is_file() and path.stat().st_size > 0:
+            return str(path)
+    except OSError:
+        # Missing or unreadable cache data is a miss; the original remains playable.
+        pass
+    return source
+
+
+def discard_playback_cache(source: str, cached: str) -> None:
+    try:
+        expected = _cache_path(source)
+        if Path(cached) == expected:
+            expected.unlink(missing_ok=True)
+    except OSError:
+        # A locked/missing disposable preview cannot prevent original playback.
+        pass
+
+
+def needs_seek_proxy(packets: list[dict]) -> bool:
+    """Require measured >2-second keyframe gaps; never guess from probe failure."""
+    last_keyframe = None
+    for packet in packets:
+        try:
+            pts = float(packet['pts_time'])
+        except (KeyError, TypeError, ValueError):
+            # Malformed packet metadata is not evidence of a long keyframe gap.
+            continue
+        if not math.isfinite(pts):
+            continue
+        if last_keyframe is not None and pts - last_keyframe > 2.1:
+            return True
+        if 'K' in packet.get('flags', ''):
+            last_keyframe = pts
+    return False
+
+
+def prepare_playback_path(source: str, cancelled: threading.Event) -> str:
+    """Probe at most eight seconds, then build one bounded optional preview."""
+    temporary = None
+    try:
+        cached = cached_playback_path(source)
+        if cached != source or cancelled.is_set():
+            return cached
+        target = _cache_path(source)
+        probe = run_media_process(
+            [get_ffprobe_exe(), '-v', 'error', '-select_streams', 'v:0',
+             '-read_intervals', '0%+8', '-show_entries',
+             'packet=pts_time,flags:format=duration:stream=color_transfer',
+             '-of', 'json', source], cancelled, timeout_seconds=4)
+        if probe is None or probe[0] != 0:
+            return source
+        document = json.loads(probe[1])
+        if any(stream.get('color_transfer') in {'smpte2084', 'arib-std-b67'}
+               for stream in document.get('streams', [])):
+            return source  # Keep HDR on its original, color-managed decoder path.
+        duration = float(document.get('format', {}).get('duration', 0))
+        if not math.isfinite(duration) or not 0 < duration <= 300:
+            return source
+        packets = document.get('packets', [])
+        if not needs_seek_proxy(packets):
+            return source
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(f'.{os.getpid()}-{threading.get_ident()}.partial.mp4')
+        ffmpeg = get_ffmpeg_exe()
+        result = run_media_process(
+            [ffmpeg, '-v', 'error', '-nostdin', '-y', '-threads', '2',
+             '-filter_threads', '1', '-i', source, '-map', '0:v:0', '-map', '0:a?',
+             *software_video_args(16000, ffmpeg), '-threads:v', '2',
+             '-c:a', 'copy', '-movflags', '+faststart', str(temporary)],
+            cancelled, timeout_seconds=120)
+        if (result is None or result[0] != 0 or cancelled.is_set()
+                or _cache_path(source) != target
+                or temporary.stat().st_size > 2 * 1024**3):
+            return source
+        checked = run_media_process(
+            [get_ffprobe_exe(), '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'json', str(temporary)], cancelled, timeout_seconds=4)
+        if checked is None or checked[0] != 0 or cancelled.is_set():
+            return source
+        preview_duration = float(json.loads(checked[1])['format']['duration'])
+        if not math.isfinite(preview_duration) or abs(preview_duration - duration) > 0.2:
+            return source
+        os.replace(temporary, target)
+        # Cache data is disposable. Keep at most eight previews / 2 GiB,
+        # excluding the one about to be opened. Locked Windows files stay put.
+        entries = sorted(CACHE_DIR.glob('*.mp4'), key=lambda p: p.stat().st_mtime,
+                         reverse=True)
+        total = target.stat().st_size
+        kept = 1
+        for entry in entries:
+            if entry == target or '.partial.' in entry.name:
+                continue
+            total += entry.stat().st_size
+            kept += 1
+            if kept > 8 or total > 2 * 1024**3:
+                try:
+                    entry.unlink()
+                except OSError:
+                    # Another open editor can hold a Windows cache file; eviction is best effort.
+                    pass
+        return str(target)
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, KeyError):
+        # Preview optimization is optional and must not block source playback.
+        return source
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                # Cancellation cleanup must not replace a successfully returned source path.
+                pass

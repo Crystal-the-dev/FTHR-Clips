@@ -1,11 +1,7 @@
-"""Shared pytest setup.
+"""Shared pytest setup for the uninstalled FTHR_UI source tree.
 
-The app is not an installed package — `FTHR_UI` is a plain source directory
-that main.py runs from, and PyInstaller is pointed at it via `pathex`. Tests
-therefore add it to sys.path. Centralizing that setup prevents import order from
-becoming significant.
-
-Existing per-module inserts are harmless duplicates and were left alone.
+Add the UI directory to sys.path centrally so test imports do not depend
+on collection order.
 """
 
 import os

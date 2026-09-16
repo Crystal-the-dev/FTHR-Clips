@@ -1,15 +1,7 @@
-# requirements-dev.txt — pinned tooling for tests, linting and packaging.
-#
-# Install on top of the runtime lock:
-#
-#     python -m pip install -r requirements-alpha.txt -r requirements-dev.txt
-#
-# Kept separate because none of this ships inside the artifact. CI installs
-# both; a release build installs only requirements-alpha.txt.
-#
-# Verified on: Windows 10 x64, CPython 3.14.3, 2026-08-06.
+# Pinned development tools; install alongside requirements-alpha.txt.
+# These tools support testing, linting, and packaging and are not bundled.
 
-# --- Test ------------------------------------------------------------------
+# Test
 pytest==9.1.1
 pytest-qt==4.5.0
 iniconfig==2.3.0          # via pytest
@@ -19,10 +11,10 @@ colorama==0.4.6           # via pytest on Windows
 Pygments==2.20.0          # via pytest
 typing_extensions==4.15.0 # via pytest-qt
 
-# --- Lint ------------------------------------------------------------------
+# Lint
 ruff==0.16.1
 
-# --- Packaging (Windows + Linux bundles) -----------------------------------
+# Packaging (Windows + Linux bundles)
 pyinstaller==6.19.0
 pyinstaller-hooks-contrib==2026.4
 altgraph==0.17.5          # via pyinstaller

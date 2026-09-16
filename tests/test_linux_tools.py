@@ -1,10 +1,4 @@
-"""Tests for central external-tool resolution (AUDIT: bare-name subprocess calls).
-
-The code used to run `grim`, `hyprctl`, `xdotool`, `nc` and `xdg-open` by bare
-name, so PATH decided which binary executed. These tests manipulate PATH and
-assert that resolution is explicit, absolute, cached, and that a missing tool
-produces a usable message instead of a swallowed FileNotFoundError.
-"""
+"""Check absolute, cached helper resolution and missing-tool diagnostics."""
 
 import os
 import stat
@@ -34,9 +28,7 @@ def _make_fake_tool(directory, name, body='#!/bin/sh\necho fake\n'):
     return p
 
 
-# ---------------------------------------------------------------------------
 # Resolution
-# ---------------------------------------------------------------------------
 
 @pytest.mark.skipif(sys.platform == 'win32',
                     reason='Linux helper tools are not resolved on Windows')
@@ -78,13 +70,7 @@ def test_require_raises_with_context(tmp_path, monkeypatch):
 
 @pytest.mark.skipif(sys.platform == 'win32', reason='POSIX PATH semantics')
 def test_earlier_path_entry_wins_and_is_visible(tmp_path, monkeypatch):
-    """A shadowing binary earlier in PATH must be *visible*, not silent.
-
-    This is the scenario the change was made for: a writable directory early in
-    PATH substituting a helper. We cannot stop PATH from working the way PATH
-    works, but resolving once to an absolute path means the choice is logged
-    and inspectable rather than implicit at every call site.
-    """
+    """A PATH override must appear explicitly in the resolved helper path."""
     first = tmp_path / 'first'
     second = tmp_path / 'second'
     first.mkdir()
@@ -108,9 +94,7 @@ def test_non_executable_file_is_not_a_tool(tmp_path, monkeypatch):
     assert not linux_tools.available('grim')
 
 
-# ---------------------------------------------------------------------------
 # Caching
-# ---------------------------------------------------------------------------
 
 @pytest.mark.skipif(sys.platform == 'win32', reason='POSIX PATH semantics')
 def test_resolution_is_cached(tmp_path, monkeypatch):
@@ -124,9 +108,7 @@ def test_resolution_is_cached(tmp_path, monkeypatch):
     assert linux_tools.path('grim') is None, 'reset_cache must re-resolve'
 
 
-# ---------------------------------------------------------------------------
 # Classification and reporting
-# ---------------------------------------------------------------------------
 
 def test_required_and_optional_are_distinguished():
     assert linux_tools.tool('grim').required is True
@@ -150,9 +132,7 @@ def test_windows_never_resolves_linux_tools(monkeypatch, tmp_path):
     assert linux_tools.path('grim') is None
 
 
-# ---------------------------------------------------------------------------
 # Integration: the generated hotkey command must carry resolved values
-# ---------------------------------------------------------------------------
 
 @pytest.mark.skipif(sys.platform == 'win32', reason='Linux hotkey socket')
 def test_generated_socket_command_uses_resolved_nc_and_private_path(
@@ -198,5 +178,5 @@ def test_displayed_hotkey_instructions_use_private_socket(
 
     assert '/tmp/fthr_hotkey.sock' not in instructions
     assert str(linux_runtime.hotkey_socket_path(create_dir=False)) in instructions
-    for action in ('save_clip', 'save_extended_clip', 'save_screenshot'):
+    for action in ('save_clip', 'save_screenshot'):
         assert action in instructions

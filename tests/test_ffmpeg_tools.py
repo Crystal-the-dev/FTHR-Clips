@@ -1,11 +1,4 @@
-"""Regression tests for AUDIT-005 — LGPL-only FFmpeg usage.
-
-Two things must stay true forever:
-  1. FTHR never asks for a GPL-only encoder (libx264 / libx265).
-  2. A missing ffmpeg produces a clear, reportable error instead of a silent
-     no-op (the old imageio-ffmpeg path degraded silently on Windows because
-     the binary was never bundled at all).
-"""
+"""Check bundled encoder selection and reporting when FFmpeg is unavailable."""
 import re
 import sys
 from pathlib import Path
@@ -30,7 +23,7 @@ def _clear_cache():
     reset_cache()
 
 
-# ── encoder selection ──────────────────────────────────────────────────────
+# encoder selection
 
 def test_software_args_never_request_gpl_encoders(monkeypatch):
     """The whole point of AUDIT-005: no x264/x265 in any ffmpeg invocation."""
@@ -145,7 +138,7 @@ def test_probe_falls_back_when_ffmpeg_unrunnable():
     assert ffmpeg_tools._probe_encoders('definitely-not-a-real-binary') == 'libopenh264'
 
 
-# ── binary resolution ──────────────────────────────────────────────────────
+# binary resolution
 
 def test_missing_ffmpeg_raises_reportable_error(monkeypatch):
     """Must raise, not return None — the old code returned silently and the
@@ -186,7 +179,7 @@ def test_bundled_ffmpeg_is_found_in_dev_checkout():
     assert Path(get_ffmpeg_exe()).is_file()
 
 
-# ── the source tree itself must stay clean ─────────────────────────────────
+# the source tree itself must stay clean
 
 def test_no_source_file_hardcodes_gpl_encoders():
     """Guards against someone re-adding '-c:v libx264' to a new ffmpeg call."""

@@ -1,12 +1,7 @@
-"""Theme color, typography, icon, and notification-sound customization.
+"""Persist color, typography, icon, and sound themes under ~/.fthr/theme/.
 
-Handles colors (hex tokens that feed the QSS), typography, icons (PNG/SVG
-swaps), and sounds (the little blip when you grab a clip). All of it persists
-under ~/.fthr/theme/, and complete themes can be exported or imported.
-
-Themes are loaded once at startup and QSS is regenerated only when the user
-applies changes, avoiding repeated whole-tree restyling during color selection.
-Merging with defaults keeps older theme files compatible with new color tokens.
+Merge defaults when loading older themes. Regenerate QSS on Apply to avoid
+restyling the widget tree on every color-picker change.
 """
 from __future__ import annotations
 
@@ -176,7 +171,7 @@ class ThemeManager:
 
         self._data = self._load()
 
-    # ─── Persistence ──────��───────────────────────────────────────────────
+    # Persistence ──────��
 
     def _load(self) -> dict:
         default = {
@@ -239,7 +234,7 @@ class ThemeManager:
             except OSError:
                 pass
 
-    # ─── Color access ─────────────────────────────────────────────────────
+    # Color access
 
     def get_color(self, token: str) -> str:
         # The '#ff00ff' fallback is deliberate: if you ever see screaming magenta
@@ -262,7 +257,7 @@ class ThemeManager:
     def is_color_default(self, token: str) -> bool:
         return self._data['colors'].get(token) == DEFAULT_COLORS.get(token)
 
-    # ─── Icon access ──────────────────────────────────────────────────────
+    # Icon access
 
     def get_custom_icon_path(self, filename: str) -> Optional[Path]:
         rel = self._data['icons'].get(filename)
@@ -288,7 +283,7 @@ class ThemeManager:
             if full.exists():
                 full.unlink(missing_ok=True)
 
-    # ─── Sound access ─────────────────────────────────────────────────────
+    # Sound access
 
     def get_custom_sound_path(self, key: str) -> Optional[Path]:
         rel = self._data['sounds'].get(key)
@@ -313,7 +308,7 @@ class ThemeManager:
             if full.exists():
                 full.unlink(missing_ok=True)
 
-    # ─── Icon tint access ─────────────────────────────────────────────
+    # Icon tint access
 
     def get_icon_tint(self, filename: str) -> str:
         tints = self._data.get('icon_tints', {})
@@ -339,7 +334,7 @@ class ThemeManager:
     def reset_all_icon_tints(self):
         self._data['icon_tints'] = {'_global': DEFAULT_ICON_TINT}
 
-    # ─── Capture card color access ────────────────────────────────────
+    # Capture card color access
 
     def get_capture_card_color(self, key: str) -> str:
         return self._data.get('capture_card', {}).get(
@@ -355,7 +350,7 @@ class ThemeManager:
     def reset_capture_card_colors(self):
         self._data['capture_card'] = dict(DEFAULT_CAPTURE_CARD_COLORS)
 
-    # ─── Typography access ────────────────────────────────────────────
+    # Typography access
 
     def get_font(self, role: str) -> str:
         return str(self._data.get('fonts', {}).get(
@@ -398,7 +393,7 @@ class ThemeManager:
                 result[str(family)] = path
         return result
 
-    # ─── Export / Import ──────────────────────────────────────────────────
+    # Export / Import
 
     def export_theme(self, dest_zip: Path) -> bool:
         """Bundle the entire theme (colors, fonts, icons, and sounds) into a ZIP."""
@@ -504,7 +499,7 @@ class ThemeManager:
             print(f'[Theme] Import failed: {e}')
             return False
 
-    # ─── Utility ──────────────────────────────────────────────────────────
+    # Utility
 
     @property
     def icons_dir(self) -> Path:

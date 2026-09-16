@@ -1,9 +1,7 @@
-"""Low-latency playback for notification and customization sounds.
+"""Play cached notification and customization sounds.
 
-Short WAV cues use ``QSoundEffect`` because it is designed for preloaded,
-low-latency effects. Imported formats that QSoundEffect does not support use a
-cached ``QMediaPlayer`` and wait for the local file to finish loading before
-starting playback.
+Preload WAV cues with QSoundEffect. Other formats use QMediaPlayer and
+start after their local file has loaded.
 """
 
 from __future__ import annotations

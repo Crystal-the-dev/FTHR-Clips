@@ -1,13 +1,7 @@
-"""Bounded, privacy-conscious field diagnostics for alpha support.
+"""Collect bounded diagnostics for user-exported support ZIPs.
 
-The alpha support model is deliberately offline: a tester reproduces a
-problem, explicitly exports a ZIP, and sends it to the developers.  This
-module provides the session correlation, structured event stream, bounded
-engine log, hardware summary, and redacted export used by that workflow.
-
-Nothing in this module runs in a capture/audio frame loop.  Producers only
-enqueue small transition, timing, error, or aggregate-health events; a daemon
-thread performs disk I/O.
+Producers enqueue session, timing, error, and health events; a daemon writes
+them to disk. Capture/audio loops perform no diagnostic file I/O.
 """
 
 from __future__ import annotations
@@ -91,6 +85,8 @@ class DiagnosticError(str, Enum):
     EXPORT_PROCESS_FAILED = 'EXPORT_PROCESS_FAILED'
     EXPORT_STALLED = 'EXPORT_STALLED'
     LIBRARY_SCAN_FAILED = 'LIBRARY_SCAN_FAILED'
+    LIBRARY_ROOT_UNAVAILABLE = 'LIBRARY_ROOT_UNAVAILABLE'
+    LIBRARY_SCAN_CANCELLED = 'LIBRARY_SCAN_CANCELLED'
 
 
 def _utc_now() -> str:
