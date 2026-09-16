@@ -1,6 +1,6 @@
-# FTHR Clips 1.0.0-alpha
+# FTHR Clips 1.1.0-alpha
 
-This is a local alpha build for qualification work. It is not approved for public release.
+This is the first patched alpha release.
 
 ## What is in here
 
@@ -15,7 +15,7 @@ This is a local alpha build for qualification work. It is not approved for publi
 
 ## Current status
 
-This build is still being validated, not distributed publicly.
+This build is ready for public testing.
 
 - NVIDIA H.264/HEVC/AV1 stall fixes are integrated and covered by automated
   lifecycle tests. A complete physical Windows qualification after those fixes
@@ -30,19 +30,4 @@ This build is still being validated, not distributed publicly.
   Wayland/X11 capture, audio, hotkeys, and multi-monitor behaviour remain
   physically unverified.
 
-## Linux AppImage location
 
-The AppImage is not checked in to the repo. It is generated locally by running:
-
-```bash
-bash build_linux.sh
-```
-
-Then it lands in:
-
-```text
-build_output/FTHRClips-1.0.0-alpha-x86_64.AppImage
-```
-
-This path is a local build artifact. Passing the package gates does not make it
-a public-release-qualified or physically qualified Linux build.
