@@ -174,6 +174,15 @@ Issues and PRs are welcome. Please open an issue first for significant changes s
 - Code style: standard Python (no formatter enforced yet)
 - C++ style: match the existing code
 
+AI-Generated Contributions
+
+The use of generative AI when contributing to this repository is generally permitted with the following exceptions:
+
+any AI-assisted contribution that affect any security-critical systems, privacy, data handling, encryption, authentication, update mechanisms, must be reviewed by a competent human contributor, gary does not count.
+
+All creative work that is part of your contribution, including icons, illustrations, audio, music, and sound effects, must be fully created by human artists. 
+AI is a tool to assist, not a replacement for human creativity.
+
 ---
 
 ## License
@@ -215,3 +224,13 @@ Licence texts: [`licenses/`](licenses/), also installed alongside the app.
 | [Recording reliability changes](docs/recording-reliability-2026-09-16.md) | Manual recording, faster finalization, focus recovery, and validation results |
 | [`SECURITY.md`](SECURITY.md) | Reporting a security issue |
 | [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | Every bundled component and its licence |
+
+
+## Transparency
+Note about AI usage
+
+AI tools were used to review and edit parts of the code. (also the comments cuz I'm lazy)
+
+NONE of the assets used on both app and website were created with AI.
+
+All changes made by AI were reviewed/corrected by human contributors.
