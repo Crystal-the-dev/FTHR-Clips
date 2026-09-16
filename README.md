@@ -2,7 +2,7 @@
 
 # FTHR Clips
 
-**Local instant replay for Windows. Hit a hotkey and save the moment that just happened.**
+**Instant Replay, Recordings and Screenshots with easy sharing and editing tools built in, right on your Windows or Linux PC—local first.**
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20experimental-lightgrey)](KNOWN_ISSUES.md)
@@ -19,12 +19,7 @@
 
 ## What it does
 
-FTHR Clips records your screen in the background at all times. When something clip-worthy happens, you hit a hotkey and it saves the last N seconds as a clip. No upload required, no account, no subscription.
-
-It runs as a tray icon. You forget it's there until you need it.
-
-For the September library, playback and idle-capture fixes, see the
-[reliability patch notes and validation results](RELIABILITY_PATCH.md).
+FTHRClips run silently in the background capturing your game and when you press a hotkey it saves the clip. But unlike other applications FTHRClips is built to protect your privacy and doesn't depend on a network connection.
 
 ---
 
@@ -39,7 +34,7 @@ For the September library, playback and idle-capture fixes, see the
 | **Capture** | Monitor selection and scaling modes |
 | **Hotkeys** | Global hotkeys via Hyprland binds (Linux) or system hooks (Windows); Windows supports controller chords |
 | **Hotkeys** | Save clip · Start/stop · Dismiss notification |
-| **Audio** | System-output and microphone tracks; Windows 11 per-app stems are code-ready but still require hardware qualification |
+| **Audio** | System-output and microphone tracks; Windows 11 per-app stems are code-ready but still require hardware qualification (aka we fucked up and it didn't work)|
 | **Post-processing** | Watermark overlay |
 | **Post-processing** | Webcam overlay (picture-in-picture) |
 | **Post-processing** | Windows third-party keyboard window overlay with live chroma-key color picking and intensity control |
@@ -53,16 +48,10 @@ For the September library, playback and idle-capture fixes, see the
 
 ## Download
 
-There is currently **no public-release-qualified build**. Local alpha artifacts
-must not be published until the signing and physical gaps in `KNOWN_ISSUES.md`
-are closed.
+you can download a ready installer or app image right on our downloads page 
+downloads.fthrclips.com
+or compile the code yourself with this repo.
 
-| Platform | Current status |
-|----------|----------------|
-| Linux | `build_output/FTHRClips-1.0.0-alpha-x86_64.AppImage` after a local build |
-| Windows | `FTHRClips-Setup-<version>-x64.exe` after local signing/qualification |
-
----
 
 ## Linux Setup
 
@@ -101,13 +90,6 @@ fixed terminate/kill/reap deadline if an XCB reply ignores the normal interrupt
 callback. XWayland is deliberately not used as a fallback for unsupported
 Wayland compositors because it can expose a black root window.
 
-**Hotkeys (default):**
-
-| Key | Action |
-|-----|--------|
-| `F9` | Save clip (last 30 s) |
-| `F12` | Save screenshot |
-| `F8` | Confirm game detection prompt |
 
 ---
 
@@ -173,16 +155,14 @@ The native capture engine runs as a separate process and communicates with the
 Python UI via shared memory. Windows uses WGC/DXGI capture with the selected
 NVENC, AMF, or QSV encoder and WASAPI audio. Linux uses supported Wayland
 capture protocols or native X11/RandR with FFmpeg and PulseAudio-compatible
-audio. Native X11 remains physically unqualified and XWayland fallback is
-refused. Platform hotkey activation is
+audio. Platform hotkey activation is
 forwarded by the UI through the same shared-memory command contract; Linux also
 uses an owner-only Unix socket for compositor key bindings.
 
-Upload networking is not part of Core. The uploader is a dormant verified
-package installed only after accepting its terms and privacy policy. Lustful
-requires an additional, separately consented Hardware Identity package; Catbox
-never installs or invokes it. The package boundary and notices are enforced by
-the release verifiers and documented in `THIRD_PARTY_NOTICES.md`.
+the uploader is separate from the main app and doesn't work unless deliberately installed. 
+Even after it installing it only connects when you allow it to.
+please note that all clips uploaded to third party services fall under their terms and privacy policy:
+`THIRD_PARTY_NOTICES.md`.
 
 ---
 
@@ -202,7 +182,7 @@ Issues and PRs are welcome. Please open an issue first for significant changes s
 [GNU General Public License v3](LICENSE) (`GPL-3.0-only`).** You may use,
 study, modify, and redistribute it under those terms.
 
-Copyright © 2026 FTHR Community. The program comes without warranty; see the
+Copyright © 2026 FTHR Software. The program comes without warranty; see the
 complete terms in [`LICENSE`](LICENSE).
 
 Downloadable builds contain the GPLv3-licensed FTHR application together with
