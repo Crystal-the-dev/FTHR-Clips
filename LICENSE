@@ -1,3 +1,17 @@
+FTHR Clips project license notice
+=================================
+
+Copyright © 2026 Haakon Schaller, trading as FTHR-Software.
+
+Except for third-party components and separately licensed project assets
+identified in COPYRIGHT.md and THIRD_PARTY_NOTICES.md, FTHR-authored source
+code in this repository is licensed under the GNU General Public License,
+version 3 only (GPL-3.0-only).
+
+This project notice is provided for FTHR Clips. The complete GNU General
+Public License v3 text follows below, unchanged.
+
+
                     GNU GENERAL PUBLIC LICENSE
                        Version 3, 29 June 2007
 
@@ -619,5 +633,3 @@ Program, unless a warranty or assumption of liability accompanies a
 copy of the Program in return for a fee.
 
                      END OF TERMS AND CONDITIONS
-
-
