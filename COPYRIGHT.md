@@ -7,8 +7,7 @@ FTHR Clips and the FTHR-authored material in this repository are owned by:
 **Haakon Schaller, trading as FTHR-Software**
 
 FTHR-Software is a sole proprietorship operated under the trade name
-FTHR-Software. The current statutory business information is available at
-the [FTHR-Software legal notice](https://about.fthrclips.com/).
+FTHR-Software. All needed business information is available at: [FTHR-Software legal notice](https://about.fthrclips.com/).
 
 Copyright © 2026 Haakon Schaller, trading as FTHR-Software.
 
@@ -24,17 +23,6 @@ version 3 only** (`GPL-3.0-only`). See [`LICENSE`](LICENSE).
 
 This includes the application, capture engines, uploader, hardware-ID service,
 tests, and project build/release tooling maintained by FTHR-Software.
-
-Recommended header for nontrivial FTHR-authored source files:
-
-```text
-Copyright © 2026 Haakon Schaller, trading as FTHR-Software
-SPDX-License-Identifier: GPL-3.0-only
-```
-
-For Python files, use `#` comment markers; for C/C++, JavaScript, and similar
-files, use the language’s normal comment syntax. Do not add this header to
-third-party or generated files unless their own terms expressly permit it.
 
 ## Project-generated assets
 
